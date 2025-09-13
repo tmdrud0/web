@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="UTF-8">
+  <title>Submissions</title>
+  <style>
+    table {
+        border-collapse: collapse;
+        width: 100%;
+    }
+    table, th, td {
+        border: 1px solid #ccc;
+    }
+    th, td {
+        padding: 8px;
+    }
+    .paging {
+        margin-top: 15px;
+    }
+    a.button {
+        text-decoration: none;
+        background-color: #007bff;
+        color: white;
+        padding: 5px 10px;
+        border-radius: 3px;
+    }
+  </style>
+</head>
+<body>
+<!-- 공통 헤더 삽입 -->
+<div th:replace="fragments/header :: header"></div>
+
+<div style="padding: 20px;">
+  <h2>Submission List</h2>
+
+  <!-- 검색 폼 -->
+  <form method="get" action="/submissions">
+    <input type="text" name="user" placeholder="Search by username" th:value="${userFilter}" />
+    <input type="text" name="problemId" placeholder="Search by problem ID" th:value="${problemFilter}" />
+    <button type="submit">Search</button>
+  </form>
+
+  <!-- 제출 목록 테이블 -->
+  <table>
+    <thead>
+    <tr>
+      <th>ID</th>
+      <th>User</th>
+      <th>Problem</th>
+      <th>Time</th>
+      <th>Result</th>
+      <th>Detail</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr th:each="submission : ${submissionsSlice.content}">
+      <td th:text="${submission.id}">ID</td>
+      <td>
+        <a th:href="@{'/profile/' + ${submission.userId}}"
+           th:text="${submission.username}">User</a>
+      </td>
+      <td>
+        <a th:href="@{'/problem/' + ${submission.problemId}}"
+           th:text="${submission.problemName}">Problem</a>
+      </td>
+      <td th:text="${#temporals.format(submission.submittedTime, 'yyyy-MM-dd HH:mm:ss')}">Time</td>
+      <td th:text="${submission.result}">Result</td>
+      <td>
+        <a class="button" th:href="@{'/submission/' + ${submission.id}}">View Code</a>
+      </td>
+    </tr>
+    </tbody>
+  </table>
+
+  <!-- 커서 기반 페이징 -->
+  <div class="paging">
+    <div th:if="${submissionsSlice.hasNext()}">
+      <a th:href="@{/submissions(user=${userFilter}, problemId=${problemFilter}, lastId=${submissionsSlice.content[#lists.size(submissionsSlice.content) - 1].id}, size=10)}">
+        Load More
+      </a>
+    </div>
+  </div>
+</div>
+</body>
+</html>

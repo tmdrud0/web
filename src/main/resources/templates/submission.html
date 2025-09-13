@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="UTF-8">
+  <title>Submission Code</title>
+  <style>
+    pre {
+      background-color: #f4f4f4;
+      padding: 15px;
+      border: 1px solid #ddd;
+      overflow-x: auto;
+      font-family: Consolas, Monaco, 'Andale Mono', 'Ubuntu Mono', monospace;
+    }
+  </style>
+</head>
+<body>
+<div th:replace="fragments/header :: header"></div>
+<div style="padding: 20px;">
+  <h2>Submission Code</h2>
+  <pre><code th:text="${submission.code}">Code goes here...</code></pre>
+  <p><a th:href="@{/submissions}">Back to Submissions</a></p>
+</div>
+</body>
+</html>

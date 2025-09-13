@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="UTF-8">
+  <title>Problems</title>
+  <style>
+    table { border-collapse: collapse; width: 100%; }
+    table, th, td { border: 1px solid #ccc; }
+    th, td { padding: 8px; }
+    .paging { margin-top: 15px; }
+  </style>
+</head>
+<body>
+<!-- 공통 헤더 삽입 -->
+<div th:replace="fragments/header :: header"></div>
+
+<div style="padding: 20px;">
+  <h2>Problems List</h2>
+  <!-- 검색 폼 -->
+  <form method="get" action="/problems">
+    <input type="text" name="problemId" placeholder="Search by Problem ID" th:value="${problemIdFilter}" />
+    <input type="text" name="problemName" placeholder="Search by Problem Name" th:value="${problemNameFilter}" />
+    <button type="submit">Search</button>
+  </form>
+
+  <!-- 문제 목록 테이블 -->
+  <table>
+    <thead>
+    <tr>
+      <th>ID</th>
+      <th>Name</th>
+      <th>Contest</th>
+      <th>Solved?</th>
+      <th>Detail</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr th:each="problem : ${problemsPage.content}">
+      <td th:text="${problem.id}">ID</td>
+      <td th:text="${problem.name}">Name</td>
+      <td th:text="${problem.contestName}">Contest</td>
+      <td>
+        <span th:text="${solvedProblemIds.contains(problem.id) ? '✔' : '✘'}"></span>
+      </td>
+      <td>
+        <a th:href="@{'/problem/' + ${problem.id}}">View Detail</a>
+      </td>
+    </tr>
+    </tbody>
+  </table>
+
+  <!-- 페이징 네비게이션 -->
+  <div class="paging">
+    <span th:text="'Page ' + (${problemsPage.number} + 1) + ' of ' + ${problemsPage.totalPages}"></span>
+    <div>
+      <a th:if="${problemsPage.hasPrevious()}"
+         th:href="@{/problems(problemId=${problemIdFilter}, problemName=${problemNameFilter}, page=${problemsPage.number - 1}, size=${problemsPage.size})}">
+        Previous
+      </a>
+      <a th:if="${problemsPage.hasNext()}"
+         th:href="@{/problems(problemId=${problemIdFilter}, problemName=${problemNameFilter}, page=${problemsPage.number + 1}, size=${problemsPage.size})}">
+        Next
+      </a>
+    </div>
+  </div>
+</div>
+</body>
+</html>

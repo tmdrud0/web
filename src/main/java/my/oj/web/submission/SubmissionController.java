@@ -1,0 +1,138 @@
+package my.oj.web.submission;
+
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import my.oj.web.auth.CurrentUser;
+import my.oj.web.problem.ProblemRepository;
+import my.oj.web.submission.dto.SubmissionFormDto;
+import my.oj.web.submission.dto.SubmissionReceipt;
+import my.oj.web.submission.dto.SubmissionSummaryDto;
+import my.oj.web.submission.dto.SubmitSubmissionCommand;
+import my.oj.web.user.dto.UserDto;
+import org.springframework.data.domain.Slice;
+import org.springframework.stereotype.Controller;
+import org.springframework.ui.Model;
+import org.springframework.validation.BindingResult;
+import org.springframework.web.bind.WebDataBinder;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.InitBinder;
+import org.springframework.web.bind.annotation.ModelAttribute;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.servlet.mvc.support.RedirectAttributes;
+
+import java.beans.PropertyEditorSupport;
+
+@Controller
+@RequiredArgsConstructor
+@Slf4j
+public class SubmissionController {
+
+    private final SubmissionRepository submissionRepository;
+    private final ProblemRepository problemRepository;
+    private final SubmissionService submissionService;
+
+    @GetMapping("/submissions")
+    public String listSubmissions(
+            @RequestParam(required = false, defaultValue = "") String user,
+            @RequestParam(required = false) Long problemId,
+            @RequestParam(required = false) Long lastId,
+            @RequestParam(defaultValue = "10") int size,
+            @CurrentUser UserDto currentUser,
+            Model model) {
+
+        Slice<SubmissionSummaryDto> submissionsSlice =
+                submissionRepository.findSummaries(user, problemId, lastId, size);
+
+        model.addAttribute("submissionsSlice", submissionsSlice);
+        model.addAttribute("userFilter", user);
+        model.addAttribute("problemFilter", problemId);
+        return "submissions";
+    }
+
+    @GetMapping("/problems/{id}/submission")
+    public String showSubmissionForm(@PathVariable Long id,
+                                     @CurrentUser UserDto currentUser,
+                                     Model model) {
+        var problem = problemRepository.findDtoById(id);
+        if (problem == null) {
+            return "redirect:/problems";
+        }
+
+        model.addAttribute("problem", problem);
+        return "submissionForm";
+    }
+
+    @PostMapping("/problems/{id}/submission")
+    public String submit(
+            @PathVariable Long id,
+            @Valid @ModelAttribute("form") SubmissionFormDto form,
+            BindingResult binding,
+            @CurrentUser UserDto currentUser,
+            RedirectAttributes redirectAttributes) {
+
+        if (binding.hasErrors()) {
+            redirectAttributes.addFlashAttribute("error", "Invalid submission form");
+            return "redirect:/problem/" + id;
+        }
+
+        try {
+            SubmissionReceipt receipt = submissionService.submit(
+                    new SubmitSubmissionCommand(
+                            currentUser.id(), id, form.code()
+                    )
+            );
+
+            if (receipt.isDuplicate()) {
+                redirectAttributes.addFlashAttribute("message", "An identical submission already exists (ID #" + receipt.submissionId() + ").");
+                return "redirect:/problem/" + id;
+            }
+
+            if (receipt.isContest()) {
+                redirectAttributes.addFlashAttribute("message", "Contest submission has been queued");
+                return "redirect:/problem/" + id;
+            }
+
+            return "redirect:/submission/" + receipt.submissionId();
+        } catch (IllegalArgumentException e) {
+            redirectAttributes.addFlashAttribute("error", e.getMessage());
+            return "redirect:/problem/" + id;
+        }
+    }
+
+    @GetMapping("/submission/{id}")
+    public String viewSubmissionCode(@PathVariable Long id,
+                                     @CurrentUser UserDto currentUser,
+                                     Model model) {
+        var submissionView = submissionRepository.findViewById(id);
+
+        if (submissionView.isEmpty()) {
+            return "redirect:/submissions";
+        }
+
+        model.addAttribute("submission", submissionView.get());
+        return "submission";
+    }
+
+    @InitBinder
+    public void initBinder(WebDataBinder binder) {
+        binder.registerCustomEditor(Long.class, new PropertyEditorSupport() {
+            @Override
+            public void setAsText(String text) {
+                if (text == null || text.trim().isEmpty()) {
+                    setValue(null);
+                    return;
+                }
+                try {
+                    setValue(Long.parseLong(text.trim()));
+                } catch (NumberFormatException e) {
+                    setValue(null);
+                }
+            }
+        });
+    }
+}
+
+

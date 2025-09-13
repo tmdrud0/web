@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="UTF-8">
+  <title>Contest List</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #f8f9fa; }
+    .container { padding: 24px 32px; }
+    h2 { margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,0.05); }
+    thead { background: #f1f3f5; }
+    th, td { padding: 12px 14px; text-align: center; font-size: 14px; }
+    tbody tr:nth-child(odd) { background: #f8f9fa; }
+    tbody tr:hover { background: #eef2ff; }
+    a.link { color: #0d6efd; text-decoration: none; font-weight: 600; }
+    .status-badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; color: #fff; font-weight: 600; }
+    .status-UPCOMING { background: #6c757d; }
+    .status-RUNNING { background: #28a745; }
+    .status-ENDED { background: #dc3545; }
+    .time-note { font-size: 12px; color: #495057; }
+    .pagination { margin-top: 18px; text-align: center; }
+    .pagination a { margin: 0 4px; text-decoration: none; color: #0d6efd; }
+    .empty-state { margin-top: 16px; text-align: center; color: #6c757d; }
+  </style>
+</head>
+<body>
+<div th:replace="fragments/header :: header"></div>
+<div class="container">
+  <h2>Contest List</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Contest</th>
+        <th>Status</th>
+        <th>Start</th>
+        <th>End</th>
+        <th>Info</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr th:each="contest : ${contestPage}">
+        <td>
+          <a class="link" th:href="@{'/contests/' + ${contest.id()} }" th:text="${contest.id()}">ID</a>
+        </td>
+        <td th:text="${contest.name()}">Contest Name</td>
+        <td>
+          <span th:text="${contest.statusLabel()}" th:class="'status-badge status-' + ${contest.status()}" class="status-badge">Status</span>
+        </td>
+        <td th:text="${#temporals.format(contest.startTime(), 'yyyy-MM-dd HH:mm')}">Start</td>
+        <td th:text="${#temporals.format(contest.endTime(), 'yyyy-MM-dd HH:mm')}">End</td>
+        <td class="time-note" th:text="${contest.timeMessage()}">Info</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="empty-state" th:if="${contestPage.totalElements == 0}">
+      No contests have been scheduled yet.
+  </div>
+  <div class="pagination" th:if="${contestPage.totalPages > 1}">
+      <a th:each="pageNum : ${#numbers.sequence(0, contestPage.totalPages - 1)}"
+         th:classappend="${pageNum == contestPage.number} ? 'active'"
+         th:href="@{'/contests'(page=${pageNum}, size=${contestPage.size})}" th:text="${pageNum + 1}"></a>
+  </div>
+</div>
+</body>
+</html>
