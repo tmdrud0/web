@@ -22,10 +22,21 @@ public class Contest {
     private LocalDateTime startTime;
     private LocalDateTime endTime;
 
+    @Column(name = "finalized_at")
+    private LocalDateTime finalizedAt;
+
     @OneToMany(mappedBy = "contest")
     private List<Problem> problems = new ArrayList<>();
 
     public Contest(String name) {
         this.name = name;
+    }
+
+    public boolean isFinalized() {
+        return finalizedAt != null;
+    }
+
+    public void markFinalized(LocalDateTime time) {
+        this.finalizedAt = time;
     }
 }

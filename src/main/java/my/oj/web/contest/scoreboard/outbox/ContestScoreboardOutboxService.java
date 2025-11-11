@@ -12,6 +12,7 @@ import java.time.LocalDateTime;
 public class ContestScoreboardOutboxService {
 
     private final ContestScoreboardOutboxRepository repository;
+    private final ContestScoreboardOutboxSequenceStore sequenceStore;
 
     @Transactional
     public ContestScoreboardOutbox enqueue(Long contestSubmissionId,
@@ -22,7 +23,7 @@ public class ContestScoreboardOutboxService {
                                            LocalDateTime submittedTime,
                                            SubmissionResult result,
                                            LocalDateTime judgedAt) {
-        ContestScoreboardOutbox outbox = ContestScoreboardOutbox.pending(
+        ContestScoreboardOutboxPayload payload = new ContestScoreboardOutboxPayload(
                 contestSubmissionId,
                 contestId,
                 problemId,
@@ -31,6 +32,18 @@ public class ContestScoreboardOutboxService {
                 submittedTime,
                 result,
                 judgedAt
+        );
+        Long redisSequence = sequenceStore.reserveSequence(payload);
+        ContestScoreboardOutbox outbox = ContestScoreboardOutbox.pending(
+                contestSubmissionId,
+                contestId,
+                problemId,
+                userId,
+                contestStart,
+                submittedTime,
+                result,
+                judgedAt,
+                redisSequence
         );
         return repository.save(outbox);
     }

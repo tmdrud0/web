@@ -1,7 +1,7 @@
 package my.oj.web.user;
+
 import jakarta.persistence.Embeddable;
 import lombok.Getter;
-import lombok.Setter;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -22,9 +22,11 @@ public class Streak {
     public void updateUserStreak() {
         LocalDateTime today = LocalDateTime.now();
 
-        if(today.toLocalDate().isEqual(lastSolvedDate.toLocalDate())) return;
+        if (lastSolvedDate != null && today.toLocalDate().isEqual(lastSolvedDate.toLocalDate())) {
+            return;
+        }
 
-        if(lastSolvedDate.toLocalDate().isEqual(today.minusDays(1).toLocalDate())) {
+        if (lastSolvedDate != null && lastSolvedDate.toLocalDate().isEqual(today.minusDays(1).toLocalDate())) {
             currentStreak++;
         } else {
             currentStreak = 1;
@@ -42,6 +44,29 @@ public class Streak {
         LocalDate last = lastSolvedDate.toLocalDate();
         if (last.isBefore(today.minusDays(1))) {
             currentStreak = 0;
+        }
+    }
+
+    public void applyBatchResult(int newCurrent) {
+        if (newCurrent < 0) {
+            newCurrent = 0;
+        }
+        this.currentStreak = newCurrent;
+        if (newCurrent > this.longestStreak) {
+            this.longestStreak = newCurrent;
+        }
+    }
+
+    public void resetByBatch() {
+        this.currentStreak = 0;
+    }
+
+    public void recordSolveAt(LocalDateTime solvedAt) {
+        if (solvedAt == null) {
+            return;
+        }
+        if (this.lastSolvedDate == null || solvedAt.isAfter(this.lastSolvedDate)) {
+            this.lastSolvedDate = solvedAt;
         }
     }
 }

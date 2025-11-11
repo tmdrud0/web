@@ -16,4 +16,7 @@ public interface ContestSubmissionRepository extends JpaRepository<ContestSubmis
     Optional<ContestSubmission> findByContestIdAndProblemIdAndUserIdAndCodeHash(Long contestId, Long problemId, Long userId, String codeHash);
 
     void deleteByContestId(Long contestId);
+
+    @Query("select coalesce(max(cs.id), 0) from ContestSubmission cs")
+    Long findMaxId();
 }

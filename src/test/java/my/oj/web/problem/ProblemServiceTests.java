@@ -20,6 +20,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.LongStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.BDDMockito.given;
@@ -55,10 +56,11 @@ class ProblemServiceTests {
     @Test
     void getSolvedProblemIds_returnsAllForLowSolvedUsers() {
         given(userRepository.findById(1L)).willReturn(Optional.of(lowSolvedUser));
+        List<Long> currentProblems = LongStream.rangeClosed(1, 30).boxed().toList();
         given(acceptedSubmissionRepository.findSolvedProblemIdsByUserId(1L))
                 .willReturn(List.of(1L, 2L, 3L));
 
-        Set<Long> result = problemService.getSolvedProblemIds(1L, List.of(10L, 20L));
+        Set<Long> result = problemService.getSolvedProblemIds(1L, currentProblems);
 
         assertThat(result).containsExactlyInAnyOrder(1L, 2L, 3L);
         then(acceptedSubmissionRepository).should().findSolvedProblemIdsByUserId(1L);
@@ -68,13 +70,14 @@ class ProblemServiceTests {
     @Test
     void getSolvedProblemIds_filtersForHeavyUsers() {
         given(userRepository.findById(2L)).willReturn(Optional.of(heavySolvedUser));
-        given(acceptedSubmissionRepository.findSolvedProblemIdsInList(2L, List.of(5L, 6L)))
-                .willReturn(List.of(5L));
+        List<Long> currentProblems = LongStream.rangeClosed(1, 30).boxed().toList();
+        given(acceptedSubmissionRepository.findSolvedProblemIdsInList(2L, currentProblems))
+                .willReturn(List.of(5L, 6L));
 
-        Set<Long> result = problemService.getSolvedProblemIds(2L, List.of(5L, 6L));
+        Set<Long> result = problemService.getSolvedProblemIds(2L, currentProblems);
 
-        assertThat(result).containsExactly(5L);
-        then(acceptedSubmissionRepository).should().findSolvedProblemIdsInList(2L, List.of(5L, 6L));
+        assertThat(result).containsExactlyInAnyOrder(5L, 6L);
+        then(acceptedSubmissionRepository).should().findSolvedProblemIdsInList(2L, currentProblems);
         then(acceptedSubmissionRepository).shouldHaveNoMoreInteractions();
     }
 

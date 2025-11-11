@@ -12,9 +12,6 @@ import java.util.Optional;
 
 public interface ContestSubmissionResultRepository extends JpaRepository<ContestSubmissionResult, Long> {
 
-    @Query("select csr from ContestSubmissionResult csr join fetch csr.submission s where s.id = :submissionId")
-    Optional<ContestSubmissionResult> findBySubmissionIdWithSubmission(@Param("submissionId") Long submissionId);
-
     @Query("""
             select csr.submission.id
             from ContestSubmissionResult csr

@@ -39,16 +39,22 @@ public class SubmissionController {
             @RequestParam(required = false, defaultValue = "") String user,
             @RequestParam(required = false) Long problemId,
             @RequestParam(required = false) Long lastId,
-            @RequestParam(defaultValue = "10") int size,
+            @RequestParam(defaultValue = "100") int size,
+            @RequestParam(defaultValue = "desc") String order,
+            @RequestParam(defaultValue = "false") boolean acceptedOnly,
             @CurrentUser UserDto currentUser,
             Model model) {
 
+        SubmissionSortOrder sortOrder = SubmissionSortOrder.from(order);
         Slice<SubmissionSummaryDto> submissionsSlice =
-                submissionRepository.findSummaries(user, problemId, lastId, size);
+                submissionRepository.findSummaries(user, problemId, lastId, size, sortOrder, acceptedOnly);
 
         model.addAttribute("submissionsSlice", submissionsSlice);
         model.addAttribute("userFilter", user);
         model.addAttribute("problemFilter", problemId);
+        model.addAttribute("orderFilter", sortOrder.name().toLowerCase());
+        model.addAttribute("acceptedOnlyFilter", acceptedOnly);
+        model.addAttribute("pageSize", size);
         return "submissions";
     }
 

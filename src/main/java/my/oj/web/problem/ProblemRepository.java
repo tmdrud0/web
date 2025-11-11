@@ -3,9 +3,6 @@ package my.oj.web.problem;
 
 import my.oj.web.problem.dto.ContestProblemDto;
 import my.oj.web.problem.dto.ProblemDto;
-import my.oj.web.submission.dto.MinimalSubmissionDto;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;

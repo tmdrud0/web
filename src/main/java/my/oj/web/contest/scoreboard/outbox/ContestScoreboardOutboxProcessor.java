@@ -15,6 +15,7 @@ public class ContestScoreboardOutboxProcessor {
 
     private final ContestScoreboardOutboxService outboxService;
     private final ContestScoreboardService scoreboardService;
+    private final ContestScoreboardOutboxSequenceStore sequenceStore;
 
     @Async
     @EventListener
@@ -38,7 +39,9 @@ public class ContestScoreboardOutboxProcessor {
                     outbox.getSubmittedTime(),
                     outbox.getResult()
             );
-            outbox.markSuccess(LocalDateTime.now());
+            LocalDateTime processedAt = LocalDateTime.now();
+            outbox.markSuccess(processedAt);
+            sequenceStore.markProcessed(outbox.getRedisSequence(), processedAt);
         } catch (Exception ex) {
             outbox.markFailed(ex.getMessage());
             throw ex;

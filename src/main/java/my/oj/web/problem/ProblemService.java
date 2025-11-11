@@ -23,6 +23,8 @@ import java.util.Set;
 @Transactional(readOnly = true)
 public class ProblemService {
 
+    private static final long SOLVED_COUNT_MULTIPLIER = 4L;
+
     private final ProblemRepository problemRepository;
     private final SubmissionRepository submissionRepository;
     private final AcceptedSubmissionRepository acceptedRepository;
@@ -33,13 +35,20 @@ public class ProblemService {
     }
 
     public Set<Long> getSolvedProblemIds(Long userId, List<Long> currentProblemIds) {
-        final Long SOLVED_COUNT_THRESHOLD = 500L;
         User user = userRepository.findById(userId).orElseThrow();
+        List<Long> problemIds = currentProblemIds != null ? currentProblemIds : List.of();
 
-        if (user.getSolvedCount() < SOLVED_COUNT_THRESHOLD)
+        if (problemIds.isEmpty()) {
+            return Set.of();
+        }
+
+        long dynamicThreshold = problemIds.size() * SOLVED_COUNT_MULTIPLIER;
+
+        if (user.getSolvedCount() < dynamicThreshold) {
             return new HashSet<>(acceptedRepository.findSolvedProblemIdsByUserId(userId));
-        else
-            return new HashSet<>(acceptedRepository.findSolvedProblemIdsInList(userId, currentProblemIds));
+        }
+
+        return new HashSet<>(acceptedRepository.findSolvedProblemIdsInList(userId, problemIds));
     }
 
     public ProblemDetailDto getProblemDetail(Long problemId, UserDto user) {

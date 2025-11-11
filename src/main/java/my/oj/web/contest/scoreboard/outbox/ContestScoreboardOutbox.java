@@ -55,6 +55,9 @@ public class ContestScoreboardOutbox {
     @Column(length = 500)
     private String lastErrorMessage;
 
+    @Column(name = "redis_seq")
+    private Long redisSequence;
+
     public static ContestScoreboardOutbox pending(Long contestSubmissionId,
                                                   Long contestId,
                                                   Long problemId,
@@ -62,7 +65,8 @@ public class ContestScoreboardOutbox {
                                                   LocalDateTime contestStart,
                                                   LocalDateTime submittedTime,
                                                   SubmissionResult result,
-                                                  LocalDateTime judgedAt) {
+                                                  LocalDateTime judgedAt,
+                                                  Long redisSequence) {
         ContestScoreboardOutbox outbox = new ContestScoreboardOutbox();
         outbox.contestSubmissionId = contestSubmissionId;
         outbox.contestId = contestId;
@@ -74,6 +78,7 @@ public class ContestScoreboardOutbox {
         outbox.judgedAt = judgedAt;
         outbox.status = ContestScoreboardOutboxStatus.PENDING;
         outbox.createdAt = LocalDateTime.now();
+        outbox.redisSequence = redisSequence;
         return outbox;
     }
 

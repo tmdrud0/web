@@ -4,6 +4,7 @@ import jakarta.servlet.http.HttpSession;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import my.oj.web.auth.CurrentUser;
+import my.oj.web.user.User;
 import my.oj.web.user.dto.UserDto;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
@@ -18,7 +19,6 @@ import org.springframework.web.bind.annotation.RequestParam;
 public class UserController {
 
     private final UserService userService;
-    private final my.oj.web.user.rank.streaksnapshot.StreakMaintenanceService streakMaintenanceService;
 
     @GetMapping("/")
     public String index() {
@@ -73,7 +73,6 @@ public class UserController {
     public String showUserProfile(@PathVariable Long id,
                                   @CurrentUser UserDto loggedInUser,
                                   Model model) {
-        streakMaintenanceService.ensureFreshnessForUser(id);
         User user = userService.findById(id).orElse(null);
         if (user == null) {
             return "redirect:/";
@@ -82,4 +81,5 @@ public class UserController {
         return "profile";
     }
 }
+
 

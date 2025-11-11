@@ -6,5 +6,10 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Slice;
 
 public interface SubmissionRepositoryCustom {
-    Slice<SubmissionSummaryDto> findSummaries(String username, Long problemId, Long lastId, int pageSize);
-    }
+    Slice<SubmissionSummaryDto> findSummaries(String username,
+                                              Long problemId,
+                                              Long lastId,
+                                              int pageSize,
+                                              SubmissionSortOrder order,
+                                              boolean acceptedOnly);
+}

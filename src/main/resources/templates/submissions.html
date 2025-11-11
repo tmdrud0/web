@@ -37,6 +37,15 @@
   <form method="get" action="/submissions">
     <input type="text" name="user" placeholder="Search by username" th:value="${userFilter}" />
     <input type="text" name="problemId" placeholder="Search by problem ID" th:value="${problemFilter}" />
+    <select name="order">
+      <option value="desc" th:selected="${orderFilter == 'desc'}">Newest first</option>
+      <option value="asc" th:selected="${orderFilter == 'asc'}">Oldest first</option>
+    </select>
+    <label>
+      <input type="checkbox" name="acceptedOnly" value="true" th:checked="${acceptedOnlyFilter}" />
+      Accepted only
+    </label>
+    <input type="hidden" name="size" th:value="${pageSize}" />
     <button type="submit">Search</button>
   </form>
 
@@ -75,7 +84,7 @@
   <!-- 커서 기반 페이징 -->
   <div class="paging">
     <div th:if="${submissionsSlice.hasNext()}">
-      <a th:href="@{/submissions(user=${userFilter}, problemId=${problemFilter}, lastId=${submissionsSlice.content[#lists.size(submissionsSlice.content) - 1].id}, size=10)}">
+      <a th:href="@{/submissions(user=${userFilter}, problemId=${problemFilter}, lastId=${submissionsSlice.content[#lists.size(submissionsSlice.content) - 1].id}, size=${pageSize}, order=${orderFilter}, acceptedOnly=${acceptedOnlyFilter})}">
         Load More
       </a>
     </div>

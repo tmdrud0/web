@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 class ContestSubmissionBatchExecutorTests {
 
@@ -45,6 +46,25 @@ class ContestSubmissionBatchExecutorTests {
 
         assertThat(processedIds).containsExactlyElementsOf(List.of(1L, 2L, 3L, 10L));
         assertThat(requestedAfterIds).containsExactly(null, 3L, 10L);
+    }
+
+    @Test
+    void processBatches_retriesTransientFailure() {
+        List<Long> batch = List.of(1L, 2L);
+        AtomicInteger consumerCalls = new AtomicInteger();
+
+        executor.processBatches(
+                42L,
+                2,
+                (contestId, afterId, pageable) -> afterId == null ? batch : List.of(),
+                ids -> {
+                    if (consumerCalls.getAndIncrement() == 0) {
+                        throw new RuntimeException("transient failure");
+                    }
+                }
+        );
+
+        assertThat(consumerCalls.get()).isEqualTo(2);
     }
 
     private static class NoOpTransactionManager implements PlatformTransactionManager {

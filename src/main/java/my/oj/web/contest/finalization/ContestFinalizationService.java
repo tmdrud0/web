@@ -1,17 +1,17 @@
 package my.oj.web.contest.finalization;
 
+import my.oj.web.contest.Contest;
+import my.oj.web.contest.ContestRepository;
 import my.oj.web.contest.scoreboard.ContestScoreboardService;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
-import my.oj.web.contest.finalization.ContestRejudgeService;
-import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
-import my.oj.web.submission.Submission;
-import my.oj.web.submission.SubmissionRepository;
 import my.oj.web.submission.SubmissionResult;
-import my.oj.web.submission.event.normal.NormalSubmissionResultService;
+import my.oj.web.submission.accepted.AcceptedSubmission;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -23,136 +23,156 @@ import java.util.Map;
 @Service
 public class ContestFinalizationService {
 
-    private static final int SYNC_BATCH_SIZE = 500;
+    private static final Logger log = LoggerFactory.getLogger(ContestFinalizationService.class);
 
     private final ContestFinalScoreService finalScoreService;
+    private final ContestRepository contestRepository;
     private final ContestScoreboardService scoreboardService;
     private final ContestScoreboardOutboxRepository outboxRepository;
     private final ContestRejudgeService rejudgeService;
     private final ContestSubmissionResultRepository resultRepository;
     private final ContestSubmissionService contestSubmissionService;
-    private final SubmissionRepository submissionRepository;
-    private final NormalSubmissionResultService normalSubmissionResultService;
-    private final ContestSubmissionBatchExecutor batchExecutor;
+    private final ContestFinalizationBatchRepository batchRepository;
 
     public ContestFinalizationService(ContestFinalScoreService finalScoreService,
+                                      ContestRepository contestRepository,
                                       ContestScoreboardService scoreboardService,
                                       ContestScoreboardOutboxRepository outboxRepository,
                                       ContestRejudgeService rejudgeService,
                                       ContestSubmissionResultRepository resultRepository,
                                       ContestSubmissionService contestSubmissionService,
-                                      SubmissionRepository submissionRepository,
-                                      NormalSubmissionResultService normalSubmissionResultService,
-                                      ContestSubmissionBatchExecutor batchExecutor) {
+                                      ContestFinalizationBatchRepository batchRepository) {
         this.finalScoreService = finalScoreService;
+        this.contestRepository = contestRepository;
         this.scoreboardService = scoreboardService;
         this.outboxRepository = outboxRepository;
         this.rejudgeService = rejudgeService;
         this.resultRepository = resultRepository;
         this.contestSubmissionService = contestSubmissionService;
-        this.submissionRepository = submissionRepository;
-        this.normalSubmissionResultService = normalSubmissionResultService;
-        this.batchExecutor = batchExecutor;
+        this.batchRepository = batchRepository;
     }
 
     public void finalizeContest(Long contestId) {
+        Contest contest = contestRepository.findById(contestId)
+                .orElseThrow(() -> new IllegalArgumentException("Contest not found: " + contestId));
+
+        if (contest.isFinalized()) {
+            log.info("Contest {} already finalized at {}", contestId, contest.getFinalizedAt());
+            return;
+        }
+
         rejudgeService.rejudgeAcceptedSubmissions(contestId);
         resultRepository.copyProvisionalToFinal(contestId);
 
+        List<ContestSubmissionResult> results = resultRepository.findAllByContestIdWithSubmission(contestId);
+
         finalScoreService.deleteScores(contestId, ContestFinalScoreStatus.PROVISIONAL);
-        finalScoreService.rebuildScores(contestId, ContestFinalScoreStatus.FINAL);
+        finalScoreService.rebuildScores(contestId, ContestFinalScoreStatus.FINAL, results);
 
-        syncContestSubmissionsToNormal(contestId);
+        applyContestResultsToNormal(contest, results);
+
         contestSubmissionService.purgeContest(contestId);
-
         scoreboardService.reset(contestId);
         outboxRepository.deleteByContestId(contestId);
+
+        contest.markFinalized(LocalDateTime.now());
+        contestRepository.save(contest);
     }
 
-    private void syncContestSubmissionsToNormal(Long contestId) {
-        batchExecutor.processBatches(
-                contestId,
-                SYNC_BATCH_SIZE,
-                resultRepository::findSubmissionIdsByContestId,
-                this::transferBatch
-        );
-    }
-
-    private void transferBatch(List<Long> submissionIds) {
-        if (submissionIds == null || submissionIds.isEmpty()) {
-            return;
-        }
-        List<ContestSubmission> submissions = contestSubmissionService.findAllByIdsInOrder(submissionIds);
-        if (submissions.isEmpty()) {
+    void applyContestResultsToNormal(Contest contest, List<ContestSubmissionResult> results) {
+        if (results == null || results.isEmpty()) {
             return;
         }
 
-        Map<Long, ContestSubmissionResult> resultMap = loadResults(submissionIds);
-        List<Submission> toPersist = new ArrayList<>(submissions.size());
-        List<SubmissionSyncPayload> payloads = new ArrayList<>(submissions.size());
+        List<ContestFinalizationBatchRepository.SubmissionRow> submissionRows = new ArrayList<>(results.size());
+        Map<Long, Map<Long, ContestSubmission>> acceptedByUser = new HashMap<>();
+        Map<Long, Long> initialSolved = new HashMap<>();
 
-        for (ContestSubmission submission : submissions) {
-            ContestSubmissionResult result = resultMap.get(submission.getId());
-            SubmissionResult effectiveResult = resolveResult(result);
-            LocalDateTime judgedAt = resolveJudgedAt(result, submission);
-
-            Submission normal = Submission.create(
-                    submission.getUser(),
-                    submission.getProblem(),
-                    submission.getCode(),
-                    submission.getSubmittedTime()
-            );
-            normal.setResult(effectiveResult);
-
-            toPersist.add(normal);
-            payloads.add(new SubmissionSyncPayload(effectiveResult, judgedAt));
-        }
-
-        List<Submission> saved = submissionRepository.saveAll(toPersist);
-        for (int i = 0; i < saved.size(); i++) {
-            Submission savedSubmission = saved.get(i);
-            SubmissionSyncPayload payload = payloads.get(i);
-            normalSubmissionResultService.handleSubmissionResult(
-                    savedSubmission.getId(),
-                    payload.result(),
-                    payload.judgedAt()
-            );
-        }
-    }
-
-    private Map<Long, ContestSubmissionResult> loadResults(List<Long> submissionIds) {
-        List<ContestSubmissionResult> results = resultRepository.findAllById(submissionIds);
-        Map<Long, ContestSubmissionResult> map = new HashMap<>(results.size());
         for (ContestSubmissionResult result : results) {
-            map.put(result.getId(), result);
+            ContestSubmission submission = result.getSubmission();
+            if (submission == null) {
+                continue;
+            }
+            SubmissionResult effective = resolveResult(result, true);
+            submissionRows.add(new ContestFinalizationBatchRepository.SubmissionRow(
+                    submission.getUser().getId(),
+                    submission.getProblem().getId(),
+                    submission.getSubmittedTime(),
+                    submission.getCode(),
+                    submission.getCodeHash(),
+                    effective
+            ));
+
+            initialSolved.putIfAbsent(submission.getUser().getId(), submission.getUser().getSolvedCount());
+
+            if (effective != SubmissionResult.ACCEPTED) {
+                continue;
+            }
+
+            acceptedByUser
+                    .computeIfAbsent(submission.getUser().getId(), id -> new HashMap<>())
+                    .merge(submission.getProblem().getId(), submission, (existing, candidate) ->
+                            existing.getSubmittedTime().isBefore(candidate.getSubmittedTime()) ? existing : candidate);
         }
-        return map;
+
+        batchRepository.insertSubmissions(submissionRows);
+
+        if (acceptedByUser.isEmpty()) {
+            return;
+        }
+
+        LocalDateTime contestEnd = contest.getEndTime();
+        List<AcceptedSubmission> acceptedRows = new ArrayList<>();
+        Map<Long, ContestFinalizationBatchRepository.UserSolvedDelta> solvedChanges = new HashMap<>();
+
+        for (Map.Entry<Long, Map<Long, ContestSubmission>> entry : acceptedByUser.entrySet()) {
+            Long userId = entry.getKey();
+            Map<Long, ContestSubmission> perProblem = entry.getValue();
+            if (perProblem.isEmpty()) {
+                continue;
+            }
+            long delta = perProblem.size();
+            long oldSolved = initialSolved.getOrDefault(userId, 0L);
+            solvedChanges.merge(
+                    userId,
+                    new ContestFinalizationBatchRepository.UserSolvedDelta(oldSolved, delta),
+                    (existing, incoming) -> new ContestFinalizationBatchRepository.UserSolvedDelta(
+                            existing.oldSolved(),
+                            existing.delta() + incoming.delta()
+                    )
+            );
+
+            for (ContestSubmission submission : perProblem.values()) {
+                acceptedRows.add(AcceptedSubmission.create(
+                        submission.getUser(),
+                        submission.getProblem(),
+                        submission.getSubmittedTime()
+                ));
+            }
+        }
+
+        if (acceptedRows.isEmpty()) {
+            return;
+        }
+
+        persistContestResults(contestEnd, acceptedRows, solvedChanges);
     }
 
-    private SubmissionResult resolveResult(ContestSubmissionResult result) {
+    void persistContestResults(LocalDateTime contestEnd,
+                               List<AcceptedSubmission> acceptedRows,
+                               Map<Long, ContestFinalizationBatchRepository.UserSolvedDelta> solvedChanges) {
+        batchRepository.insertAcceptedSubmissions(acceptedRows);
+        LocalDateTime effectiveTime = contestEnd != null ? contestEnd : LocalDateTime.now();
+        batchRepository.incrementSolvedCountsAndDailyActivity(solvedChanges, effectiveTime);
+    }
+
+    private SubmissionResult resolveResult(ContestSubmissionResult result, boolean useFinalResult) {
         if (result == null) {
             return SubmissionResult.PENDING;
         }
-        if (result.getFinalResult() != null) {
+        if (useFinalResult && result.getFinalResult() != null) {
             return result.getFinalResult();
         }
         return result.getProvisionalResult();
     }
-
-    private LocalDateTime resolveJudgedAt(ContestSubmissionResult result, ContestSubmission submission) {
-        if (result == null) {
-            return submission.getSubmittedTime();
-        }
-        if (result.getFinalJudgedAt() != null) {
-            return result.getFinalJudgedAt();
-        }
-        if (result.getProvisionalJudgedAt() != null) {
-            return result.getProvisionalJudgedAt();
-        }
-        return submission.getSubmittedTime();
-    }
-
-    private record SubmissionSyncPayload(SubmissionResult result, LocalDateTime judgedAt) {
-    }
 }
-

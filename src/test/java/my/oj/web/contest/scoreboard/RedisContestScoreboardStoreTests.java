@@ -6,8 +6,6 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.util.List;
-import java.util.Map;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -74,6 +72,62 @@ class RedisContestScoreboardStoreTests {
         store.recordJudgement(100L, contestId, 41L, 5555L, start, start.plusMinutes(4), SubmissionResult.WRONG_ANSWER);
 
         assertThat(store.currentRanking(contestId)).containsExactlyElementsOf(before);
+    }
+
+    @Test
+    void topRankingRespectsRequestedSize() {
+        long contestId = 21L;
+        LocalDateTime start = LocalDateTime.of(2024, 8, 1, 9, 0);
+
+        for (int i = 1; i <= 5; i++) {
+            long userId = i;
+            store.recordJudgement(1000L + i, contestId, 90L + i, userId, start, start.plusMinutes(i * 5L), SubmissionResult.ACCEPTED);
+        }
+
+        ContestScoreboardSlice topThree = store.topRanking(contestId, 3);
+
+        assertThat(topThree.startRank()).isEqualTo(1);
+        assertThat(topThree.entries()).hasSize(3);
+        assertThat(topThree.totalParticipants()).isEqualTo(5);
+        assertThat(topThree.entries().stream().map(ContestScoreboardEntry::userId))
+                .containsExactly(1L, 2L, 3L);
+    }
+
+    @Test
+    void sliceReturnsRequestedWindow() {
+        long contestId = 23L;
+        LocalDateTime start = LocalDateTime.of(2024, 8, 3, 9, 0);
+
+        for (int i = 1; i <= 8; i++) {
+            long userId = i;
+            store.recordJudgement(3000L + i, contestId, 200L + i, userId, start, start.plusMinutes(i * 2L), SubmissionResult.ACCEPTED);
+        }
+
+        ContestScoreboardSlice slice = store.slice(contestId, 4, 3);
+
+        assertThat(slice.startRank()).isEqualTo(4);
+        assertThat(slice.entries()).hasSize(3);
+        assertThat(slice.totalParticipants()).isEqualTo(8);
+        assertThat(slice.entries().stream().map(ContestScoreboardEntry::userId))
+                .containsExactly(4L, 5L, 6L);
+    }
+
+    @Test
+    void rankingAroundUserCentersWindowWhenPossible() {
+        long contestId = 22L;
+        LocalDateTime start = LocalDateTime.of(2024, 8, 2, 9, 0);
+
+        for (int i = 1; i <= 6; i++) {
+            long userId = i;
+            store.recordJudgement(2000L + i, contestId, 100L + i, userId, start, start.plusMinutes(i * 3L), SubmissionResult.ACCEPTED);
+        }
+
+        var aroundUser = store.rankingAroundUser(contestId, 4L, 3).orElseThrow();
+
+        assertThat(aroundUser.startRank()).isEqualTo(3);
+        assertThat(aroundUser.entries()).hasSize(3);
+        assertThat(aroundUser.entries().stream().map(ContestScoreboardEntry::userId))
+                .containsExactly(3L, 4L, 5L);
     }
 
     private static final class InMemoryRedisClient implements ContestRedisKeyValueClient {
@@ -146,14 +200,10 @@ class RedisContestScoreboardStoreTests {
 
         @Override
         public List<String> zRevRange(String key, long start, long end) {
-            Map<String, Double> members = zsets.get(key);
-            if (members == null || members.isEmpty()) {
+            List<Map.Entry<String, Double>> sorted = sortedEntries(key);
+            if (sorted.isEmpty()) {
                 return List.of();
             }
-            List<Map.Entry<String, Double>> sorted = new ArrayList<>(members.entrySet());
-            sorted.sort(Comparator.comparing(Map.Entry<String, Double>::getValue)
-                    .reversed()
-                    .thenComparing(Map.Entry::getKey));
 
             int fromIndex = (int) Math.max(0, start);
             int toIndex;
@@ -170,6 +220,23 @@ class RedisContestScoreboardStoreTests {
                 slice.add(sorted.get(i).getKey());
             }
             return slice;
+        }
+
+        @Override
+        public Long zRevRank(String key, String member) {
+            List<Map.Entry<String, Double>> sorted = sortedEntries(key);
+            for (int i = 0; i < sorted.size(); i++) {
+                if (sorted.get(i).getKey().equals(member)) {
+                    return (long) i;
+                }
+            }
+            return null;
+        }
+
+        @Override
+        public long zCard(String key) {
+            Map<String, Double> members = zsets.get(key);
+            return members != null ? members.size() : 0L;
         }
 
         @Override
@@ -191,6 +258,18 @@ class RedisContestScoreboardStoreTests {
         public boolean sIsMember(String key, String member) {
             Set<String> members = sets.get(key);
             return members != null && members.contains(member);
+        }
+
+        private List<Map.Entry<String, Double>> sortedEntries(String key) {
+            Map<String, Double> members = zsets.get(key);
+            if (members == null || members.isEmpty()) {
+                return List.of();
+            }
+            List<Map.Entry<String, Double>> sorted = new ArrayList<>(members.entrySet());
+            sorted.sort(Comparator.comparing(Map.Entry<String, Double>::getValue)
+                    .reversed()
+                    .thenComparing(Map.Entry::getKey));
+            return sorted;
         }
 
         private Set<String> filter(Set<String> keys, String pattern) {

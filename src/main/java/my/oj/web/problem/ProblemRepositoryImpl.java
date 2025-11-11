@@ -45,6 +45,7 @@ public class ProblemRepositoryImpl implements ProblemRepositoryCustom {
                 .from(problem)
                 .join(problem.contest, contest)
                 .where(builder)
+                .orderBy(problem.id.asc())
                 .offset(pageable.getOffset())
                 .limit(pageable.getPageSize())
                 .fetch();

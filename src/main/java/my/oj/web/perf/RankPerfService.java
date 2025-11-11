@@ -1,25 +1,24 @@
 package my.oj.web.perf;
 
-import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Random;
 
 import lombok.RequiredArgsConstructor;
+import my.oj.web.perf.dto.AroundBenchResult;
 import my.oj.web.perf.dto.BucketRebuildResult;
-import my.oj.web.perf.dto.SeedRequest;
-import my.oj.web.perf.dto.SeedResult;
-import my.oj.web.perf.dto.SnapshotResult;
+import my.oj.web.perf.dto.LongestBenchResult;
 import my.oj.web.perf.dto.SolvedBenchResult;
 import my.oj.web.perf.dto.StreakBenchResult;
-import my.oj.web.user.rank.NaiveSolvedRepository;
-import my.oj.web.user.rank.RankRepository;
-import my.oj.web.user.rank.RankService;
-import my.oj.web.user.rank.solvedbucket.SolvedBucketRepository;
-import my.oj.web.user.rank.streaksnapshot.NaiveStreakRepository;
-import my.oj.web.user.rank.streaksnapshot.StreakRankService;
-import my.oj.web.user.rank.streaksnapshot.StreakSnapshotService;
-import org.springframework.jdbc.core.JdbcTemplate;
+import my.oj.web.user.rank.dto.RankItemDto;
+import my.oj.web.user.rank.dto.RankPageDto;
+import my.oj.web.user.rank.streak.longest.LongestStreakSnapshotRepository;
+import my.oj.web.user.rank.streak.longest.LongestStreakRankService;
+import my.oj.web.user.rank.streak.longest.NaiveLongestStreakRepository;
+import my.oj.web.user.rank.solved.NaiveSolvedRepository;
+import my.oj.web.user.rank.solved.SolvedRankRepository;
+import my.oj.web.user.rank.solved.SolvedRankService;
+import my.oj.web.user.rank.solved.solvedbucket.SolvedBucketRepository;
+import my.oj.web.user.rank.streak.NaiveStreakRepository;
+import my.oj.web.user.rank.streak.StreakRankService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -27,60 +26,17 @@ import org.springframework.transaction.annotation.Transactional;
 @RequiredArgsConstructor
 public class RankPerfService {
 
-    private final JdbcTemplate jdbc;
-    private final StreakSnapshotService snapshotService;
     private final StreakRankService streakRankService;
     private final NaiveStreakRepository naiveStreakRepository;
     private final NaiveSolvedRepository naiveSolvedRepository;
-    private final RankRepository rankRepository;
+    private final SolvedRankRepository rankRepository;
     private final SolvedBucketRepository solvedBucketRepository;
-    private final RankService rankService;
+    private final SolvedRankService rankService;
+    private final LongestStreakRankService longestStreakRankService;
+    private final LongestStreakSnapshotRepository longestStreakSnapshotRepository;
+    private final NaiveLongestStreakRepository naiveLongestStreakRepository;
 
     @Transactional
-    public SeedResult seedUsers(SeedRequest request) {
-        String sql = "INSERT INTO `user`(name, pass, solved_count, streak_last_solved_date, "
-                + "streak_current_streak, streak_longest_streak) VALUES (?,?,?,?,?,?)";
-        var now = LocalDateTime.now();
-        var random = new Random(42);
-        int inserted = 0;
-        List<Object[]> buffer = new java.util.ArrayList<>(request.batchSize());
-
-        for (int i = 1; i <= request.totalUsers(); i++) {
-            int daysAgo = random.nextInt(5);
-            LocalDateTime lastSolved = now.minusDays(daysAgo).minusMinutes(random.nextInt(1440));
-            int currentStreak = random.nextInt(30);
-            int longestStreak = Math.max(currentStreak, random.nextInt(50));
-            buffer.add(new Object[]{
-                    "u" + i,
-                    "p",
-                    random.nextLong(1000),
-                    lastSolved,
-                    currentStreak,
-                    longestStreak
-            });
-
-            if (buffer.size() == request.batchSize()) {
-                jdbc.batchUpdate(sql, buffer);
-                inserted += buffer.size();
-                buffer.clear();
-            }
-        }
-
-        if (!buffer.isEmpty()) {
-            jdbc.batchUpdate(sql, buffer);
-            inserted += buffer.size();
-        }
-
-        return new SeedResult(inserted);
-    }
-
-    public SnapshotResult rebuildSnapshot(int pageSize) {
-        long t0 = System.nanoTime();
-        snapshotService.rebuild(LocalDate.now(), pageSize);
-        long t1 = System.nanoTime();
-        return new SnapshotResult(nanosToMillis(t0, t1));
-    }
-
     public BucketRebuildResult rebuildSolvedBuckets() {
         long t0 = System.nanoTime();
         rankService.rebuildSolvedBuckets();
@@ -90,28 +46,28 @@ public class RankPerfService {
 
     public StreakBenchResult benchmarkStreak(int page, int size) {
         int offset = Math.max(0, page) * size;
-        long n0 = System.nanoTime();
+        long naiveStart = System.nanoTime();
         var naiveRows = naiveStreakRepository.fetchNaivePage(offset, size);
-        long n1 = System.nanoTime();
+        long naiveEnd = System.nanoTime();
 
-        long s0 = System.nanoTime();
-        var snapshot = streakRankService.getPage(page, size);
-        long s1 = System.nanoTime();
+        long optimizedStart = System.nanoTime();
+        var optimized = streakRankService.getPage((long) page * size + 1, size);
+        long optimizedEnd = System.nanoTime();
 
         return new StreakBenchResult(
                 offset,
                 naiveRows.size(),
-                nanosToMillis(n0, n1),
-                snapshot.items().size(),
-                nanosToMillis(s0, s1)
+                nanosToMillis(naiveStart, naiveEnd),
+                optimized.items().size(),
+                nanosToMillis(optimizedStart, optimizedEnd)
         );
     }
 
     public SolvedBenchResult benchmarkSolved(int page, int size) {
         int offset = Math.max(0, page) * size;
-        long n0 = System.nanoTime();
+        long naiveStart = System.nanoTime();
         var naiveRows = naiveSolvedRepository.fetchNaivePage(offset, size);
-        long n1 = System.nanoTime();
+        long naiveEnd = System.nanoTime();
 
         long pageStartRank = (long) page * size + 1;
         var bucket = solvedBucketRepository.findBucketForRank(pageStartRank);
@@ -126,32 +82,144 @@ public class RankPerfService {
             offsetInGroup = 0;
         }
 
-        var cursor = rankRepository.findKthInGroup(bucketSolvedCount, offsetInGroup);
-        if (cursor == null) {
-            cursor = rankRepository.findKthInGroup(bucketSolvedCount, 0);
-            if (cursor == null) {
-                throw new IllegalStateException("Empty bucket for solvedCount=" + bucketSolvedCount);
-            }
-        }
-
-        long s0 = System.nanoTime();
-        var optimizedRows = rankRepository.fetchPageFromCursor(
-                cursor.getSolvedCount(),
-                cursor.getLastSolvedDate(),
-                cursor.getId(),
+        long optimizedStart = System.nanoTime();
+        var optimizedRows = rankRepository.fetchPageFromBucket(
+                bucketSolvedCount,
+                offsetInGroup,
                 size
         );
-        long s1 = System.nanoTime();
+        long optimizedEnd = System.nanoTime();
 
         return new SolvedBenchResult(
                 offset,
                 naiveRows.size(),
-                nanosToMillis(n0, n1),
+                nanosToMillis(naiveStart, naiveEnd),
                 optimizedRows.size(),
-                nanosToMillis(s0, s1),
+                nanosToMillis(optimizedStart, optimizedEnd),
                 pageStartRank,
                 bucketSolvedCount,
                 bucketCumHigher
+        );
+    }
+
+    public LongestBenchResult benchmarkLongest(int page, int size) {
+        int offset = Math.max(0, page) * size;
+        long naiveStart = System.nanoTime();
+        var naiveRows = naiveLongestStreakRepository.fetchNaivePage(offset, size);
+        long naiveEnd = System.nanoTime();
+
+        long pageStartRank = (long) page * size + 1;
+        long totalPositive = longestStreakSnapshotRepository.count();
+        if (totalPositive == 0) {
+            throw new IllegalStateException("Buckets not initialized. Run /perf/buckets/longest/rebuild first.");
+        }
+        if (pageStartRank > totalPositive) {
+            pageStartRank = ((totalPositive - 1) / size) * size + 1;
+        }
+
+        long optimizedStart = System.nanoTime();
+        var optimizedRows = longestStreakSnapshotRepository.findPage(pageStartRank, size);
+        long optimizedEnd = System.nanoTime();
+
+        return new LongestBenchResult(
+                offset,
+                naiveRows.size(),
+                nanosToMillis(naiveStart, naiveEnd),
+                optimizedRows.size(),
+                nanosToMillis(optimizedStart, optimizedEnd),
+                pageStartRank,
+                0,
+                0
+        );
+    }
+
+    public RankItemDto getSolvedRank(long rank) {
+        return rankService.getUserAtRank(rank);
+    }
+
+    public RankItemDto getStreakRank(long rank) {
+        return streakRankService.getUserAtRank(rank);
+    }
+
+    public RankItemDto getLongestRank(long rank) {
+        return longestStreakRankService.getUserAtRank(rank);
+    }
+
+    public AroundBenchResult benchmarkSolvedAroundRank(long rank, int size) {
+        RankItemDto target = rankService.getUserAtRank(rank);
+        long userId = target.userId();
+
+        long optimizedStart = System.nanoTime();
+        RankPageDto optimized = rankService.getSolvedCountPageForUser(userId, size);
+        long optimizedEnd = System.nanoTime();
+
+        long pageStart = optimized.pageStartRank();
+        int offset = (int) Math.max(0, pageStart - 1);
+
+        long naiveStart = System.nanoTime();
+        List<NaiveSolvedRepository.NaiveRowProjection> naiveRows = naiveSolvedRepository.fetchNaivePage(offset, size);
+        long naiveEnd = System.nanoTime();
+
+        return new AroundBenchResult(
+                rank,
+                userId,
+                target,
+                optimized.myRank(),
+                optimized.pageStartRank(),
+                nanosToMillis(optimizedStart, optimizedEnd),
+                nanosToMillis(naiveStart, naiveEnd)
+        );
+    }
+
+    public AroundBenchResult benchmarkStreakAroundRank(long rank, int size) {
+        RankItemDto target = streakRankService.getUserAtRank(rank);
+        long userId = target.userId();
+
+        long optimizedStart = System.nanoTime();
+        RankPageDto optimized = streakRankService.getPageAroundUser(userId, size);
+        long optimizedEnd = System.nanoTime();
+
+        long pageStart = optimized.pageStartRank();
+        int offset = (int) Math.max(0, pageStart - 1);
+
+        long naiveStart = System.nanoTime();
+        List<NaiveStreakRepository.NaiveRowProjection> naiveRows = naiveStreakRepository.fetchNaivePage(offset, size);
+        long naiveEnd = System.nanoTime();
+
+        return new AroundBenchResult(
+                rank,
+                userId,
+                target,
+                optimized.myRank(),
+                optimized.pageStartRank(),
+                nanosToMillis(optimizedStart, optimizedEnd),
+                nanosToMillis(naiveStart, naiveEnd)
+        );
+    }
+
+    public AroundBenchResult benchmarkLongestAroundRank(long rank, int size) {
+        RankItemDto target = longestStreakRankService.getUserAtRank(rank);
+        long userId = target.userId();
+
+        long optimizedStart = System.nanoTime();
+        RankPageDto optimized = longestStreakRankService.getPageAroundUser(userId, size);
+        long optimizedEnd = System.nanoTime();
+
+        long pageStart = optimized.pageStartRank();
+        int offset = (int) Math.max(0, pageStart - 1);
+
+        long naiveStart = System.nanoTime();
+        var naiveRows = naiveLongestStreakRepository.fetchNaivePage(offset, size);
+        long naiveEnd = System.nanoTime();
+
+        return new AroundBenchResult(
+                rank,
+                userId,
+                target,
+                optimized.myRank(),
+                optimized.pageStartRank(),
+                nanosToMillis(optimizedStart, optimizedEnd),
+                nanosToMillis(naiveStart, naiveEnd)
         );
     }
 
@@ -159,3 +227,5 @@ public class RankPerfService {
         return (end - start) / 1_000_000.0;
     }
 }
+
+

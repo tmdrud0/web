@@ -1,5 +1,7 @@
 package my.oj.web.contest.submission.support;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Component;
@@ -12,6 +14,10 @@ import java.util.function.Consumer;
 
 @Component
 public class ContestSubmissionBatchExecutor {
+
+    private static final Logger log = LoggerFactory.getLogger(ContestSubmissionBatchExecutor.class);
+    private static final int DEFAULT_MAX_RETRIES = 3;
+    private static final long RETRY_BACKOFF_MILLIS = 50L;
 
     private final TransactionTemplate transactionTemplate;
 
@@ -48,11 +54,33 @@ public class ContestSubmissionBatchExecutor {
             }
             List<Long> batch = List.copyOf(submissionIds);
             if (mode == BatchTransactionMode.TRANSACTIONAL) {
-                transactionTemplate.executeWithoutResult(status -> batchConsumer.accept(batch));
+                executeWithRetry(() -> transactionTemplate.executeWithoutResult(status -> batchConsumer.accept(batch)));
             } else {
-                batchConsumer.accept(batch);
+                executeWithRetry(() -> batchConsumer.accept(batch));
             }
             lastProcessedId = batch.get(batch.size() - 1);
+        }
+    }
+
+    private void executeWithRetry(Runnable runnable) {
+        int attempt = 0;
+        while (true) {
+            try {
+                runnable.run();
+                return;
+            } catch (RuntimeException ex) {
+                attempt++;
+                if (attempt > DEFAULT_MAX_RETRIES) {
+                    throw ex;
+                }
+                log.warn("Batch execution failed on attempt {}. Retrying...", attempt, ex);
+                try {
+                    Thread.sleep(RETRY_BACKOFF_MILLIS * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw ex;
+                }
+            }
         }
     }
 

@@ -1,5 +1,6 @@
 package my.oj.web.user.activity;
 
+import my.oj.web.config.TestQuerydslConfig;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -12,7 +13,7 @@ import java.time.LocalDateTime;
 import static org.assertj.core.api.Assertions.assertThat;
 
 @DataJpaTest
-@Import(my.oj.web.submission.SubmissionConfig.class)
+@Import(TestQuerydslConfig.class)
 class DailyActiveUserRepositoryTests {
 
     @Autowired

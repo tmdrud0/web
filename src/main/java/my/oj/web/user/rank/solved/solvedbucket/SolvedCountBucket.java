@@ -1,4 +1,4 @@
-package my.oj.web.user.rank.solvedbucket;
+package my.oj.web.user.rank.solved.solvedbucket;
 
 import jakarta.persistence.*;
 import lombok.AccessLevel;

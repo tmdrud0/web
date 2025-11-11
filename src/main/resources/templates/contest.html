@@ -25,6 +25,10 @@
         tbody tr:hover { background: #eef2ff; }
         .empty-state { text-align: center; padding: 24px; color: #6c757d; }
         .link-button { text-decoration: none; color: #0d6efd; font-weight: 600; }
+        .highlight { background: #fff3cd !important; }
+        .scoreboard-meta { margin-top: 8px; font-size: 13px; color: #6c757d; }
+        .sub-panel { margin-top: 24px; }
+        .disabled-link { color: #adb5bd; pointer-events: none; cursor: default; }
     </style>
 </head>
 <body>
@@ -73,7 +77,27 @@
     </div>
 
     <div class="panel" th:if="${activeTab} == 'scoreboard'">
-        <h3>Live Scoreboard</h3>
+        <h3 th:text="${scoreboardFinalized} ? (${scoreboardAroundMe} ? 'Final Scoreboard – Around Me' : 'Final Scoreboard')
+                : (${scoreboardAroundMe} ? 'Scoreboard – Around Me' : 'Live Scoreboard')}">Live Scoreboard</h3>
+        <div class="scoreboard-meta" th:if="${scoreboardTotalParticipants} > 0">
+            <span th:text="'Total participants: ' + ${scoreboardTotalParticipants}">Total participants</span>
+            <span th:if="${hasScoreboard}" th:text="' | Showing ranks ' + ${scoreboardStartRank} + ' – ' + (${scoreboardStartRank} + ${#lists.size(scoreboardRows)} - 1)">Range</span>
+            <span th:if="${scoreboardFinalized}"> | Final standings</span>
+        </div>
+        <div class="scoreboard-meta" style="margin-top: 8px; display: flex; gap: 12px; flex-wrap: wrap;"
+             th:if="${scoreboardTotalParticipants} > 0">
+            <a th:if="${!scoreboardAroundMe}"
+               th:classappend="${scoreboardPrevCursor == null} ? ' disabled-link'"
+               th:href="${scoreboardPrevCursor != null} ? '/contests/' + ${contest.id} + '?tab=scoreboard&cursor=' + ${scoreboardPrevCursor} : null">Prev</a>
+            <a th:if="${!scoreboardAroundMe}"
+               th:classappend="${scoreboardNextCursor == null} ? ' disabled-link'"
+               th:href="${scoreboardNextCursor != null} ? '/contests/' + ${contest.id} + '?tab=scoreboard&cursor=' + ${scoreboardNextCursor} : null">Next</a>
+            <a th:if="${!scoreboardAroundMe and currentUserId != null}"
+               th:href="@{'/contests/' + ${contest.id} + '?tab=scoreboard&aroundMe=true'}">View Around Me</a>
+            <span th:if="${scoreboardAroundMe}">
+                <a th:href="@{'/contests/' + ${contest.id} + '?tab=scoreboard'}">Back to Top Ranking</a>
+            </span>
+        </div>
         <div class="empty-state" th:if="${!hasScoreboard}">
             Scoreboard data will appear once submissions are judged.
         </div>
@@ -87,7 +111,7 @@
             </tr>
             </thead>
             <tbody>
-            <tr th:each="row : ${scoreboardRows}">
+            <tr th:each="row : ${scoreboardRows}" th:classappend="${currentUserId != null and currentUserId == row.userId()} ? ' highlight'">
                 <td th:text="${row.rank()}">1</td>
                 <td th:text="${row.userName()}">User</td>
                 <td th:text="${row.solvedCount()}">0</td>

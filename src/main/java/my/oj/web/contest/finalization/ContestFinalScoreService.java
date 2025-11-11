@@ -7,6 +7,7 @@ import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.submission.SubmissionResult;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,12 +20,19 @@ public class ContestFinalScoreService {
 
     private final ContestSubmissionResultRepository resultRepository;
     private final ContestFinalScoreRepository finalScoreRepository;
+    @Qualifier("contestFinalScoreboardService")
     private final ContestScoreboardService scoreboardService;
 
     @Transactional
     public void rebuildScores(Long contestId, ContestFinalScoreStatus status) {
+        List<ContestSubmissionResult> results = resultRepository.findAllByContestIdWithSubmission(contestId);
+        rebuildScores(contestId, status, results);
+    }
+
+    @Transactional
+    public void rebuildScores(Long contestId, ContestFinalScoreStatus status, List<ContestSubmissionResult> preloadedResults) {
         finalScoreRepository.deleteByContestIdAndStatus(contestId, status);
-        List<ContestScoreboardEntry> entries = calculateEntries(contestId, status == ContestFinalScoreStatus.FINAL);
+        List<ContestScoreboardEntry> entries = calculateEntries(contestId, status == ContestFinalScoreStatus.FINAL, preloadedResults);
         List<ContestFinalScore> scores = new ArrayList<>(entries.size());
         int rank = 1;
         for (ContestScoreboardEntry entry : entries) {
@@ -50,7 +58,9 @@ public class ContestFinalScoreService {
         return finalScoreRepository.findByContestIdAndStatusOrderByRankAsc(contestId, status);
     }
 
-    private List<ContestScoreboardEntry> calculateEntries(Long contestId, boolean useFinalResult) {
+    private List<ContestScoreboardEntry> calculateEntries(Long contestId,
+                                                          boolean useFinalResult,
+                                                          List<ContestSubmissionResult> preloadedResults) {
         if (!useFinalResult) {
             List<ContestScoreboardEntry> liveEntries = scoreboardService.currentRanking(contestId);
             if (!liveEntries.isEmpty()) {
@@ -58,7 +68,8 @@ public class ContestFinalScoreService {
             }
         }
 
-        List<ContestSubmissionResult> results = resultRepository.findAllByContestIdWithSubmission(contestId);
+        List<ContestSubmissionResult> results = preloadedResults != null ? preloadedResults :
+                resultRepository.findAllByContestIdWithSubmission(contestId);
         if (results.isEmpty()) {
             return List.of();
         }

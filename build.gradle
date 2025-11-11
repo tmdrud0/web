@@ -67,7 +67,11 @@ sourceSets {
 
 
 tasks.named('test') {
-    useJUnitPlatform()
+    useJUnitPlatform {
+        if (!Boolean.getBoolean("includeLoadTests")) {
+            excludeTags "load-test"
+        }
+    }
     // Run tests with MySQL-backed 'test' profile by default
     systemProperty "spring.profiles.active", System.getProperty("spring.profiles.active", "test")
 }

@@ -2,9 +2,7 @@ package my.oj.web.user.rank;
 
 import my.oj.web.user.User;
 import my.oj.web.user.UserRepository;
-import my.oj.web.user.activity.DailyActiveUserRepository;
 import my.oj.web.user.dto.UserDto;
-import my.oj.web.user.rank.streaksnapshot.StreakSnapshotService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -15,7 +13,6 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.lang.reflect.Field;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -31,12 +28,6 @@ class RankControllerStreakTests {
 
     @Autowired
     UserRepository userRepository;
-
-    @Autowired
-    StreakSnapshotService snapshotService;
-
-    @Autowired
-    DailyActiveUserRepository dailyActiveUserRepository;
 
     @Autowired
     PlatformTransactionManager transactionManager;
@@ -56,19 +47,14 @@ class RankControllerStreakTests {
             LocalDateTime now = LocalDateTime.now();
             try {
                 setStreak(loggedIn, now.minusHours(4), 1, 2);
-                setStreak(u2, now.minusHours(1), 1, 3);
+                setStreak(u2, now.minusHours(1), 2, 3);
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
 
-            LocalDate today = now.toLocalDate();
-            dailyActiveUserRepository.upsert(today.minusDays(1), loggedIn.getId(), now.minusHours(4));
-            dailyActiveUserRepository.upsert(today.minusDays(1), u2.getId(), now.minusHours(1));
             userRepository.flush();
-            return today;
+            return null;
         });
-
-        snapshotService.rebuild(LocalDate.now(), 10);
     }
 
     @Test

@@ -30,7 +30,7 @@ public class ContestFinalScore {
     @Column(name = "penalty", nullable = false)
     private long penalty;
 
-    @Column(name = "rank", nullable = false)
+    @Column(name = "`rank`", nullable = false)
     private int rank;
 
     @Enumerated(EnumType.STRING)

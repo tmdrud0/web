@@ -5,6 +5,8 @@ import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
@@ -21,6 +23,12 @@ import java.util.Set;
 public class RedisTemplateContestRedisKeyValueClient implements ContestRedisKeyValueClient {
 
     private final StringRedisTemplate redisTemplate;
+    private static final RedisScript<Long> RELEASE_LOCK_SCRIPT =
+            new DefaultRedisScript<>(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                            + "return redis.call('del', KEYS[1]) "
+                            + "else return 0 end",
+                    Long.class);
 
     public RedisTemplateContestRedisKeyValueClient(StringRedisTemplate redisTemplate) {
         this.redisTemplate = redisTemplate;
@@ -34,6 +42,15 @@ public class RedisTemplateContestRedisKeyValueClient implements ContestRedisKeyV
     @Override
     public boolean setIfAbsent(String key, String value, Duration ttl) {
         return Boolean.TRUE.equals(redisTemplate.opsForValue().setIfAbsent(key, value, ttl));
+    }
+
+    @Override
+    public boolean deleteIfValueEquals(String key, String expectedValue) {
+        if (expectedValue == null) {
+            return false;
+        }
+        Long deleted = redisTemplate.execute(RELEASE_LOCK_SCRIPT, List.of(key), expectedValue);
+        return deleted != null && deleted > 0;
     }
 
     @Override
@@ -82,6 +99,17 @@ public class RedisTemplateContestRedisKeyValueClient implements ContestRedisKeyV
             return List.of();
         }
         return new ArrayList<>(members);
+    }
+
+    @Override
+    public Long zRevRank(String key, String member) {
+        return redisTemplate.opsForZSet().reverseRank(key, member);
+    }
+
+    @Override
+    public long zCard(String key) {
+        Long size = redisTemplate.opsForZSet().zCard(key);
+        return size != null ? size : 0L;
     }
 
     @Override

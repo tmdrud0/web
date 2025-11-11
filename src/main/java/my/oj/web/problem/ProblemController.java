@@ -32,7 +32,7 @@ public class ProblemController {
             @RequestParam(required = false, defaultValue = "") String problemName,
             @RequestParam(required = false) Long problemId,
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "10") int size,
+            @RequestParam(defaultValue = "30") int size,
             @CurrentUser UserDto currentUser,
             Model model) {
 

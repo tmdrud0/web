@@ -12,6 +12,8 @@ public interface ContestRedisKeyValueClient {
 
     boolean setIfAbsent(String key, String value, Duration ttl);
 
+    boolean deleteIfValueEquals(String key, String expectedValue);
+
     void delete(String key);
 
     void delete(Collection<String> keys);
@@ -27,6 +29,10 @@ public interface ContestRedisKeyValueClient {
     void zAdd(String key, double score, String member);
 
     List<String> zRevRange(String key, long start, long end);
+
+    Long zRevRank(String key, String member);
+
+    long zCard(String key);
 
     Set<String> scan(String pattern);
 

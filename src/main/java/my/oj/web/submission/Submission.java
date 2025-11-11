@@ -58,4 +58,11 @@ public class Submission {
         this.code = code;
         this.codeHash = CodeHashGenerator.generate(code);
     }
+
+    public void regenerateCodeHash(int attempt) {
+        if (attempt < 0) {
+            throw new IllegalArgumentException("attempt must be non-negative");
+        }
+        this.codeHash = CodeHashGenerator.generateWithAttempt(this.code, attempt);
+    }
 }

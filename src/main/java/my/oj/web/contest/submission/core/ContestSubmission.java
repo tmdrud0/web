@@ -21,7 +21,7 @@ import java.time.LocalDateTime;
 public class ContestSubmission {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "id", nullable = false)
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)
@@ -61,5 +61,15 @@ public class ContestSubmission {
         contestSubmission.codeHash = codeHash;
         contestSubmission.submittedTime = submittedTime;
         return contestSubmission;
+    }
+
+    public void assignId(Long submissionId) {
+        if (submissionId == null) {
+            throw new IllegalArgumentException("Contest submission id cannot be null");
+        }
+        if (this.id != null && !this.id.equals(submissionId)) {
+            throw new IllegalStateException("Contest submission id is already assigned");
+        }
+        this.id = submissionId;
     }
 }
