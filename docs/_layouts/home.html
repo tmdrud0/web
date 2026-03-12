@@ -1,0 +1,44 @@
+---
+layout: default
+---
+
+<section class="hero">
+  <p class="eyebrow">GitHub Pages Blog</p>
+  <h1>성능 병목과 운영 설계를 기록하는 개발 로그</h1>
+  <p class="hero-copy">
+    Spring Boot, MySQL, Redis, Gatling으로 실제 병목을 재현하고
+    구조를 바꾸면서 얻은 결과를 정리합니다.
+  </p>
+  <div class="hero-metrics">
+    <article>
+      <strong>{{ site.posts | size }}</strong>
+      <span>Published posts</span>
+    </article>
+    <article>
+      <strong>3 topics</strong>
+      <span>Write path, recovery, ranking</span>
+    </article>
+    <article>
+      <strong>GitHub Pages</strong>
+      <span>Markdown-first publishing</span>
+    </article>
+  </div>
+</section>
+
+<section class="post-grid">
+  {% for post in site.posts %}
+    <article class="post-card">
+      <p class="post-date">{{ post.date | date: "%Y.%m.%d" }}</p>
+      <h2><a href="{{ post.url | relative_url }}">{{ post.title }}</a></h2>
+      <p class="post-description">{{ post.description }}</p>
+      {% if post.tags %}
+        <p class="tag-row">
+          {% for tag in post.tags %}
+            <span>#{{ tag }}</span>
+          {% endfor %}
+        </p>
+      {% endif %}
+      <a class="primary-link" href="{{ post.url | relative_url }}">글 읽기</a>
+    </article>
+  {% endfor %}
+</section>

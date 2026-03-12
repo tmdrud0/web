@@ -1,0 +1,51 @@
+<svg width="960" height="600" viewBox="0 0 960 600" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="960" height="600" rx="24" fill="#F8FAFC"/>
+  <rect x="48" y="48" width="864" height="504" rx="20" fill="#FFFFFF" stroke="#E2E8F0"/>
+  <text x="80" y="92" fill="#0F172A" font-family="Segoe UI, Arial, sans-serif" font-size="28" font-weight="700">First-failure RPS by write mode</text>
+  <text x="80" y="122" fill="#475569" font-family="Segoe UI, Arial, sans-serif" font-size="16">Higher is better. Bulk keeps pushing the failure point back, especially with a small pool.</text>
+
+  <rect x="646" y="78" width="16" height="16" rx="4" fill="#F97316"/>
+  <text x="672" y="91" fill="#334155" font-family="Segoe UI, Arial, sans-serif" font-size="15">Immediate</text>
+  <rect x="760" y="78" width="16" height="16" rx="4" fill="#0F766E"/>
+  <text x="786" y="91" fill="#334155" font-family="Segoe UI, Arial, sans-serif" font-size="15">Bulk</text>
+
+  <line x1="130" y1="460" x2="860" y2="460" stroke="#0F172A" stroke-width="2"/>
+  <line x1="130" y1="160" x2="130" y2="460" stroke="#0F172A" stroke-width="2"/>
+
+  <line x1="130" y1="360" x2="860" y2="360" stroke="#E2E8F0"/>
+  <line x1="130" y1="260" x2="860" y2="260" stroke="#E2E8F0"/>
+  <line x1="130" y1="160" x2="860" y2="160" stroke="#E2E8F0"/>
+
+  <text x="90" y="466" fill="#475569" font-family="Segoe UI, Arial, sans-serif" font-size="14">0</text>
+  <text x="68" y="366" fill="#475569" font-family="Segoe UI, Arial, sans-serif" font-size="14">2000</text>
+  <text x="68" y="266" fill="#475569" font-family="Segoe UI, Arial, sans-serif" font-size="14">4000</text>
+  <text x="68" y="166" fill="#475569" font-family="Segoe UI, Arial, sans-serif" font-size="14">6000</text>
+  <text transform="translate(34 340) rotate(-90)" fill="#475569" font-family="Segoe UI, Arial, sans-serif" font-size="14">RPS</text>
+
+  <rect x="188" y="260" width="42" height="200" rx="8" fill="#F97316"/>
+  <rect x="238" y="160" width="42" height="300" rx="8" fill="#0F766E"/>
+  <text x="193" y="250" fill="#9A3412" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">4000</text>
+  <text x="243" y="150" fill="#115E59" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">6000</text>
+
+  <rect x="348" y="260" width="42" height="200" rx="8" fill="#F97316"/>
+  <rect x="398" y="210" width="42" height="250" rx="8" fill="#0F766E"/>
+  <text x="353" y="250" fill="#9A3412" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">4000</text>
+  <text x="403" y="200" fill="#115E59" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">5000</text>
+
+  <rect x="508" y="360" width="42" height="100" rx="8" fill="#F97316"/>
+  <rect x="558" y="260" width="42" height="200" rx="8" fill="#0F766E"/>
+  <text x="513" y="350" fill="#9A3412" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">2000</text>
+  <text x="563" y="250" fill="#115E59" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">4000</text>
+
+  <rect x="668" y="360" width="42" height="100" rx="8" fill="#F97316"/>
+  <rect x="718" y="260" width="42" height="200" rx="8" fill="#0F766E"/>
+  <text x="673" y="350" fill="#9A3412" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">2000</text>
+  <text x="720" y="250" fill="#115E59" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">4000+</text>
+
+  <text x="177" y="500" fill="#0F172A" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="600">1x / p100</text>
+  <text x="337" y="500" fill="#0F172A" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="600">3x / p100</text>
+  <text x="497" y="500" fill="#0F172A" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="600">1x / p10</text>
+  <text x="657" y="500" fill="#0F172A" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="600">3x / p10</text>
+
+  <text x="143" y="536" fill="#64748B" font-family="Segoe UI, Arial, sans-serif" font-size="13">1x: one insert per submission, 3x: three inserts per submission, p100/p10: Hikari pool size</text>
+</svg>

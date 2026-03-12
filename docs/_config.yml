@@ -1,0 +1,21 @@
+title: "Kim's Engineering Notes"
+description: "성능 최적화와 서비스 설계를 기록하는 GitHub Pages 블로그"
+lang: "ko-KR"
+timezone: "Asia/Seoul"
+url: "https://tmdrud0.github.io"
+baseurl: "/web"
+markdown: kramdown
+permalink: /posts/:title/
+
+exclude:
+  - PORTFOLIO_CONTEST_INSERT_OPTIMIZATION.md
+  - PORTFOLIO_CONTEST_SCOREBOARD_RECOVERY.md
+  - PORTFOLIO_RANK_QUERY_OPTIMIZATION.md
+  - velog
+
+defaults:
+  - scope:
+      path: ""
+      type: "posts"
+    values:
+      layout: "post"
