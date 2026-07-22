@@ -34,10 +34,6 @@ public class SubmissionStoreStrategySelector {
         }
     }
 
-    public SubmissionStoreResult storeAsNormal(Submission submission) {
-        return normalStrategy.save(submission);
-    }
-
     public boolean onContest(Problem problem, LocalDateTime submittedTime) {
         if (problem == null) {
             return false;

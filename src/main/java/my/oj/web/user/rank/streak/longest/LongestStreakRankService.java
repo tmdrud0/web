@@ -92,10 +92,6 @@ public class LongestStreakRankService {
         );
     }
 
-    public void rebuildSnapshot() {
-        snapshotService.rebuildSnapshot();
-    }
-
     private RankPageDto buildPageFromRank(long startRank, int pageSize, long myRank) {
         List<LongestStreakSnapshot> rows = snapshotRepository.findPage(startRank, pageSize);
         List<RankItemDto> items = RankPageAssembler.toRankItems(

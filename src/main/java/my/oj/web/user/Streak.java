@@ -20,23 +20,6 @@ public class Streak implements Serializable {
         longestStreak = 0;
     }
 
-    public void updateUserStreak() {
-        LocalDateTime today = LocalDateTime.now();
-
-        if (lastSolvedDate != null && today.toLocalDate().isEqual(lastSolvedDate.toLocalDate())) {
-            return;
-        }
-
-        if (lastSolvedDate != null && lastSolvedDate.toLocalDate().isEqual(today.minusDays(1).toLocalDate())) {
-            currentStreak++;
-        } else {
-            currentStreak = 1;
-        }
-
-        lastSolvedDate = today;
-        longestStreak = Math.max(currentStreak, longestStreak);
-    }
-
     public void resetCurrentIfStale(LocalDate today) {
         if (lastSolvedDate == null) {
             currentStreak = 0;
