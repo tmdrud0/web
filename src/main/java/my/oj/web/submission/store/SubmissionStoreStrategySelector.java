@@ -7,6 +7,8 @@ import my.oj.web.submission.Submission;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 
 @Component
 @RequiredArgsConstructor
@@ -18,6 +20,18 @@ public class SubmissionStoreStrategySelector {
         return onContest(submission.getProblem(), submission.getSubmittedTime())
                 ? contestStrategy.save(submission)
                 : normalStrategy.save(submission);
+    }
+
+    public CompletionStage<SubmissionStoreResult> storeAsync(Submission submission) {
+        if (onContest(submission.getProblem(), submission.getSubmittedTime())) {
+            return contestStrategy.saveAsync(submission);
+        }
+
+        try {
+            return CompletableFuture.completedFuture(normalStrategy.save(submission));
+        } catch (RuntimeException ex) {
+            return CompletableFuture.failedFuture(ex);
+        }
     }
 
     public SubmissionStoreResult storeAsNormal(Submission submission) {

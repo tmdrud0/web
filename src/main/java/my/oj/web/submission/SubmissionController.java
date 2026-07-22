@@ -24,6 +24,9 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.servlet.mvc.support.RedirectAttributes;
 
 import java.beans.PropertyEditorSupport;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
 
 @Controller
 @RequiredArgsConstructor
@@ -72,7 +75,7 @@ public class SubmissionController {
     }
 
     @PostMapping("/problems/{id}/submission")
-    public String submit(
+    public CompletionStage<String> submit(
             @PathVariable Long id,
             @Valid @ModelAttribute("form") SubmissionFormDto form,
             BindingResult binding,
@@ -81,31 +84,48 @@ public class SubmissionController {
 
         if (binding.hasErrors()) {
             redirectAttributes.addFlashAttribute("error", "Invalid submission form");
-            return "redirect:/problem/" + id;
+            return CompletableFuture.completedFuture("redirect:/problem/" + id);
         }
 
         try {
-            SubmissionReceipt receipt = submissionService.submit(
+            return submissionService.submitAsync(
                     new SubmitSubmissionCommand(
                             currentUser.id(), id, form.code()
                     )
-            );
+            ).handle((receipt, error) -> {
+                if (error != null) {
+                    Throwable cause = unwrapCompletionException(error);
+                    if (cause instanceof IllegalArgumentException) {
+                        redirectAttributes.addFlashAttribute("error", cause.getMessage());
+                        return "redirect:/problem/" + id;
+                    }
+                    throw new CompletionException(cause);
+                }
 
-            if (receipt.isDuplicate()) {
-                redirectAttributes.addFlashAttribute("message", "An identical submission already exists (ID #" + receipt.submissionId() + ").");
-                return "redirect:/problem/" + id;
-            }
+                if (receipt.isDuplicate()) {
+                    redirectAttributes.addFlashAttribute("message", "An identical submission already exists (ID #" + receipt.submissionId() + ").");
+                    return "redirect:/problem/" + id;
+                }
 
-            if (receipt.isContest()) {
-                redirectAttributes.addFlashAttribute("message", "Contest submission has been queued");
-                return "redirect:/problem/" + id;
-            }
+                if (receipt.isContest()) {
+                    redirectAttributes.addFlashAttribute("message", "Contest submission has been queued");
+                    return "redirect:/problem/" + id;
+                }
 
-            return "redirect:/submission/" + receipt.submissionId();
+                return "redirect:/submission/" + receipt.submissionId();
+            });
         } catch (IllegalArgumentException e) {
             redirectAttributes.addFlashAttribute("error", e.getMessage());
-            return "redirect:/problem/" + id;
+            return CompletableFuture.completedFuture("redirect:/problem/" + id);
         }
+    }
+
+    private static Throwable unwrapCompletionException(Throwable error) {
+        Throwable current = error;
+        while (current instanceof CompletionException && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current;
     }
 
     @GetMapping("/submission/{id}")

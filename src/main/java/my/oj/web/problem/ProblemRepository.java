@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Optional;
 
 public interface ProblemRepository extends JpaRepository<Problem, Long>, ProblemRepositoryCustom {
     @Query("SELECT new my.oj.web.problem.dto.ProblemDto(p.id, p.name, c.id, c.name, p.contestNum) " +
@@ -20,4 +21,12 @@ public interface ProblemRepository extends JpaRepository<Problem, Long>, Problem
             "FROM Problem p " +
             "WHERE p.contest.id = :contestId")
     public List<ContestProblemDto> findDtoByContestId(@Param("contestId") Long contestId);
+
+    @Query("""
+            SELECT p
+            FROM Problem p
+            LEFT JOIN FETCH p.contest
+            WHERE p.id = :problemId
+            """)
+    Optional<Problem> findWithContestById(@Param("problemId") Long problemId);
 }
