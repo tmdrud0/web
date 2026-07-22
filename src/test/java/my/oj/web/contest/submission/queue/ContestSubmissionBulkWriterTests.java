@@ -48,7 +48,12 @@ class ContestSubmissionBulkWriterTests {
             return null;
         }).when(dispatcher).dispatch(org.mockito.ArgumentMatchers.eq(1), org.mockito.ArgumentMatchers.any());
 
-        writer = new ContestSubmissionBulkWriter(processor, metrics, dispatcher, 1, 1);
+        writer = new ContestSubmissionBulkWriter(
+                processor,
+                metrics,
+                dispatcher,
+                new ContestSubmissionBulkProperties(1, 1)
+        );
         var stage = writer.saveAsync(new ContestSubmissionQueueRequest(
                 1L,
                 2L,

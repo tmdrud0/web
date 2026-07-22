@@ -6,7 +6,6 @@ import my.oj.web.contest.submission.core.ContestSubmissionService;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -39,13 +38,12 @@ public class ContestSubmissionAsyncBulkWriter implements ContestSubmissionQueued
     public ContestSubmissionAsyncBulkWriter(ContestSubmissionBulkProcessor processor,
                                             ContestSubmissionBulkMetrics metrics,
                                             ContestSubmissionIdGenerator idGenerator,
-                                            @Value("${contest.submission.bulk.batch-size:100}") int batchSize,
-                                            @Value("${contest.submission.bulk.worker-count:1}") int workerCount) {
+                                            ContestSubmissionBulkProperties properties) {
         this.processor = processor;
         this.metrics = metrics;
         this.idGenerator = idGenerator;
-        this.batchSize = Math.max(1, batchSize);
-        this.workerCount = Math.max(1, workerCount);
+        this.batchSize = properties.effectiveBatchSize();
+        this.workerCount = properties.effectiveWorkerCount();
         this.executor = Executors.newFixedThreadPool(this.workerCount, r -> {
             Thread thread = new Thread(r, "contest-submission-bulk-async");
             thread.setDaemon(true);

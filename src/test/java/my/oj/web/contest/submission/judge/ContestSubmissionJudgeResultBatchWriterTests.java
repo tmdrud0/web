@@ -13,6 +13,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -47,7 +48,10 @@ class ContestSubmissionJudgeResultBatchWriterTests {
             captured.set(invocation.getArgument(0));
             return null;
         }).when(persistence).persistAll(anyList());
-        writer = new ContestSubmissionJudgeResultBatchWriter(persistence, 4, 1, 8, Duration.ofMillis(100));
+        writer = new ContestSubmissionJudgeResultBatchWriter(
+                persistence,
+                properties(4, 1, 8, Duration.ofMillis(100))
+        );
         writer.start();
 
         List<Future<?>> futures = new java.util.ArrayList<>();
@@ -79,7 +83,7 @@ class ContestSubmissionJudgeResultBatchWriterTests {
             assertThat(releasePersistence.await(3, TimeUnit.SECONDS)).isTrue();
             return null;
         }).when(persistence).persistAll(anyList());
-        writer = new ContestSubmissionJudgeResultBatchWriter(persistence, 1, 1, 1, Duration.ZERO);
+        writer = new ContestSubmissionJudgeResultBatchWriter(persistence, properties(1, 1, 1, Duration.ZERO));
         writer.start();
 
         Future<?> listener = callers.submit(() -> writer.persist(
@@ -105,7 +109,7 @@ class ContestSubmissionJudgeResultBatchWriterTests {
             assertThat(releaseWorkers.await(3, TimeUnit.SECONDS)).isTrue();
             return null;
         }).when(persistence).persistAll(anyList());
-        writer = new ContestSubmissionJudgeResultBatchWriter(persistence, 1, 2, 2, Duration.ZERO);
+        writer = new ContestSubmissionJudgeResultBatchWriter(persistence, properties(1, 2, 2, Duration.ZERO));
         writer.start();
 
         Future<?> first = callers.submit(() -> writer.persist(
@@ -132,7 +136,7 @@ class ContestSubmissionJudgeResultBatchWriterTests {
                 mock(JdbcContestSubmissionJudgeResultBatchPersistence.class);
         RuntimeException failure = new RuntimeException("commit failed");
         doThrow(failure).when(persistence).persistAll(anyList());
-        writer = new ContestSubmissionJudgeResultBatchWriter(persistence, 1, 1, 1, Duration.ZERO);
+        writer = new ContestSubmissionJudgeResultBatchWriter(persistence, properties(1, 1, 1, Duration.ZERO));
         writer.start();
 
         assertThatThrownBy(() -> writer.persist(
@@ -140,6 +144,44 @@ class ContestSubmissionJudgeResultBatchWriterTests {
                 SubmissionResult.PARTIAL_ACCEPTED,
                 LocalDateTime.now()
         )).isSameAs(failure);
+    }
+
+    @Test
+    void shutdownWaitsForInFlightPersistence() throws Exception {
+        JdbcContestSubmissionJudgeResultBatchPersistence persistence =
+                mock(JdbcContestSubmissionJudgeResultBatchPersistence.class);
+        CountDownLatch persistenceStarted = new CountDownLatch(1);
+        CountDownLatch releasePersistence = new CountDownLatch(1);
+        CountDownLatch shutdownStarted = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            persistenceStarted.countDown();
+            assertThat(releasePersistence.await(3, TimeUnit.SECONDS)).isTrue();
+            return null;
+        }).when(persistence).persistAll(anyList());
+        writer = new ContestSubmissionJudgeResultBatchWriter(persistence, properties(1, 1, 1, Duration.ZERO));
+        writer.start();
+
+        Future<?> listener = callers.submit(() -> writer.persist(
+                projection(1L),
+                SubmissionResult.PARTIAL_ACCEPTED,
+                LocalDateTime.now()
+        ));
+        assertThat(persistenceStarted.await(2, TimeUnit.SECONDS)).isTrue();
+
+        Future<?> shutdown = callers.submit(() -> {
+            shutdownStarted.countDown();
+            writer.shutdown();
+        });
+        assertThat(shutdownStarted.await(2, TimeUnit.SECONDS)).isTrue();
+        try {
+            assertThatThrownBy(() -> shutdown.get(100, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
+        } finally {
+            releasePersistence.countDown();
+        }
+
+        listener.get(2, TimeUnit.SECONDS);
+        shutdown.get(2, TimeUnit.SECONDS);
     }
 
     private static ContestSubmissionJudgeProjection projection(long submissionId) {
@@ -151,5 +193,17 @@ class ContestSubmissionJudgeResultBatchWriterTests {
         given(projection.getSubmittedTime()).willReturn(LocalDateTime.now());
         given(projection.getCode()).willReturn("code");
         return projection;
+    }
+
+    private static ContestSubmissionJudgeResultWriterProperties properties(int batchSize,
+                                                                            int workerCount,
+                                                                            int queueCapacity,
+                                                                            Duration maxWait) {
+        return new ContestSubmissionJudgeResultWriterProperties(
+                batchSize,
+                workerCount,
+                queueCapacity,
+                maxWait
+        );
     }
 }

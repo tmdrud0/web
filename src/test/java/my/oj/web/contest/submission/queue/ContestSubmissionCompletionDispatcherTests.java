@@ -4,10 +4,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ContestSubmissionCompletionDispatcherTests {
 
@@ -23,7 +28,10 @@ class ContestSubmissionCompletionDispatcherTests {
     @Test
     void dispatch_usesCallerThreadWhenBoundedQueueIsFull() throws Exception {
         ContestSubmissionBulkMetrics metrics = new ContestSubmissionBulkMetrics();
-        dispatcher = new ContestSubmissionCompletionDispatcher(metrics, 1, 1);
+        dispatcher = new ContestSubmissionCompletionDispatcher(
+                metrics,
+                new ContestSubmissionCompletionProperties(1, 1)
+        );
         CountDownLatch firstStarted = new CountDownLatch(1);
         CountDownLatch releaseFirst = new CountDownLatch(1);
         CountDownLatch secondCompleted = new CountDownLatch(1);
@@ -47,6 +55,49 @@ class ContestSubmissionCompletionDispatcherTests {
         dispatcher.shutdown();
         dispatcher = null;
         assertThat(metrics.snapshot().completionTaskCount()).isEqualTo(3);
+    }
+
+    @Test
+    void shutdown_waitsForInFlightAndQueuedCompletions() throws Exception {
+        ContestSubmissionBulkMetrics metrics = new ContestSubmissionBulkMetrics();
+        dispatcher = new ContestSubmissionCompletionDispatcher(
+                metrics,
+                new ContestSubmissionCompletionProperties(1, 1)
+        );
+        CountDownLatch firstStarted = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        CountDownLatch secondCompleted = new CountDownLatch(1);
+        CountDownLatch shutdownStarted = new CountDownLatch(1);
+        ExecutorService shutdownCaller = Executors.newSingleThreadExecutor();
+
+        try {
+            dispatcher.dispatch(1, () -> {
+                firstStarted.countDown();
+                await(releaseFirst);
+            });
+            assertThat(firstStarted.await(2, TimeUnit.SECONDS)).isTrue();
+            dispatcher.dispatch(1, secondCompleted::countDown);
+
+            Future<?> shutdown = shutdownCaller.submit(() -> {
+                shutdownStarted.countDown();
+                dispatcher.shutdown();
+            });
+            assertThat(shutdownStarted.await(2, TimeUnit.SECONDS)).isTrue();
+            try {
+                assertThatThrownBy(() -> shutdown.get(100, TimeUnit.MILLISECONDS))
+                        .isInstanceOf(TimeoutException.class);
+            } finally {
+                releaseFirst.countDown();
+            }
+
+            shutdown.get(2, TimeUnit.SECONDS);
+            assertThat(secondCompleted.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(metrics.snapshot().completionTaskCount()).isEqualTo(2);
+            dispatcher = null;
+        } finally {
+            releaseFirst.countDown();
+            shutdownCaller.shutdownNow();
+        }
     }
 
     private static void await(CountDownLatch latch) {

@@ -6,7 +6,6 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Duration;
 import java.util.Optional;
@@ -32,10 +31,12 @@ class ContestScoreboardOutboxSchedulerTests {
 
     @BeforeEach
     void setUp() {
-        scheduler = new ContestScoreboardOutboxScheduler(processor, recoveryService, processLock);
-        ReflectionTestUtils.setField(scheduler, "batchSize", 50);
-        ReflectionTestUtils.setField(scheduler, "recoveryBatchSize", 10);
-        ReflectionTestUtils.setField(scheduler, "claimTimeout", "30s");
+        ContestScoreboardOutboxProperties properties = new ContestScoreboardOutboxProperties(
+                50,
+                10,
+                Duration.ofSeconds(30)
+        );
+        scheduler = new ContestScoreboardOutboxScheduler(processor, recoveryService, processLock, properties);
     }
 
     @Test
