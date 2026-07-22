@@ -148,6 +148,11 @@ class RedisContestScoreboardStoreTests {
         }
 
         @Override
+        public boolean deleteIfValueEquals(String key, String expectedValue) {
+            return strings.remove(key, expectedValue);
+        }
+
+        @Override
         public void delete(String key) {
             strings.remove(key);
             hashes.remove(key);

@@ -58,6 +58,18 @@ public class ContestScoreboardOutbox {
     @Column(name = "redis_seq")
     private Long redisSequence;
 
+    @Column(name = "claim_token", length = 36)
+    private String claimToken;
+
+    @Column(name = "claimed_at")
+    private LocalDateTime claimedAt;
+
+    @Column(nullable = false)
+    private int attempts;
+
+    @Column(name = "next_attempt_at")
+    private LocalDateTime nextAttemptAt;
+
     public static ContestScoreboardOutbox pending(Long contestSubmissionId,
                                                   Long contestId,
                                                   Long problemId,
@@ -80,6 +92,26 @@ public class ContestScoreboardOutbox {
         outbox.createdAt = LocalDateTime.now();
         outbox.redisSequence = redisSequence;
         return outbox;
+    }
+
+    public ContestScoreboardOutboxPayload toPayload() {
+        return new ContestScoreboardOutboxPayload(
+                contestSubmissionId,
+                contestId,
+                problemId,
+                userId,
+                contestStart,
+                submittedTime,
+                result,
+                judgedAt
+        );
+    }
+
+    public void assignRedisSequence(Long redisSequence) {
+        if (redisSequence == null) {
+            return;
+        }
+        this.redisSequence = redisSequence;
     }
 
     public boolean isProcessable() {
