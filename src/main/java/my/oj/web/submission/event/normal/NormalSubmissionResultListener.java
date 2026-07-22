@@ -12,7 +12,9 @@ public class NormalSubmissionResultListener {
     private final NormalSubmissionResultService submissionResultService;
 
     @Async
-    @EventListener(condition = "#evt.origin == T(my.oj.web.submission.SubmissionOrigin).NORMAL")
+    @EventListener(
+            condition = "#evt.origin == T(my.oj.web.submission.SubmissionOrigin).NORMAL"
+    )
     public void onResult(SubmissionResultEvent evt) {
         if (evt.submissionId() == null) {
             return;

@@ -23,7 +23,9 @@ public class NormalSubmissionSubmittedListener {
     private final Judgement judgement;
 
     @Async
-    @EventListener(condition = "#evt.origin == T(my.oj.web.submission.SubmissionOrigin).NORMAL")
+    @EventListener(
+            condition = "#evt.origin == T(my.oj.web.submission.SubmissionOrigin).NORMAL"
+    )
     public void onSubmitted(SubmissionSubmittedEvent evt) {
         Long submissionId = evt.submissionId();
         if (submissionId == null) {
