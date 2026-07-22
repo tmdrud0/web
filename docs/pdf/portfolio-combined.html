@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>온라인저지 개발과정</title>
+  <link rel="stylesheet" href="portfolio-combined.css">
+</head>
+<body>
+  <main class="markdown-body">
+    <h1 id="_1">온라인저지 개발과정</h1>
+<h2 id="_2">목차</h2>
+<ol>
+<li><a href="#1--대회-제출-insert-경로-최적화">대회 제출 Insert 경로 최적화</a></li>
+<li><a href="#2--judge-서버-설계-과정">JUDGE 서버 설계 과정</a></li>
+<li><a href="#3--redis-scoreboard-recovery">Redis Scoreboard Recovery</a></li>
+<li><a href="#4--rank-조회-경로-최적화">Rank 조회 경로 최적화</a></li>
+</ol>
+<div class="page-break"></div>
+
+<h2 id="1-insert">1. 대회 제출 Insert 경로 최적화</h2>
+<h3 id="_3">핵심 아이디어</h3>
+<p>핵심 아이디어는 MySQL의 batch rewrite를 실제로 활용하는 것이었다.</p>
+<p>JDBC batch와 <code>rewriteBatchedStatements=true</code>가 제대로 동작하면 여러 insert가 아래처럼 하나의 multi-values insert로 합쳐질 수 있다.</p>
+<pre><code class="language-sql">insert into contest_submission (...) values (...), (...), (...);
+</code></pre>
+<h3 id="_4">어떻게 구현했는가</h3>
+<p>요청을 바로 insert하지 않고 잠시 큐에 모은 뒤 chunk 단위로 flush하도록 구성했다.</p>
+<p>큐에서 꺼낸 요청을 하나의 트랜잭션, <code>EntityManager</code> 안에서 처리하여, Hibernate batch와 MySQL rewrite가 적용되도록 만들었다.</p>
+<ul>
+<li>ID를 DB auto increment가 아니라 애플리케이션에서 먼저 할당했다</li>
+</ul>
+<h3 id="_5">테스트 결과</h3>
+<table>
+<thead>
+<tr>
+<th>시나리오</th>
+<th style="text-align: right;">immediate</th>
+<th style="text-align: right;">bulk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>insert 1건, pool 100</td>
+<td style="text-align: right;">첫 실패 4000 RPS</td>
+<td style="text-align: right;">첫 실패 6000 RPS</td>
+</tr>
+<tr>
+<td>insert 3건, pool 100</td>
+<td style="text-align: right;">첫 실패 4000 RPS</td>
+<td style="text-align: right;">첫 실패 5000 RPS</td>
+</tr>
+<tr>
+<td>insert 1건, pool 10</td>
+<td style="text-align: right;">첫 실패 2000 RPS</td>
+<td style="text-align: right;">첫 실패 4000 RPS</td>
+</tr>
+<tr>
+<td>insert 3건, pool 10</td>
+<td style="text-align: right;">첫 실패 2000 RPS</td>
+<td style="text-align: right;">첫 실패 4000 RPS</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_6">실패했던 부분</h3>
+<ol>
+<li>OSIV가 켜져 있으면 lazy로 <code>SELECT</code>가 숨어있기 쉽고 큐에서도 커넥션을 잡고 있어서 커넥션이 고갈됐다.</li>
+<li><code>saveAll(...)</code> 때문에 신규 insert인데도 <code>merge</code> 경로를 타면서 row마다 <code>select ... where id = ?</code>가 붙고 있었다.</li>
+</ol>
+<h2 id="2-judge">2. JUDGE 서버 설계 과정</h2>
+<h3 id="_7">배경</h3>
+<p>채점서버는 rest api로 채점을 지원한다.</p>
+<p>최초에 대회 제출 후 처리는 event를 발행하여 asny로 건별로 api를 호출후 
+결과로 <code>contest_submission_result</code>, <code>contest_submission_outbox</code>를 생성했다.</p>
+<p>문제는 대회제출의 부하가 그대로 체점서버로 옮겨가고 spring 서버가 죽었을 때 복구가 안된다는 점이다.</p>
+<h3 id="1">1. 한 트랜잭션 구조</h3>
+<ol>
+<li>DB에서 <code>PENDING</code> 제출을  <code>SELECT ... FOR UPDATE SKIP LOCKED</code>로 여러 건 조회한다</li>
+<li>같은 트랜잭션 안에서 judge를 병렬 실행한다</li>
+<li>judge가 모두 끝나면 <code>contest_submission_result</code>, <code>contest_submission_outbox</code>를 쓴다</li>
+<li>마지막에 <code>contest_submission.judge_status = DONE</code>으로 갱신하고 commit 한다</li>
+</ol>
+<ul>
+<li>contest submission때와는 달리 insert ignore이 필요해서 jdbc batch를 이용했다.</li>
+<li>중간에 프로세스가 죽으면 트랜잭션 rollback으로 정리된다</li>
+<li>채점서버 api 병렬 호출 수준을 조절 가능.</li>
+</ul>
+<p>채점서버 가정 및 한계 :
+- 병렬로 10개씩 처리 가능하고 대회시에는 보통 제출이 10ms걸린다고 생각했다.(대회시 부분채점)
+- 하지만 간단한 검증을 가지고 있어도 코드를 잘못짤 수도 있기에 1000건당 하나만 2초정도 걸린다고 가정.
+- 지금 구조에서는 트랜잭션 하나에서 다른 judge의 완료를 기다려야 하기에 100건이 다 10ms면 100ms예상.
+- 하나라도 2초가 걸리는 게 있으면 그동안 judge의 병렬 처리를 전혀 이용하지 못한다.</p>
+<h3 id="2">2. 현재 구조</h3>
+<h4 id="1-claim">1. claim</h4>
+<p>DB에서 <code>PENDING</code> 제출을 짧은 트랜잭션으로 선점한다.</p>
+<ul>
+<li><code>judge_status = 'PROCESSING'</code></li>
+<li><code>judge_claim_token = ?</code>  : 다시 조회를 위해 필요</li>
+<li><code>judge_claimed_at = now</code> : 회복을 위해 필요</li>
+</ul>
+<p>선점 후 queue에 넣는다.</p>
+<h4 id="2-judge_1">2. judge</h4>
+<ul>
+<li>worker가 queue에서 제출을 꺼내 채점서버 api 호출한다.</li>
+</ul>
+<p>응답을 queue에 넣는다. </p>
+<h4 id="3-write">3. write</h4>
+<p>queue에서 일정 건씩 꺼내 batch로 한 번에 처리한다.</p>
+<ol>
+<li><code>contest_submission_result</code> insert</li>
+<li><code>contest_submission_outbox</code> insert</li>
+<li><code>contest_submission.judge_status = DONE</code> update</li>
+</ol>
+<h4 id="4-recovery">4. recovery</h4>
+<ul>
+<li><code>PROCESSING</code>인데 <code>judge_claimed_at</code>이 일정 시간보다 오래되면 다시 <code>PENDING</code>으로 복구한다
+채점 서버는 멱등성이 보장된다는 가정이다.</li>
+</ul>
+<h3 id="3">3. 한계</h3>
+<ul>
+<li>
+<p>recovery timeout
+현재 채점 서버 api 호출시간이 최대 2초로 가정하고 있는데 
+이것을 준수해도 100건을 읽는다고 했을 때 어느 입력에서 100건이 모두 2초가 걸리는 것 같은 최악의 상황까지 가정하면
+넉넉하게 잡아야하는데 그럴수록 회복이 늦어질 수 있다.</p>
+</li>
+<li>
+<p>메모리 queue 구간은 durable하지 않다
+각 과정의 병목에 서로 영향을 받지 않기위해 queue를 2개 두어서 분리했다.
+이것은 중간 설계의 문제를 해결하지만 그만큼 durable하지 않은 구간을 늘린다.</p>
+</li>
+</ul>
+<p>둘 다 정합성보다 중복 처리 비용 문제에 가깝다.</p>
+<div class="page-break"></div>
+<h2 id="3-redis-scoreboard-recovery">3. Redis Scoreboard Recovery</h2>
+<h3 id="_8">무엇을 해결했는가</h3>
+<p>대회 스코어보드를 Redis에 두고 redis가 죽었을 때 효율적인 회복법을 구현했다.</p>
+<h3 id="score-board">score board 구조</h3>
+<p>judge 서버 : outbox 생성
+batch 서버 : outbox 주기적으로 redis로 전송
+redis score board : score board 관리</p>
+<h3 id="_9">문제</h3>
+<p>복구할때 <code>contest_submission_outbox.id</code>는 아쉬움이 있다.</p>
+<ul>
+<li><code>outbox.id</code>는 DB insert 순서이지 Redis 적용 순서가 아니다.</li>
+<li>실패와 재시도로 인해 일부 id만 비어 있을 수 있다.</li>
+</ul>
+<p><code>outbox.id</code>만으로는 Redis 회복이 어렵다.</p>
+<h3 id="_10">비교</h3>
+<h4 id="_11">자연 복구</h4>
+<ul>
+<li>Redis에서 하나의 처리를 완료할 때마다 <code>redis_seq</code>를 발행하고 이를 outbox에 저장한다. </li>
+<li>만약 같은 값이 들어오면 같은 <code>redis_seq</code>를 반환한다.</li>
+<li>Redis가 죽었다가 RDB 방식으로 스냅샷을 복구하면 <code>redis_seq</code>도 낮아져서 outbox에서 duplicate <code>redis_seq</code>가 발생한다</li>
+<li>batch 서버가 이 중복 seq를 주기적으로 찾아 replay한다</li>
+</ul>
+<p>장점: 별도 복구 모드가 필요 없어서 운영 흐름을 끊지 않는다</p>
+<p>단점: 복구 속도가 트래픽에 영향을 받는다</p>
+<h4 id="db-gapless-seq">대안 DB gapless seq</h4>
+<p>DB가 <code>gapless seq</code>를 직접 발급한다.</p>
+<ul>
+<li>outbox insert 시점에 DB가 별도 seq를 부여한다</li>
+<li>Redis는 이 seq를 그대로 받아 scoreboard 반영과 복구 기준으로 사용한다</li>
+<li>복구 시에는 Redis가 성공하지 못한 가장 작은 seq를 보내고, Spring에서 그 seq부터 이미 처리됐어야할 것들을 다시 밀어 넣는다 (go back n)</li>
+</ul>
+<p>장점: 트래픽이 복구에 필요하지 않다.</p>
+<p>단점 :
+- gapless를 보장하려면 seq 발급 구간을 직렬화해야 한다
+- 위의 방식과는 다르게 회복을 여러 서버에서 돌리기 쉽기 않다.</p>
+<h4 id="_12">선택</h4>
+<p>자연복구 방식을 사용하고 대회가 끝나고 나서 혹시 있을지도 모르는 미처리 중복을 처리해준다.</p>
+<div class="page-break"></div>
+<h2 id="4-rank">4. Rank 조회 경로 최적화</h2>
+<h3 id="_13">무엇을 만들고 있었는가</h3>
+<p>랭킹 페이지를 만들 수 있는 기본적은 쿼리는 아래와 같을 것이다.</p>
+<pre><code class="language-sql">SELECT ...
+FROM user u
+WHERE ...
+ORDER BY score DESC, last_solved_date ASC, id ASC
+LIMIT :offset, :limit
+</code></pre>
+<p>병목의 핵심은 정렬 자체보다 <code>OFFSET</code>이며, 유저 수가 커질수록 뒤쪽 페이지 비용이 거의 선형으로 증가한다.</p>
+<ul>
+<li><code>around me</code> 기능은 유저가 자신의 랭킹 페이지로 이동하는 기능이다.
+  한 번에 자기 위치로 이동하기 때문에 커서를 사용하기도 힘들다.</li>
+</ul>
+<h3 id="_14">핵심 아이디어</h3>
+<h4 id="1-solved-count">1. solved count</h4>
+<p><code>solved_count_bucket</code> 테이블에 아래 정보를 저장했다.
+- 푼 문제 수 <code>n</code>
+- 해당 solved count를 가진 유저 수
+- 자신보다 solved count가 큰 유저 수</p>
+<ol>
+<li>내 solved count를 읽는다</li>
+<li>bucket에서 <code>나보다 solved count가 큰 유저 수</code>를 읽는다</li>
+<li>같은 solved count를 가진 유저들 중에서 내가 몇 번째인지 계산한다</li>
+<li>둘을 더해서 내 rank를 구한다</li>
+<li>그 rank가 속한 page start를 계산한다</li>
+<li>해당 solved count 구간에서 page size만큼 읽는다</li>
+</ol>
+<p>이 구조가 가능한 이유는 <code>solved_count</code>가 1씩 증가만 할 수 있기 때문이다.
+그래서 전체 랭킹을 매번 다시 정렬하지 않고, 작은 bucket 테이블만 유지해도 내 rank를 계산할 수 있다.</p>
+<p>다만 이 방식의 성능은 <code>전체 유저 수</code>만이 아니라 <code>값의 분포</code>에 크게 좌우된다.</p>
+<h4 id="2-current-streak">2. current streak</h4>
+<p>현재 스트릭은 하루 한 번 배치 시점에 <code>0이 아닌 유저만</code> 모은 <code>user_streak_rank_snapshot</code>을 생성한다.</p>
+<ol>
+<li>snapshot에서 내 row를 바로 찾는다</li>
+<li>거기에 이미 저장된 <code>snapshot_rank</code>를 읽는다</li>
+<li>그 rank로 page start를 계산한다</li>
+<li><code>snapshot_rank BETWEEN start AND end</code>로 해당 page만 읽는다</li>
+</ol>
+<p>current streak는 조회 시점에 <code>내 rank를 계산</code>하는 것이 아니라, 이미 계산된 rank를 읽는 구조다.</p>
+<h3 id="_15">테스트 결과</h3>
+<p>비교는 각 랭크 타입마다 앞/중간/뒤 지점에서 수행했다.</p>
+<table>
+<thead>
+<tr>
+<th>Rank type</th>
+<th style="text-align: right;">Front</th>
+<th style="text-align: right;">Middle</th>
+<th style="text-align: right;">Back</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>current streak</code> naive</td>
+<td style="text-align: right;"><code>161 ms</code></td>
+<td style="text-align: right;"><code>8,890 ms</code></td>
+<td style="text-align: right;"><code>14,382 ms</code></td>
+</tr>
+<tr>
+<td><code>current streak</code> optimized</td>
+<td style="text-align: right;"><code>0.586 ms</code></td>
+<td style="text-align: right;"><code>0.443 ms</code></td>
+<td style="text-align: right;"><code>0.113 ms</code></td>
+</tr>
+<tr>
+<td><code>solved</code> naive</td>
+<td style="text-align: right;"><code>19.1 ms</code></td>
+<td style="text-align: right;"><code>217,842 ms</code></td>
+<td style="text-align: right;"><code>233,231 ms</code></td>
+</tr>
+<tr>
+<td><code>solved</code> optimized</td>
+<td style="text-align: right;"><code>24.2 ms</code></td>
+<td style="text-align: right;"><code>369 ms</code></td>
+<td style="text-align: right;"><code>47,747 ms</code></td>
+</tr>
+</tbody>
+</table>
+<p>10만 유저 데이터셋에서 같은 solved bucket 방식의 deep page fetch는 약 <code>0.46 ms</code> 수준이었다.</p>
+  </main>
+</body>
+</html>

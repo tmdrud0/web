@@ -48,7 +48,10 @@ public class ContestSubmission {
     private String codeHash;
 
     public static ContestSubmission create(User user, Problem problem, String code, String codeHash, LocalDateTime submittedTime) {
-        Contest contest = problem.getContest();
+        return create(problem.getContest(), user, problem, code, codeHash, submittedTime);
+    }
+
+    public static ContestSubmission create(Contest contest, User user, Problem problem, String code, String codeHash, LocalDateTime submittedTime) {
         if (contest == null) {
             throw new IllegalArgumentException("Contest submission requires an associated contest");
         }
@@ -60,6 +63,12 @@ public class ContestSubmission {
         contestSubmission.code = code;
         contestSubmission.codeHash = codeHash;
         contestSubmission.submittedTime = submittedTime;
+        return contestSubmission;
+    }
+
+    public static ContestSubmission placeholder(Long submissionId) {
+        ContestSubmission contestSubmission = new ContestSubmission();
+        contestSubmission.assignId(submissionId);
         return contestSubmission;
     }
 

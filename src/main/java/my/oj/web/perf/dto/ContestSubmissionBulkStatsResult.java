@@ -1,0 +1,23 @@
+package my.oj.web.perf.dto;
+
+public record ContestSubmissionBulkStatsResult(long chunkCount,
+                                               long failedChunkCount,
+                                               long totalSubmissionCount,
+                                               double averageChunkElapsedMillis,
+                                               long maxChunkElapsedMillis,
+                                               long maxChunkSize,
+                                               long maxPendingBefore,
+                                               long maxPendingAfter,
+                                               int lastPendingAfter,
+                                               long maxActiveWorkers,
+                                               long completionTaskCount,
+                                               long failedCompletionTaskCount,
+                                               long completionSubmissionCount,
+                                               double averageCompletionQueueDelayMillis,
+                                               long maxCompletionQueueDelayMillis,
+                                               double averageCompletionElapsedMillis,
+                                               long maxCompletionElapsedMillis,
+                                               long maxCompletionQueueDepth,
+                                               long maxActiveCompletionWorkers,
+                                               long completionCallerRunsCount) {
+}

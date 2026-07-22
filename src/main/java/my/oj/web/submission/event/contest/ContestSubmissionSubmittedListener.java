@@ -9,6 +9,7 @@ import my.oj.web.submission.event.SubmissionResultEvent;
 import my.oj.web.submission.event.SubmissionSubmittedEvent;
 import my.oj.web.submission.judge.Judgement;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Async;
@@ -18,6 +19,7 @@ import java.time.LocalDateTime;
 
 @Component
 @RequiredArgsConstructor
+@ConditionalOnProperty(prefix = "contest.submission.judge.event-listener", name = "enabled", havingValue = "true", matchIfMissing = true)
 public class ContestSubmissionSubmittedListener {
 
     private final ContestSubmissionService contestSubmissionService;
@@ -25,8 +27,10 @@ public class ContestSubmissionSubmittedListener {
     @Qualifier("contestJudgement")
     private final Judgement contestJudgement;
 
-    @Async
-    @EventListener(condition = "#evt.origin == T(my.oj.web.submission.SubmissionOrigin).CONTEST")
+    @Async("contestSubmissionExecutor")
+    @EventListener(
+            condition = "#evt.origin == T(my.oj.web.submission.SubmissionOrigin).CONTEST"
+    )
     public void onContestSubmission(SubmissionSubmittedEvent evt) {
         Long contestSubmissionId = evt.submissionId();
         if (contestSubmissionId == null) {

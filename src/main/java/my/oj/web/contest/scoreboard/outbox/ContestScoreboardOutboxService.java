@@ -6,24 +6,24 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.Optional;
 
 @Service
 @RequiredArgsConstructor
 public class ContestScoreboardOutboxService {
 
     private final ContestScoreboardOutboxRepository repository;
-    private final ContestScoreboardOutboxSequenceStore sequenceStore;
 
     @Transactional
-    public ContestScoreboardOutbox enqueue(Long contestSubmissionId,
-                                           Long contestId,
-                                           Long problemId,
-                                           Long userId,
-                                           LocalDateTime contestStart,
-                                           LocalDateTime submittedTime,
-                                           SubmissionResult result,
-                                           LocalDateTime judgedAt) {
-        ContestScoreboardOutboxPayload payload = new ContestScoreboardOutboxPayload(
+    public Optional<ContestScoreboardOutbox> enqueueIfAbsent(Long contestSubmissionId,
+                                                             Long contestId,
+                                                             Long problemId,
+                                                             Long userId,
+                                                             LocalDateTime contestStart,
+                                                             LocalDateTime submittedTime,
+                                                             SubmissionResult result,
+                                                             LocalDateTime judgedAt) {
+        boolean inserted = insertPendingIfAbsent(
                 contestSubmissionId,
                 contestId,
                 problemId,
@@ -33,19 +33,37 @@ public class ContestScoreboardOutboxService {
                 result,
                 judgedAt
         );
-        Long redisSequence = sequenceStore.reserveSequence(payload);
-        ContestScoreboardOutbox outbox = ContestScoreboardOutbox.pending(
+        if (!inserted) {
+            return Optional.empty();
+        }
+        return repository.findByContestSubmissionId(contestSubmissionId);
+    }
+
+    @Transactional
+    public boolean insertPendingIfAbsent(Long contestSubmissionId,
+                                         Long contestId,
+                                         Long problemId,
+                                         Long userId,
+                                         LocalDateTime contestStart,
+                                         LocalDateTime submittedTime,
+                                         SubmissionResult result,
+                                         LocalDateTime judgedAt) {
+        return repository.insertPendingIfAbsent(
                 contestSubmissionId,
                 contestId,
                 problemId,
                 userId,
                 contestStart,
                 submittedTime,
-                result,
                 judgedAt,
-                redisSequence
-        );
-        return repository.save(outbox);
+                result.name(),
+                LocalDateTime.now()
+        ) == 1;
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<ContestScoreboardOutbox> findByContestSubmissionId(Long contestSubmissionId) {
+        return repository.findByContestSubmissionId(contestSubmissionId);
     }
 
     @Transactional

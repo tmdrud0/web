@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Portfolio Book</title>
+    <link rel="stylesheet" href="portfolio-book.css">
+</head>
+<body>
+<main class="book">
+    <section class="page">
+        <header class="portfolio-header">
+            <div class="portfolio-kicker">Portfolio 01</div>
+            <h1>대회 제출 Insert 경로 최적화</h1>
+            <p class="lede">대회 중 가장 먼저 부하를 받는 제출 저장 경로를 대상으로, batch rewrite가 실제로 이득을 내는 구조로 경로 자체를 정리한 작업이다.</p>
+            <div class="summary-grid">
+                <div class="meta">
+                    <div class="meta-label">Context</div>
+                    <div class="meta-value">온라인 저지의 대회 제출 저장 경로</div>
+                </div>
+                <div class="meta">
+                    <div class="meta-label">Goal</div>
+                    <div class="meta-value">처리량 향상, 고부하 안정성 확보, 원인 검증</div>
+                </div>
+                <div class="meta">
+                    <div class="meta-label">Validation</div>
+                    <div class="meta-value">Gatling step-load, 첫 실패 RPS 비교</div>
+                </div>
+            </div>
+        </header>
+
+        <div class="section">
+            <h2>무엇을 만들고 있었는가</h2>
+            <p>이 프로젝트는 온라인 저지 서비스다. 사용자가 대회 중 문제를 제출하면 서버는 먼저 대회 제출 정보를 저장하고, 이후 채점과 스코어보드 반영이 이어진다.</p>
+            <p>내가 최적화한 대상은 이 중에서도 가장 먼저 호출되는 <strong>대회 제출 저장 경로</strong>였다.</p>
+            <ul>
+                <li>사용자는 제출 버튼을 누른 뒤 즉시 응답을 체감한다.</li>
+                <li>대회 시간에는 같은 경로로 트래픽이 집중된다.</li>
+                <li>이 경로가 느리면 전체 서비스 품질이 바로 떨어진다.</li>
+            </ul>
+        </div>
+
+        <div class="section two-col">
+            <div>
+                <h2>목표</h2>
+                <ul>
+                    <li>대회 제출 저장 경로의 처리량을 높인다.</li>
+                    <li>고부하에서도 안정적으로 버티게 만든다.</li>
+                    <li>왜 빨라졌는지 설명 가능한 수준까지 원인을 검증한다.</li>
+                </ul>
+                <h2>핵심 아이디어</h2>
+                <p>핵심 아이디어는 MySQL의 batch rewrite를 실제로 활용하는 것이었다. JDBC batch와 <code>rewriteBatchedStatements=true</code>가 제대로 동작하면 여러 insert가 아래처럼 하나의 multi-values insert로 합쳐질 수 있다.</p>
+                <pre>insert into contest_submission (...) values (...), (...), (...);</pre>
+            </div>
+            <div>
+                <h2>어떻게 구현했는가</h2>
+                <div class="panel">
+                    <h3>1. 요청을 큐에 모으는 writer</h3>
+                    <p>여러 요청을 같은 트랜잭션, 같은 EntityManager 안에서 처리해야 JPA batch와 MySQL rewrite가 실제로 의미 있게 동작한다. 그래서 요청을 바로 insert하지 않고 잠시 큐에 모은 뒤 chunk 단위로 flush하도록 구성했다.</p>
+                </div>
+                <div class="panel soft" style="margin-top:8px;">
+                    <h3>2. chunk 단위로 실제 insert를 수행하는 processor</h3>
+                    <p>큐에서 꺼낸 요청을 하나의 트랜잭션 안에서 처리하고, Hibernate batch와 MySQL rewrite가 적용되도록 만들었다.</p>
+                    <ul class="small">
+                        <li>ID를 DB auto increment가 아니라 애플리케이션에서 먼저 할당했다.</li>
+                        <li><code>saveAll(...)</code> 대신 <code>entityManager.persist(...)</code>를 사용했다.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="section summary-box small">
+            <strong>saveAll에서 persist로 바꾼 이유.</strong> 초기에는 <code>saveAll(...)</code>을 사용하고 있었는데, 엔티티 ID를 애플리케이션에서 먼저 할당하는 구조와 만나면서 JPA가 <code>merge</code> 경로를 타고 row마다 <code>select ... where id = ?</code>를 추가로 발생시키고 있었다. 이 부분은 <code>entityManager.persist(...)</code> 기반으로 바꾸면서 제거했다.
+        </div>
+        <div class="page-no">1 / 7</div>
+    </section>
+
+    <section class="page">
+        <header class="portfolio-header">
+            <div class="portfolio-kicker">Portfolio 01</div>
+            <h1>대회 제출 Insert 경로 최적화</h1>
+        </header>
+
+        <div class="section">
+            <h2>결과 그래프</h2>
+            <div class="chart-wrap">
+                <div class="legend">
+                    <span class="immediate">Immediate</span>
+                    <span class="bulk">Bulk</span>
+                </div>
+                <svg viewBox="0 0 860 240" aria-label="Insert result chart">
+                    <rect x="0" y="0" width="860" height="240" fill="#ffffff"/>
+                    <g stroke="#dde4ec" stroke-width="1">
+                        <line x1="160" y1="36" x2="790" y2="36"/>
+                        <line x1="160" y1="76" x2="790" y2="76"/>
+                        <line x1="160" y1="116" x2="790" y2="116"/>
+                        <line x1="160" y1="156" x2="790" y2="156"/>
+                        <line x1="160" y1="196" x2="790" y2="196"/>
+                        <line x1="160" y1="12" x2="160" y2="196" stroke="#cbd4df"/>
+                    </g>
+                    <g font-family="Malgun Gothic, Segoe UI, sans-serif" font-size="11" fill="#556274">
+                        <text x="160" y="214">0</text>
+                        <text x="265" y="214">1k</text>
+                        <text x="370" y="214">2k</text>
+                        <text x="475" y="214">3k</text>
+                        <text x="580" y="214">4k</text>
+                        <text x="685" y="214">5k</text>
+                        <text x="770" y="214">6k RPS</text>
+                        <text x="18" y="50" font-size="12" fill="#1c2735">insert 1건, pool 100</text>
+                        <text x="18" y="90" font-size="12" fill="#1c2735">insert 3건, pool 100</text>
+                        <text x="18" y="130" font-size="12" fill="#1c2735">insert 1건, pool 10</text>
+                        <text x="18" y="170" font-size="12" fill="#1c2735">insert 3건, pool 10</text>
+                    </g>
+                    <g>
+                        <rect x="160" y="40" width="420" height="10" fill="#f97316"/>
+                        <rect x="160" y="54" width="630" height="10" fill="#0f766e"/>
+                        <rect x="160" y="80" width="420" height="10" fill="#f97316"/>
+                        <rect x="160" y="94" width="525" height="10" fill="#0f766e"/>
+                        <rect x="160" y="120" width="210" height="10" fill="#f97316"/>
+                        <rect x="160" y="134" width="420" height="10" fill="#0f766e"/>
+                        <rect x="160" y="160" width="210" height="10" fill="#f97316"/>
+                        <rect x="160" y="174" width="420" height="10" fill="#0f766e"/>
+                    </g>
+                </svg>
+            </div>
+        </div>
+
+        <div class="section two-col">
+            <div class="panel">
+                <h2>실패했던 부분</h2>
+                <ol>
+                    <li>저장 전 조회가 섞여 있어서 큐에 넣기 전부터 트랜잭션과 커넥션을 오래 점유하고 있었다.</li>
+                    <li>lazy 로딩 때문에 worker 안에서 예상하지 못한 <code>SELECT</code>가 추가로 나가고 있었다.</li>
+                    <li>OSIV가 켜져 있으면 이런 lazy 접근이 더 늦은 시점까지 살아남아 커넥션 사용 구간이 퍼졌다.</li>
+                    <li><code>saveAll(...)</code> 때문에 신규 insert인데도 <code>merge</code> 경로를 타면서 row마다 <code>select ... where id = ?</code>가 붙고 있었다.</li>
+                </ol>
+            </div>
+            <div class="panel soft">
+                <h2>결론</h2>
+                <ul>
+                    <li>DB 작업이 무겁고 커넥션 풀 같은 DB 자원이 제한적일수록 bulk insert의 효과가 커진다.</li>
+                    <li>큐 적재 이전 단계가 다른 작업과 같은 트랜잭션으로 묶이면, 대기 시간 동안 커넥션과 애플리케이션 자원을 함께 점유해 오히려 비효율적일 수 있다.</li>
+                    <li>유저 요청이 저장 완료를 직접 기다려야 하면 큐 대기 비용까지 응답시간에 포함되므로, batch 이득이 충분히 크지 않으면 손해를 볼 수 있다.</li>
+                    <li>반대로 즉시 반환 가능하거나 백그라운드 작업이라면 서블릿 스레드, HTTP in-flight, TCP 연결 같은 앞단 자원을 오래 점유하지 않아 더 잘 맞는다.</li>
+                </ul>
+            </div>
+        </div>
+        <div class="page-no">2 / 7</div>
+    </section>
+
+    <section class="page">
+        <header class="portfolio-header">
+            <div class="portfolio-kicker">Portfolio 02</div>
+            <h1>Rank 조회 경로 최적화</h1>
+            <p class="lede">1천만 유저 규모에서도 around me 페이지 조회가 버티는지 확인하기 위해, OFFSET 중심 쿼리를 rank 계산 중심 구조로 바꿨다.</p>
+            <div class="summary-grid">
+                <div class="meta">
+                    <div class="meta-label">Problem</div>
+                    <div class="meta-value">뒤쪽 페이지로 갈수록 느려지는 LIMIT/OFFSET</div>
+                </div>
+                <div class="meta">
+                    <div class="meta-label">Approach</div>
+                    <div class="meta-value">내 rank와 page start만 먼저 계산</div>
+                </div>
+                <div class="meta">
+                    <div class="meta-label">Validation</div>
+                    <div class="meta-value">실행계획 + 실제 응답 시간 비교</div>
+                </div>
+            </div>
+        </header>
+
+        <div class="section">
+            <h2>무엇을 만들고 있었는가</h2>
+            <p>사용자는 랭킹 페이지에서 현재 위치를 확인하고, 자신이 포함된 페이지로 바로 이동할 수 있어야 한다.</p>
+            <p>문제는 유저 수가 커질 때였다.</p>
+            <ul>
+                <li>단순 <code>ORDER BY ... LIMIT offset, size</code> 방식은 뒤쪽 페이지로 갈수록 느려진다.</li>
+                <li><code>around me</code> 기능은 내 랭크를 먼저 알아낸 뒤 해당 페이지를 읽어야 한다.</li>
+            </ul>
+            <pre>SELECT ...
+FROM user u
+WHERE ...
+ORDER BY score DESC, last_solved_date ASC, id ASC
+LIMIT :offset, :limit</pre>
+            <p>이 쿼리는 정렬 인덱스를 잘 타더라도 깊은 페이지에서는 앞 row를 계속 읽고 버려야 한다. 즉 병목의 핵심은 정렬 자체보다 <code>OFFSET</code>이며, 유저 수가 커질수록 뒤쪽 페이지 비용이 거의 선형으로 증가한다.</p>
+        </div>
+
+        <div class="section two-col">
+            <div class="panel">
+                <h2>목표</h2>
+                <ul>
+                    <li>1천만 유저 규모에서도 <code>around me</code> 페이지 조회가 버티는지 확인한다.</li>
+                    <li>단순 offset 방식과 개선된 방식의 차이를 실행계획과 실제 시간으로 비교한다.</li>
+                </ul>
+            </div>
+            <div class="panel soft">
+                <h2>핵심 아이디어</h2>
+                <p><code>around me</code>가 필요로 하는 정보는 두 가지뿐이다.</p>
+                <ol class="small">
+                    <li>내 정확한 rank</li>
+                    <li>그 rank가 포함된 페이지의 시작 rank</li>
+                </ol>
+                <p class="small">이 두 값만 빠르게 구할 수 있으면, 나머지는 그 페이지에 해당하는 row만 읽으면 된다.</p>
+            </div>
+        </div>
+
+        <div class="section two-col">
+            <div class="panel">
+                <h3>1. solved count</h3>
+                <p><code>solved_count_bucket</code> 테이블에 푼 문제 수 <code>n</code>, 해당 solved count를 가진 유저 수, 자신보다 solved count가 큰 유저 수를 저장했다.</p>
+                <ol class="small">
+                    <li>내 solved count를 읽는다.</li>
+                    <li>bucket에서 나보다 solved count가 큰 유저 수를 읽는다.</li>
+                    <li>같은 solved count 그룹 안에서 내 순서를 계산한다.</li>
+                    <li>둘을 더해 내 rank와 page start를 구한다.</li>
+                </ol>
+            </div>
+            <div class="panel soft">
+                <h3>2. current streak</h3>
+                <p>하루 한 번 배치 시점에 <code>0이 아닌 유저만</code> 모은 <code>user_streak_rank_snapshot</code>을 생성한다.</p>
+                <ol class="small">
+                    <li>snapshot에서 내 row를 바로 찾는다.</li>
+                    <li>이미 저장된 <code>snapshot_rank</code>를 읽는다.</li>
+                    <li>그 rank로 page start를 계산하고 해당 page만 읽는다.</li>
+                </ol>
+                <p class="small">즉 current streak는 조회 시점에 rank를 계산하는 것이 아니라, 이미 계산된 rank를 읽는 구조다.</p>
+            </div>
+        </div>
+        <div class="page-no">3 / 7</div>
+    </section>
+
+    <section class="page">
+        <header class="portfolio-header">
+            <div class="portfolio-kicker">Portfolio 02</div>
+            <h1>Rank 조회 경로 최적화</h1>
+        </header>
+
+        <div class="section">
+            <h2>테스트 결과</h2>
+            <p>비교는 각 랭크 타입마다 앞/중간/뒤 지점 한 페이지씩 총 3지점에서 수행했다.</p>
+            <ul>
+                <li><code>current streak</code>: <code>101</code>, <code>49,601</code>, <code>99,301</code></li>
+                <li><code>solved</code>: <code>101</code>, <code>4,000,501</code>, <code>8,000,901</code></li>
+            </ul>
+            <div class="chart-wrap">
+                <div class="legend">
+                    <span class="naive">Naive</span>
+                    <span class="optimized">Optimized</span>
+                </div>
+                <svg viewBox="0 0 860 270" aria-label="Rank latency chart">
+                    <rect x="0" y="0" width="860" height="270" fill="#ffffff"/>
+                    <g stroke="#dde4ec" stroke-width="1">
+                        <line x1="155" y1="46" x2="785" y2="46"/>
+                        <line x1="155" y1="120" x2="785" y2="120"/>
+                        <line x1="155" y1="194" x2="785" y2="194"/>
+                        <line x1="155" y1="236" x2="785" y2="236"/>
+                        <line x1="155" y1="18" x2="155" y2="236" stroke="#cbd4df"/>
+                    </g>
+                    <g font-family="Malgun Gothic, Segoe UI, sans-serif" font-size="11" fill="#556274">
+                        <text x="155" y="256">0.1</text>
+                        <text x="225" y="256">1</text>
+                        <text x="295" y="256">10</text>
+                        <text x="365" y="256">100</text>
+                        <text x="435" y="256">1k</text>
+                        <text x="505" y="256">10k</text>
+                        <text x="575" y="256">100k ms</text>
+                        <text x="20" y="50" font-size="13" fill="#1c2735">current streak</text>
+                        <text x="20" y="124" font-size="13" fill="#1c2735">solved</text>
+                    </g>
+                    <g stroke="#dc2626" stroke-width="3" fill="none">
+                        <line x1="540" y1="46" x2="602" y2="46"/>
+                        <line x1="602" y1="46" x2="617" y2="46"/>
+                        <line x1="493" y1="120" x2="673" y2="120"/>
+                        <line x1="673" y1="120" x2="676" y2="120"/>
+                    </g>
+                    <g stroke="#2563eb" stroke-width="3" fill="none">
+                        <line x1="208" y1="72" x2="202" y2="72"/>
+                        <line x1="202" y1="72" x2="168" y2="72"/>
+                        <line x1="500" y1="146" x2="420" y2="146"/>
+                        <line x1="420" y1="146" x2="565" y2="146"/>
+                    </g>
+                    <g fill="#dc2626">
+                        <circle cx="540" cy="46" r="6"/>
+                        <circle cx="602" cy="46" r="6"/>
+                        <circle cx="617" cy="46" r="6"/>
+                        <circle cx="493" cy="120" r="6"/>
+                        <circle cx="673" cy="120" r="6"/>
+                        <circle cx="676" cy="120" r="6"/>
+                    </g>
+                    <g fill="#2563eb">
+                        <circle cx="208" cy="72" r="6"/>
+                        <circle cx="202" cy="72" r="6"/>
+                        <circle cx="168" cy="72" r="6"/>
+                        <circle cx="500" cy="146" r="6"/>
+                        <circle cx="420" cy="146" r="6"/>
+                        <circle cx="565" cy="146" r="6"/>
+                    </g>
+                    <g font-family="Malgun Gothic, Segoe UI, sans-serif" font-size="11" font-weight="700">
+                        <text x="548" y="34" fill="#991b1b">161 / 8,890 / 14,382 ms</text>
+                        <text x="501" y="108" fill="#991b1b">19.1 / 217,842 / 233,231 ms</text>
+                        <text x="216" y="92" fill="#1d4ed8">0.586 / 0.443 / 0.113 ms</text>
+                        <text x="508" y="164" fill="#1d4ed8">24.2 / 369 / 47,747 ms</text>
+                    </g>
+                </svg>
+            </div>
+            <p>bucket 방식은 규모가 더 작을 때는 충분히 실용적이었다. 10만 유저 데이터셋에서 같은 solved bucket 방식의 deep page fetch는 약 <code>0.46 ms</code> 수준이었다.</p>
+        </div>
+
+        <div class="section">
+            <h2>실행계획: current streak</h2>
+            <p>optimized는 snapshot에서 필요한 rank 구간만 읽는다.</p>
+            <pre>SELECT ...
+FROM user_streak_rank_snapshot s
+JOIN user u ON u.id = s.user_id
+WHERE s.snapshot_rank BETWEEN :startRank AND :endRank
+ORDER BY s.snapshot_rank</pre>
+            <p><code>rank 99,301</code>이 포함된 뒤쪽 페이지 기준 실행계획은 이랬다.</p>
+            <pre>-&gt; Nested loop inner join  (actual time=0.151..0.221 rows=15 loops=1)
+    -&gt; Index range scan on s using PRIMARY
+       over (99301 &lt;= snapshot_rank &lt;= 99400)
+       (actual time=0.0816..0.0878 rows=15 loops=1)
+    -&gt; Single-row index lookup on u using PRIMARY
+       (actual time=0.00829..0.00831 rows=1 loops=15)</pre>
+        </div>
+        <div class="page-no">4 / 7</div>
+    </section>
+
+    <section class="page">
+        <header class="portfolio-header">
+            <div class="portfolio-kicker">Portfolio 02</div>
+            <h1>Rank 조회 경로 최적화</h1>
+        </header>
+
+        <div class="section">
+            <h2>실행계획: solved</h2>
+            <p>optimized는 먼저 bucket으로 <code>solved_count</code> 구간을 찾은 뒤 해당 범위만 읽는다.</p>
+            <pre>SELECT ...
+FROM user u FORCE INDEX (idx_user_ranking)
+WHERE u.solved_count &lt;= :sc
+ORDER BY u.solved_count DESC, u.streak_last_solved_date ASC, u.id ASC
+LIMIT :limit OFFSET :offsetInBucket</pre>
+            <p>중간 지점인 <code>rank 4,000,501</code>에서 bucket이 가리킨 값은 <code>solved_count=8</code>, bucket 내부 offset은 <code>23,638</code>이었다.</p>
+            <pre>-&gt; Limit/Offset: 100/23638 row(s)  (actual time=183..183 rows=100 loops=1)
+    -&gt; Index range scan on u using idx_user_ranking
+       over (8 &lt;= solved_count)
+       with index condition: (u.solved_count &lt;= 8)
+       (actual time=0.346..183 rows=23738 loops=1)</pre>
+            <p>즉 solved는 <code>전체 순위 문제</code>를 <code>같은 solved count 그룹 내부 문제</code>로 줄이는 데는 성공했지만, tie group이 큰 분포에서는 그 내부 offset이 다시 병목이 된다.</p>
+        </div>
+
+        <div class="section two-col">
+            <div class="panel">
+                <h2>한계</h2>
+                <p>현재 <code>solved</code>는 bucket으로 시작점을 빠르게 찾지만, tie group 내부를 여전히 offset으로 읽는다. 그래서 <code>solved_count=1</code>처럼 유저가 많은 구간에서는 뒤쪽 페이지 비용이 크다.</p>
+            </div>
+            <div class="panel soft">
+                <h2>정리</h2>
+                <p>이 작업에서 중요한 점은 단순히 쿼리를 튜닝한 것이 아니라, 조회 시점에 무엇을 계산하고 무엇을 미리 만들어 둘지 자체를 랭크 타입별로 다르게 설계했다는 점이다.</p>
+                <ul>
+                    <li>current streak: 조회 전에 rank를 끝내 둔 snapshot 구조</li>
+                    <li>solved: 조회 시 rank 계산 범위를 줄이는 bucket 구조</li>
+                </ul>
+            </div>
+        </div>
+        <div class="page-no">5 / 7</div>
+    </section>
+
+    <section class="page">
+        <header class="portfolio-header">
+            <div class="portfolio-kicker">Portfolio 03</div>
+            <h1>Redis Scoreboard Recovery</h1>
+            <p class="lede">Redis가 과거 스냅샷으로 복구될 수 있다는 전제를 두고, 유실을 어떻게 다시 찾아 반영할지에 초점을 맞춰 설계한 복구 구조다.</p>
+            <div class="summary-grid">
+                <div class="meta">
+                    <div class="meta-label">Issue</div>
+                    <div class="meta-value">DB에는 있지만 Redis에는 없는 반영 결과</div>
+                </div>
+                <div class="meta">
+                    <div class="meta-label">Key Idea</div>
+                    <div class="meta-value">duplicate redis_seq를 복구 신호로 사용</div>
+                </div>
+                <div class="meta">
+                    <div class="meta-label">Operation</div>
+                    <div class="meta-value">운영 중 자연 복구 + 종료 시 catch-up replay</div>
+                </div>
+            </div>
+        </header>
+
+        <div class="section">
+            <h2>무엇을 해결했는가</h2>
+            <p>대회 스코어보드를 Redis에 두면 조회는 빠르다. 대신 Redis가 장애 후 예전 스냅샷으로 복구되면, DB에는 남아 있지만 Redis에는 없는 반영 결과가 생길 수 있다.</p>
+            <p>문제는 Redis를 다시 띄우는 것이 아니라, <strong>무엇이 유실됐는지 어떻게 다시 찾아서 반영할 것인가</strong>였다.</p>
+        </div>
+
+        <div class="section two-col">
+            <div class="panel">
+                <h2>문제</h2>
+                <ul>
+                    <li><code>outbox.id</code>는 DB insert 순서이지 Redis 적용 순서가 아니다.</li>
+                    <li>실패와 재시도로 인해 일부 id만 비어 있을 수 있다.</li>
+                    <li>Redis가 예전 스냅샷으로 복구돼도 <code>outbox.id</code> 자체는 되돌아가지 않는다.</li>
+                </ul>
+                <p class="small">즉 <code>outbox.id</code>만으로는 Redis 입장에서 유실을 자연스럽게 감지하기 어렵다.</p>
+            </div>
+            <div class="panel soft">
+                <h2>선택</h2>
+                <p><code>outbox.id</code>와 별도로 Redis가 발급하는 <code>redis_seq</code>를 두었다.</p>
+                <ul class="small">
+                    <li><code>outbox.id</code>: 멱등 적용 키</li>
+                    <li><code>redis_seq</code>: 복구 감지 키</li>
+                    <li>이미 본 제출이면 기존 seq 반환</li>
+                    <li>처음 보는 제출이면 새 seq 발급</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>왜 복구 신호가 되는가</h2>
+            <p>Redis가 예전 스냅샷으로 복구되면 seq counter와 <code>contestSubmissionId -&gt; redis_seq</code> 매핑도 같이 과거로 돌아간다. 그 뒤 새 결과가 들어오면 예전에 쓰던 <code>redis_seq</code>가 다시 발급될 수 있고, Spring 서버는 outbox에서 이 중복 seq를 찾아 replay할 수 있다.</p>
+            <p><strong>즉 duplicate redis_seq를 복구 신호로 사용했다.</strong></p>
+        </div>
+
+        <div class="section three-col">
+            <div class="panel">
+                <h3>대안: DB gapless seq</h3>
+                <p class="small">seq 자체가 DB에 영속되므로 명확하지만, gapless를 유지하려면 seq 발급 구간을 직렬화해야 하고 여러 서버에서 다루기 어렵다.</p>
+            </div>
+            <div class="panel">
+                <h3>명시적 복구</h3>
+                <p class="small">현재 max seq 또는 체크포인트를 읽고 그보다 큰 outbox를 다시 보낸다. 범위는 명확하지만 별도 복구 절차와 운영 관리가 필요하다.</p>
+            </div>
+            <div class="panel soft">
+                <h3>자연 복구</h3>
+                <p class="small">평소처럼 outbox를 계속 처리하다가 duplicate <code>redis_seq</code>를 감지하면 replay한다. 운영 흐름을 끊지 않는 대신, 복구 속도는 새 이벤트 유입량의 영향을 받는다.</p>
+            </div>
+        </div>
+        <div class="page-no">6 / 7</div>
+    </section>
+
+    <section class="page">
+        <header class="portfolio-header">
+            <div class="portfolio-kicker">Portfolio 03</div>
+            <h1>Redis Scoreboard Recovery</h1>
+        </header>
+
+        <div class="section">
+            <h2>복구 흐름 시각화</h2>
+            <div class="chart-wrap">
+                <svg viewBox="0 0 860 290" aria-label="Recovery flow chart">
+                    <rect x="0" y="0" width="860" height="290" fill="#ffffff"/>
+                    <defs>
+                        <marker id="arrow-book" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                            <path d="M 0 0 L 10 5 L 0 10 z" fill="#58677b"/>
+                        </marker>
+                    </defs>
+                    <g font-family="Malgun Gothic, Segoe UI, sans-serif">
+                        <rect x="24" y="52" width="190" height="50" fill="#eef5ff" stroke="#bfd3ef"/>
+                        <text x="40" y="74" font-size="15" font-weight="700" fill="#18202b">1. judge 서버</text>
+                        <text x="40" y="91" font-size="11" fill="#39485a">결과 저장, outbox 생성</text>
+
+                        <rect x="250" y="52" width="190" height="50" fill="#f2fbf4" stroke="#c5e4cb"/>
+                        <text x="266" y="74" font-size="15" font-weight="700" fill="#18202b">2. batch 서버</text>
+                        <text x="266" y="91" font-size="11" fill="#39485a">outbox를 Redis에 반영</text>
+
+                        <rect x="476" y="52" width="190" height="50" fill="#f7f3ff" stroke="#d9c9f2"/>
+                        <text x="492" y="74" font-size="15" font-weight="700" fill="#18202b">3. Redis</text>
+                        <text x="492" y="91" font-size="11" fill="#39485a">redis_seq 발급, scoreboard 반영</text>
+
+                        <rect x="476" y="160" width="190" height="64" fill="#fff8ed" stroke="#efd3a4"/>
+                        <text x="492" y="181" font-size="15" font-weight="700" fill="#18202b">4. snapshot rollback</text>
+                        <text x="492" y="198" font-size="11" fill="#39485a">예전 상태로 복구되면</text>
+                        <text x="492" y="214" font-size="11" fill="#39485a">옛 redis_seq가 다시 나올 수 있음</text>
+
+                        <rect x="250" y="236" width="190" height="44" fill="#fff2f2" stroke="#efc2c2"/>
+                        <text x="266" y="255" font-size="15" font-weight="700" fill="#18202b">5. replay</text>
+                        <text x="266" y="271" font-size="11" fill="#39485a">duplicate redis_seq 감지 후 재반영</text>
+                    </g>
+                    <g stroke="#58677b" stroke-width="2.5" fill="none" marker-end="url(#arrow-book)">
+                        <path d="M214 77 H250"/>
+                        <path d="M440 77 H476"/>
+                        <path d="M571 102 V160"/>
+                        <path d="M476 191 H440 V258"/>
+                    </g>
+                </svg>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="panel">
+                <h2>최종 구조</h2>
+                <ul>
+                    <li>평소: duplicate <code>redis_seq</code> 기반 자연 복구</li>
+                    <li>대회 종료 시: Redis <code>max seq</code> 기준 catch-up replay</li>
+                </ul>
+                <p>즉 운영 중에는 절차를 단순하게 두고, 종료 시점에는 한 번 더 정합성을 맞추는 구조다.</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="panel">
+                <h2>정리</h2>
+                <p>이 구조는 Redis를 완전히 신뢰하지도, 복구 절차를 무겁게 만들지도 않는다. 운영 중에는 자동으로 회복하고, 종료 시에는 명시적으로 정합성을 맞추는 절충안을 선택했다.</p>
+            </div>
+        </div>
+        <div class="page-no">7 / 7</div>
+    </section>
+</main>
+</body>
+</html>

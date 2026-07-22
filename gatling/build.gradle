@@ -1,3 +1,5 @@
+import io.gatling.gradle.GatlingRunTask
+
 plugins {
   id 'io.gatling.gradle' version '3.10.5'
 }
@@ -9,4 +11,76 @@ repositories {
 gatling {
   logLevel = 'INFO'
 }
+
+tasks.register('prepareStandaloneGatling') {
+  group = 'Gatling'
+  description = 'Compiles Gatling simulations and writes a standalone classpath file for direct java execution.'
+  dependsOn tasks.named('compileGatlingScala')
+  dependsOn tasks.named('processGatlingResources')
+
+  def outputDir = layout.buildDirectory.dir('standalone-gatling')
+  outputs.dir(outputDir)
+
+  doLast {
+    def root = outputDir.get().asFile
+    root.mkdirs()
+
+    def classpathEntries = sourceSets.gatling.runtimeClasspath.files.collect { it.absolutePath }
+    def classpathFile = new File(root, 'classpath.txt')
+    classpathFile.text = classpathEntries.join(File.pathSeparator)
+  }
+}
+
+def registerSimulationTask = { String taskName, String simulationPattern, String taskDescription ->
+  tasks.register(taskName, GatlingRunTask) {
+    group = 'Gatling'
+    description = taskDescription
+    simulations = {
+      include simulationPattern
+    }
+    systemProperties = (System.properties.findAll { key, _ ->
+      String name = key.toString()
+      name.startsWith('perf.') || name.startsWith('gatling.')
+    } + gradle.startParameter.systemPropertiesArgs.findAll { key, _ ->
+      String name = key.toString()
+      name.startsWith('perf.') || name.startsWith('gatling.')
+    }) as Map<String, ?>
+  }
+}
+
+registerSimulationTask(
+    'contestSubmissionRun',
+    '**/ContestSubmissionSimulation.scala',
+    'Runs only ContestSubmissionSimulation.'
+)
+
+registerSimulationTask(
+    'contestSubmissionStepLoadRun',
+    '**/ContestSubmissionStepLoadSimulation.scala',
+    'Runs only ContestSubmissionStepLoadSimulation.'
+)
+
+registerSimulationTask(
+    'contestScoreboardReadRun',
+    '**/ContestScoreboardReadSimulation.scala',
+    'Runs only ContestScoreboardReadSimulation.'
+)
+
+registerSimulationTask(
+    'realContestSubmissionRun',
+    '**/RealContestSubmissionSimulation.scala',
+    'Runs only RealContestSubmissionSimulation.'
+)
+
+registerSimulationTask(
+    'realContestSubmissionSessionReuseRun',
+    '**/RealContestSubmissionSessionReuseSimulation.scala',
+    'Runs only RealContestSubmissionSessionReuseSimulation.'
+)
+
+registerSimulationTask(
+    'ojGoalLoadRun',
+    '**/OjGoalLoadSimulation.scala',
+    'Runs only OjGoalLoadSimulation.'
+)
 

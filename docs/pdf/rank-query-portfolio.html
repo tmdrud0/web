@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rank 조회 경로 최적화</title>
+    <link rel="stylesheet" href="portfolio-print.css">
+</head>
+<body>
+<main class="portfolio">
+    <section class="sheet">
+        <div class="hero">
+            <div class="eyebrow">Portfolio 02</div>
+            <h1>Rank 조회 경로 최적화</h1>
+            <p class="hero-subtitle">1천만 유저 규모에서 around me 페이지가 버티도록, OFFSET 중심 조회를 rank 계산 중심 구조로 바꿨다.</p>
+            <div class="hero-meta">
+                <div class="meta-card">
+                    <div class="meta-label">Problem</div>
+                    <div class="meta-value">깊은 페이지일수록 선형으로 커지는 OFFSET 비용</div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">Idea</div>
+                    <div class="meta-value">내 rank와 page start만 빠르게 계산</div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">Scale</div>
+                    <div class="meta-value">1천만 유저 기준 실행계획과 실측 시간 비교</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">문제 정의</h2>
+            <div class="grid-2">
+                <div class="card">
+                    <h3>병목은 정렬보다 OFFSET</h3>
+                    <p>정렬 인덱스를 잘 타더라도, 깊은 페이지에서는 앞 row를 계속 읽고 버려야 한다. 결국 around me에서 필요한 것은 모든 앞 페이지가 아니라 <strong>내 rank와 그 rank가 속한 page start</strong>다.</p>
+                    <div class="chip-row">
+                        <span class="chip red">깊은 페이지 취약</span>
+                        <span class="chip warn">선형 증가</span>
+                        <span class="chip blue">around me 핵심</span>
+                    </div>
+                </div>
+                <div class="card accent-panel">
+                    <h3>접근 전략</h3>
+                    <ul class="key-points">
+                        <li><strong>current streak</strong>: 배치로 미리 계산한 snapshot_rank를 읽는다.</li>
+                        <li><strong>solved</strong>: solved_count_bucket으로 tie group 범위를 빠르게 찾는다.</li>
+                        <li>둘 다 최종 단계에서는 필요한 페이지 구간만 읽는다.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">구조 설계</h2>
+            <div class="flow-grid">
+                <div class="step-card">
+                    <h3>Current streak: snapshot 기반 조회</h3>
+                    <p>하루 한 번, 0이 아닌 유저만 모아 streak snapshot을 만들고 rank를 저장했다. 조회 시점에는 이미 정렬이 끝난 결과에서 필요한 rank 범위만 읽으므로, 깊은 페이지에서도 비용이 흔들리지 않는다.</p>
+                </div>
+                <div class="step-card">
+                    <h3>Solved: bucket 기반 rank 계산</h3>
+                    <p>solved count별 인원수와 상위 인원수를 별도 bucket 테이블에 저장했다. 이를 이용해 전체 순위를 tie group 내부 순위 문제로 축소했지만, 분포에 따라 tie group 내부 offset 비용이 다시 드러날 수 있다.</p>
+                </div>
+            </div>
+            <div class="callout" style="margin-top:12px;">
+                <h3>핵심 판단</h3>
+                <p>current streak는 <strong>조회 전에 rank를 끝내 두는 방식</strong>, solved는 <strong>조회 시 rank 계산 범위를 줄이는 방식</strong>이다. 둘의 성능 차이는 바로 이 사전 계산 강도의 차이에서 나온다.</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">결과 요약</h2>
+            <div class="metric-grid">
+                <div class="metric-card">
+                    <div class="metric-label">Current Streak, Back</div>
+                    <div class="metric-value">127k x</div>
+                    <div class="metric-detail">14,382 ms → 0.113 ms</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Current Streak, Middle</div>
+                    <div class="metric-value">20k x</div>
+                    <div class="metric-detail">8,890 ms → 0.443 ms</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Solved, Middle</div>
+                    <div class="metric-value">590 x</div>
+                    <div class="metric-detail">217,842 ms → 369 ms</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Solved, Front</div>
+                    <div class="metric-value">Trade-off</div>
+                    <div class="metric-detail">19.1 ms → 24.2 ms, 앞 구간은 약간 느려짐</div>
+                </div>
+            </div>
+        </div>
+        <div class="page-tag">Page 1</div>
+    </section>
+
+    <section class="sheet">
+        <div class="section" style="margin-top:0;">
+            <h2 class="section-title">시각화: Current Streak 지연 시간</h2>
+            <p class="section-intro">표 수치 차이가 수만 배라서 log scale dot plot으로 바꿨다. 오른쪽으로 갈수록 느리다.</p>
+            <div class="chart-card">
+                <div class="legend">
+                    <span class="legend-item"><span class="swatch naive"></span>Naive</span>
+                    <span class="legend-item"><span class="swatch optimized"></span>Optimized</span>
+                </div>
+                <svg viewBox="0 0 900 360" aria-label="Current streak latency chart">
+                    <rect x="0" y="0" width="900" height="360" rx="18" fill="#f8fbfe"/>
+                    <g stroke="#d9e3ef" stroke-width="1">
+                        <line x1="170" y1="72" x2="820" y2="72"/>
+                        <line x1="170" y1="170" x2="820" y2="170"/>
+                        <line x1="170" y1="268" x2="820" y2="268"/>
+                        <line x1="170" y1="312" x2="820" y2="312" stroke="#c8d4e4" stroke-width="1.2"/>
+                        <line x1="170" y1="44" x2="170" y2="312" stroke="#c8d4e4" stroke-width="1.2"/>
+                        <line x1="241" y1="44" x2="241" y2="312"/>
+                        <line x1="313" y1="44" x2="313" y2="312"/>
+                        <line x1="385" y1="44" x2="385" y2="312"/>
+                        <line x1="457" y1="44" x2="457" y2="312"/>
+                        <line x1="529" y1="44" x2="529" y2="312"/>
+                        <line x1="601" y1="44" x2="601" y2="312"/>
+                        <line x1="673" y1="44" x2="673" y2="312"/>
+                        <line x1="745" y1="44" x2="745" y2="312"/>
+                        <line x1="817" y1="44" x2="817" y2="312"/>
+                    </g>
+                    <g font-family="Malgun Gothic, Segoe UI, sans-serif" font-size="11" fill="#64748b">
+                        <text x="170" y="332">0.1</text>
+                        <text x="236" y="332">1</text>
+                        <text x="307" y="332">10</text>
+                        <text x="379" y="332">100</text>
+                        <text x="447" y="332">1k</text>
+                        <text x="518" y="332">10k</text>
+                        <text x="585" y="332">100k ms</text>
+
+                        <text x="30" y="78" font-size="14" fill="#1f2937">Front rank 101</text>
+                        <text x="30" y="176" font-size="14" fill="#1f2937">Middle rank 49,601</text>
+                        <text x="30" y="274" font-size="14" fill="#1f2937">Back rank 99,301</text>
+                    </g>
+
+                    <g stroke="#dc2626" stroke-width="3" fill="none">
+                        <line x1="557" y1="72" x2="618" y2="170"/>
+                        <line x1="618" y1="170" x2="634" y2="268"/>
+                    </g>
+                    <g stroke="#2563eb" stroke-width="3" fill="none">
+                        <line x1="223" y1="72" x2="215" y2="170"/>
+                        <line x1="215" y1="170" x2="180" y2="268"/>
+                    </g>
+
+                    <g>
+                        <circle cx="557" cy="72" r="8" fill="#dc2626"/>
+                        <circle cx="618" cy="170" r="8" fill="#dc2626"/>
+                        <circle cx="634" cy="268" r="8" fill="#dc2626"/>
+                        <circle cx="223" cy="72" r="8" fill="#2563eb"/>
+                        <circle cx="215" cy="170" r="8" fill="#2563eb"/>
+                        <circle cx="180" cy="268" r="8" fill="#2563eb"/>
+                    </g>
+
+                    <g font-size="12" font-weight="700">
+                        <text x="569" y="67" fill="#991b1b">161 ms</text>
+                        <text x="630" y="165" fill="#991b1b">8,890 ms</text>
+                        <text x="646" y="263" fill="#991b1b">14,382 ms</text>
+                        <text x="235" y="67" fill="#1d4ed8">0.586 ms</text>
+                        <text x="227" y="165" fill="#1d4ed8">0.443 ms</text>
+                        <text x="192" y="263" fill="#1d4ed8">0.113 ms</text>
+                    </g>
+                </svg>
+                <p class="chart-caption">snapshot을 읽는 구조로 바뀌자, 뒤쪽 페이지에서도 조회 시간이 거의 일정하게 유지됐다.</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">시각화: Solved 지연 시간</h2>
+            <p class="section-intro">Solved는 bucket으로 범위를 줄였지만, 큰 tie group에서는 내부 offset 비용이 남는다. 그래프가 이 한계를 그대로 보여준다.</p>
+            <div class="chart-card">
+                <div class="legend">
+                    <span class="legend-item"><span class="swatch naive"></span>Naive</span>
+                    <span class="legend-item"><span class="swatch optimized"></span>Optimized</span>
+                </div>
+                <svg viewBox="0 0 900 360" aria-label="Solved latency chart">
+                    <rect x="0" y="0" width="900" height="360" rx="18" fill="#f8fbfe"/>
+                    <g stroke="#d9e3ef" stroke-width="1">
+                        <line x1="170" y1="72" x2="820" y2="72"/>
+                        <line x1="170" y1="170" x2="820" y2="170"/>
+                        <line x1="170" y1="268" x2="820" y2="268"/>
+                        <line x1="170" y1="312" x2="820" y2="312" stroke="#c8d4e4" stroke-width="1.2"/>
+                        <line x1="170" y1="44" x2="170" y2="312" stroke="#c8d4e4" stroke-width="1.2"/>
+                        <line x1="241" y1="44" x2="241" y2="312"/>
+                        <line x1="313" y1="44" x2="313" y2="312"/>
+                        <line x1="385" y1="44" x2="385" y2="312"/>
+                        <line x1="457" y1="44" x2="457" y2="312"/>
+                        <line x1="529" y1="44" x2="529" y2="312"/>
+                        <line x1="601" y1="44" x2="601" y2="312"/>
+                        <line x1="673" y1="44" x2="673" y2="312"/>
+                        <line x1="745" y1="44" x2="745" y2="312"/>
+                        <line x1="817" y1="44" x2="817" y2="312"/>
+                    </g>
+                    <g font-family="Malgun Gothic, Segoe UI, sans-serif" font-size="11" fill="#64748b">
+                        <text x="170" y="332">0.1</text>
+                        <text x="236" y="332">1</text>
+                        <text x="307" y="332">10</text>
+                        <text x="379" y="332">100</text>
+                        <text x="447" y="332">1k</text>
+                        <text x="518" y="332">10k</text>
+                        <text x="585" y="332">100k ms</text>
+
+                        <text x="30" y="78" font-size="14" fill="#1f2937">Front rank 101</text>
+                        <text x="30" y="176" font-size="14" fill="#1f2937">Middle rank 4,000,501</text>
+                        <text x="30" y="274" font-size="14" fill="#1f2937">Back rank 8,000,901</text>
+                    </g>
+
+                    <g stroke="#dc2626" stroke-width="3" fill="none">
+                        <line x1="510" y1="72" x2="689" y2="170"/>
+                        <line x1="689" y1="170" x2="692" y2="268"/>
+                    </g>
+                    <g stroke="#2563eb" stroke-width="3" fill="none">
+                        <line x1="520" y1="72" x2="440" y2="170"/>
+                        <line x1="440" y1="170" x2="581" y2="268"/>
+                    </g>
+
+                    <g>
+                        <circle cx="510" cy="72" r="8" fill="#dc2626"/>
+                        <circle cx="689" cy="170" r="8" fill="#dc2626"/>
+                        <circle cx="692" cy="268" r="8" fill="#dc2626"/>
+                        <circle cx="520" cy="72" r="8" fill="#2563eb"/>
+                        <circle cx="440" cy="170" r="8" fill="#2563eb"/>
+                        <circle cx="581" cy="268" r="8" fill="#2563eb"/>
+                    </g>
+
+                    <g font-size="12" font-weight="700">
+                        <text x="522" y="67" fill="#991b1b">19.1 ms</text>
+                        <text x="701" y="165" fill="#991b1b">217,842 ms</text>
+                        <text x="704" y="263" fill="#991b1b">233,231 ms</text>
+                        <text x="532" y="67" fill="#1d4ed8">24.2 ms</text>
+                        <text x="452" y="165" fill="#1d4ed8">369 ms</text>
+                        <text x="593" y="263" fill="#1d4ed8">47,747 ms</text>
+                    </g>
+                </svg>
+                <p class="chart-caption">front 페이지에서는 bucket 계산 오버헤드가 약간 있지만, 중간 구간부터는 이득이 압도적이다. 다만 큰 tie group에서는 완전한 해결이 아니다.</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">한계와 다음 단계</h2>
+            <div class="grid-2">
+                <div class="card warning-panel">
+                    <h3>현재 한계</h3>
+                    <p>solved는 전체 순위 문제를 tie group 내부 문제로 줄였지만, <strong>solved_count=1</strong>처럼 큰 group에서는 내부 offset이 다시 병목이 된다.</p>
+                </div>
+                <div class="card accent-panel">
+                    <h3>다음 개선 방향</h3>
+                    <p>tie group 내부도 seek 방식으로 읽거나, solved 조회 역시 snapshot 계열 구조로 전환하면 깊은 페이지 비용을 더 낮출 수 있다.</p>
+                </div>
+            </div>
+        </div>
+        <div class="page-tag">Page 2</div>
+    </section>
+</main>
+</body>
+</html>

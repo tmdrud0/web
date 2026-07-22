@@ -10,6 +10,20 @@ import java.util.Optional;
 
 public interface ContestSubmissionRepository extends JpaRepository<ContestSubmission, Long> {
 
+    @Query("""
+            select cs.id as submissionId,
+                   c.id as contestId,
+                   cs.problem.id as problemId,
+                   cs.user.id as userId,
+                   c.startTime as contestStart,
+                   cs.submittedTime as submittedTime,
+                   cs.code as code
+            from ContestSubmission cs
+            join cs.contest c
+            where cs.id = :submissionId
+            """)
+    Optional<ContestSubmissionJudgeProjection> findJudgeProjectionById(@Param("submissionId") Long submissionId);
+
     @Query("select cs from ContestSubmission cs where cs.id in :ids order by cs.id")
     List<ContestSubmission> findAllByIdInOrderById(@Param("ids") Collection<Long> ids);
 
@@ -19,4 +33,14 @@ public interface ContestSubmissionRepository extends JpaRepository<ContestSubmis
 
     @Query("select coalesce(max(cs.id), 0) from ContestSubmission cs")
     Long findMaxId();
+
+    @Query(value = """
+            select cs.id
+            from contest_submission cs
+            left join contest_submission_result csr on csr.submission_id = cs.id
+            where csr.submission_id is null
+            order by cs.id
+            limit :limit
+            """, nativeQuery = true)
+    List<Long> findTopUnjudgedSubmissionIds(@Param("limit") int limit);
 }

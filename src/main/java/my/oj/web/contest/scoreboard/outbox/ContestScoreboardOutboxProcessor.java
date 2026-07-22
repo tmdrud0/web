@@ -1,50 +1,116 @@
 package my.oj.web.contest.scoreboard.outbox;
 
 import lombok.RequiredArgsConstructor;
-import my.oj.web.contest.scoreboard.ContestScoreboardService;
-import org.springframework.context.event.EventListener;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
 
 @Component
 @RequiredArgsConstructor
 public class ContestScoreboardOutboxProcessor {
 
     private final ContestScoreboardOutboxService outboxService;
-    private final ContestScoreboardService scoreboardService;
-    private final ContestScoreboardOutboxSequenceStore sequenceStore;
-
-    @Async
-    @EventListener
-    public void onOutboxCreated(ContestScoreboardOutboxCreatedEvent evt) {
-        processById(evt.outboxId());
-    }
+    private final ContestScoreboardOutboxApplier outboxApplier;
+    private final ContestScoreboardOutboxStore outboxStore;
 
     @Transactional
-    public void processById(Long outboxId) {
+    public boolean processById(Long outboxId) {
         ContestScoreboardOutbox outbox = outboxService.lockById(outboxId);
         if (!outbox.isProcessable()) {
-            return;
+            return false;
         }
         try {
-            scoreboardService.recordJudgement(
-                    outbox.getId(),
-                    outbox.getContestId(),
-                    outbox.getProblemId(),
-                    outbox.getUserId(),
-                    outbox.getContestStart(),
-                    outbox.getSubmittedTime(),
-                    outbox.getResult()
-            );
+            Long redisSequence = outboxApplier.apply(outbox.getId(), outbox.toPayload());
             LocalDateTime processedAt = LocalDateTime.now();
+            outbox.assignRedisSequence(redisSequence);
             outbox.markSuccess(processedAt);
-            sequenceStore.markProcessed(outbox.getRedisSequence(), processedAt);
+            return true;
         } catch (Exception ex) {
             outbox.markFailed(ex.getMessage());
-            throw ex;
+            return false;
         }
     }
+
+    public BatchProcessResult processBatch(int batchSize, Duration claimLease) {
+        List<ContestScoreboardOutboxStore.ClaimedEvent> claimed = outboxStore.claim(batchSize, claimLease);
+        if (claimed.isEmpty()) {
+            return BatchProcessResult.empty();
+        }
+
+        List<ContestScoreboardOutboxApplier.ApplyRequest> requests = claimed.stream()
+                .map(event -> new ContestScoreboardOutboxApplier.ApplyRequest(
+                        event.eventId(),
+                        event.payload()
+                ))
+                .toList();
+        List<ContestScoreboardOutboxApplier.ApplyResult> applyResults;
+        try {
+            applyResults = outboxApplier.applyAll(requests);
+            if (applyResults == null) {
+                applyResults = List.of();
+            }
+        } catch (RuntimeException exception) {
+            String error = exceptionMessage(exception);
+            applyResults = requests.stream()
+                    .map(request -> ContestScoreboardOutboxApplier.ApplyResult.failure(
+                            request.eventId(),
+                            error
+                    ))
+                    .toList();
+        }
+
+        List<ContestScoreboardOutboxStore.CompletedEvent> completed = new ArrayList<>(claimed.size());
+        List<ContestScoreboardOutboxStore.FailedEvent> failed = new ArrayList<>();
+        for (int index = 0; index < claimed.size(); index++) {
+            ContestScoreboardOutboxStore.ClaimedEvent event = claimed.get(index);
+            if (index >= applyResults.size()) {
+                failed.add(new ContestScoreboardOutboxStore.FailedEvent(
+                        event,
+                        "Scoreboard applier returned fewer results than requested"
+                ));
+                continue;
+            }
+
+            ContestScoreboardOutboxApplier.ApplyResult result = applyResults.get(index);
+            if (result.eventId() != event.eventId()) {
+                failed.add(new ContestScoreboardOutboxStore.FailedEvent(
+                        event,
+                        "Scoreboard applier result order did not match the claimed event order"
+                ));
+            } else if (result.succeeded()) {
+                completed.add(new ContestScoreboardOutboxStore.CompletedEvent(
+                        event,
+                        result.redisSequence()
+                ));
+            } else {
+                failed.add(new ContestScoreboardOutboxStore.FailedEvent(event, result.errorMessage()));
+            }
+        }
+
+        ContestScoreboardOutboxStore.BatchCompletionResult completion = outboxStore.completeAll(completed, failed);
+        return new BatchProcessResult(
+                claimed.size(),
+                completion.completedApplied(),
+                completion.failedApplied(),
+                completion.staleCount()
+        );
+    }
+
+    public record BatchProcessResult(int claimed, int completed, int failed, int stale) {
+
+        static BatchProcessResult empty() {
+            return new BatchProcessResult(0, 0, 0, 0);
+        }
+    }
+
+    private static String exceptionMessage(RuntimeException exception) {
+        Throwable cause = exception.getCause() == null ? exception : exception.getCause();
+        String message = cause.getMessage();
+        return cause.getClass().getSimpleName() + (message == null ? "" : ": " + message);
+    }
+
 }

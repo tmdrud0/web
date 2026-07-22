@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Redis Scoreboard Recovery</title>
+    <link rel="stylesheet" href="portfolio-print.css">
+</head>
+<body>
+<main class="portfolio">
+    <section class="sheet">
+        <div class="hero">
+            <div class="eyebrow">Portfolio 03</div>
+            <h1>Redis Scoreboard Recovery</h1>
+            <p class="hero-subtitle">Redis가 과거 스냅샷으로 복구돼도 유실 반영을 다시 찾을 수 있도록, 적용 순서와 복구 신호를 분리해 설계했다.</p>
+            <div class="hero-meta">
+                <div class="meta-card">
+                    <div class="meta-label">Issue</div>
+                    <div class="meta-value">Redis 복구 후 DB와 scoreboard 상태 불일치</div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">Key Design</div>
+                    <div class="meta-value">duplicate redis_seq를 복구 신호로 사용</div>
+                </div>
+                <div class="meta-card">
+                    <div class="meta-label">Outcome</div>
+                    <div class="meta-value">운영 중 자연 복구 + 종료 시 정합성 보정</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">문제 정의</h2>
+            <div class="grid-2">
+                <div class="card">
+                    <h3>왜 outbox.id만으로 부족했는가</h3>
+                    <p>outbox.id는 DB insert 순서이지 Redis 적용 순서가 아니다. 실패와 재시도로 중간 id가 비어 있을 수 있고, Redis가 예전 스냅샷으로 복구돼도 DB의 id는 되돌아가지 않는다. 그래서 Redis 입장에서 유실을 자연스럽게 감지하기 어렵다.</p>
+                </div>
+                <div class="card accent-panel">
+                    <h3>설계 목표</h3>
+                    <ul class="key-points">
+                        <li>평소 운영에서는 별도 복구 모드 없이 자연스럽게 회복한다.</li>
+                        <li>복구 신호는 Redis가 스스로 노출할 수 있어야 한다.</li>
+                        <li>대회 종료 시에는 한 번 더 명시적으로 정합성을 맞춘다.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">핵심 아이디어</h2>
+            <div class="grid-2">
+                <div class="step-card">
+                    <h3>적용 키와 복구 키를 분리</h3>
+                    <p><strong>outbox.id</strong>는 멱등 적용 키로 남기고, 별도로 Redis가 발급하는 <strong>redis_seq</strong>를 두었다. redis_seq는 Redis 관점의 적용 순서를 의미하므로, snapshot rollback 이후 중복 발급이 복구 신호가 된다.</p>
+                </div>
+                <div class="step-card">
+                    <h3>중복 seq를 발견하면 replay</h3>
+                    <p>Redis가 과거 상태로 돌아가면 seq counter와 contestSubmissionId 매핑도 함께 과거로 돌아간다. 이후 새 반영이 들어왔을 때 예전 seq가 다시 발급될 수 있고, batch 서버는 이 duplicate redis_seq를 찾아 누락 구간을 다시 밀어 넣는다.</p>
+                </div>
+            </div>
+            <div class="callout" style="margin-top:12px;">
+                <h3>핵심 문장</h3>
+                <p>이 구조의 본질은 <strong>유실 여부를 DB 기준으로 추론하지 않고, Redis가 스스로 드러내는 이상 신호를 복구 트리거로 사용한 것</strong>이다.</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">대안 비교</h2>
+            <div class="compare-grid">
+                <div class="compare-card">
+                    <h3>DB gapless seq</h3>
+                    <p>복구 기준이 DB에 영속되므로 명확하지만, gapless 발급 구간을 직렬화해야 하고 여러 서버에서 다루기 어려워진다.</p>
+                    <div class="chip-row">
+                        <span class="chip accent">정합성 강함</span>
+                        <span class="chip red">발급 병목 가능</span>
+                    </div>
+                </div>
+                <div class="compare-card">
+                    <h3>명시적 복구 절차</h3>
+                    <p>현재 max seq를 읽어 그보다 큰 outbox를 다시 보내는 방식이다. 범위는 명확하지만 운영에서 장애 감지와 복구 시작을 별도로 관리해야 한다.</p>
+                    <div class="chip-row">
+                        <span class="chip blue">복구 범위 명확</span>
+                        <span class="chip warn">운영 절차 추가</span>
+                    </div>
+                </div>
+                <div class="compare-card accent-panel">
+                    <h3>선택한 방식: 자연 복구</h3>
+                    <p>평소처럼 outbox를 계속 처리하면서 duplicate redis_seq를 감지한다. 운영 흐름을 끊지 않으면서, 복구가 필요한 순간만 batch replay가 개입한다.</p>
+                    <div class="chip-row">
+                        <span class="chip accent">운영 단순</span>
+                        <span class="chip blue">복구 자동화</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="page-tag">Page 1</div>
+    </section>
+
+    <section class="sheet">
+        <div class="section" style="margin-top:0;">
+            <h2 class="section-title">복구 흐름 시각화</h2>
+            <p class="section-intro">복구 로직을 텍스트 대신 흐름도로 정리했다. 핵심은 Redis가 과거 상태로 돌아왔을 때 duplicate redis_seq가 발생하고, 이 신호로 replay를 시작하는 지점이다.</p>
+            <div class="chart-card">
+                <svg viewBox="0 0 900 430" aria-label="Recovery flow diagram">
+                    <rect x="0" y="0" width="900" height="430" rx="18" fill="#f8fbfe"/>
+                    <defs>
+                        <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                            <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+                        </marker>
+                    </defs>
+
+                    <g font-family="Malgun Gothic, Segoe UI, sans-serif">
+                        <rect x="60" y="78" width="220" height="76" rx="18" fill="#e0f2fe" stroke="#7dd3fc"/>
+                        <text x="86" y="110" font-size="18" font-weight="700" fill="#0f172a">1. Judge 서버</text>
+                        <text x="86" y="136" font-size="13" fill="#334155">결과 저장 + outbox 생성</text>
+
+                        <rect x="340" y="78" width="220" height="76" rx="18" fill="#dcfce7" stroke="#86efac"/>
+                        <text x="366" y="110" font-size="18" font-weight="700" fill="#0f172a">2. Batch 서버</text>
+                        <text x="366" y="136" font-size="13" fill="#334155">outbox를 Redis에 반영</text>
+
+                        <rect x="620" y="78" width="220" height="76" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+                        <text x="646" y="110" font-size="18" font-weight="700" fill="#0f172a">3. Redis</text>
+                        <text x="646" y="136" font-size="13" fill="#334155">contestSubmissionId별 redis_seq 발급</text>
+
+                        <rect x="620" y="214" width="220" height="94" rx="18" fill="#fff7ed" stroke="#fdba74"/>
+                        <text x="646" y="246" font-size="18" font-weight="700" fill="#0f172a">4. 장애 후 복구</text>
+                        <text x="646" y="272" font-size="13" fill="#334155">과거 snapshot으로 돌아오면</text>
+                        <text x="646" y="292" font-size="13" fill="#334155">옛 redis_seq가 다시 발급될 수 있음</text>
+
+                        <rect x="340" y="336" width="220" height="62" rx="18" fill="#fee2e2" stroke="#fca5a5"/>
+                        <text x="366" y="366" font-size="18" font-weight="700" fill="#0f172a">5. Replay 실행</text>
+                        <text x="366" y="388" font-size="13" fill="#334155">duplicate redis_seq 감지 후 누락 구간 재반영</text>
+                    </g>
+
+                    <g stroke="#64748b" stroke-width="3" fill="none" marker-end="url(#arrow)">
+                        <path d="M280 116 H340"/>
+                        <path d="M560 116 H620"/>
+                        <path d="M730 154 V214"/>
+                        <path d="M620 261 H560 V367"/>
+                    </g>
+
+                    <g font-family="Malgun Gothic, Segoe UI, sans-serif" font-size="12" fill="#475569" font-weight="700">
+                        <text x="420" y="101">outbox polling</text>
+                        <text x="684" y="101">apply + seq assign</text>
+                        <text x="742" y="190">snapshot rollback</text>
+                        <text x="566" y="318">duplicate seq</text>
+                    </g>
+                </svg>
+                <p class="chart-caption">Redis rollback이 발생해도, batch 서버는 duplicate redis_seq만 보면 복구가 필요한 시점을 알아낼 수 있다.</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">최종 운영 구조</h2>
+            <div class="grid-3">
+                <div class="card">
+                    <h3>평소 운영</h3>
+                    <p>duplicate redis_seq 기반 자연 복구를 사용한다. 별도 복구 모드 없이 기존 처리 흐름을 유지한다.</p>
+                </div>
+                <div class="card accent-panel">
+                    <h3>대회 종료 시</h3>
+                    <p>Redis의 max seq 기준 catch-up replay를 한 번 더 수행해 종료 시점 정합성을 맞춘다.</p>
+                </div>
+                <div class="card">
+                    <h3>역할 분리</h3>
+                    <p>judge 서버는 결과와 outbox 저장, batch 서버는 반영과 replay, Redis는 빠른 조회용 파생 상태를 담당한다.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">정리</h2>
+            <div class="callout">
+                <h3>핵심 결론</h3>
+                <p>이 설계는 Redis를 완전히 신뢰하지도, 복구 절차를 무겁게 만들지도 않는다. 운영 중에는 자동으로 회복하고, 종료 시에는 명시적으로 정합성을 맞추는 절충안을 선택했다.</p>
+            </div>
+        </div>
+        <div class="page-tag">Page 2</div>
+    </section>
+</main>
+</body>
+</html>
