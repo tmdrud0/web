@@ -18,12 +18,9 @@ import org.hibernate.sql.model.PreparableMutationOperation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
-import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.context.TestConfiguration;
-import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.TestPropertySource;
@@ -31,20 +28,16 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 import javax.sql.DataSource;
 import jakarta.persistence.EntityManagerFactory;
-import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
-import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -67,6 +60,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         "spring.jpa.properties.hibernate.order_inserts=true"
 })
 @EnabledIfEnvironmentVariable(named = "INCLUDE_MYSQL_BATCH_VERIFICATION", matches = "true")
+@Import(JdbcBatchProbeTestConfiguration.class)
 class ContestSubmissionMySqlBatchRewriteIntegrationTests {
 
     @Autowired
@@ -169,7 +163,7 @@ class ContestSubmissionMySqlBatchRewriteIntegrationTests {
                 """,
                 (rs, rowNum) -> rs.getString("argument")
         ).stream()
-                .map(ContestSubmissionMySqlBatchRewriteIntegrationTests::normalizeSql)
+                .map(JdbcBatchProbeTestConfiguration::normalizeSql)
                 .filter(sql -> sql.contains("insert into contest_submission"))
                 .toList();
 
@@ -324,7 +318,7 @@ class ContestSubmissionMySqlBatchRewriteIntegrationTests {
                 """,
                 (rs, rowNum) -> rs.getString("argument")
         ).stream()
-                .map(ContestSubmissionMySqlBatchRewriteIntegrationTests::normalizeSql)
+                .map(JdbcBatchProbeTestConfiguration::normalizeSql)
                 .filter(sql -> sql.contains("insert into contest_submission"))
                 .toList();
 
@@ -373,14 +367,6 @@ class ContestSubmissionMySqlBatchRewriteIntegrationTests {
         }
     }
 
-    private static String normalizeSql(String sql) {
-        return sql == null ? "" : sql
-                .replace('`', ' ')
-                .replaceAll("\\s+", " ")
-                .trim()
-                .toLowerCase(Locale.ROOT);
-    }
-
     private static boolean isMultiValueInsert(String sql) {
         int valuesIndex = sql.indexOf(" values ");
         if (valuesIndex < 0) {
@@ -394,133 +380,4 @@ class ContestSubmissionMySqlBatchRewriteIntegrationTests {
         return String.join(",", java.util.Collections.nCopies(count, "?"));
     }
 
-    @TestConfiguration
-    static class JdbcBatchProbeConfig {
-
-        @Bean
-        JdbcBatchProbe jdbcBatchProbe() {
-            return new JdbcBatchProbe();
-        }
-
-        @Bean
-        static BeanPostProcessor jdbcBatchProbeBeanPostProcessor(JdbcBatchProbe probe) {
-            return new BeanPostProcessor() {
-                @Override
-                public Object postProcessAfterInitialization(Object bean, String beanName) throws BeansException {
-                    if (!(bean instanceof DataSource dataSource) || !beanName.equals("dataSource")) {
-                        return bean;
-                    }
-                    return Proxy.newProxyInstance(
-                            DataSource.class.getClassLoader(),
-                            new Class<?>[]{DataSource.class},
-                            (proxy, method, args) -> {
-                                Object result = method.invoke(dataSource, args);
-                                if (!method.getName().equals("getConnection") || !(result instanceof Connection connection)) {
-                                    return result;
-                                }
-                                return wrapConnection(connection, probe);
-                            }
-                    );
-                }
-            };
-        }
-
-        private static Connection wrapConnection(Connection connection, JdbcBatchProbe probe) {
-            return (Connection) Proxy.newProxyInstance(
-                    Connection.class.getClassLoader(),
-                    new Class<?>[]{Connection.class},
-                    (proxy, method, args) -> {
-                        Object result = method.invoke(connection, args);
-                        if (!method.getName().startsWith("prepareStatement")
-                                || args == null
-                                || args.length == 0
-                                || !(args[0] instanceof String sql)) {
-                            return result;
-                        }
-                        String normalizedSql = normalizeSql(sql);
-                        if (!(result instanceof PreparedStatement preparedStatement)
-                                || !normalizedSql.contains("insert into contest_submission")) {
-                            return result;
-                        }
-                        probe.recordTargetSql(normalizedSql);
-                        return wrapPreparedStatement(preparedStatement, normalizedSql, probe);
-                    }
-            );
-        }
-
-        private static PreparedStatement wrapPreparedStatement(PreparedStatement preparedStatement,
-                                                               String sql,
-                                                               JdbcBatchProbe probe) {
-            return (PreparedStatement) Proxy.newProxyInstance(
-                    PreparedStatement.class.getClassLoader(),
-                    new Class<?>[]{PreparedStatement.class},
-                    (proxy, method, args) -> {
-                        String name = method.getName();
-                        switch (name) {
-                            case "addBatch" -> probe.recordAddBatch(sql);
-                            case "executeBatch", "executeLargeBatch" -> probe.recordExecuteBatch(sql);
-                            case "executeUpdate", "executeLargeUpdate", "execute" -> probe.recordExecuteUpdate(sql);
-                            default -> {
-                            }
-                        }
-                        return method.invoke(preparedStatement, args);
-                    }
-            );
-        }
-    }
-
-    static class JdbcBatchProbe {
-        private final AtomicInteger addBatchCount = new AtomicInteger();
-        private final AtomicInteger executeBatchCount = new AtomicInteger();
-        private final AtomicInteger executeUpdateCount = new AtomicInteger();
-        private final List<String> targetSqls = Collections.synchronizedList(new ArrayList<>());
-        private final List<String> events = Collections.synchronizedList(new ArrayList<>());
-
-        void recordTargetSql(String sql) {
-            targetSqls.add(sql);
-        }
-
-        void recordAddBatch(String sql) {
-            addBatchCount.incrementAndGet();
-            events.add("addBatch :: " + sql);
-        }
-
-        void recordExecuteBatch(String sql) {
-            executeBatchCount.incrementAndGet();
-            events.add("executeBatch :: " + sql);
-        }
-
-        void recordExecuteUpdate(String sql) {
-            executeUpdateCount.incrementAndGet();
-            events.add("executeUpdate :: " + sql);
-        }
-
-        int addBatchCount() {
-            return addBatchCount.get();
-        }
-
-        int executeBatchCount() {
-            return executeBatchCount.get();
-        }
-
-        int executeUpdateCount() {
-            return executeUpdateCount.get();
-        }
-
-        List<String> targetSqls() {
-            return List.copyOf(targetSqls);
-        }
-
-        List<String> events() {
-            return List.copyOf(events);
-        }
-
-        void reset() {
-            addBatchCount.set(0);
-            executeBatchCount.set(0);
-            executeUpdateCount.set(0);
-            targetSqls.clear();
-            events.clear();
-        }
-    }
 }

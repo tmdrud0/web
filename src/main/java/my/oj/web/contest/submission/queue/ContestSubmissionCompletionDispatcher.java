@@ -1,7 +1,6 @@
 package my.oj.web.contest.submission.queue;
 
 import jakarta.annotation.PreDestroy;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
@@ -19,18 +18,17 @@ public class ContestSubmissionCompletionDispatcher {
 
     public ContestSubmissionCompletionDispatcher(
             ContestSubmissionBulkMetrics metrics,
-            @Value("${contest.submission.completion.thread-count:8}") int threadCount,
-            @Value("${contest.submission.completion.queue-capacity:256}") int queueCapacity
+            ContestSubmissionCompletionProperties properties
     ) {
         this.metrics = metrics;
         AtomicInteger threadSequence = new AtomicInteger();
-        int effectiveThreadCount = Math.max(1, threadCount);
+        int effectiveThreadCount = properties.effectiveThreadCount();
         this.executor = new ThreadPoolExecutor(
                 effectiveThreadCount,
                 effectiveThreadCount,
                 0L,
                 TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(Math.max(1, queueCapacity)),
+                new ArrayBlockingQueue<>(properties.effectiveQueueCapacity()),
                 runnable -> {
                     Thread thread = new Thread(
                             runnable,

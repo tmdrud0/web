@@ -30,24 +30,12 @@ public class ContestScoreboardService {
         return store.currentRanking(contestId);
     }
 
-    public ContestScoreboardSnapshot snapshot(long contestId) {
-        return store.snapshot(contestId);
-    }
-
-    public ContestScoreboardSlice topRanking(long contestId, int size) {
-        return slice(contestId, 1, size);
-    }
-
     public ContestScoreboardSlice slice(long contestId, long startRank, int size) {
         return store.slice(contestId, startRank, size);
     }
 
     public Optional<ContestScoreboardSlice> rankingAroundUser(long contestId, long userId, int windowSize) {
         return store.rankingAroundUser(contestId, userId, windowSize);
-    }
-
-    public long totalParticipants(long contestId) {
-        return store.totalParticipants(contestId);
     }
 
     public void reset(long contestId) {

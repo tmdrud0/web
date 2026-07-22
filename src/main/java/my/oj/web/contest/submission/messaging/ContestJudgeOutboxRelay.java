@@ -5,7 +5,6 @@ import org.springframework.amqp.core.MessageDeliveryMode;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -29,14 +28,12 @@ class ContestJudgeOutboxRelay {
 
     ContestJudgeOutboxRelay(ContestJudgeOutboxStore outboxStore,
                             @Qualifier("contestJudgeRabbitTemplate") RabbitTemplate rabbitTemplate,
-                            @Value("${contest.submission.judge.rabbit.publisher.batch-size:50}") int batchSize,
-                            @Value("${contest.submission.judge.rabbit.publisher.claim-timeout:30s}") Duration claimLease,
-                            @Value("${contest.submission.judge.rabbit.publisher.confirm-timeout:10s}") Duration confirmTimeout) {
+                            ContestJudgeOutboxRelayProperties properties) {
         this.outboxStore = outboxStore;
         this.rabbitTemplate = rabbitTemplate;
-        this.batchSize = Math.max(1, batchSize);
-        this.claimLease = claimLease;
-        this.confirmTimeout = confirmTimeout;
+        this.batchSize = properties.effectiveBatchSize();
+        this.claimLease = properties.claimTimeout();
+        this.confirmTimeout = properties.confirmTimeout();
     }
 
     @Scheduled(fixedDelayString = "${contest.submission.judge.rabbit.publisher.poll-interval-ms:1000}")

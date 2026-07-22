@@ -1,12 +1,14 @@
 package my.oj.web.contest.submission.queue;
 
+import my.oj.web.contest.submission.core.ContestSubmissionWriteRequest;
+import my.oj.web.contest.submission.core.ContestSubmissionWriter;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 @Component
 @ConditionalOnProperty(prefix = "contest.submission.writer", name = "mode", havingValue = "immediate")
-public class ContestSubmissionImmediateWriter implements ContestSubmissionQueuedWriter {
+public class ContestSubmissionImmediateWriter implements ContestSubmissionWriter {
 
     private final ContestSubmissionBulkProcessor processor;
 
@@ -15,7 +17,7 @@ public class ContestSubmissionImmediateWriter implements ContestSubmissionQueued
     }
 
     @Override
-    public ContestSubmissionService.ContestSubmissionCreateResult save(ContestSubmissionQueueRequest request) {
+    public ContestSubmissionService.ContestSubmissionCreateResult save(ContestSubmissionWriteRequest request) {
         return processor.processSingle(request);
     }
 }

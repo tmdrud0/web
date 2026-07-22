@@ -4,8 +4,6 @@ import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.Contest;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxCreatedNotifier;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
-import my.oj.web.contest.submission.queue.ContestSubmissionQueueRequest;
-import my.oj.web.contest.submission.queue.ContestSubmissionQueuedWriter;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
 import my.oj.web.problem.Problem;
@@ -32,7 +30,7 @@ public class ContestSubmissionService {
     private final ContestScoreboardOutboxCreatedNotifier scoreboardOutboxNotifier;
     private final ContestSubmissionDuplicateRegistry duplicateRegistry;
     private final ContestSubmissionIdGenerator idGenerator;
-    private final ContestSubmissionQueuedWriter queuedWriter;
+    private final ContestSubmissionWriter submissionWriter;
 
     public ContestSubmissionCreateResult create(User user, Problem problem, String code, LocalDateTime submittedTime) {
         Contest contest = problem.getContest();
@@ -51,7 +49,7 @@ public class ContestSubmissionService {
             return new ContestSubmissionCreateResult(duplicate, true);
         }
 
-        ContestSubmissionQueueRequest request = new ContestSubmissionQueueRequest(
+        ContestSubmissionWriteRequest request = new ContestSubmissionWriteRequest(
                 contest.getId(),
                 problem.getId(),
                 user.getId(),
@@ -59,7 +57,7 @@ public class ContestSubmissionService {
                 canonicalHash,
                 submittedTime
         ).withReservedSubmissionId(idGenerator.nextId());
-        ContestSubmissionCreateResult result = queuedWriter.save(request);
+        ContestSubmissionCreateResult result = submissionWriter.save(request);
         duplicateRegistry.registerSubmission(contest.getId(), problem.getId(), user.getId(), canonicalHash, result.submission().getId());
         return result;
     }
@@ -90,7 +88,7 @@ public class ContestSubmissionService {
             return CompletableFuture.completedFuture(new ContestSubmissionCreateResult(duplicate, true));
         }
 
-        ContestSubmissionQueueRequest request = new ContestSubmissionQueueRequest(
+        ContestSubmissionWriteRequest request = new ContestSubmissionWriteRequest(
                 contest.getId(),
                 problem.getId(),
                 user.getId(),
@@ -99,7 +97,7 @@ public class ContestSubmissionService {
                 submittedTime
         ).withReservedSubmissionId(idGenerator.nextId());
 
-        return queuedWriter.saveAsync(request).thenApply(result -> {
+        return submissionWriter.saveAsync(request).thenApply(result -> {
             duplicateRegistry.registerSubmission(
                     contest.getId(), problem.getId(), user.getId(), canonicalHash, result.submission().getId()
             );

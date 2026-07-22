@@ -3,6 +3,7 @@ package my.oj.web.contest.submission.queue;
 import jakarta.persistence.EntityManagerFactory;
 import my.oj.web.contest.Contest;
 import my.oj.web.contest.ContestRepository;
+import my.oj.web.contest.submission.core.ContestSubmissionWriteRequest;
 import my.oj.web.contest.submission.core.ContestSubmissionRepository;
 import my.oj.web.problem.Problem;
 import my.oj.web.problem.ProblemRepository;
@@ -210,12 +211,12 @@ class ContestSubmissionBulkLoadTests {
                             return;
                         }
                         int end = Math.min(start + DIRECT_BATCH_SIZE, DIRECT_TOTAL_SUBMISSIONS);
-                        List<ContestSubmissionQueueRequest> requests = new ArrayList<>(end - start);
+                        List<ContestSubmissionWriteRequest> requests = new ArrayList<>(end - start);
                         for (int index = start; index < end; index++) {
                             User user = users.get(index % users.size());
                             Problem problem = problems.get(index % problems.size());
                             String code = "direct-code-" + index;
-                            requests.add(new ContestSubmissionQueueRequest(
+                            requests.add(new ContestSubmissionWriteRequest(
                                     problem.getContest().getId(),
                                     problem.getId(),
                                     user.getId(),

@@ -4,11 +4,9 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import my.oj.web.contest.submission.core.ContestSubmissionJudgeProjection;
 import my.oj.web.submission.SubmissionResult;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -39,16 +37,13 @@ public class ContestSubmissionJudgeResultBatchWriter implements ContestSubmissio
 
     public ContestSubmissionJudgeResultBatchWriter(
             JdbcContestSubmissionJudgeResultBatchPersistence persistence,
-            @Value("${contest.submission.judge.result-writer.batch-size:16}") int batchSize,
-            @Value("${contest.submission.judge.result-writer.worker-count:1}") int workerCount,
-            @Value("${contest.submission.judge.result-writer.queue-capacity:256}") int queueCapacity,
-            @Value("${contest.submission.judge.result-writer.max-wait:5ms}") Duration maxWait
+            ContestSubmissionJudgeResultWriterProperties properties
     ) {
         this.persistence = persistence;
-        this.batchSize = Math.max(1, batchSize);
-        this.workerCount = Math.max(1, workerCount);
-        this.queue = new ArrayBlockingQueue<>(Math.max(this.batchSize, queueCapacity));
-        this.maxWaitNanos = Math.max(0L, maxWait.toNanos());
+        this.batchSize = properties.effectiveBatchSize();
+        this.workerCount = properties.effectiveWorkerCount();
+        this.queue = new ArrayBlockingQueue<>(properties.effectiveQueueCapacity());
+        this.maxWaitNanos = properties.effectiveMaxWaitNanos();
         AtomicInteger threadSequence = new AtomicInteger();
         this.executor = Executors.newFixedThreadPool(this.workerCount, runnable -> {
             Thread thread = new Thread(

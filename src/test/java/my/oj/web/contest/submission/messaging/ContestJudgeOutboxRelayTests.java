@@ -28,9 +28,11 @@ class ContestJudgeOutboxRelayTests {
     private final ContestJudgeOutboxRelay relay = new ContestJudgeOutboxRelay(
             outboxStore,
             rabbitTemplate,
-            50,
-            Duration.ofSeconds(30),
-            Duration.ofSeconds(10)
+            new ContestJudgeOutboxRelayProperties(
+                    50,
+                    Duration.ofSeconds(30),
+                    Duration.ofSeconds(10)
+            )
     );
     private final ContestJudgeOutboxStore.ClaimedEvent event =
             new ContestJudgeOutboxStore.ClaimedEvent(7L, 42L, "claim-token");

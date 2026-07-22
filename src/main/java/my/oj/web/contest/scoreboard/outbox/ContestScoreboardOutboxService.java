@@ -15,31 +15,6 @@ public class ContestScoreboardOutboxService {
     private final ContestScoreboardOutboxRepository repository;
 
     @Transactional
-    public Optional<ContestScoreboardOutbox> enqueueIfAbsent(Long contestSubmissionId,
-                                                             Long contestId,
-                                                             Long problemId,
-                                                             Long userId,
-                                                             LocalDateTime contestStart,
-                                                             LocalDateTime submittedTime,
-                                                             SubmissionResult result,
-                                                             LocalDateTime judgedAt) {
-        boolean inserted = insertPendingIfAbsent(
-                contestSubmissionId,
-                contestId,
-                problemId,
-                userId,
-                contestStart,
-                submittedTime,
-                result,
-                judgedAt
-        );
-        if (!inserted) {
-            return Optional.empty();
-        }
-        return repository.findByContestSubmissionId(contestSubmissionId);
-    }
-
-    @Transactional
     public boolean insertPendingIfAbsent(Long contestSubmissionId,
                                          Long contestId,
                                          Long problemId,

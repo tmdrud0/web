@@ -3,6 +3,7 @@ package my.oj.web.contest.submission.queue;
 import jakarta.persistence.EntityManager;
 import my.oj.web.contest.Contest;
 import my.oj.web.contest.submission.messaging.ContestJudgeOutboxWriter;
+import my.oj.web.contest.submission.core.ContestSubmissionWriteRequest;
 import my.oj.web.problem.Problem;
 import my.oj.web.user.Streak;
 import my.oj.web.user.User;
@@ -56,7 +57,7 @@ class ContestSubmissionBulkProcessorTests {
 
     @Test
     void process_reusesPendingSubmission_whenChunkContainsDuplicate() {
-        ContestSubmissionQueueRequest first = new ContestSubmissionQueueRequest(
+        ContestSubmissionWriteRequest first = new ContestSubmissionWriteRequest(
                 10L,
                 20L,
                 30L,
@@ -65,7 +66,7 @@ class ContestSubmissionBulkProcessorTests {
                 LocalDateTime.now(),
                 100L
         );
-        ContestSubmissionQueueRequest duplicate = new ContestSubmissionQueueRequest(
+        ContestSubmissionWriteRequest duplicate = new ContestSubmissionWriteRequest(
                 10L,
                 20L,
                 30L,
@@ -100,7 +101,7 @@ class ContestSubmissionBulkProcessorTests {
 
     @Test
     void process_throwsWhenReservedIdMissing() {
-        ContestSubmissionQueueRequest request = new ContestSubmissionQueueRequest(
+        ContestSubmissionWriteRequest request = new ContestSubmissionWriteRequest(
                 10L,
                 20L,
                 30L,

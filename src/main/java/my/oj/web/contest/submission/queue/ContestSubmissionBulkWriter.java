@@ -1,8 +1,9 @@
 package my.oj.web.contest.submission.queue;
 
 import jakarta.annotation.PreDestroy;
+import my.oj.web.contest.submission.core.ContestSubmissionWriteRequest;
+import my.oj.web.contest.submission.core.ContestSubmissionWriter;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -18,7 +19,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 @Component
 @ConditionalOnProperty(prefix = "contest.submission.writer", name = "mode", havingValue = "bulk", matchIfMissing = true)
-public class ContestSubmissionBulkWriter implements ContestSubmissionQueuedWriter {
+public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
 
     private final ContestSubmissionBulkProcessor processor;
     private final ContestSubmissionBulkMetrics metrics;
@@ -33,13 +34,12 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionQueuedWrite
     public ContestSubmissionBulkWriter(ContestSubmissionBulkProcessor processor,
                                        ContestSubmissionBulkMetrics metrics,
                                        ContestSubmissionCompletionDispatcher completionDispatcher,
-                                       @Value("${contest.submission.bulk.batch-size:100}") int batchSize,
-                                       @Value("${contest.submission.bulk.worker-count:1}") int workerCount) {
+                                       ContestSubmissionBulkProperties properties) {
         this.processor = processor;
         this.metrics = metrics;
         this.completionDispatcher = completionDispatcher;
-        this.batchSize = Math.max(1, batchSize);
-        this.workerCount = Math.max(1, workerCount);
+        this.batchSize = properties.effectiveBatchSize();
+        this.workerCount = properties.effectiveWorkerCount();
         this.executor = Executors.newFixedThreadPool(this.workerCount, r -> {
             Thread thread = new Thread(r, "contest-submission-bulk");
             thread.setDaemon(true);
@@ -48,13 +48,13 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionQueuedWrite
     }
 
     @Override
-    public ContestSubmissionService.ContestSubmissionCreateResult save(ContestSubmissionQueueRequest request) {
+    public ContestSubmissionService.ContestSubmissionCreateResult save(ContestSubmissionWriteRequest request) {
         return saveAsync(request).toCompletableFuture().join();
     }
 
     @Override
     public CompletionStage<ContestSubmissionService.ContestSubmissionCreateResult> saveAsync(
-            ContestSubmissionQueueRequest request
+            ContestSubmissionWriteRequest request
     ) {
         CompletableFuture<ContestSubmissionService.ContestSubmissionCreateResult> future = new CompletableFuture<>();
         queue.add(new PendingSubmission(request, future));
@@ -183,7 +183,7 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionQueuedWrite
         }
     }
 
-    private record PendingSubmission(ContestSubmissionQueueRequest request,
+    private record PendingSubmission(ContestSubmissionWriteRequest request,
                                      CompletableFuture<ContestSubmissionService.ContestSubmissionCreateResult> future) {
     }
 

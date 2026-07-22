@@ -24,12 +24,6 @@ public class ContestFinalScoreService {
     private final ContestScoreboardService scoreboardService;
 
     @Transactional
-    public void rebuildScores(Long contestId, ContestFinalScoreStatus status) {
-        List<ContestSubmissionResult> results = resultRepository.findAllByContestIdWithSubmission(contestId);
-        rebuildScores(contestId, status, results);
-    }
-
-    @Transactional
     public void rebuildScores(Long contestId, ContestFinalScoreStatus status, List<ContestSubmissionResult> preloadedResults) {
         finalScoreRepository.deleteByContestIdAndStatus(contestId, status);
         List<ContestScoreboardEntry> entries = calculateEntries(contestId, status == ContestFinalScoreStatus.FINAL, preloadedResults);

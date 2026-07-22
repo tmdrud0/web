@@ -304,6 +304,14 @@ Judge를 두 인스턴스로 늘리고 Snowflake worker ID를 `200`, `201`로 �
 
 WSL은 8 vCPU와 10GB로 제한하고 Compose CPU 상한 합을 7.5로 고정했다. 남은 0.5 CPU는 다음 단계의 관측 스택에 예약한다. 이웃 서비스의 무제한 자원 경합을 막아 병목 원인을 특정 서비스에 귀속할 수 있게 하고, 이후 수치가 같은 전제에서 비교되도록 했다. 세부 하드웨어·메모리·미들웨어 설정과 검증 명령은 [`ENVIRONMENT.md`](ENVIRONMENT.md)를 기준으로 삼는다.
 
+### 4.1.2 가동성 정리 — 역할 기동과 운영 설정의 명시화
+
+기능·처리량 설정은 유지하면서 실행 구성을 읽고 검증하기 쉽게 정리했다. 제출 실행기, bulk/completion, scoreboard outbox, judge relay/result writer 설정을 타입이 있는 설정 객체로 묶어 기동 시 한 번 바인딩하고, 실제 `multi-web`·`multi-batch`·`multi-judge` 프로필 그룹을 사용하는 역할별 기동 테스트를 추가했다.
+
+Compose의 반복 정의는 YAML 앵커로 통합하되 렌더링된 서비스 정의가 기존과 같음을 해시로 확인했다.
+
+종료 시 drain 정책, 재시작 정책, readiness 의미는 장애 시 메시지 처리 결과를 바꿀 수 있으므로 이 구조 정리에는 포함하지 않았다. 현재 완료 통지와 judge 결과 writer의 종료 대기 동작만 회귀 테스트로 고정했고, bulk writer의 graceful shutdown은 별도 운영 변경 후보로 남겼다.
+
 ### 4.2 전체 흐름
 
 ```mermaid

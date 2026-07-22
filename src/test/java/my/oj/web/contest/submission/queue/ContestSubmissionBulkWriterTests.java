@@ -1,6 +1,7 @@
 package my.oj.web.contest.submission.queue;
 
 import my.oj.web.contest.submission.core.ContestSubmission;
+import my.oj.web.contest.submission.core.ContestSubmissionWriteRequest;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -48,8 +49,13 @@ class ContestSubmissionBulkWriterTests {
             return null;
         }).when(dispatcher).dispatch(org.mockito.ArgumentMatchers.eq(1), org.mockito.ArgumentMatchers.any());
 
-        writer = new ContestSubmissionBulkWriter(processor, metrics, dispatcher, 1, 1);
-        var stage = writer.saveAsync(new ContestSubmissionQueueRequest(
+        writer = new ContestSubmissionBulkWriter(
+                processor,
+                metrics,
+                dispatcher,
+                new ContestSubmissionBulkProperties(1, 1)
+        );
+        var stage = writer.saveAsync(new ContestSubmissionWriteRequest(
                 1L,
                 2L,
                 3L,

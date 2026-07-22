@@ -1,8 +1,8 @@
-package my.oj.web.contest.submission.queue;
+package my.oj.web.contest.submission.core;
 
 import java.time.LocalDateTime;
 
-public record ContestSubmissionQueueRequest(
+public record ContestSubmissionWriteRequest(
         long contestId,
         long problemId,
         long userId,
@@ -12,7 +12,7 @@ public record ContestSubmissionQueueRequest(
         Long reservedSubmissionId
 ) {
 
-    public ContestSubmissionQueueRequest(long contestId,
+    public ContestSubmissionWriteRequest(long contestId,
                                          long problemId,
                                          long userId,
                                          String code,
@@ -21,8 +21,8 @@ public record ContestSubmissionQueueRequest(
         this(contestId, problemId, userId, code, codeHash, submittedTime, null);
     }
 
-    public ContestSubmissionQueueRequest withReservedSubmissionId(long submissionId) {
-        return new ContestSubmissionQueueRequest(
+    public ContestSubmissionWriteRequest withReservedSubmissionId(long submissionId) {
+        return new ContestSubmissionWriteRequest(
                 contestId,
                 problemId,
                 userId,
