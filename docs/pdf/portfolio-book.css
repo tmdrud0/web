@@ -1,0 +1,274 @@
+@page {
+    size: A4;
+    margin: 12mm;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+}
+
+body {
+    margin: 0;
+    background: #eef1f5;
+    color: #18202b;
+    font-family: "Malgun Gothic", "Segoe UI", sans-serif;
+    font-size: 12.2px;
+    line-height: 1.48;
+}
+
+.book {
+    width: 100%;
+}
+
+.page {
+    width: 184mm;
+    height: 272mm;
+    margin: 0 auto 10px;
+    padding: 10mm 11mm 9mm;
+    background: #fff;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    break-after: page;
+    position: relative;
+}
+
+.page:last-child {
+    break-after: auto;
+}
+
+.portfolio-header {
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid #dde3eb;
+}
+
+.portfolio-kicker {
+    color: #526072;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+h1,
+h2,
+h3 {
+    margin: 0;
+    line-height: 1.2;
+}
+
+h1 {
+    margin-top: 4px;
+    font-size: 22px;
+    letter-spacing: -0.02em;
+}
+
+h2 {
+    margin-bottom: 6px;
+    font-size: 16px;
+}
+
+h3 {
+    margin-bottom: 5px;
+    font-size: 13px;
+}
+
+p {
+    margin: 0 0 6px;
+}
+
+ul,
+ol {
+    margin: 6px 0 8px 20px;
+    padding: 0;
+}
+
+li + li {
+    margin-top: 4px;
+}
+
+.lede {
+    margin-top: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #253447;
+}
+
+.summary-box {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border: 1px solid #d8dee8;
+    background: #f7f9fc;
+}
+
+.summary-grid,
+.two-col,
+.three-col {
+    display: grid;
+    gap: 10px;
+}
+
+.summary-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.two-col {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.three-col {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.meta {
+    padding: 8px 9px;
+    border: 1px solid #dbe2ec;
+    background: #fbfcfe;
+}
+
+.meta-label {
+    color: #617086;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.meta-value {
+    margin-top: 5px;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.section {
+    margin-top: 10px;
+}
+
+.panel {
+    padding: 8px 9px;
+    border: 1px solid #dce3ec;
+    background: #fbfcfe;
+}
+
+.panel.soft {
+    background: #f6f8fb;
+}
+
+.metrics {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.metric {
+    padding: 8px;
+    border: 1px solid #dce3ec;
+    background: #f9fbfd;
+}
+
+.metric-title {
+    color: #5b6a7c;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+.metric-value {
+    margin-top: 5px;
+    font-size: 19px;
+    font-weight: 700;
+}
+
+.metric-text {
+    margin-top: 4px;
+    font-size: 11px;
+}
+
+.chart-wrap {
+    margin-top: 8px;
+    padding: 8px;
+    border: 1px solid #dbe3ec;
+    background: #fff;
+}
+
+.chart-caption {
+    margin-top: 7px;
+    color: #5b6a7c;
+    font-size: 11px;
+}
+
+.legend {
+    display: flex;
+    gap: 14px;
+    margin-bottom: 8px;
+    color: #4a5565;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.legend span::before {
+    content: "";
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: 6px;
+    border-radius: 50%;
+    vertical-align: -1px;
+}
+
+.legend .immediate::before {
+    background: #f97316;
+}
+
+.legend .bulk::before {
+    background: #0f766e;
+}
+
+.legend .naive::before {
+    background: #dc2626;
+}
+
+.legend .optimized::before {
+    background: #2563eb;
+}
+
+pre {
+    margin: 8px 0 0;
+    padding: 8px;
+    overflow: hidden;
+    border: 1px solid #d7deea;
+    background: #f7f9fc;
+    color: #1c2735;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 10px;
+    line-height: 1.35;
+    white-space: pre-wrap;
+}
+
+.small {
+    font-size: 11px;
+}
+
+.appendix-list li {
+    font-size: 11px;
+}
+
+.page-no {
+    position: absolute;
+    right: 12mm;
+    bottom: 7mm;
+    color: #6f7d90;
+    font-size: 10px;
+}
+
+svg {
+    display: block;
+    width: 100%;
+    height: auto;
+}
