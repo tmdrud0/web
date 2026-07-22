@@ -35,3 +35,32 @@ out/
 
 ### VS Code ###
 .vscode/
+
+### Local secrets ###
+.env
+.env.*
+!.env.example
+
+### Local tool caches and downloaded runtimes ###
+.gradle-user-home/
+node_modules/
+Redis-x64-3.0.504/
+
+### Local runtime and diagnostic outputs ###
+*.log
+*.jfr
+*.gatling.log
+*.hprof
+*.rdb
+results/
+results-standalone/
+var/
+
+### Generated performance data ###
+/batch_updates.sql
+/generated.sql
+/updates.sql
+/users.sql
+
+### Local helper launchers ###
+/codex_bootrun_*.cmd
