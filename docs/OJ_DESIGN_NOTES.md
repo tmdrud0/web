@@ -1,4 +1,7 @@
-# OJ 개선/설계
+# OJ 개선/설계 기록
+
+> 초기 설계와 최적화 판단을 보존하는 역사 문서다. 현재 실행 구조는 `ARCHITECTURE.md`, 파이프라인 상세 역사는 `CONTEST_SUBMISSION_PIPELINE_HISTORY.md`를 기준으로 한다.
+
 https://github.com/tmdrud0/web
 # 서비스 운영 목표 & 부하 가정
 ## 핵심 지표
