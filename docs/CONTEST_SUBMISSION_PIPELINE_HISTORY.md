@@ -308,6 +308,8 @@ WSL은 8 vCPU와 10GB로 제한하고 Compose CPU 상한 합을 7.5로 고정했
 
 기능·처리량 설정은 유지하면서 실행 구성을 읽고 검증하기 쉽게 정리했다. 제출 실행기, bulk/completion, scoreboard outbox, judge relay/result writer 설정을 타입이 있는 설정 객체로 묶어 기동 시 한 번 바인딩하고, 실제 `multi-web`·`multi-batch`·`multi-judge` 프로필 그룹을 사용하는 역할별 기동 테스트를 추가했다.
 
+Compose의 반복 정의는 YAML 앵커로 통합하되 렌더링된 서비스 정의가 기존과 같음을 해시로 확인했다.
+
 종료 시 drain 정책, 재시작 정책, readiness 의미는 장애 시 메시지 처리 결과를 바꿀 수 있으므로 이 구조 정리에는 포함하지 않았다. 현재 완료 통지와 judge 결과 writer의 종료 대기 동작만 회귀 테스트로 고정했고, bulk writer의 graceful shutdown은 별도 운영 변경 후보로 남겼다.
 
 ### 4.2 전체 흐름

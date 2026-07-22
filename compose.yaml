@@ -1,3 +1,49 @@
+x-spring-build: &spring-build
+  context: .
+  args:
+    JAR_FILE: build/libs/web-0.0.1-SNAPSHOT.jar
+
+x-web-depends-on: &web-depends-on
+  mysql:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+
+x-worker-depends-on: &worker-depends-on
+  mysql:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  rabbitmq:
+    condition: service_healthy
+
+x-spring-environment: &spring-environment
+  DB_HOST: mysql
+  DB_PORT: 3306
+  DB_NAME: oj
+  DB_USER: root
+  DB_PASSWORD: 1234
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+
+x-rabbitmq-environment: &rabbitmq-environment
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: 5672
+  RABBITMQ_USER: oj
+  RABBITMQ_PASSWORD: oj-password
+
+x-web-healthcheck: &web-healthcheck
+  test: ["CMD-SHELL", "bash -c ': >/dev/tcp/127.0.0.1/8080'"]
+  interval: 10s
+  timeout: 5s
+  retries: 20
+
+x-worker-healthcheck: &worker-healthcheck
+  test: ["CMD-SHELL", "grep -aq java /proc/1/cmdline"]
+  interval: 10s
+  timeout: 5s
+  retries: 20
+
 services:
   nginx:
     image: nginx:1.27-alpine
@@ -90,34 +136,17 @@ services:
           memory: 1024M
 
   web-1:
-    build:
-      context: .
-      args:
-        JAR_FILE: build/libs/web-0.0.1-SNAPSHOT.jar
+    build: *spring-build
     container_name: oj-web-1
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+    depends_on: *web-depends-on
     environment:
       SPRING_PROFILES_ACTIVE: ${WEB1_PROFILES:-multi-web}
-      DB_HOST: mysql
-      DB_PORT: 3306
-      DB_NAME: oj
-      DB_USER: root
-      DB_PASSWORD: 1234
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      <<: *spring-environment
       CONTEST_SUBMISSION_WORKER_ID: 1
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
     ports:
       - "8081:8080"
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c ': >/dev/tcp/127.0.0.1/8080'"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
+    healthcheck: *web-healthcheck
     deploy:
       resources:
         limits:
@@ -125,34 +154,17 @@ services:
           memory: 1280M
 
   web-2:
-    build:
-      context: .
-      args:
-        JAR_FILE: build/libs/web-0.0.1-SNAPSHOT.jar
+    build: *spring-build
     container_name: oj-web-2
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+    depends_on: *web-depends-on
     environment:
       SPRING_PROFILES_ACTIVE: ${WEB2_PROFILES:-multi-web}
-      DB_HOST: mysql
-      DB_PORT: 3306
-      DB_NAME: oj
-      DB_USER: root
-      DB_PASSWORD: 1234
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      <<: *spring-environment
       CONTEST_SUBMISSION_WORKER_ID: 2
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
     ports:
       - "8082:8080"
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c ': >/dev/tcp/127.0.0.1/8080'"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
+    healthcheck: *web-healthcheck
     deploy:
       resources:
         limits:
@@ -160,38 +172,15 @@ services:
           memory: 1280M
 
   batch-1:
-    build:
-      context: .
-      args:
-        JAR_FILE: build/libs/web-0.0.1-SNAPSHOT.jar
+    build: *spring-build
     container_name: oj-batch-1
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+    depends_on: *worker-depends-on
     environment:
       SPRING_PROFILES_ACTIVE: ${BATCH1_PROFILES:-multi-batch}
-      DB_HOST: mysql
-      DB_PORT: 3306
-      DB_NAME: oj
-      DB_USER: root
-      DB_PASSWORD: 1234
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_PORT: 5672
-      RABBITMQ_USER: oj
-      RABBITMQ_PASSWORD: oj-password
+      <<: [*spring-environment, *rabbitmq-environment]
       CONTEST_SUBMISSION_WORKER_ID: 100
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
-    healthcheck:
-      test: ["CMD-SHELL", "grep -aq java /proc/1/cmdline"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
+    healthcheck: *worker-healthcheck
     deploy:
       resources:
         limits:
@@ -199,38 +188,15 @@ services:
           memory: 512M
 
   judge-1:
-    build:
-      context: .
-      args:
-        JAR_FILE: build/libs/web-0.0.1-SNAPSHOT.jar
+    build: *spring-build
     container_name: oj-judge-1
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+    depends_on: *worker-depends-on
     environment:
       SPRING_PROFILES_ACTIVE: ${JUDGE1_PROFILES:-multi-judge}
-      DB_HOST: mysql
-      DB_PORT: 3306
-      DB_NAME: oj
-      DB_USER: root
-      DB_PASSWORD: 1234
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_PORT: 5672
-      RABBITMQ_USER: oj
-      RABBITMQ_PASSWORD: oj-password
+      <<: [*spring-environment, *rabbitmq-environment]
       CONTEST_SUBMISSION_WORKER_ID: 200
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
-    healthcheck:
-      test: ["CMD-SHELL", "grep -aq java /proc/1/cmdline"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
+    healthcheck: *worker-healthcheck
     deploy:
       resources:
         limits:
@@ -238,38 +204,15 @@ services:
           memory: 768M
 
   judge-2:
-    build:
-      context: .
-      args:
-        JAR_FILE: build/libs/web-0.0.1-SNAPSHOT.jar
+    build: *spring-build
     container_name: oj-judge-2
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+    depends_on: *worker-depends-on
     environment:
       SPRING_PROFILES_ACTIVE: ${JUDGE2_PROFILES:-multi-judge}
-      DB_HOST: mysql
-      DB_PORT: 3306
-      DB_NAME: oj
-      DB_USER: root
-      DB_PASSWORD: 1234
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_PORT: 5672
-      RABBITMQ_USER: oj
-      RABBITMQ_PASSWORD: oj-password
+      <<: [*spring-environment, *rabbitmq-environment]
       CONTEST_SUBMISSION_WORKER_ID: 201
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
-    healthcheck:
-      test: ["CMD-SHELL", "grep -aq java /proc/1/cmdline"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
+    healthcheck: *worker-healthcheck
     deploy:
       resources:
         limits:
