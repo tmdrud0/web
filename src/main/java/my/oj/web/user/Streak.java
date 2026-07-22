@@ -3,12 +3,13 @@ package my.oj.web.user;
 import jakarta.persistence.Embeddable;
 import lombok.Getter;
 
+import java.io.Serializable;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 
 @Embeddable
 @Getter
-public class Streak {
+public class Streak implements Serializable {
     private LocalDateTime lastSolvedDate;
     private int currentStreak;
     private int longestStreak;

@@ -2,7 +2,9 @@
 
 ## 무엇을 만들고 있었는가
 
-랭킹 페이지를 만들 수 있는 기본적은 쿼리는 아래와 같을 것이다.
+
+- `around me` 기능은 유저가 자신의 랭킹 페이지로 이동하는 기능이다.
+
 ```sql
 SELECT ...
 FROM user u
@@ -10,10 +12,9 @@ WHERE ...
 ORDER BY score DESC, last_solved_date ASC, id ASC
 LIMIT :offset, :limit
 ```
- 병목의 핵심은 정렬 자체보다 `OFFSET`이며, 유저 수가 커질수록 뒤쪽 페이지 비용이 거의 선형으로 증가한다.
 
-- `around me` 기능은 유저가 자신의 랭킹 페이지로 이동하는 기능이다.
-  한 번에 자기 위치로 이동하기 때문에 커서를 사용하기도 힘들다.
+ 병목의 핵심은 정렬 자체보다 `OFFSET`이며, 유저 수가 커질수록 뒤쪽 페이지 비용이 거의 선형으로 증가한다.
+한 번에 자기 위치로 이동하기 때문에 커서를 사용하기도 힘들다.
 
 ## 핵심 아이디어
 
@@ -46,10 +47,14 @@ LIMIT :offset, :limit
 3. 그 rank로 page start를 계산한다
 4. `snapshot_rank BETWEEN start AND end`로 해당 page만 읽는다
 
-current streak는 조회 시점에 `내 rank를 계산`하는 것이 아니라, 이미 계산된 rank를 읽는 구조다.
+즉 current streak는 조회 시점에 `내 rank를 계산`하는 것이 아니라, 이미 계산된 rank를 읽는 구조다.
 
 ## 테스트 결과
-비교는 각 랭크 타입마다 앞/중간/뒤 지점에서 수행했다.
+비교는 각 랭크 타입마다 앞/중간/뒤 지점 한 페이지씩 총 3지점에서 수행했다.
+
+- `current streak`: `101`, `49,601`, `99,301`
+- `solved`: `101`, `4,000,501`, `8,000,901`
+
 
 | Rank type | Front | Middle | Back |
 |---|---:|---:|---:|
@@ -58,4 +63,12 @@ current streak는 조회 시점에 `내 rank를 계산`하는 것이 아니라, 
 | `solved` naive | `19.1 ms` | `217,842 ms` | `233,231 ms` |
 | `solved` optimized | `24.2 ms` | `369 ms` | `47,747 ms` |
 
-10만 유저 데이터셋에서 같은 solved bucket 방식의 deep page fetch는 약 `0.46 ms` 수준이었다.
+
+bucket 방식은 규모가 더 작을 때는 충분히 실용적이었다.  
+10만 유저 데이터셋에서 같은 solved bucket 방식의 deep page fetch는 약 `0.46 ms` 수준이었다.  
+
+## 한계
+
+현재 `solved`는 bucket으로 시작점을 빠르게 찾지만, tie group 내부를 여전히 offset으로 읽는다.  
+그래서 `solved_count=1`처럼 유저가 많은 구간에서는 뒤쪽 페이지 비용이 크다.
+반면 snapshot 방식은 빨랐지만 정렬기준이 자주 변경되지 않는 경우에만 정확하게 계산할 수 있다.
