@@ -5,6 +5,7 @@ import jakarta.persistence.PersistenceContext;
 import my.oj.web.contest.Contest;
 import my.oj.web.contest.submission.messaging.ContestJudgeOutboxWriter;
 import my.oj.web.contest.submission.core.ContestSubmission;
+import my.oj.web.contest.submission.core.ContestSubmissionWriteRequest;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
 import my.oj.web.problem.Problem;
 import my.oj.web.user.User;
@@ -35,7 +36,7 @@ public class ContestSubmissionBulkProcessor {
     }
 
     @Transactional
-    public ContestSubmissionService.ContestSubmissionCreateResult processSingle(ContestSubmissionQueueRequest request) {
+    public ContestSubmissionService.ContestSubmissionCreateResult processSingle(ContestSubmissionWriteRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("Contest submission request cannot be null");
         }
@@ -50,7 +51,7 @@ public class ContestSubmissionBulkProcessor {
     }
 
     @Transactional
-    public List<ContestSubmissionService.ContestSubmissionCreateResult> process(List<ContestSubmissionQueueRequest> requests) {
+    public List<ContestSubmissionService.ContestSubmissionCreateResult> process(List<ContestSubmissionWriteRequest> requests) {
         if (requests == null || requests.isEmpty()) {
             return List.of();
         }
@@ -59,7 +60,7 @@ public class ContestSubmissionBulkProcessor {
         List<ContestSubmission> toPersist = new ArrayList<>();
         Map<DedupKey, ContestSubmission> pendingByKey = new LinkedHashMap<>();
 
-        for (ContestSubmissionQueueRequest request : requests) {
+        for (ContestSubmissionWriteRequest request : requests) {
             DedupKey key = DedupKey.from(request);
             ContestSubmission queuedDuplicate = pendingByKey.get(key);
             if (queuedDuplicate != null) {
@@ -83,7 +84,7 @@ public class ContestSubmissionBulkProcessor {
         return responses;
     }
 
-    private ContestSubmission createSubmission(ContestSubmissionQueueRequest request) {
+    private ContestSubmission createSubmission(ContestSubmissionWriteRequest request) {
         Contest contest = entityManager.getReference(Contest.class, request.contestId());
         User user = entityManager.getReference(User.class, request.userId());
         Problem problem = entityManager.getReference(Problem.class, request.problemId());
@@ -104,7 +105,7 @@ public class ContestSubmissionBulkProcessor {
     }
 
     private record DedupKey(long contestId, long problemId, long userId, String codeHash) {
-        private static DedupKey from(ContestSubmissionQueueRequest request) {
+        private static DedupKey from(ContestSubmissionWriteRequest request) {
             return new DedupKey(
                     request.contestId(),
                     request.problemId(),

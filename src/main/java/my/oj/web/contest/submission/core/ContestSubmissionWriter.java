@@ -1,16 +1,14 @@
-package my.oj.web.contest.submission.queue;
-
-import my.oj.web.contest.submission.core.ContestSubmissionService;
+package my.oj.web.contest.submission.core;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
-public interface ContestSubmissionQueuedWriter {
+public interface ContestSubmissionWriter {
 
-    ContestSubmissionService.ContestSubmissionCreateResult save(ContestSubmissionQueueRequest request);
+    ContestSubmissionService.ContestSubmissionCreateResult save(ContestSubmissionWriteRequest request);
 
     default CompletionStage<ContestSubmissionService.ContestSubmissionCreateResult> saveAsync(
-            ContestSubmissionQueueRequest request
+            ContestSubmissionWriteRequest request
     ) {
         try {
             return CompletableFuture.completedFuture(save(request));

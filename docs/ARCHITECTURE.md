@@ -39,8 +39,8 @@ flowchart LR
 | `problem` | 문제 조회와 대회 문제 연결 | `ProblemController`, `ProblemRepository` |
 | `submission` | 일반/대회 제출 진입점과 결과 화면 | `SubmissionController`, `SubmissionService` |
 | `contest` | 대회 목록·상세와 대회 상태 | `ContestController`, `ContestService` |
-| `contest/submission/core` | 대회 제출 모델과 저장 유스케이스 | `ContestSubmissionService` |
-| `contest/submission/queue` | 제출 batch 수집·처리·영속화 | `ContestSubmissionBulkWriter`, `ContestSubmissionBulkProcessor` |
+| `contest/submission/core` | 대회 제출 모델·유스케이스와 저장 포트 | `ContestSubmissionService`, `ContestSubmissionWriter` |
+| `contest/submission/queue` | core 저장 포트의 immediate/batch 구현과 영속화 | `ContestSubmissionBulkWriter`, `ContestSubmissionBulkProcessor` |
 | `contest/submission/messaging` | judge DB outbox와 RabbitMQ 발행/소비 | `ContestJudgeOutboxRelay`, `ContestJudgeRabbitListener` |
 | `contest/submission/judge` | 채점 실행과 결과 batch 저장 | `ContestSubmissionJudgeProcessor`, `ContestSubmissionJudgeResultBatchWriter` |
 | `contest/submission/support` | ID, 중복 방지, rate limit 지원 | `ContestSubmissionIdGenerator` 구현체 |

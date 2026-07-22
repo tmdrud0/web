@@ -1,6 +1,8 @@
 package my.oj.web.contest.submission.queue;
 
 import jakarta.annotation.PreDestroy;
+import my.oj.web.contest.submission.core.ContestSubmissionWriteRequest;
+import my.oj.web.contest.submission.core.ContestSubmissionWriter;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -17,7 +19,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 @Component
 @ConditionalOnProperty(prefix = "contest.submission.writer", name = "mode", havingValue = "bulk", matchIfMissing = true)
-public class ContestSubmissionBulkWriter implements ContestSubmissionQueuedWriter {
+public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
 
     private final ContestSubmissionBulkProcessor processor;
     private final ContestSubmissionBulkMetrics metrics;
@@ -46,13 +48,13 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionQueuedWrite
     }
 
     @Override
-    public ContestSubmissionService.ContestSubmissionCreateResult save(ContestSubmissionQueueRequest request) {
+    public ContestSubmissionService.ContestSubmissionCreateResult save(ContestSubmissionWriteRequest request) {
         return saveAsync(request).toCompletableFuture().join();
     }
 
     @Override
     public CompletionStage<ContestSubmissionService.ContestSubmissionCreateResult> saveAsync(
-            ContestSubmissionQueueRequest request
+            ContestSubmissionWriteRequest request
     ) {
         CompletableFuture<ContestSubmissionService.ContestSubmissionCreateResult> future = new CompletableFuture<>();
         queue.add(new PendingSubmission(request, future));
@@ -181,7 +183,7 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionQueuedWrite
         }
     }
 
-    private record PendingSubmission(ContestSubmissionQueueRequest request,
+    private record PendingSubmission(ContestSubmissionWriteRequest request,
                                      CompletableFuture<ContestSubmissionService.ContestSubmissionCreateResult> future) {
     }
 

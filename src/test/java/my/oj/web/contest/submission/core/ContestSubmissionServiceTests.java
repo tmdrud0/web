@@ -3,8 +3,6 @@ package my.oj.web.contest.submission.core;
 import my.oj.web.contest.Contest;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxCreatedNotifier;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
-import my.oj.web.contest.submission.queue.ContestSubmissionQueueRequest;
-import my.oj.web.contest.submission.queue.ContestSubmissionQueuedWriter;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
 import my.oj.web.problem.Problem;
@@ -52,7 +50,7 @@ class ContestSubmissionServiceTests {
     private ContestSubmissionDuplicateRegistry duplicateRegistry;
 
     @Mock
-    private ContestSubmissionQueuedWriter queuedWriter;
+    private ContestSubmissionWriter submissionWriter;
 
     @Mock
     private ContestSubmissionIdGenerator idGenerator;
@@ -78,7 +76,7 @@ class ContestSubmissionServiceTests {
                 outboxNotifier,
                 duplicateRegistry,
                 idGenerator,
-                queuedWriter
+                submissionWriter
         );
     }
 
@@ -89,15 +87,15 @@ class ContestSubmissionServiceTests {
         given(idGenerator.nextId()).willReturn(500L);
         ContestSubmission saved = ContestSubmission.create(user, problem, "print(1)", CodeHashGenerator.generate("print(1)"), now);
         ReflectionTestUtils.setField(saved, "id", 500L);
-        given(queuedWriter.save(any())).willReturn(new ContestSubmissionService.ContestSubmissionCreateResult(saved, false));
+        given(submissionWriter.save(any())).willReturn(new ContestSubmissionService.ContestSubmissionCreateResult(saved, false));
 
         ContestSubmissionService.ContestSubmissionCreateResult result =
                 contestSubmissionService.create(user, problem, "print(1)", now);
 
         assertThat(result.duplicate()).isFalse();
         assertThat(result.submission().getId()).isEqualTo(500L);
-        ArgumentCaptor<ContestSubmissionQueueRequest> captor = ArgumentCaptor.forClass(ContestSubmissionQueueRequest.class);
-        verify(queuedWriter).save(captor.capture());
+        ArgumentCaptor<ContestSubmissionWriteRequest> captor = ArgumentCaptor.forClass(ContestSubmissionWriteRequest.class);
+        verify(submissionWriter).save(captor.capture());
         assertThat(captor.getValue().problemId()).isEqualTo(200L);
         assertThat(captor.getValue().reservedSubmissionId()).isEqualTo(500L);
         verify(duplicateRegistry).registerSubmission(eq(100L), eq(200L), eq(10L), eq(CodeHashGenerator.generate("print(1)")), eq(500L));
@@ -110,14 +108,14 @@ class ContestSubmissionServiceTests {
         given(idGenerator.nextId()).willReturn(777L);
         ContestSubmission existing = ContestSubmission.create(user, problem, "print(1)", CodeHashGenerator.generate("print(1)"), now.minusMinutes(1));
         ReflectionTestUtils.setField(existing, "id", 777L);
-        given(queuedWriter.save(any())).willReturn(new ContestSubmissionService.ContestSubmissionCreateResult(existing, true));
+        given(submissionWriter.save(any())).willReturn(new ContestSubmissionService.ContestSubmissionCreateResult(existing, true));
 
         ContestSubmissionService.ContestSubmissionCreateResult result =
                 contestSubmissionService.create(user, problem, "print(1)", now);
 
         assertThat(result.duplicate()).isTrue();
         assertThat(result.submission().getId()).isEqualTo(777L);
-        verify(queuedWriter).save(any());
+        verify(submissionWriter).save(any());
         verifyNoInteractions(outboxNotifier);
     }
 
@@ -129,7 +127,7 @@ class ContestSubmissionServiceTests {
 
         CompletableFuture<ContestSubmissionService.ContestSubmissionCreateResult> writerFuture =
                 new CompletableFuture<>();
-        given(queuedWriter.saveAsync(any())).willReturn(writerFuture);
+        given(submissionWriter.saveAsync(any())).willReturn(writerFuture);
 
         CompletionStage<ContestSubmissionService.ContestSubmissionCreateResult> stage =
                 contestSubmissionService.createAsync(user, problem, "print(2)", now);
@@ -174,7 +172,7 @@ class ContestSubmissionServiceTests {
         assertThat(result.duplicate()).isTrue();
         assertThat(result.submission().getId()).isEqualTo(888L);
         verify(submissionRepository).findById(888L);
-        verifyNoInteractions(queuedWriter);
+        verifyNoInteractions(submissionWriter);
         verify(duplicateRegistry).registerSubmission(eq(100L), eq(200L), eq(10L), eq(CodeHashGenerator.generate("print(1)")), eq(888L));
     }
 
