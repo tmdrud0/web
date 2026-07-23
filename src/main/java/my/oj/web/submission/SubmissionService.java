@@ -13,7 +13,6 @@ import my.oj.web.submission.store.SubmissionStoreResult;
 import my.oj.web.submission.store.SubmissionStoreStrategySelector;
 import my.oj.web.user.User;
 import my.oj.web.user.UserRepository;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 
@@ -29,8 +28,6 @@ public class SubmissionService {
     private final SubmissionStoreStrategySelector storeSelector;
     private final ApplicationEventPublisher publisher;
     private final ContestSubmissionRateLimiter contestSubmissionRateLimiter;
-    @Value("${contest.submission.post-process.enabled:true}")
-    private boolean contestSubmissionPostProcessEnabled = true;
 
     public SubmissionReceipt submit(SubmitSubmissionCommand cmd) {
         User user = userRepository.findById(cmd.userId())
@@ -99,9 +96,7 @@ public class SubmissionService {
     }
 
     private SubmissionReceipt completeSubmission(SubmissionStoreResult result) {
-        boolean shouldPublishEvent = !result.duplicate()
-                && (result.origin() != SubmissionOrigin.CONTEST || contestSubmissionPostProcessEnabled);
-        if (shouldPublishEvent) {
+        if (!result.duplicate() && result.origin() == SubmissionOrigin.NORMAL) {
             publisher.publishEvent(new SubmissionSubmittedEvent(
                     result.submissionId(),
                     result.origin()

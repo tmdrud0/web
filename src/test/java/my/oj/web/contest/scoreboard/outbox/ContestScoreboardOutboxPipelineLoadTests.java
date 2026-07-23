@@ -30,9 +30,6 @@ import static org.assertj.core.api.Assertions.assertThat;
         "contest.outbox.immediate.enabled=false",
         "contest.outbox.scheduler.enabled=false",
         "rank.streak.batch.enabled=false",
-        "contest.submission.post-process.enabled=false",
-        "contest.submission.judge.event-listener.enabled=false",
-        "contest.submission.judge.scheduler.enabled=false",
         "contest.submission.judge.rabbit.publisher.enabled=false",
         "contest.submission.judge.rabbit.listener.enabled=false"
 })

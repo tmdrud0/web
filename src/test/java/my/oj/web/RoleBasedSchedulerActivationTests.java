@@ -7,13 +7,6 @@ import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxProperties;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRecoveryService;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxScheduler;
-import my.oj.web.contest.submission.core.ContestSubmissionRepository;
-import my.oj.web.contest.submission.core.ContestSubmissionService;
-import my.oj.web.contest.submission.judge.ContestSubmissionJudgeProcessor;
-import my.oj.web.contest.submission.judge.ContestSubmissionJudgeScheduler;
-import my.oj.web.submission.event.contest.ContestSubmissionResultListener;
-import my.oj.web.submission.event.contest.ContestSubmissionSubmittedListener;
-import my.oj.web.submission.judge.Judgement;
 import my.oj.web.user.rank.streak.StreakRankBatchScheduler;
 import my.oj.web.user.rank.streak.StreakRankBatchService;
 import org.junit.jupiter.api.Test;
@@ -26,7 +19,6 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.core.env.Profiles;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import static org.mockito.Mockito.mock;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -38,9 +30,6 @@ class RoleBasedSchedulerActivationTests {
                     TestDependencies.class,
                     ContestScoreboardOutboxCreatedListener.class,
                     ContestScoreboardOutboxScheduler.class,
-                    ContestSubmissionSubmittedListener.class,
-                    ContestSubmissionResultListener.class,
-                    ContestSubmissionJudgeScheduler.class,
                     StreakRankBatchScheduler.class
             );
 
@@ -51,9 +40,6 @@ class RoleBasedSchedulerActivationTests {
             assertThatProfileIsActive(context, "web-role");
             assertThatMissing(context, ContestScoreboardOutboxCreatedListener.class);
             assertThatMissing(context, ContestScoreboardOutboxScheduler.class);
-            assertThatMissing(context, ContestSubmissionSubmittedListener.class);
-            assertThatMissing(context, ContestSubmissionResultListener.class);
-            assertThatMissing(context, ContestSubmissionJudgeScheduler.class);
             assertThatMissing(context, StreakRankBatchScheduler.class);
         }
     }
@@ -64,9 +50,6 @@ class RoleBasedSchedulerActivationTests {
             assertThatProfileIsActive(context, "multi-server");
             assertThatProfileIsActive(context, "batch-role");
             assertThatMissing(context, ContestScoreboardOutboxCreatedListener.class);
-            assertThatMissing(context, ContestSubmissionSubmittedListener.class);
-            assertThatMissing(context, ContestSubmissionResultListener.class);
-            assertThatMissing(context, ContestSubmissionJudgeScheduler.class);
             assertThatPresent(context, ContestScoreboardOutboxScheduler.class);
             assertThatPresent(context, StreakRankBatchScheduler.class);
             ContestScoreboardOutboxProperties properties = context.getBean(ContestScoreboardOutboxProperties.class);
@@ -77,28 +60,22 @@ class RoleBasedSchedulerActivationTests {
     }
 
     @Test
-    void multiJudgeProfileDisablesLegacyContestJudgeScheduler() {
+    void multiJudgeProfileDisablesSchedulers() {
         try (ConfigurableApplicationContext context = runWithProfile("multi-judge")) {
             assertThatProfileIsActive(context, "multi-server");
             assertThatProfileIsActive(context, "judge-role");
             assertThatMissing(context, ContestScoreboardOutboxCreatedListener.class);
             assertThatMissing(context, ContestScoreboardOutboxScheduler.class);
-            assertThatMissing(context, ContestSubmissionSubmittedListener.class);
-            assertThatMissing(context, ContestSubmissionResultListener.class);
-            assertThatMissing(context, ContestSubmissionJudgeScheduler.class);
             assertThatMissing(context, StreakRankBatchScheduler.class);
         }
     }
 
     @Test
-    void defaultsEnableImmediateAndEventListeners() {
+    void defaultsEnableImmediateAndSchedulers() {
         contextRunner
                 .run(context -> {
                     assertThatPresent(context, ContestScoreboardOutboxCreatedListener.class);
                     assertThatPresent(context, ContestScoreboardOutboxScheduler.class);
-                    assertThatPresent(context, ContestSubmissionSubmittedListener.class);
-                    assertThatPresent(context, ContestSubmissionResultListener.class);
-                    assertThatMissing(context, ContestSubmissionJudgeScheduler.class);
                     assertThatPresent(context, StreakRankBatchScheduler.class);
                 });
     }
@@ -158,36 +135,6 @@ class RoleBasedSchedulerActivationTests {
         }
 
         @Bean
-        ContestSubmissionService contestSubmissionService() {
-            return mock(ContestSubmissionService.class);
-        }
-
-        @Bean
-        ContestSubmissionRepository contestSubmissionRepository() {
-            return mock(ContestSubmissionRepository.class);
-        }
-
-        @Bean
-        ContestSubmissionJudgeProcessor contestSubmissionJudgeProcessor() {
-            return mock(ContestSubmissionJudgeProcessor.class);
-        }
-
-        @Bean(name = "contestSubmissionExecutor")
-        ThreadPoolTaskExecutor contestSubmissionExecutor() {
-            ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-            executor.setCorePoolSize(1);
-            executor.setMaxPoolSize(1);
-            executor.setQueueCapacity(10);
-            executor.initialize();
-            return executor;
-        }
-
-        @Bean(name = "contestJudgement")
-        Judgement contestJudgement() {
-            return mock(Judgement.class);
-        }
-
-        @Bean
         StreakRankBatchService streakRankBatchService() {
             return mock(StreakRankBatchService.class);
         }
@@ -198,9 +145,6 @@ class RoleBasedSchedulerActivationTests {
             TestDependencies.class,
             ContestScoreboardOutboxCreatedListener.class,
             ContestScoreboardOutboxScheduler.class,
-            ContestSubmissionSubmittedListener.class,
-            ContestSubmissionResultListener.class,
-            ContestSubmissionJudgeScheduler.class,
             StreakRankBatchScheduler.class
     })
     static class ProfileTestConfiguration {

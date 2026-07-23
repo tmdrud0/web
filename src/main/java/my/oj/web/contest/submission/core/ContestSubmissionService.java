@@ -106,13 +106,6 @@ public class ContestSubmissionService {
     }
 
     @Transactional
-    public void applyProvisionalResult(Long contestSubmissionId, SubmissionResult result, LocalDateTime judgedAt) {
-        ContestSubmissionJudgeProjection submission = repository.findJudgeProjectionById(contestSubmissionId)
-                .orElseThrow(() -> new IllegalStateException("Contest submission not found: " + contestSubmissionId));
-        applyProvisionalResult(submission, result, judgedAt);
-    }
-
-    @Transactional
     public void applyProvisionalResult(ContestSubmissionJudgeProjection submission,
                                        SubmissionResult result,
                                        LocalDateTime judgedAt) {

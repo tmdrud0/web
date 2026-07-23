@@ -312,6 +312,10 @@ Compose의 반복 정의는 YAML 앵커로 통합하되 렌더링된 서비스 �
 
 종료 시 drain 정책, 재시작 정책, readiness 의미는 장애 시 메시지 처리 결과를 바꿀 수 있으므로 이 구조 정리에는 포함하지 않았다. 현재 완료 통지와 judge 결과 writer의 종료 대기 동작만 회귀 테스트로 고정했고, bulk writer의 graceful shutdown은 별도 운영 변경 후보로 남겼다.
 
+### 4.1.3 RabbitMQ 채점 경로 단일화
+
+RabbitMQ 전환 전에 사용하던 Spring application event 기반 대회 채점 listener와 DB 미채점 행 polling scheduler를 제거했다. 대회 제출은 이제 outbox relay와 RabbitMQ consumer를 통해서만 채점되며, 일반 제출의 application event 경로는 그대로 유지한다. 과거 설계와 선택 근거는 이 문서의 V0~V6 기록과 Git 이력에서 확인할 수 있다.
+
 ### 4.2 전체 흐름
 
 ```mermaid

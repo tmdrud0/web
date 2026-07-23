@@ -188,14 +188,14 @@ class ContestSubmissionServiceTests {
     @Test
     void applyProvisionalResult_skipsOutboxWhenProvisionalAlreadyRecorded() {
         ContestSubmissionJudgeProjection submission = judgeProjection(999L);
-        given(submissionRepository.findJudgeProjectionById(999L)).willReturn(Optional.of(submission));
         given(resultRepository.insertProvisionalIfAbsent(999L, 100L, SubmissionResult.PARTIAL_ACCEPTED.name(), now))
                 .willReturn(0);
 
-        contestSubmissionService.applyProvisionalResult(999L, SubmissionResult.PARTIAL_ACCEPTED, now);
+        contestSubmissionService.applyProvisionalResult(submission, SubmissionResult.PARTIAL_ACCEPTED, now);
 
         verify(outboxService, never()).insertPendingIfAbsent(anyLong(), anyLong(), anyLong(), anyLong(), any(), any(), any(), any());
         verifyNoInteractions(outboxNotifier);
+        verifyNoInteractions(submissionRepository);
     }
 
     @Test
