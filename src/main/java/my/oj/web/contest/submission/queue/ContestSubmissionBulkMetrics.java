@@ -30,6 +30,18 @@ public class ContestSubmissionBulkMetrics {
     private final LongAccumulator maxCompletionElapsedMillis = new LongAccumulator(Math::max, 0L);
     private final LongAccumulator maxCompletionQueueDepth = new LongAccumulator(Math::max, 0L);
     private final LongAccumulator maxActiveCompletionWorkers = new LongAccumulator(Math::max, 0L);
+    private final LongAdder rejectedSubmissionCount = new LongAdder();
+    private final AtomicInteger currentInFlight = new AtomicInteger();
+    private final LongAccumulator maxInFlight = new LongAccumulator(Math::max, 0L);
+
+    public void recordRejectedSubmission() {
+        rejectedSubmissionCount.increment();
+    }
+
+    public void recordInFlight(int inFlight) {
+        currentInFlight.set(inFlight);
+        maxInFlight.accumulate(inFlight);
+    }
 
     public void recordSuccess(int chunkSize, long elapsedMillis, int pendingBefore, int pendingAfter, int activeWorkers) {
         chunkCount.increment();
@@ -99,7 +111,10 @@ public class ContestSubmissionBulkMetrics {
                 maxCompletionElapsedMillis.get(),
                 maxCompletionQueueDepth.get(),
                 maxActiveCompletionWorkers.get(),
-                completionCallerRunsCount.sum()
+                completionCallerRunsCount.sum(),
+                rejectedSubmissionCount.sum(),
+                currentInFlight.get(),
+                maxInFlight.get()
         );
     }
 
@@ -124,6 +139,9 @@ public class ContestSubmissionBulkMetrics {
         maxCompletionElapsedMillis.reset();
         maxCompletionQueueDepth.reset();
         maxActiveCompletionWorkers.reset();
+        rejectedSubmissionCount.reset();
+        currentInFlight.set(0);
+        maxInFlight.reset();
     }
 
     public record Snapshot(long chunkCount,
@@ -145,6 +163,9 @@ public class ContestSubmissionBulkMetrics {
                            long maxCompletionElapsedMillis,
                            long maxCompletionQueueDepth,
                            long maxActiveCompletionWorkers,
-                           long completionCallerRunsCount) {
+                           long completionCallerRunsCount,
+                           long rejectedSubmissionCount,
+                           int currentInFlight,
+                           long maxInFlight) {
     }
 }

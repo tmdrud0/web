@@ -163,7 +163,10 @@ public class ContestPerfService {
                 snapshot.maxCompletionElapsedMillis(),
                 snapshot.maxCompletionQueueDepth(),
                 snapshot.maxActiveCompletionWorkers(),
-                snapshot.completionCallerRunsCount()
+                snapshot.completionCallerRunsCount(),
+                snapshot.rejectedSubmissionCount(),
+                snapshot.currentInFlight(),
+                snapshot.maxInFlight()
         );
     }
 

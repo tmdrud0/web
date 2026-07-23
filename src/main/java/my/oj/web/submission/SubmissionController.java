@@ -4,6 +4,7 @@ import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import my.oj.web.auth.CurrentUser;
+import my.oj.web.contest.submission.support.ContestSubmissionOverloadedException;
 import my.oj.web.problem.ProblemRepository;
 import my.oj.web.submission.dto.SubmissionFormDto;
 import my.oj.web.submission.dto.SubmissionReceipt;
@@ -95,7 +96,7 @@ public class SubmissionController {
             ).handle((receipt, error) -> {
                 if (error != null) {
                     Throwable cause = unwrapCompletionException(error);
-                    if (cause instanceof IllegalArgumentException) {
+                    if (cause instanceof IllegalArgumentException || cause instanceof ContestSubmissionOverloadedException) {
                         redirectAttributes.addFlashAttribute("error", cause.getMessage());
                         return "redirect:/problem/" + id;
                     }
@@ -114,7 +115,7 @@ public class SubmissionController {
 
                 return "redirect:/submission/" + receipt.submissionId();
             });
-        } catch (IllegalArgumentException e) {
+        } catch (IllegalArgumentException | ContestSubmissionOverloadedException e) {
             redirectAttributes.addFlashAttribute("error", e.getMessage());
             return CompletableFuture.completedFuture("redirect:/problem/" + id);
         }

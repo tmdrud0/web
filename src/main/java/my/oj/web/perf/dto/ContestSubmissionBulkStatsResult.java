@@ -19,5 +19,8 @@ public record ContestSubmissionBulkStatsResult(long chunkCount,
                                                long maxCompletionElapsedMillis,
                                                long maxCompletionQueueDepth,
                                                long maxActiveCompletionWorkers,
-                                               long completionCallerRunsCount) {
+                                               long completionCallerRunsCount,
+                                               long rejectedSubmissionCount,
+                                               int currentInFlight,
+                                               long maxInFlight) {
 }
