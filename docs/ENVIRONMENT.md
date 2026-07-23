@@ -50,12 +50,12 @@ localhostForwarding=true
 |---|---:|---:|---:|---|
 | web | 2 | 1 | 1280M | `-XX:MaxRAMPercentage=60` |
 | judge | 2 | 0.75 | 768M | `-XX:MaxRAMPercentage=60` |
-| batch | 1 | 0.5 | 512M | `-XX:MaxRAMPercentage=60` |
+| batch | 1 | 0.5 | 1024M | `-XX:MaxRAMPercentage=60` |
 | mysql | 1 | 2 | 2560M | 해당 없음 |
 | redis | 1 | 0.5 | 512M | 해당 없음 |
 | rabbitmq | 1 | 0.75 | 1024M | 해당 없음 |
 | nginx | 1 | 0.25 | 128M | 해당 없음 |
-| **Compose 합계** | **9** | **7.5** | **8832M** | |
+| **Compose 합계** | **9** | **7.5** | **9344M** | |
 | **관측 스택 예약** | | **0.5** | 별도 결정 | 다음 단계에서 사용 |
 | **WSL CPU 예산** | | **8.0** | **10GB** | 상한 합이 VM 예산을 넘지 않음 |
 
@@ -161,11 +161,9 @@ docker inspect --format '{{.Name}} OOMKilled={{.State.OOMKilled}}' $containers
 - Redis maxmemory는 `402653184` bytes이고 정책은 `noeviction`이다.
 - 모든 컨테이너의 `OOMKilled`가 `false`다.
 
-### 8.1 알려진 batch 콜드 스타트 제약
+### 8.1 batch 메모리 상한 보정
 
-앱 이미지 5개를 동시에 다시 만드는 콜드 스타트에서 `batch-1`이 512M 상한에 닿아 한 차례 OOM 종료된 사례가 있다. 같은 컨테이너를 다시 시작하면 정상 기동했고, 대기 중이던 judge outbox도 자동 처리됐다. 안정 상태에서도 batch 메모리가 약 505MiB까지 관찰되어 측정 전에는 반드시 `batch-1`의 `healthy`, `OOMKilled=false`, 메모리 LIMIT를 함께 확인한다.
-
-이번 구조 정리에서는 고정한 자원 상한과 재시작 의미를 바꾸지 않았다. 후속 운영 단계에서는 batch 힙·Hikari 풀·기동 순서·재시작 정책을 함께 측정한 뒤 예산 안에서 조정한다.
+512M 상한에서는 합산 139 RPS, 768M 상한에서는 합산 200 RPS 제출의 HTTP 단계가 끝난 뒤 outbox를 발행하는 동안 `batch-1`이 OOM 종료됐다. judge outbox relay와 기타 예약 작업이 같은 프로세스에 있으므로, 2026-07-23 실측을 근거로 상한을 1024M로 높였다. CPU 상한 합 7.5는 그대로이며 Compose 메모리 상한 합 9344M도 10GB VM 예산 안이다. 측정 전에는 계속 `batch-1`의 `healthy`, `OOMKilled=false`, 메모리 LIMIT를 확인한다.
 
 ## 9. 제출 파이프라인 스모크
 
@@ -178,3 +176,29 @@ docker inspect --format '{{.Name}} OOMKilled={{.State.OOMKilled}}' $containers
 5. Redis `contest:scoreboard:<contestId>:ranking`에 해당 user가 존재한다.
 
 실제 스모크에 사용한 contest/user/problem/submission ID와 측정 커밋 해시는 측정 기록에 남기되, 이 기준선 문서에는 특정 데이터 ID를 고정하지 않는다.
+
+## 10. 격리된 web×2 부하 스택
+
+`compose.loadtest.yaml`은 `compose.yaml`, 프로젝트명 `oj-loadtest`와 함께 사용한다.
+컨테이너·볼륨 이름과 DB를 `oj_loadtest`로 격리하므로 일반 `oj` DB와 볼륨을 건드리지 않는다.
+
+```powershell
+docker compose -p oj-loadtest -f compose.yaml -f compose.loadtest.yaml config
+docker compose -p oj-loadtest -f compose.yaml -f compose.loadtest.yaml up -d --build
+```
+
+override에도 기본 스택과 같은 CPU 상한 합 7.5를 적용한다. 두 스택을 함께 실행하면 고정한
+8-vCPU 예산을 넘으므로 동시에 기동하지 않는다. Gatling은 Docker Desktop의 불안정한 IPv6
+localhost 포워딩을 피하도록 `http://127.0.0.1:18080`(nginx)을 사용하며, 모든 RPS는
+`web-1 + web-2` 합산 값이다.
+
+부하 프로필은 Redis 중복 방지는 유지하지만 사용자별 cooldown은 끈다. 의도한 HTTP 429와
+서버 용량 부족을 섞지 않기 위해서다. 각 웹 노드는 처리 중이거나 대기 중인 제출을 최대
+256건만 수용한다. 부하용 `/perf` API는 포화 시 HTTP 503과 `Retry-After`를 반환하며,
+브라우저 제출 화면은 오류 flash message가 있는 302 redirect를 반환한다.
+
+2026-07-23 기준 통과선은 제출 200 RPS와 scoreboard 조회 300 RPS다. 제출 27,015건이
+성공률 100%, p95 159ms로 처리됐고 결과/outbox 건수가 모두 일치했으며, 조회는 실제
+Redis 참가자 9,364명이 있는 scoreboard에서 40,515건, 성공률 100%, p95 24ms였다. 제출 1000 RPS와
+조회 2000 RPS는 현재 통과선이 아니라 각각 애플리케이션 적체와 Windows→Docker 포트
+포워딩 한계를 관찰하는 과부하 시나리오다. 정확한 실행법은 `gatling/README.md`를 따른다.

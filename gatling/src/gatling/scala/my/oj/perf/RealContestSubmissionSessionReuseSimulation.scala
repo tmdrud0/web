@@ -117,4 +117,5 @@ class RealContestSubmissionSessionReuseSimulation extends Simulation {
       rampUsers(concurrentUsers).during(rampSeconds.seconds)
     )
   ).protocols(httpProtocol)
+    .assertions(LoadTestAssertions.globalAssertions: _*)
 }

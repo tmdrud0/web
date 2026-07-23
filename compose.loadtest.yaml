@@ -1,0 +1,73 @@
+# Dedicated, isolated two-web load-test overlay. Run only with compose.yaml:
+#   docker compose -p oj-loadtest -f compose.yaml -f compose.loadtest.yaml ...
+#
+# The base compose resource limits remain unchanged (7.5 CPU total). Do not
+# run this stack with the normal stack on the fixed 8-vCPU Docker budget.
+name: oj-loadtest
+
+services:
+  nginx:
+    container_name: oj-loadtest-nginx
+    ports: !override
+      - "18080:80"
+
+  mysql:
+    container_name: oj-loadtest-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: 1234
+      MYSQL_DATABASE: oj_loadtest
+
+  redis:
+    container_name: oj-loadtest-redis
+
+  rabbitmq:
+    container_name: oj-loadtest-rabbitmq
+    ports: !reset []
+
+  web-1:
+    container_name: oj-loadtest-web-1
+    environment:
+      SPRING_PROFILES_ACTIVE: multi-web,perf,loadtest
+      DB_NAME: oj_loadtest
+      CONTEST_SUBMISSION_WORKER_ID: 1
+    # Direct ports are setup/diagnostic-only. Gatling must use nginx:18080.
+    ports: !override
+      - "18081:8080"
+
+  web-2:
+    container_name: oj-loadtest-web-2
+    environment:
+      SPRING_PROFILES_ACTIVE: multi-web,perf,loadtest
+      DB_NAME: oj_loadtest
+      CONTEST_SUBMISSION_WORKER_ID: 2
+    ports: !override
+      - "18082:8080"
+
+  batch-1:
+    container_name: oj-loadtest-batch-1
+    environment:
+      SPRING_PROFILES_ACTIVE: multi-batch,loadtest
+      DB_NAME: oj_loadtest
+      CONTEST_SUBMISSION_WORKER_ID: 100
+
+  judge-1:
+    container_name: oj-loadtest-judge-1
+    environment:
+      SPRING_PROFILES_ACTIVE: multi-judge,loadtest
+      DB_NAME: oj_loadtest
+      CONTEST_SUBMISSION_WORKER_ID: 200
+
+  judge-2:
+    container_name: oj-loadtest-judge-2
+    environment:
+      SPRING_PROFILES_ACTIVE: multi-judge,loadtest
+      DB_NAME: oj_loadtest
+      CONTEST_SUBMISSION_WORKER_ID: 201
+
+volumes:
+  mysql-data:
+    name: oj-loadtest-mysql-data
+  redis-data:
+    name: oj-loadtest-redis-data
+  rabbitmq-data:
+    name: oj-loadtest-rabbitmq-data

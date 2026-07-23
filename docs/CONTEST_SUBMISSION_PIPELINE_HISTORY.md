@@ -990,3 +990,27 @@ RabbitMQ는 Kafka의 저장 효율과 replay 기능을 포기하는 대신, `pre
 DB outbox를 함께 사용해 제출 수락의 영속성과 메시지 전달을 분리했고, publisher confirm과 consumer ACK 양쪽의 불확실성은 멱등 DB write로 흡수했다. 결과적으로 과거 DB claim/heartbeat/sweeper를 judge 작업 자체에서 제거할 수 있었다. 다만 outbox relay의 claim lease는 여전히 필요하다.
 
 현재 성능 한계는 RabbitMQ가 아니라 그보다 앞선 HTTP 경로다. 동기 Redis dedup 호출과 무제한 JVM queue를 정리하지 않고 worker, Tomcat thread, Hikari pool만 늘리면 더 많은 in-flight와 메모리 사용을 허용할 뿐 안정적인 1000 TPS 시스템이 되지는 않는다.
+
+## 15. 고정 자원 기준선 재설정 — bounded admission과 web×2 Gatling
+
+2026-07-23에는 고정한 8-vCPU/10GB WSL 예산에서 실제 nginx → web×2 → MySQL → batch →
+RabbitMQ → judge×2 → Redis scoreboard 경로를 격리 스택으로 측정했다.
+
+- 제출 admission을 웹 노드당 256건으로 제한했다. 이 제한은 처리 중이거나 대기 중인 요청의
+  수를 묶어 둔다. `/perf` API는 포화 시 HTTP 503과 `Retry-After`를 반환하고 브라우저
+  제출 화면은 기존 302 redirect와 오류 flash message를 사용한다.
+- `batch-1`은 512M에서 139 RPS, 768M에서 200 RPS 후단 처리 중 OOM이 확인되어 1024M로
+  보정했다. CPU 상한 합은 7.5, Compose 메모리 상한 합은 9344M로 VM 예산 안이다.
+- 통과 기준선은 web×2 합산 제출 200 RPS와 scoreboard 조회 300 RPS다. 제출 27,015건의
+  성공률은 100%, p95는 159ms였고 제출·채점 결과·scoreboard outbox 완료 건수가 일치했다.
+  Redis 참가자 9,364명이 생성된 뒤 조회 40,515건의 성공률 100%, p95 24ms를 기록했다.
+- 제출 1000 RPS는 web 적체와 OOM, 조회 2000 RPS는 Windows→Docker 포트 포워딩의 연결
+  거부를 재현했다. 두 수치는 현재 통과선이 아니라 장애·한계 시나리오다.
+- 대회 종료 50:50 10,000건은 외부 테스트 트랜잭션을 제거하고 실제 서비스 경계를 사용해
+  13.15초(760.19 submissions/s)에 완료됐다. 현재 `REQUIRES_NEW` 청크 커밋은 이 처리 시간을
+  지키기 위한 구조다. 중간 실패 후 안전한 재시도와 동시 종료 요청의 단일 실행을 보장하려면
+  `FINALIZING` 상태 전이와 단계별 멱등성을 추가해야 하며, 이는 별도 후속 과제로 남긴다.
+
+부하기는 Gradle daemon과 분리한 Windows Gatling JVM으로 실행한다. 따라서 부하기 GC와
+서버 병목을 구분할 수 있고, 모든 측정은 `docs/ENVIRONMENT.md`와 측정 시점 커밋 해시를
+함께 참조해야 한다.

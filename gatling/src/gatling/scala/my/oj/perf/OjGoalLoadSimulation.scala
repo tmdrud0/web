@@ -97,4 +97,5 @@ class OjGoalLoadSimulation extends Simulation {
       constantUsersPerSec(readRps).during(readHoldSeconds.seconds)
     )
   ).protocols(httpProtocol)
+    .assertions(LoadTestAssertions.globalAssertions: _*)
 }
