@@ -20,6 +20,8 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.SimpleTransactionStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.LocalDateTime;
@@ -52,6 +54,8 @@ class ContestFinalizationServiceTests {
     private ContestSubmissionService contestSubmissionService;
     @Mock
     private ContestFinalizationBatchRepository batchRepository;
+    @Mock
+    private PlatformTransactionManager transactionManager;
 
     @InjectMocks
     private ContestFinalizationService contestFinalizationService;
@@ -110,6 +114,7 @@ class ContestFinalizationServiceTests {
 
         given(contestRepository.findById(contestId)).willReturn(Optional.of(contest));
         given(resultRepository.findAllByContestIdWithSubmission(contestId)).willReturn(results);
+        given(transactionManager.getTransaction(any())).willReturn(new SimpleTransactionStatus());
 
         contestFinalizationService.finalizeContest(contestId);
 

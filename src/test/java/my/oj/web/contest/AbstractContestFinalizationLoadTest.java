@@ -1,6 +1,7 @@
 package my.oj.web.contest;
 
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.LocalDateTime;
 
 import my.oj.web.contest.finalization.ContestFinalizationService;
@@ -22,11 +23,11 @@ import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.boot.test.mock.mockito.MockBean;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 @SpringBootTest
 @ActiveProfiles("test")
@@ -40,6 +41,7 @@ abstract class AbstractContestFinalizationLoadTest {
     private static final int USER_COUNT = positiveInt("contest.load.userCount", 10_000);
     private static final int TOTAL_SUBMISSIONS = positiveInt("contest.load.totalSubmissions", 10_000);
     private static final int BATCH_SIZE = positiveInt("contest.load.batchSize", 1_000);
+    private static final Duration FINALIZATION_TIMEOUT = Duration.ofMinutes(2);
 
     private long seedDurationNanos;
 
@@ -51,9 +53,6 @@ abstract class AbstractContestFinalizationLoadTest {
 
     @MockBean
     private ContestRejudgeService contestRejudgeService;
-
-    @Autowired
-    private PlatformTransactionManager transactionManager;
 
     @Value("${loadtest.judge.mode}")
     private String judgeMode;
@@ -90,8 +89,9 @@ abstract class AbstractContestFinalizationLoadTest {
     void finalizeContest_handlesTenThousandSubmissions() {
         long expectedParticipants = Math.min(USER_COUNT, TOTAL_SUBMISSIONS);
         long start = System.nanoTime();
-        new TransactionTemplate(transactionManager).executeWithoutResult(
-                status -> contestFinalizationService.finalizeContest(CONTEST_ID)
+        assertTimeoutPreemptively(
+                FINALIZATION_TIMEOUT,
+                () -> contestFinalizationService.finalizeContest(CONTEST_ID)
         );
         long elapsed = System.nanoTime() - start;
 
