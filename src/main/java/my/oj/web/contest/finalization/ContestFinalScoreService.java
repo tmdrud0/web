@@ -3,11 +3,11 @@ package my.oj.web.contest.finalization;
 import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
 import my.oj.web.contest.scoreboard.ContestScoreboardService;
+import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardStore;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.submission.SubmissionResult;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -20,8 +20,8 @@ public class ContestFinalScoreService {
 
     private final ContestSubmissionResultRepository resultRepository;
     private final ContestFinalScoreRepository finalScoreRepository;
-    @Qualifier("contestFinalScoreboardService")
-    private final ContestScoreboardService scoreboardService;
+    /** The live scoreboard. Read only — replaying judgements uses a throwaway buffer. */
+    private final ContestScoreboardService liveScoreboardService;
 
     @Transactional
     public void rebuildScores(Long contestId, ContestFinalScoreStatus status, List<ContestSubmissionResult> preloadedResults) {
@@ -56,7 +56,7 @@ public class ContestFinalScoreService {
                                                           boolean useFinalResult,
                                                           List<ContestSubmissionResult> preloadedResults) {
         if (!useFinalResult) {
-            List<ContestScoreboardEntry> liveEntries = scoreboardService.currentRanking(contestId);
+            List<ContestScoreboardEntry> liveEntries = liveScoreboardService.currentRanking(contestId);
             if (!liveEntries.isEmpty()) {
                 return liveEntries;
             }
@@ -68,28 +68,27 @@ public class ContestFinalScoreService {
             return List.of();
         }
 
-        scoreboardService.reset(contestId);
-        try {
-            for (ContestSubmissionResult result : results) {
-                ContestSubmission submission = result.getSubmission();
-                SubmissionResult effective = resolveResult(result, useFinalResult);
-                if (effective == null) {
-                    continue;
-                }
-                scoreboardService.recordJudgement(
-                        result.getId(),
-                        contestId,
-                        submission.getProblem().getId(),
-                        submission.getUser().getId(),
-                        submission.getContest().getStartTime(),
-                        submission.getSubmittedTime(),
-                        effective
-                );
+        // Ranking is derived by replaying every judgement and reading the accumulated
+        // standings. That is scratch work, so it runs on a buffer scoped to this call
+        // rather than on the live scoreboard, which readers are hitting concurrently.
+        ContestScoreboardService replay = new ContestScoreboardService(new InMemoryContestScoreboardStore());
+        for (ContestSubmissionResult result : results) {
+            ContestSubmission submission = result.getSubmission();
+            SubmissionResult effective = resolveResult(result, useFinalResult);
+            if (effective == null) {
+                continue;
             }
-            return new ArrayList<>(scoreboardService.currentRanking(contestId));
-        } finally {
-            scoreboardService.reset(contestId);
+            replay.recordJudgement(
+                    result.getId(),
+                    contestId,
+                    submission.getProblem().getId(),
+                    submission.getUser().getId(),
+                    submission.getContest().getStartTime(),
+                    submission.getSubmittedTime(),
+                    effective
+            );
         }
+        return new ArrayList<>(replay.currentRanking(contestId));
     }
 
     private SubmissionResult resolveResult(ContestSubmissionResult result, boolean useFinalResult) {

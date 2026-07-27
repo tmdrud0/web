@@ -45,15 +45,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 @ActiveProfiles("test")
 @TestPropertySource(properties = {
         "spring.datasource.url=jdbc:mysql://localhost:3306/oj_codex_batch_verify_20260326?createDatabaseIfNotExist=true&rewriteBatchedStatements=true&cachePrepStmts=true",
-        "contest.submission.writer.mode=bulk",
         "contest.submission.bulk.batch-size=3",
         "contest.submission.bulk.worker-count=1",
         "contest.submission.bulk.flush-interval-millis=5000",
-        "contest.submission.post-process.enabled=false",
-        "contest.outbox.immediate.enabled=false",
         "contest.outbox.scheduler.enabled=false",
-        "contest.submission.judge.event-listener.enabled=false",
-        "contest.submission.judge.scheduler.enabled=false",
         "contest.submission.rate-limit.store=none",
         "contest.submission.dedup.store=memory",
         "spring.jpa.properties.hibernate.jdbc.batch_size=100",

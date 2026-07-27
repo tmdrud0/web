@@ -81,4 +81,5 @@ class RealContestSubmissionSimulation extends Simulation {
       constantUsersPerSec(targetRps).during(holdSeconds.seconds)
     )
   ).protocols(httpProtocol)
+    .assertions(LoadTestAssertions.globalAssertions: _*)
 }

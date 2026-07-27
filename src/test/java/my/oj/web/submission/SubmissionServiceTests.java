@@ -137,7 +137,7 @@ class SubmissionServiceTests {
     }
 
     @Test
-    void submitAsync_completesAfterContestStoreAndPublishesEvent() {
+    void submitAsync_completesAfterContestStoreWithoutPublishingApplicationEvent() {
         Contest contest = new Contest("Contest");
         ReflectionTestUtils.setField(contest, "id", 89L);
         Problem contestProblem = Problem.create("Contest Prob", contest, 1L);
@@ -160,7 +160,7 @@ class SubmissionServiceTests {
 
         SubmissionReceipt receipt = stage.toCompletableFuture().join();
         assertThat(receipt.submissionId()).isEqualTo(303L);
-        verify(publisher).publishEvent(any(SubmissionSubmittedEvent.class));
+        verify(publisher, never()).publishEvent(any());
         verify(contestSubmissionRateLimiter, never()).release(anyLong(), anyLong());
     }
 

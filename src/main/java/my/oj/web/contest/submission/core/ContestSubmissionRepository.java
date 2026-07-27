@@ -31,14 +31,4 @@ public interface ContestSubmissionRepository extends JpaRepository<ContestSubmis
 
     @Query("select coalesce(max(cs.id), 0) from ContestSubmission cs")
     Long findMaxId();
-
-    @Query(value = """
-            select cs.id
-            from contest_submission cs
-            left join contest_submission_result csr on csr.submission_id = cs.id
-            where csr.submission_id is null
-            order by cs.id
-            limit :limit
-            """, nativeQuery = true)
-    List<Long> findTopUnjudgedSubmissionIds(@Param("limit") int limit);
 }

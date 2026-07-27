@@ -4,7 +4,6 @@ import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.submission.core.ContestSubmissionJudgeProjection;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
 import my.oj.web.submission.SubmissionResult;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
@@ -14,7 +13,6 @@ import java.time.LocalDateTime;
 public class ContestSubmissionJudgeProcessor {
 
     private final ContestSubmissionService contestSubmissionService;
-    @Qualifier("contestJudgement")
     private final ContestSubmissionJudgement contestJudgement;
     private final ContestSubmissionJudgeResultWriter resultWriter;
 

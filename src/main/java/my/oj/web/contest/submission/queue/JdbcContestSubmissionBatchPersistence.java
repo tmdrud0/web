@@ -1,7 +1,6 @@
 package my.oj.web.contest.submission.queue;
 
 import my.oj.web.contest.submission.core.ContestSubmission;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
@@ -14,11 +13,6 @@ import java.sql.Timestamp;
 import java.util.List;
 
 @Component
-@ConditionalOnProperty(
-        prefix = "contest.submission.bulk",
-        name = "persistence-mode",
-        havingValue = "jdbc"
-)
 public class JdbcContestSubmissionBatchPersistence implements ContestSubmissionBatchPersistence {
 
     private static final String INSERT_SQL = """

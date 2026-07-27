@@ -66,6 +66,7 @@ class ContestSubmissionStepLoadSimulation extends Simulation {
   setUp(
     submitScenario.inject(buildInjectionProfile())
   ).protocols(httpProtocol)
+    .assertions(LoadTestAssertions.globalAssertions: _*)
 
   private def buildInjectionProfile(): List[OpenInjectionStep] = {
     val targets = staircaseTargets()

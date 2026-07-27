@@ -2,8 +2,7 @@ package my.oj.web.contest.finalization;
 
 import my.oj.web.contest.Contest;
 import my.oj.web.contest.ContestRepository;
-import my.oj.web.contest.scoreboard.ContestScoreboardService;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
+import my.oj.web.contest.scoreboard.ContestScoreboardMaintenanceService;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
@@ -20,6 +19,8 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.SimpleTransactionStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.LocalDateTime;
@@ -41,9 +42,7 @@ class ContestFinalizationServiceTests {
     @Mock
     private ContestRepository contestRepository;
     @Mock
-    private ContestScoreboardService scoreboardService;
-    @Mock
-    private ContestScoreboardOutboxRepository outboxRepository;
+    private ContestScoreboardMaintenanceService scoreboardMaintenanceService;
     @Mock
     private ContestRejudgeService rejudgeService;
     @Mock
@@ -52,6 +51,8 @@ class ContestFinalizationServiceTests {
     private ContestSubmissionService contestSubmissionService;
     @Mock
     private ContestFinalizationBatchRepository batchRepository;
+    @Mock
+    private PlatformTransactionManager transactionManager;
 
     @InjectMocks
     private ContestFinalizationService contestFinalizationService;
@@ -110,6 +111,7 @@ class ContestFinalizationServiceTests {
 
         given(contestRepository.findById(contestId)).willReturn(Optional.of(contest));
         given(resultRepository.findAllByContestIdWithSubmission(contestId)).willReturn(results);
+        given(transactionManager.getTransaction(any())).willReturn(new SimpleTransactionStatus());
 
         contestFinalizationService.finalizeContest(contestId);
 
@@ -119,8 +121,7 @@ class ContestFinalizationServiceTests {
         verify(finalScoreService).rebuildScores(contestId, ContestFinalScoreStatus.FINAL, results);
         verify(contestRepository).save(contest);
         verify(contestSubmissionService).purgeContest(contestId);
-        verify(scoreboardService).reset(contestId);
-        verify(outboxRepository).deleteByContestId(contestId);
+        verify(scoreboardMaintenanceService).clearLiveContestState(contestId);
 
         ArgumentCaptor<List<ContestFinalizationBatchRepository.SubmissionRow>> submissionsCaptor = ArgumentCaptor.forClass(List.class);
         verify(batchRepository).insertSubmissions(submissionsCaptor.capture());

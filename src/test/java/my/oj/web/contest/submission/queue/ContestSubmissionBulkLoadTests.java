@@ -38,15 +38,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest
 @ActiveProfiles("test")
 @TestPropertySource(properties = {
-        "contest.submission.writer.mode=bulk",
         "contest.submission.bulk.batch-size=100",
         "contest.submission.bulk.worker-count=4",
         "contest.submission.bulk.flush-interval-millis=200",
-        "contest.submission.post-process.enabled=false",
-        "contest.outbox.immediate.enabled=false",
         "contest.outbox.scheduler.enabled=false",
-        "contest.submission.judge.event-listener.enabled=false",
-        "contest.submission.judge.scheduler.enabled=false",
         "contest.submission.rate-limit.store=none",
         "contest.submission.dedup.store=memory",
         "spring.jpa.properties.hibernate.jdbc.batch_size=100",
@@ -62,10 +57,6 @@ class ContestSubmissionBulkLoadTests {
                 "MYSQL_LOAD_TEST_URL",
                 "jdbc:mysql://localhost:3306/oj_codex_bulk_load_20260326"
                         + "?createDatabaseIfNotExist=true&rewriteBatchedStatements=true&cachePrepStmts=true"
-        ));
-        registry.add("contest.submission.bulk.persistence-mode", () -> System.getenv().getOrDefault(
-                "CONTEST_SUBMISSION_BULK_PERSISTENCE_MODE",
-                "jpa"
         ));
     }
 

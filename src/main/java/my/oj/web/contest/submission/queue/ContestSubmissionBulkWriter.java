@@ -4,7 +4,7 @@ import jakarta.annotation.PreDestroy;
 import my.oj.web.contest.submission.core.ContestSubmissionWriteRequest;
 import my.oj.web.contest.submission.core.ContestSubmissionWriter;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import my.oj.web.contest.submission.support.ContestSubmissionOverloadedException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -15,10 +15,12 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Component
-@ConditionalOnProperty(prefix = "contest.submission.writer", name = "mode", havingValue = "bulk", matchIfMissing = true)
 public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
 
     private final ContestSubmissionBulkProcessor processor;
@@ -27,9 +29,13 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
     private final ConcurrentLinkedQueue<PendingSubmission> queue = new ConcurrentLinkedQueue<>();
     private final AtomicInteger activeWorkers = new AtomicInteger();
     private final AtomicInteger pendingCount = new AtomicInteger();
+    private final Semaphore inFlightPermits;
+    private final AtomicBoolean accepting = new AtomicBoolean(true);
+    private final Object lifecycleMonitor = new Object();
     private final ExecutorService executor;
     private final int batchSize;
     private final int workerCount;
+    private final int maxInFlight;
 
     public ContestSubmissionBulkWriter(ContestSubmissionBulkProcessor processor,
                                        ContestSubmissionBulkMetrics metrics,
@@ -40,6 +46,8 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
         this.completionDispatcher = completionDispatcher;
         this.batchSize = properties.effectiveBatchSize();
         this.workerCount = properties.effectiveWorkerCount();
+        this.maxInFlight = properties.effectiveMaxInFlight();
+        this.inFlightPermits = new Semaphore(maxInFlight);
         this.executor = Executors.newFixedThreadPool(this.workerCount, r -> {
             Thread thread = new Thread(r, "contest-submission-bulk");
             thread.setDaemon(true);
@@ -57,8 +65,15 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
             ContestSubmissionWriteRequest request
     ) {
         CompletableFuture<ContestSubmissionService.ContestSubmissionCreateResult> future = new CompletableFuture<>();
-        queue.add(new PendingSubmission(request, future));
-        pendingCount.incrementAndGet();
+        synchronized (lifecycleMonitor) {
+            if (!accepting.get() || !inFlightPermits.tryAcquire()) {
+                metrics.recordRejectedSubmission();
+                return CompletableFuture.failedFuture(new ContestSubmissionOverloadedException());
+            }
+            metrics.recordInFlight(currentInFlight());
+            queue.add(new PendingSubmission(request, future));
+            pendingCount.incrementAndGet();
+        }
         triggerFlushIfNecessary();
         return future;
     }
@@ -88,7 +103,7 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
                 return;
             }
             if (activeWorkers.compareAndSet(current, current + 1)) {
-                executor.execute(this::drainFullBatches);
+                executeDrain(this::drainFullBatches);
             }
         }
     }
@@ -100,7 +115,7 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
                 return;
             }
             if (activeWorkers.compareAndSet(current, current + 1)) {
-                executor.execute(this::drainAllPending);
+                executeDrain(this::drainAllPending);
                 return;
             }
         }
@@ -159,6 +174,7 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
     private void processChunk(List<PendingSubmission> chunk) {
         int pendingBefore = pendingCount.get();
         long startedAt = System.nanoTime();
+        boolean permitsReleased = false;
         try {
             List<ContestSubmissionService.ContestSubmissionCreateResult> results = processor.process(
                     chunk.stream().map(PendingSubmission::request).toList()
@@ -168,19 +184,60 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
             }
             long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
             metrics.recordSuccess(chunk.size(), elapsedMillis, pendingBefore, pendingCount.get(), activeWorkers.get());
-            completionDispatcher.dispatch(chunk.size(), () -> {
+            releaseChunk(chunk);
+            permitsReleased = true;
+            dispatchOrComplete(chunk.size(), () -> {
                 for (int i = 0; i < chunk.size(); i++) {
                     chunk.get(i).future().complete(results.get(i));
                 }
             });
-        } catch (Exception ex) {
+        } catch (RuntimeException ex) {
             long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
             metrics.recordFailure(chunk.size(), elapsedMillis, pendingBefore, pendingCount.get(), activeWorkers.get());
-            completionDispatcher.dispatch(
+            if (!permitsReleased) {
+                releaseChunk(chunk);
+            }
+            dispatchOrComplete(
                     chunk.size(),
                     () -> chunk.forEach(pending -> pending.future().completeExceptionally(ex))
             );
         }
+    }
+
+    private void dispatchOrComplete(int submissionCount, Runnable completion) {
+        try {
+            completionDispatcher.dispatch(submissionCount, completion);
+        } catch (RuntimeException ex) {
+            completion.run();
+        }
+    }
+
+    private void releaseChunk(List<PendingSubmission> chunk) {
+        inFlightPermits.release(chunk.size());
+        metrics.recordInFlight(currentInFlight());
+    }
+
+    private void executeDrain(Runnable drain) {
+        try {
+            executor.execute(drain);
+        } catch (RejectedExecutionException ex) {
+            activeWorkers.decrementAndGet();
+            failQueuedSubmissions();
+        }
+    }
+
+    private void failQueuedSubmissions() {
+        PendingSubmission pending;
+        while ((pending = queue.poll()) != null) {
+            pendingCount.decrementAndGet();
+            inFlightPermits.release();
+            pending.future().completeExceptionally(new ContestSubmissionOverloadedException());
+        }
+        metrics.recordInFlight(currentInFlight());
+    }
+
+    private int currentInFlight() {
+        return maxInFlight - inFlightPermits.availablePermits();
     }
 
     private record PendingSubmission(ContestSubmissionWriteRequest request,
@@ -189,6 +246,10 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
 
     @PreDestroy
     public void shutdown() {
+        synchronized (lifecycleMonitor) {
+            accepting.set(false);
+            failQueuedSubmissions();
+        }
         executor.shutdownNow();
     }
 }

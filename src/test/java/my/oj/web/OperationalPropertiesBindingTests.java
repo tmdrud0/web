@@ -1,6 +1,6 @@
 package my.oj.web;
 
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxProperties;
+import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProperties;
 import my.oj.web.contest.submission.config.ContestSubmissionExecutorProperties;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultWriterProperties;
 import my.oj.web.contest.submission.messaging.ContestJudgeOutboxRelayProperties;
@@ -46,6 +46,7 @@ class OperationalPropertiesBindingTests {
             assertThat(judgeRelay.confirmTimeout()).isEqualTo(Duration.ofSeconds(10));
             assertThat(bulk.batchSize()).isEqualTo(100);
             assertThat(bulk.workerCount()).isEqualTo(1);
+            assertThat(bulk.maxInFlight()).isEqualTo(2000);
             assertThat(completion.threadCount()).isEqualTo(8);
             assertThat(completion.queueCapacity()).isEqualTo(256);
             assertThat(resultWriter.batchSize()).isEqualTo(16);
@@ -67,6 +68,7 @@ class OperationalPropertiesBindingTests {
                         "contest.submission.judge.rabbit.publisher.batch-size=0",
                         "contest.submission.bulk.batch-size=0",
                         "contest.submission.bulk.worker-count=0",
+                        "contest.submission.bulk.max-in-flight=0",
                         "contest.submission.completion.thread-count=0",
                         "contest.submission.completion.queue-capacity=0",
                         "contest.submission.judge.result-writer.batch-size=4",
@@ -95,6 +97,7 @@ class OperationalPropertiesBindingTests {
                     assertThat(judgeRelay.effectiveBatchSize()).isEqualTo(1);
                     assertThat(bulk.effectiveBatchSize()).isEqualTo(1);
                     assertThat(bulk.effectiveWorkerCount()).isEqualTo(1);
+                    assertThat(bulk.effectiveMaxInFlight()).isEqualTo(1);
                     assertThat(completion.effectiveThreadCount()).isEqualTo(1);
                     assertThat(completion.effectiveQueueCapacity()).isEqualTo(1);
                     assertThat(resultWriter.effectiveBatchSize()).isEqualTo(4);

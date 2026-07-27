@@ -1,6 +1,7 @@
 package my.oj.web.contest.scoreboard.outbox;
 
 import my.oj.web.contest.scoreboard.ContestScoreboardService;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 
 public class DirectContestScoreboardOutboxApplier implements ContestScoreboardOutboxApplier {
 
@@ -11,15 +12,15 @@ public class DirectContestScoreboardOutboxApplier implements ContestScoreboardOu
     }
 
     @Override
-    public Long apply(Long eventId, ContestScoreboardOutboxPayload payload) {
+    public Long apply(Long eventId, ContestScoreboardUpdate update) {
         scoreboardService.recordJudgement(
                 eventId,
-                payload.contestId(),
-                payload.problemId(),
-                payload.userId(),
-                payload.contestStart(),
-                payload.submittedTime(),
-                payload.result()
+                update.contestId(),
+                update.problemId(),
+                update.userId(),
+                update.contestStart(),
+                update.submittedTime(),
+                update.result()
         );
         return null;
     }

@@ -20,34 +20,16 @@ import java.util.Map;
 @Component
 public class ContestSubmissionBulkProcessor {
 
-    private final ContestSubmissionWriteAmplifier writeAmplifier;
     private final ContestJudgeOutboxWriter judgeOutboxWriter;
     private final ContestSubmissionBatchPersistence batchPersistence;
 
     @PersistenceContext
     private EntityManager entityManager;
 
-    public ContestSubmissionBulkProcessor(ContestSubmissionWriteAmplifier writeAmplifier,
-                                          ContestJudgeOutboxWriter judgeOutboxWriter,
+    public ContestSubmissionBulkProcessor(ContestJudgeOutboxWriter judgeOutboxWriter,
                                           ContestSubmissionBatchPersistence batchPersistence) {
-        this.writeAmplifier = writeAmplifier;
         this.judgeOutboxWriter = judgeOutboxWriter;
         this.batchPersistence = batchPersistence;
-    }
-
-    @Transactional
-    public ContestSubmissionService.ContestSubmissionCreateResult processSingle(ContestSubmissionWriteRequest request) {
-        if (request == null) {
-            throw new IllegalArgumentException("Contest submission request cannot be null");
-        }
-
-        ContestSubmission submission = createSubmission(request);
-        batchPersistence.insertAll(List.of(submission));
-        judgeOutboxWriter.enqueueAll(List.of(submission.getId()));
-        writeAmplifier.amplify(List.of(submission));
-        entityManager.clear();
-
-        return new ContestSubmissionService.ContestSubmissionCreateResult(submission, false);
     }
 
     @Transactional
@@ -77,7 +59,6 @@ public class ContestSubmissionBulkProcessor {
         if (!toPersist.isEmpty()) {
             batchPersistence.insertAll(toPersist);
             judgeOutboxWriter.enqueueAll(toPersist.stream().map(ContestSubmission::getId).toList());
-            writeAmplifier.amplify(toPersist);
             entityManager.clear();
         }
 

@@ -185,7 +185,7 @@ services:
       resources:
         limits:
           cpus: "0.5"
-          memory: 512M
+          memory: 1024M
 
   judge-1:
     build: *spring-build

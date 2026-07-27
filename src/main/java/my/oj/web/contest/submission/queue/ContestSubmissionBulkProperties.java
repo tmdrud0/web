@@ -6,7 +6,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 @ConfigurationProperties("contest.submission.bulk")
 public record ContestSubmissionBulkProperties(
         @DefaultValue("100") int batchSize,
-        @DefaultValue("1") int workerCount
+        @DefaultValue("1") int workerCount,
+        @DefaultValue("2000") int maxInFlight
 ) {
 
     public int effectiveBatchSize() {
@@ -15,5 +16,9 @@ public record ContestSubmissionBulkProperties(
 
     public int effectiveWorkerCount() {
         return Math.max(1, workerCount);
+    }
+
+    public int effectiveMaxInFlight() {
+        return Math.max(1, maxInFlight);
     }
 }

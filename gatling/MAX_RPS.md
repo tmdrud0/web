@@ -8,7 +8,7 @@ number instead of a single fixed-RPS pass/fail result.
 - Lowering the Hikari pool mainly makes connection starvation happen earlier.
 - A fixed `targetRps=1000` run tells you where the system breaks, but not the
   highest rate it can sustain cleanly.
-- A step load makes it easier to compare `immediate` vs `bulk` under the same
+- A step load made it easier to compare `immediate` vs `bulk` under the same
   traffic envelope.
 
 ## Run
@@ -27,14 +27,13 @@ number instead of a single fixed-RPS pass/fail result.
   -Dperf.problemId.end=5
 ```
 
-## Compare immediate vs bulk
+## Writer selection record
 
-Run the exact same seed and step profile twice:
+Previous runs compared the `immediate` and `bulk` writers with the exact same
+seed and step profile. The comparison is complete: `bulk` was selected and is
+now the only writer path.
 
-1. `--contest.submission.writer.mode=immediate`
-2. `--contest.submission.writer.mode=bulk`
-
-For bulk mode, also capture:
+For the selected bulk path, also capture:
 
 ```powershell
 Invoke-RestMethod http://localhost:8080/perf/contest/submission-bulk-stats
@@ -51,8 +50,8 @@ Treat the highest clean step as the max sustainable RPS when all of these hold:
 
 ## Practical advice
 
-- Start with pool size fixed and compare writer modes first.
+- Start with pool size fixed to establish a bulk-writer baseline.
 - After that, vary `spring.datasource.hikari.maximum-pool-size` to see whether
-  the winner changes when connections are constrained.
-- If both modes fail at the same point with connection exhaustion, the current
+  throughput changes when connections are constrained.
+- If the bulk writer fails with connection exhaustion, the current
   bottleneck is the DB connection layer, not the insert path itself.

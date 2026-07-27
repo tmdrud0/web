@@ -2,8 +2,8 @@ package my.oj.web.contest.submission.core;
 
 import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.Contest;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxCreatedNotifier;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdatePublisher;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
 import my.oj.web.problem.Problem;
@@ -26,8 +26,7 @@ public class ContestSubmissionService {
 
     private final ContestSubmissionRepository repository;
     private final ContestSubmissionResultRepository resultRepository;
-    private final ContestScoreboardOutboxService scoreboardOutboxService;
-    private final ContestScoreboardOutboxCreatedNotifier scoreboardOutboxNotifier;
+    private final ContestScoreboardUpdatePublisher scoreboardUpdatePublisher;
     private final ContestSubmissionDuplicateRegistry duplicateRegistry;
     private final ContestSubmissionIdGenerator idGenerator;
     private final ContestSubmissionWriter submissionWriter;
@@ -106,13 +105,6 @@ public class ContestSubmissionService {
     }
 
     @Transactional
-    public void applyProvisionalResult(Long contestSubmissionId, SubmissionResult result, LocalDateTime judgedAt) {
-        ContestSubmissionJudgeProjection submission = repository.findJudgeProjectionById(contestSubmissionId)
-                .orElseThrow(() -> new IllegalStateException("Contest submission not found: " + contestSubmissionId));
-        applyProvisionalResult(submission, result, judgedAt);
-    }
-
-    @Transactional
     public void applyProvisionalResult(ContestSubmissionJudgeProjection submission,
                                        SubmissionResult result,
                                        LocalDateTime judgedAt) {
@@ -126,7 +118,7 @@ public class ContestSubmissionService {
             return;
         }
 
-        boolean insertedOutbox = scoreboardOutboxService.insertPendingIfAbsent(
+        scoreboardUpdatePublisher.publishIfAbsent(new ContestScoreboardUpdate(
                 submission.getSubmissionId(),
                 submission.getContestId(),
                 submission.getProblemId(),
@@ -135,10 +127,7 @@ public class ContestSubmissionService {
                 submission.getSubmittedTime(),
                 result,
                 judgedAt
-        );
-        if (insertedOutbox) {
-            scoreboardOutboxNotifier.notifyCreated(submission.getSubmissionId());
-        }
+        ));
     }
 
     public ContestSubmissionJudgeProjection getJudgeProjectionById(Long contestSubmissionId) {

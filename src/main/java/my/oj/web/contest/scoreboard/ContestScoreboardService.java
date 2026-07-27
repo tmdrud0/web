@@ -2,7 +2,6 @@ package my.oj.web.contest.scoreboard;
 
 import lombok.RequiredArgsConstructor;
 import my.oj.web.submission.SubmissionResult;
-import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -10,7 +9,6 @@ import java.util.List;
 import java.util.Optional;
 
 @Service
-@Primary
 @RequiredArgsConstructor
 public class ContestScoreboardService {
 
