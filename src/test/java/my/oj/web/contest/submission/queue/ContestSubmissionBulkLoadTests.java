@@ -41,7 +41,6 @@ import static org.assertj.core.api.Assertions.assertThat;
         "contest.submission.bulk.batch-size=100",
         "contest.submission.bulk.worker-count=4",
         "contest.submission.bulk.flush-interval-millis=200",
-        "contest.outbox.immediate.enabled=false",
         "contest.outbox.scheduler.enabled=false",
         "contest.submission.rate-limit.store=none",
         "contest.submission.dedup.store=memory",

@@ -1,7 +1,6 @@
 package my.oj.web.contest.submission.core;
 
 import my.oj.web.contest.Contest;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxCreatedNotifier;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
@@ -44,9 +43,6 @@ class ContestSubmissionServiceTests {
     private ContestScoreboardOutboxService outboxService;
 
     @Mock
-    private ContestScoreboardOutboxCreatedNotifier outboxNotifier;
-
-    @Mock
     private ContestSubmissionDuplicateRegistry duplicateRegistry;
 
     @Mock
@@ -73,7 +69,6 @@ class ContestSubmissionServiceTests {
                 submissionRepository,
                 resultRepository,
                 outboxService,
-                outboxNotifier,
                 duplicateRegistry,
                 idGenerator,
                 submissionWriter
@@ -116,7 +111,6 @@ class ContestSubmissionServiceTests {
         assertThat(result.duplicate()).isTrue();
         assertThat(result.submission().getId()).isEqualTo(777L);
         verify(submissionWriter).save(any());
-        verifyNoInteractions(outboxNotifier);
     }
 
     @Test
@@ -194,7 +188,6 @@ class ContestSubmissionServiceTests {
         contestSubmissionService.applyProvisionalResult(submission, SubmissionResult.PARTIAL_ACCEPTED, now);
 
         verify(outboxService, never()).insertPendingIfAbsent(anyLong(), anyLong(), anyLong(), anyLong(), any(), any(), any(), any());
-        verifyNoInteractions(outboxNotifier);
         verifyNoInteractions(submissionRepository);
     }
 
@@ -213,7 +206,6 @@ class ContestSubmissionServiceTests {
 
         verify(resultRepository).insertProvisionalIfAbsent(1001L, 100L, SubmissionResult.PARTIAL_ACCEPTED.name(), now);
         verify(outboxService).insertPendingIfAbsent(eq(1001L), eq(100L), eq(200L), eq(10L), nullable(LocalDateTime.class), eq(now), eq(SubmissionResult.PARTIAL_ACCEPTED), eq(now));
-        verify(outboxNotifier).notifyCreated(1001L);
         verifyNoInteractions(submissionRepository);
     }
 

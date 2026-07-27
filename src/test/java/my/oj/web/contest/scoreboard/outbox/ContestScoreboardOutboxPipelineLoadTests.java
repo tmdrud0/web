@@ -27,7 +27,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @ActiveProfiles("test")
 @TestPropertySource(properties = {
         "contest.scoreboard.store=redis",
-        "contest.outbox.immediate.enabled=false",
         "contest.outbox.scheduler.enabled=false",
         "rank.streak.batch.enabled=false",
         "contest.submission.judge.rabbit.publisher.enabled=false",

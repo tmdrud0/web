@@ -3,7 +3,6 @@ package my.oj.web.contest;
 import my.oj.web.contest.scoreboard.ContestScoreboardStore;
 import my.oj.web.contest.scoreboard.InMemoryContestScoreboardStore;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxCreatedNotifier;
 import my.oj.web.contest.scoreboard.outbox.DirectContestScoreboardOutboxApplier;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultBatchWriter;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultWriter;
@@ -42,8 +41,6 @@ class ContestPipelineWiringTests {
     @Autowired
     ContestScoreboardOutboxApplier outboxApplier;
     @Autowired
-    ContestScoreboardOutboxCreatedNotifier outboxCreatedNotifier;
-    @Autowired
     ContestSubmissionDuplicateRegistry duplicateRegistry;
     @Autowired
     ContestSubmissionRateLimiter rateLimiter;
@@ -68,12 +65,8 @@ class ContestPipelineWiringTests {
     }
 
     @Test
-    void scoreboard_outbox_is_applied_directly_and_polled_rather_than_notified() {
+    void scoreboard_outbox_uses_direct_applier() {
         assertThat(outboxApplier).isInstanceOf(DirectContestScoreboardOutboxApplier.class);
-        // Matched by name: the Noop notifier is package-private, and widening it just
-        // to be referenced here would be the test dictating production visibility.
-        assertThat(outboxCreatedNotifier.getClass().getSimpleName())
-                .isEqualTo("NoopContestScoreboardOutboxCreatedNotifier");
     }
 
     @Test

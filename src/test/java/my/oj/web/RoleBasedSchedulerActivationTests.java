@@ -1,6 +1,5 @@
 package my.oj.web;
 
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxCreatedListener;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxProcessor;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxProcessLock;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxProperties;
@@ -28,28 +27,25 @@ class RoleBasedSchedulerActivationTests {
     private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
             .withUserConfiguration(
                     TestDependencies.class,
-                    ContestScoreboardOutboxCreatedListener.class,
                     ContestScoreboardOutboxScheduler.class,
                     StreakRankBatchScheduler.class
             );
 
     @Test
-    void multiWebProfileDisablesImmediateAndSchedulers() {
+    void multiWebProfileDisablesSchedulers() {
         try (ConfigurableApplicationContext context = runWithProfile("multi-web")) {
             assertThatProfileIsActive(context, "multi-server");
             assertThatProfileIsActive(context, "web-role");
-            assertThatMissing(context, ContestScoreboardOutboxCreatedListener.class);
             assertThatMissing(context, ContestScoreboardOutboxScheduler.class);
             assertThatMissing(context, StreakRankBatchScheduler.class);
         }
     }
 
     @Test
-    void multiBatchProfileEnablesSchedulersButKeepsImmediateOff() {
+    void multiBatchProfileEnablesSchedulers() {
         try (ConfigurableApplicationContext context = runWithProfile("multi-batch")) {
             assertThatProfileIsActive(context, "multi-server");
             assertThatProfileIsActive(context, "batch-role");
-            assertThatMissing(context, ContestScoreboardOutboxCreatedListener.class);
             assertThatPresent(context, ContestScoreboardOutboxScheduler.class);
             assertThatPresent(context, StreakRankBatchScheduler.class);
             ContestScoreboardOutboxProperties properties = context.getBean(ContestScoreboardOutboxProperties.class);
@@ -64,17 +60,15 @@ class RoleBasedSchedulerActivationTests {
         try (ConfigurableApplicationContext context = runWithProfile("multi-judge")) {
             assertThatProfileIsActive(context, "multi-server");
             assertThatProfileIsActive(context, "judge-role");
-            assertThatMissing(context, ContestScoreboardOutboxCreatedListener.class);
             assertThatMissing(context, ContestScoreboardOutboxScheduler.class);
             assertThatMissing(context, StreakRankBatchScheduler.class);
         }
     }
 
     @Test
-    void defaultsEnableImmediateAndSchedulers() {
+    void defaultsEnableSchedulers() {
         contextRunner
                 .run(context -> {
-                    assertThatPresent(context, ContestScoreboardOutboxCreatedListener.class);
                     assertThatPresent(context, ContestScoreboardOutboxScheduler.class);
                     assertThatPresent(context, StreakRankBatchScheduler.class);
                 });
@@ -143,7 +137,6 @@ class RoleBasedSchedulerActivationTests {
     @Configuration(proxyBeanMethods = false)
     @Import({
             TestDependencies.class,
-            ContestScoreboardOutboxCreatedListener.class,
             ContestScoreboardOutboxScheduler.class,
             StreakRankBatchScheduler.class
     })

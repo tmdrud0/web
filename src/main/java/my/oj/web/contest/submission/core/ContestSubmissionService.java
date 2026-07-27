@@ -2,7 +2,6 @@ package my.oj.web.contest.submission.core;
 
 import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.Contest;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxCreatedNotifier;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
@@ -27,7 +26,6 @@ public class ContestSubmissionService {
     private final ContestSubmissionRepository repository;
     private final ContestSubmissionResultRepository resultRepository;
     private final ContestScoreboardOutboxService scoreboardOutboxService;
-    private final ContestScoreboardOutboxCreatedNotifier scoreboardOutboxNotifier;
     private final ContestSubmissionDuplicateRegistry duplicateRegistry;
     private final ContestSubmissionIdGenerator idGenerator;
     private final ContestSubmissionWriter submissionWriter;
@@ -119,7 +117,7 @@ public class ContestSubmissionService {
             return;
         }
 
-        boolean insertedOutbox = scoreboardOutboxService.insertPendingIfAbsent(
+        scoreboardOutboxService.insertPendingIfAbsent(
                 submission.getSubmissionId(),
                 submission.getContestId(),
                 submission.getProblemId(),
@@ -129,9 +127,6 @@ public class ContestSubmissionService {
                 result,
                 judgedAt
         );
-        if (insertedOutbox) {
-            scoreboardOutboxNotifier.notifyCreated(submission.getSubmissionId());
-        }
     }
 
     public ContestSubmissionJudgeProjection getJudgeProjectionById(Long contestSubmissionId) {
