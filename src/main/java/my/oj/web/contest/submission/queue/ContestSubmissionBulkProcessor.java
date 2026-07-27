@@ -20,17 +20,14 @@ import java.util.Map;
 @Component
 public class ContestSubmissionBulkProcessor {
 
-    private final ContestSubmissionWriteAmplifier writeAmplifier;
     private final ContestJudgeOutboxWriter judgeOutboxWriter;
     private final ContestSubmissionBatchPersistence batchPersistence;
 
     @PersistenceContext
     private EntityManager entityManager;
 
-    public ContestSubmissionBulkProcessor(ContestSubmissionWriteAmplifier writeAmplifier,
-                                          ContestJudgeOutboxWriter judgeOutboxWriter,
+    public ContestSubmissionBulkProcessor(ContestJudgeOutboxWriter judgeOutboxWriter,
                                           ContestSubmissionBatchPersistence batchPersistence) {
-        this.writeAmplifier = writeAmplifier;
         this.judgeOutboxWriter = judgeOutboxWriter;
         this.batchPersistence = batchPersistence;
     }
@@ -62,7 +59,6 @@ public class ContestSubmissionBulkProcessor {
         if (!toPersist.isEmpty()) {
             batchPersistence.insertAll(toPersist);
             judgeOutboxWriter.enqueueAll(toPersist.stream().map(ContestSubmission::getId).toList());
-            writeAmplifier.amplify(toPersist);
             entityManager.clear();
         }
 

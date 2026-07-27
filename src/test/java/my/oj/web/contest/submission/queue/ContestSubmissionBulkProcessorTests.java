@@ -42,7 +42,6 @@ class ContestSubmissionBulkProcessorTests {
     @BeforeEach
     void setUp() {
         processor = new ContestSubmissionBulkProcessor(
-                new NoOpContestSubmissionWriteAmplifier(),
                 judgeOutboxWriter,
                 batchPersistence
         );
