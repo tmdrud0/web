@@ -36,21 +36,6 @@ public class ContestSubmissionBulkProcessor {
     }
 
     @Transactional
-    public ContestSubmissionService.ContestSubmissionCreateResult processSingle(ContestSubmissionWriteRequest request) {
-        if (request == null) {
-            throw new IllegalArgumentException("Contest submission request cannot be null");
-        }
-
-        ContestSubmission submission = createSubmission(request);
-        batchPersistence.insertAll(List.of(submission));
-        judgeOutboxWriter.enqueueAll(List.of(submission.getId()));
-        writeAmplifier.amplify(List.of(submission));
-        entityManager.clear();
-
-        return new ContestSubmissionService.ContestSubmissionCreateResult(submission, false);
-    }
-
-    @Transactional
     public List<ContestSubmissionService.ContestSubmissionCreateResult> process(List<ContestSubmissionWriteRequest> requests) {
         if (requests == null || requests.isEmpty()) {
             return List.of();

@@ -5,11 +5,9 @@ import my.oj.web.contest.scoreboard.InMemoryContestScoreboardStore;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxCreatedNotifier;
 import my.oj.web.contest.scoreboard.outbox.DirectContestScoreboardOutboxApplier;
-import my.oj.web.contest.submission.core.ContestSubmissionWriter;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultBatchWriter;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultWriter;
 import my.oj.web.contest.submission.queue.ContestSubmissionBatchPersistence;
-import my.oj.web.contest.submission.queue.ContestSubmissionBulkWriter;
 import my.oj.web.contest.submission.queue.JdbcContestSubmissionBatchPersistence;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
@@ -52,8 +50,6 @@ class ContestPipelineWiringTests {
     @Autowired
     ContestSubmissionIdGenerator idGenerator;
     @Autowired
-    ContestSubmissionWriter submissionWriter;
-    @Autowired
     ContestSubmissionBatchPersistence batchPersistence;
     @Autowired
     ContestSubmissionJudgeResultWriter judgeResultWriter;
@@ -62,7 +58,6 @@ class ContestPipelineWiringTests {
     void write_paths_match_production() {
         assertThat(batchPersistence).isInstanceOf(JdbcContestSubmissionBatchPersistence.class);
         assertThat(judgeResultWriter).isInstanceOf(ContestSubmissionJudgeResultBatchWriter.class);
-        assertThat(submissionWriter).isInstanceOf(ContestSubmissionBulkWriter.class);
     }
 
     @Test

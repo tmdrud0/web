@@ -38,7 +38,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest
 @ActiveProfiles("test")
 @TestPropertySource(properties = {
-        "contest.submission.writer.mode=bulk",
         "contest.submission.bulk.batch-size=100",
         "contest.submission.bulk.worker-count=4",
         "contest.submission.bulk.flush-interval-millis=200",

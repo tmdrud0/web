@@ -5,7 +5,6 @@ import my.oj.web.contest.submission.core.ContestSubmissionWriteRequest;
 import my.oj.web.contest.submission.core.ContestSubmissionWriter;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
 import my.oj.web.contest.submission.support.ContestSubmissionOverloadedException;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -22,7 +21,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Component
-@ConditionalOnProperty(prefix = "contest.submission.writer", name = "mode", havingValue = "bulk", matchIfMissing = true)
 public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
 
     private final ContestSubmissionBulkProcessor processor;
