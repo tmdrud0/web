@@ -4,6 +4,7 @@ import jakarta.persistence.*;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.submission.SubmissionResult;
 
 import java.time.LocalDateTime;
@@ -94,8 +95,8 @@ public class ContestScoreboardOutbox {
         return outbox;
     }
 
-    public ContestScoreboardOutboxPayload toPayload() {
-        return new ContestScoreboardOutboxPayload(
+    public ContestScoreboardUpdate toUpdate() {
+        return new ContestScoreboardUpdate(
                 contestSubmissionId,
                 contestId,
                 problemId,

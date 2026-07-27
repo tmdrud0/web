@@ -1,11 +1,11 @@
 package my.oj.web;
 
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxProcessor;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxProcessLock;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxProperties;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRecoveryService;
+import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProcessor;
+import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProcessLock;
+import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProperties;
+import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxRecoveryService;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxScheduler;
+import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxScheduler;
 import my.oj.web.user.rank.streak.StreakRankBatchScheduler;
 import my.oj.web.user.rank.streak.StreakRankBatchService;
 import org.junit.jupiter.api.Test;

@@ -1,8 +1,10 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.redis;
 
 import io.lettuce.core.RedisCommandExecutionException;
 import lombok.extern.slf4j.Slf4j;
-import my.oj.web.contest.scoreboard.ContestScoreboardConstants;
+import my.oj.web.contest.scoreboard.ContestScoreboardPolicy;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
 import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.connection.lettuce.LettuceConnection;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
@@ -10,17 +12,13 @@ import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 
 @Slf4j
 public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOutboxApplier {
 
-    static final String SEQUENCE_KEY = "contest:scoreboard:outbox:seq";
-    private static final String SUBMISSION_SEQUENCE_KEY = "contest:scoreboard:outbox:submission";
-    private static final String SCOREBOARD_PREFIX = "contest:scoreboard:";
+    static final String SEQUENCE_KEY = ContestScoreboardRedisKeys.OUTBOX_SEQUENCE;
 
     private final StringRedisTemplate redisTemplate;
     private volatile String scriptSha;
@@ -35,13 +33,13 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
     }
 
     @Override
-    public Long apply(Long eventId, ContestScoreboardOutboxPayload payload) {
-        validate(eventId, payload);
+    public Long apply(Long eventId, ContestScoreboardUpdate update) {
+        validate(eventId, update);
 
         Long sequence = redisTemplate.execute(
                 ContestScoreboardRedisScript.APPLY,
-                keys(payload),
-                (Object[]) arguments(eventId, payload)
+                keys(update),
+                (Object[]) arguments(eventId, update)
         );
         if (sequence == null) {
             throw new IllegalStateException("Redis scoreboard script returned no sequence");
@@ -55,7 +53,7 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
             return List.of();
         }
         List<ApplyRequest> safeRequests = List.copyOf(requests);
-        safeRequests.forEach(request -> validate(request.eventId(), request.payload()));
+        safeRequests.forEach(request -> validate(request.eventId(), request.update()));
 
         try {
             String loadedScriptSha = scriptSha();
@@ -66,7 +64,7 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
                             loadedScriptSha,
                             ReturnType.INTEGER,
                             6,
-                            serializedKeysAndArguments(request.eventId(), request.payload())
+                            serializedKeysAndArguments(request.eventId(), request.update())
                     );
                 }
                 return null;
@@ -173,75 +171,52 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
         return Long.parseLong(value);
     }
 
-    private byte[][] serializedKeysAndArguments(Long eventId, ContestScoreboardOutboxPayload payload) {
+    private byte[][] serializedKeysAndArguments(Long eventId, ContestScoreboardUpdate update) {
         List<String> values = new ArrayList<>(14);
-        values.addAll(keys(payload));
-        values.addAll(List.of(arguments(eventId, payload)));
+        values.addAll(keys(update));
+        values.addAll(List.of(arguments(eventId, update)));
         return values.stream()
                 .map(value -> redisTemplate.getStringSerializer().serialize(value))
                 .toArray(byte[][]::new);
     }
 
-    private static void validate(Long eventId, ContestScoreboardOutboxPayload payload) {
+    private static void validate(Long eventId, ContestScoreboardUpdate update) {
         if (eventId == null
-                || payload == null
-                || payload.contestSubmissionId() == null
-                || payload.contestId() == null
-                || payload.problemId() == null
-                || payload.userId() == null
-                || payload.result() == null) {
-            throw new IllegalArgumentException("Scoreboard outbox event and payload fields are required");
+                || update == null
+                || update.contestSubmissionId() == null
+                || update.contestId() == null
+                || update.problemId() == null
+                || update.userId() == null
+                || update.result() == null) {
+            throw new IllegalArgumentException("Scoreboard outbox event and update fields are required");
         }
     }
 
-    private static List<String> keys(ContestScoreboardOutboxPayload payload) {
+    private static List<String> keys(ContestScoreboardUpdate update) {
         return List.of(
                 SEQUENCE_KEY,
-                SUBMISSION_SEQUENCE_KEY,
-                rankingKey(payload.contestId()),
-                summaryKey(payload.contestId(), payload.userId()),
-                problemKey(payload.contestId(), payload.userId(), payload.problemId()),
-                processedKey(payload.contestId())
+                ContestScoreboardRedisKeys.OUTBOX_SUBMISSION_SEQUENCE,
+                ContestScoreboardRedisKeys.ranking(update.contestId()),
+                ContestScoreboardRedisKeys.summary(update.contestId(), update.userId()),
+                ContestScoreboardRedisKeys.problem(update.contestId(), update.userId(), update.problemId()),
+                ContestScoreboardRedisKeys.processed(update.contestId())
         );
     }
 
-    private static String[] arguments(Long eventId, ContestScoreboardOutboxPayload payload) {
+    private static String[] arguments(Long eventId, ContestScoreboardUpdate update) {
         return new String[]{
-                Long.toString(payload.contestSubmissionId()),
+                Long.toString(update.contestSubmissionId()),
                 Long.toString(eventId),
-                payload.result().name(),
-                Long.toString(contestMinutes(payload.contestStart(), payload.submittedTime())),
-                Long.toString(ContestScoreboardConstants.PENALTY_PER_WRONG_MINUTES),
-                Long.toString(ContestScoreboardConstants.SCORE_SOLVED_WEIGHT),
-                Long.toString(ContestScoreboardConstants.SCORE_PENALTY_WEIGHT),
-                Long.toString(payload.userId())
+                update.result().name(),
+                Long.toString(ContestScoreboardPolicy.computeContestMinutes(
+                        update.contestStart(),
+                        update.submittedTime()
+                )),
+                Long.toString(ContestScoreboardPolicy.PENALTY_PER_WRONG_MINUTES),
+                Long.toString(ContestScoreboardPolicy.SCORE_SOLVED_WEIGHT),
+                Long.toString(ContestScoreboardPolicy.SCORE_PENALTY_WEIGHT),
+                Long.toString(update.userId())
         };
     }
 
-    private static long contestMinutes(LocalDateTime contestStart, LocalDateTime submittedTime) {
-        if (contestStart == null || submittedTime == null) {
-            return 0L;
-        }
-        long seconds = Duration.between(contestStart, submittedTime).toSeconds();
-        if (seconds <= 0L) {
-            return 0L;
-        }
-        return (seconds + 59L) / 60L;
-    }
-
-    private static String rankingKey(Long contestId) {
-        return SCOREBOARD_PREFIX + contestId + ":ranking";
-    }
-
-    private static String summaryKey(Long contestId, Long userId) {
-        return SCOREBOARD_PREFIX + contestId + ":user:" + userId + ":summary";
-    }
-
-    private static String problemKey(Long contestId, Long userId, Long problemId) {
-        return SCOREBOARD_PREFIX + contestId + ":user:" + userId + ":problem:" + problemId;
-    }
-
-    private static String processedKey(Long contestId) {
-        return SCOREBOARD_PREFIX + contestId + ":processed";
-    }
 }

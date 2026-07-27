@@ -1,6 +1,8 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.outbox.worker;
 
 import lombok.RequiredArgsConstructor;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.PageRequest;

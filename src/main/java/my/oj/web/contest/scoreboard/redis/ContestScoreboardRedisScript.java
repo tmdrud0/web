@@ -1,4 +1,4 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.redis;
 
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;

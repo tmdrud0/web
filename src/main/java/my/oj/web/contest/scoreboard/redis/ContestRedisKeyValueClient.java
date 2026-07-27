@@ -1,4 +1,4 @@
-package my.oj.web.contest.scoreboard;
+package my.oj.web.contest.scoreboard.redis;
 
 import java.time.Duration;
 import java.util.Collection;

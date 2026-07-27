@@ -1,5 +1,7 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.redis;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
 import io.lettuce.core.RedisCommandExecutionException;
 import my.oj.web.submission.SubmissionResult;
 import org.junit.jupiter.api.Test;
@@ -59,8 +61,8 @@ class RedisContestScoreboardOutboxApplierTests {
         );
     }
 
-    private ContestScoreboardOutboxPayload payload(long submissionId) {
-        return new ContestScoreboardOutboxPayload(
+    private ContestScoreboardUpdate payload(long submissionId) {
+        return new ContestScoreboardUpdate(
                 submissionId,
                 10L,
                 20L,
@@ -81,7 +83,7 @@ class RedisContestScoreboardOutboxApplierTests {
         }
 
         @Override
-        public Long apply(Long eventId, ContestScoreboardOutboxPayload payload) {
+        public Long apply(Long eventId, ContestScoreboardUpdate update) {
             individualCalls++;
             return eventId;
         }

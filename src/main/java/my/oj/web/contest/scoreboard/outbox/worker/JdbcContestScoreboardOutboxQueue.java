@@ -1,5 +1,6 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.outbox.worker;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.submission.SubmissionResult;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -15,14 +16,14 @@ import java.util.List;
 import java.util.UUID;
 
 @Component
-class ContestScoreboardOutboxStore {
+class JdbcContestScoreboardOutboxQueue {
 
     private static final int MAX_ERROR_LENGTH = 500;
 
     private final JdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
 
-    ContestScoreboardOutboxStore(JdbcTemplate jdbcTemplate, PlatformTransactionManager transactionManager) {
+    JdbcContestScoreboardOutboxQueue(JdbcTemplate jdbcTemplate, PlatformTransactionManager transactionManager) {
         this.jdbcTemplate = jdbcTemplate;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
@@ -52,7 +53,7 @@ class ContestScoreboardOutboxStore {
                             """,
                     (resultSet, rowNum) -> new OutboxRow(
                             resultSet.getLong("id"),
-                            new ContestScoreboardOutboxPayload(
+                            new ContestScoreboardUpdate(
                                     resultSet.getLong("contest_submission_id"),
                                     resultSet.getLong("contest_id"),
                                     resultSet.getLong("problem_id"),
@@ -73,7 +74,7 @@ class ContestScoreboardOutboxStore {
 
             String claimToken = UUID.randomUUID().toString();
             List<ClaimedEvent> events = rows.stream()
-                    .map(row -> new ClaimedEvent(row.eventId(), row.payload(), claimToken))
+                    .map(row -> new ClaimedEvent(row.eventId(), row.update(), claimToken))
                     .toList();
             if (events.isEmpty()) {
                 return events;
@@ -193,7 +194,7 @@ class ContestScoreboardOutboxStore {
                 : safeError.substring(0, MAX_ERROR_LENGTH);
     }
 
-    record ClaimedEvent(long eventId, ContestScoreboardOutboxPayload payload, String claimToken) {
+    record ClaimedEvent(long eventId, ContestScoreboardUpdate update, String claimToken) {
     }
 
     record CompletedEvent(ClaimedEvent event, Long redisSequence) {
@@ -215,6 +216,6 @@ class ContestScoreboardOutboxStore {
         }
     }
 
-    private record OutboxRow(long eventId, ContestScoreboardOutboxPayload payload) {
+    private record OutboxRow(long eventId, ContestScoreboardUpdate update) {
     }
 }

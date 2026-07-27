@@ -1,5 +1,10 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.outbox.worker;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutbox;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxStatus;
 import jakarta.persistence.EntityManager;
 import my.oj.web.config.TestQuerydslConfig;
 import my.oj.web.submission.SubmissionResult;
@@ -128,7 +133,7 @@ class ContestScoreboardRecoveryIntegrationTests {
         private long currentSequence;
 
         @Override
-        public Long apply(Long eventId, ContestScoreboardOutboxPayload payload) {
+        public Long apply(Long eventId, ContestScoreboardUpdate update) {
             throw new UnsupportedOperationException("Not used by recovery tests");
         }
 

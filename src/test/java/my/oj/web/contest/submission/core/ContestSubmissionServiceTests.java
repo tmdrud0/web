@@ -1,7 +1,8 @@
 package my.oj.web.contest.submission.core;
 
 import my.oj.web.contest.Contest;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdatePublisher;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
 import my.oj.web.problem.Problem;
@@ -40,7 +41,7 @@ class ContestSubmissionServiceTests {
     private ContestSubmissionResultRepository resultRepository;
 
     @Mock
-    private ContestScoreboardOutboxService outboxService;
+    private ContestScoreboardUpdatePublisher scoreboardUpdatePublisher;
 
     @Mock
     private ContestSubmissionDuplicateRegistry duplicateRegistry;
@@ -68,7 +69,7 @@ class ContestSubmissionServiceTests {
         contestSubmissionService = new ContestSubmissionService(
                 submissionRepository,
                 resultRepository,
-                outboxService,
+                scoreboardUpdatePublisher,
                 duplicateRegistry,
                 idGenerator,
                 submissionWriter
@@ -187,7 +188,7 @@ class ContestSubmissionServiceTests {
 
         contestSubmissionService.applyProvisionalResult(submission, SubmissionResult.PARTIAL_ACCEPTED, now);
 
-        verify(outboxService, never()).insertPendingIfAbsent(anyLong(), anyLong(), anyLong(), anyLong(), any(), any(), any(), any());
+        verify(scoreboardUpdatePublisher, never()).publishIfAbsent(any());
         verifyNoInteractions(submissionRepository);
     }
 
@@ -199,13 +200,23 @@ class ContestSubmissionServiceTests {
         given(submission.getSubmittedTime()).willReturn(now);
         given(resultRepository.insertProvisionalIfAbsent(anyLong(), anyLong(), anyString(), any()))
                 .willReturn(1);
-        given(outboxService.insertPendingIfAbsent(anyLong(), anyLong(), anyLong(), anyLong(), any(), any(), any(), any()))
-                .willReturn(true);
+        given(scoreboardUpdatePublisher.publishIfAbsent(any())).willReturn(true);
 
         contestSubmissionService.applyProvisionalResult(submission, SubmissionResult.PARTIAL_ACCEPTED, now);
 
         verify(resultRepository).insertProvisionalIfAbsent(1001L, 100L, SubmissionResult.PARTIAL_ACCEPTED.name(), now);
-        verify(outboxService).insertPendingIfAbsent(eq(1001L), eq(100L), eq(200L), eq(10L), nullable(LocalDateTime.class), eq(now), eq(SubmissionResult.PARTIAL_ACCEPTED), eq(now));
+        ArgumentCaptor<ContestScoreboardUpdate> updateCaptor = ArgumentCaptor.forClass(ContestScoreboardUpdate.class);
+        verify(scoreboardUpdatePublisher).publishIfAbsent(updateCaptor.capture());
+        assertThat(updateCaptor.getValue()).isEqualTo(new ContestScoreboardUpdate(
+                1001L,
+                100L,
+                200L,
+                10L,
+                null,
+                now,
+                SubmissionResult.PARTIAL_ACCEPTED,
+                now
+        ));
         verifyNoInteractions(submissionRepository);
     }
 

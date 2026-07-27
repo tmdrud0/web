@@ -1,4 +1,4 @@
-package my.oj.web.contest.scoreboard;
+package my.oj.web.contest.scoreboard.redis;
 
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.Cursor;

@@ -1,6 +1,9 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.outbox.worker;
 
 import lombok.RequiredArgsConstructor;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutbox;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -15,7 +18,7 @@ public class ContestScoreboardOutboxProcessor {
 
     private final ContestScoreboardOutboxService outboxService;
     private final ContestScoreboardOutboxApplier outboxApplier;
-    private final ContestScoreboardOutboxStore outboxStore;
+    private final JdbcContestScoreboardOutboxQueue outboxQueue;
 
     @Transactional
     public boolean processById(Long outboxId) {
@@ -24,7 +27,7 @@ public class ContestScoreboardOutboxProcessor {
             return false;
         }
         try {
-            Long redisSequence = outboxApplier.apply(outbox.getId(), outbox.toPayload());
+            Long redisSequence = outboxApplier.apply(outbox.getId(), outbox.toUpdate());
             LocalDateTime processedAt = LocalDateTime.now();
             outbox.assignRedisSequence(redisSequence);
             outbox.markSuccess(processedAt);
@@ -36,7 +39,7 @@ public class ContestScoreboardOutboxProcessor {
     }
 
     public BatchProcessResult processBatch(int batchSize, Duration claimLease) {
-        List<ContestScoreboardOutboxStore.ClaimedEvent> claimed = outboxStore.claim(batchSize, claimLease);
+        List<JdbcContestScoreboardOutboxQueue.ClaimedEvent> claimed = outboxQueue.claim(batchSize, claimLease);
         if (claimed.isEmpty()) {
             return BatchProcessResult.empty();
         }
@@ -44,7 +47,7 @@ public class ContestScoreboardOutboxProcessor {
         List<ContestScoreboardOutboxApplier.ApplyRequest> requests = claimed.stream()
                 .map(event -> new ContestScoreboardOutboxApplier.ApplyRequest(
                         event.eventId(),
-                        event.payload()
+                        event.update()
                 ))
                 .toList();
         List<ContestScoreboardOutboxApplier.ApplyResult> applyResults;
@@ -63,12 +66,12 @@ public class ContestScoreboardOutboxProcessor {
                     .toList();
         }
 
-        List<ContestScoreboardOutboxStore.CompletedEvent> completed = new ArrayList<>(claimed.size());
-        List<ContestScoreboardOutboxStore.FailedEvent> failed = new ArrayList<>();
+        List<JdbcContestScoreboardOutboxQueue.CompletedEvent> completed = new ArrayList<>(claimed.size());
+        List<JdbcContestScoreboardOutboxQueue.FailedEvent> failed = new ArrayList<>();
         for (int index = 0; index < claimed.size(); index++) {
-            ContestScoreboardOutboxStore.ClaimedEvent event = claimed.get(index);
+            JdbcContestScoreboardOutboxQueue.ClaimedEvent event = claimed.get(index);
             if (index >= applyResults.size()) {
-                failed.add(new ContestScoreboardOutboxStore.FailedEvent(
+                failed.add(new JdbcContestScoreboardOutboxQueue.FailedEvent(
                         event,
                         "Scoreboard applier returned fewer results than requested"
                 ));
@@ -77,21 +80,21 @@ public class ContestScoreboardOutboxProcessor {
 
             ContestScoreboardOutboxApplier.ApplyResult result = applyResults.get(index);
             if (result.eventId() != event.eventId()) {
-                failed.add(new ContestScoreboardOutboxStore.FailedEvent(
+                failed.add(new JdbcContestScoreboardOutboxQueue.FailedEvent(
                         event,
                         "Scoreboard applier result order did not match the claimed event order"
                 ));
             } else if (result.succeeded()) {
-                completed.add(new ContestScoreboardOutboxStore.CompletedEvent(
+                completed.add(new JdbcContestScoreboardOutboxQueue.CompletedEvent(
                         event,
                         result.redisSequence()
                 ));
             } else {
-                failed.add(new ContestScoreboardOutboxStore.FailedEvent(event, result.errorMessage()));
+                failed.add(new JdbcContestScoreboardOutboxQueue.FailedEvent(event, result.errorMessage()));
             }
         }
 
-        ContestScoreboardOutboxStore.BatchCompletionResult completion = outboxStore.completeAll(completed, failed);
+        JdbcContestScoreboardOutboxQueue.BatchCompletionResult completion = outboxQueue.completeAll(completed, failed);
         return new BatchProcessResult(
                 claimed.size(),
                 completion.completedApplied(),

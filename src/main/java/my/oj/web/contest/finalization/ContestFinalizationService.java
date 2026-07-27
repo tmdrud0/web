@@ -2,8 +2,7 @@ package my.oj.web.contest.finalization;
 
 import my.oj.web.contest.Contest;
 import my.oj.web.contest.ContestRepository;
-import my.oj.web.contest.scoreboard.ContestScoreboardService;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
+import my.oj.web.contest.scoreboard.ContestScoreboardMaintenanceService;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
@@ -29,8 +28,7 @@ public class ContestFinalizationService {
 
     private final ContestFinalScoreService finalScoreService;
     private final ContestRepository contestRepository;
-    private final ContestScoreboardService scoreboardService;
-    private final ContestScoreboardOutboxRepository outboxRepository;
+    private final ContestScoreboardMaintenanceService scoreboardMaintenanceService;
     private final ContestRejudgeService rejudgeService;
     private final ContestSubmissionResultRepository resultRepository;
     private final ContestSubmissionService contestSubmissionService;
@@ -39,8 +37,7 @@ public class ContestFinalizationService {
 
     public ContestFinalizationService(ContestFinalScoreService finalScoreService,
                                       ContestRepository contestRepository,
-                                      ContestScoreboardService scoreboardService,
-                                      ContestScoreboardOutboxRepository outboxRepository,
+                                      ContestScoreboardMaintenanceService scoreboardMaintenanceService,
                                       ContestRejudgeService rejudgeService,
                                       ContestSubmissionResultRepository resultRepository,
                                       ContestSubmissionService contestSubmissionService,
@@ -48,8 +45,7 @@ public class ContestFinalizationService {
                                       PlatformTransactionManager transactionManager) {
         this.finalScoreService = finalScoreService;
         this.contestRepository = contestRepository;
-        this.scoreboardService = scoreboardService;
-        this.outboxRepository = outboxRepository;
+        this.scoreboardMaintenanceService = scoreboardMaintenanceService;
         this.rejudgeService = rejudgeService;
         this.resultRepository = resultRepository;
         this.contestSubmissionService = contestSubmissionService;
@@ -77,8 +73,7 @@ public class ContestFinalizationService {
         applyContestResultsToNormal(contest, results);
 
         contestSubmissionService.purgeContest(contestId);
-        scoreboardService.reset(contestId);
-        outboxRepository.deleteByContestId(contestId);
+        scoreboardMaintenanceService.clearLiveContestState(contestId);
 
         contest.markFinalized(LocalDateTime.now());
         contestRepository.save(contest);

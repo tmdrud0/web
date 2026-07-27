@@ -1,9 +1,15 @@
-package my.oj.web.contest.scoreboard;
+package my.oj.web.contest.scoreboard.redis;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
+import my.oj.web.contest.scoreboard.ContestScoreboardPolicy;
+import my.oj.web.contest.scoreboard.ContestScoreboardSlice;
+import my.oj.web.contest.scoreboard.ContestScoreboardSnapshot;
+import my.oj.web.contest.scoreboard.ContestScoreboardStore;
 import my.oj.web.submission.SubmissionResult;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.HashSet;
 import java.util.List;
@@ -16,13 +22,10 @@ import java.util.concurrent.ThreadLocalRandom;
 @ConditionalOnProperty(prefix = "contest.scoreboard", name = "store", havingValue = "redis")
 public class RedisContestScoreboardStore implements ContestScoreboardStore {
 
-    private static final String KEY_PREFIX = "contest:scoreboard:";
-    private static final String RANKING_SUFFIX = ":ranking";
-    private static final String USER_SEGMENT = ":user:";
-    private static final String SUMMARY_SUFFIX = ":summary";
-    private static final String PROBLEM_SEGMENT = ":problem:";
-    private static final String LOCK_SUFFIX = ":lock";
-    private static final String PROCESSED_SUFFIX = ":processed";
+    private static final Duration LOCK_TTL = Duration.ofSeconds(5);
+    private static final long INITIAL_BACKOFF_MILLIS = 10L;
+    private static final long MAX_BACKOFF_MILLIS = 200L;
+    private static final int MAX_LOCK_ATTEMPTS = 6;
 
     private final ContestRedisKeyValueClient redisClient;
 
@@ -66,7 +69,7 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
 
         long startIndex = normalizedStart - 1;
         long endIndex = Math.min(total - 1, startIndex + size - 1);
-        List<String> userIds = redisClient.zRevRange(rankingKey(contestId), startIndex, endIndex);
+        List<String> userIds = redisClient.zRevRange(ContestScoreboardRedisKeys.ranking(contestId), startIndex, endIndex);
         return new ContestScoreboardSlice(contestId, normalizedStart, toEntries(contestId, userIds), total);
     }
 
@@ -77,7 +80,7 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
             return Optional.empty();
         }
         int effectiveWindow = Math.max(1, Math.min(windowSize, (int) Math.min(total, Integer.MAX_VALUE)));
-        String rankingKey = rankingKey(contestId);
+        String rankingKey = ContestScoreboardRedisKeys.ranking(contestId);
         Long rankIndex = redisClient.zRevRank(rankingKey, Long.toString(userId));
         if (rankIndex == null) {
             return Optional.empty();
@@ -97,15 +100,14 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
 
     @Override
     public long totalParticipants(long contestId) {
-        return redisClient.zCard(rankingKey(contestId));
+        return redisClient.zCard(ContestScoreboardRedisKeys.ranking(contestId));
     }
 
     @Override
     public void reset(long contestId) {
-        Set<String> keys = new HashSet<>(redisClient.scan(KEY_PREFIX + contestId + USER_SEGMENT + "*"));
-        keys.addAll(redisClient.scan(userLockPrefix(contestId) + "*"));
-        keys.add(rankingKey(contestId));
-        keys.add(processedKey(contestId));
+        Set<String> keys = new HashSet<>(redisClient.scan(ContestScoreboardRedisKeys.userPattern(contestId)));
+        keys.add(ContestScoreboardRedisKeys.ranking(contestId));
+        keys.add(ContestScoreboardRedisKeys.processed(contestId));
         if (!keys.isEmpty()) {
             redisClient.delete(keys);
         }
@@ -122,7 +124,7 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
 
     private ContestScoreboardEntry toEntry(long contestId, String userIdStr) {
         long userId = Long.parseLong(userIdStr);
-        Map<String, String> summary = redisClient.hGetAll(summaryKey(contestId, userId));
+        Map<String, String> summary = redisClient.hGetAll(ContestScoreboardRedisKeys.summary(contestId, userId));
         long solved = parseLong(summary.get(ContestScoreboardSummaryFields.SOLVED));
         long penalty = parseLong(summary.get(ContestScoreboardSummaryFields.PENALTY));
         return new ContestScoreboardEntry(userId, (int) solved, penalty);
@@ -134,9 +136,9 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
                                 LocalDateTime contestStart,
                                 LocalDateTime submittedTime,
                                 SubmissionResult result) {
-        String rankingKey = rankingKey(contestId);
-        String summaryKey = summaryKey(contestId, userId);
-        String problemKey = problemKey(contestId, userId, problemId);
+        String rankingKey = ContestScoreboardRedisKeys.ranking(contestId);
+        String summaryKey = ContestScoreboardRedisKeys.summary(contestId, userId);
+        String problemKey = ContestScoreboardRedisKeys.problem(contestId, userId, problemId);
         String userIdStr = Long.toString(userId);
 
         ensureUserInitialized(rankingKey, summaryKey, userIdStr, userId);
@@ -148,7 +150,11 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
 
         if (result == SubmissionResult.ACCEPTED) {
             long wrongAttempts = parseLong(redisClient.hGet(problemKey, ContestScoreboardProblemFields.WRONG_ATTEMPTS));
-            long penaltyIncrement = ContestScoreboardMath.computePenalty(contestStart, submittedTime, wrongAttempts);
+            long penaltyIncrement = ContestScoreboardPolicy.computePenalty(
+                    contestStart,
+                    submittedTime,
+                    wrongAttempts
+            );
 
             redisClient.hSet(problemKey, ContestScoreboardProblemFields.ACCEPTED, ContestScoreboardProblemFields.ACCEPTED_FLAG);
             redisClient.hSet(problemKey, ContestScoreboardProblemFields.WRONG_ATTEMPTS, Long.toString(wrongAttempts));
@@ -184,17 +190,17 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
                                long solved,
                                long penalty,
                                long userIdNumeric) {
-        double score = ContestScoreboardMath.computeScore(solved, penalty, userIdNumeric);
+        double score = ContestScoreboardPolicy.computeScore(solved, penalty, userIdNumeric);
         redisClient.zAdd(rankingKey, score, userId);
     }
 
     private void executeWithLock(long contestId, long userId, Runnable action) {
-        String lockKey = userLockKey(contestId, userId);
-        long backoff = ContestScoreboardConstants.INITIAL_BACKOFF_MILLIS;
+        String lockKey = ContestScoreboardRedisKeys.userLock(contestId, userId);
+        long backoff = INITIAL_BACKOFF_MILLIS;
 
-        for (int attempt = 0; attempt < ContestScoreboardConstants.MAX_LOCK_ATTEMPTS; attempt++) {
+        for (int attempt = 0; attempt < MAX_LOCK_ATTEMPTS; attempt++) {
             String token = Long.toString(ThreadLocalRandom.current().nextLong(Long.MAX_VALUE));
-            boolean acquired = redisClient.setIfAbsent(lockKey, token, ContestScoreboardConstants.LOCK_TTL);
+            boolean acquired = redisClient.setIfAbsent(lockKey, token, LOCK_TTL);
             if (acquired) {
                 try {
                     action.run();
@@ -205,7 +211,7 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
             }
 
             sleep(backoff + ThreadLocalRandom.current().nextLong(backoff + 1));
-            backoff = Math.min(backoff * 2, ContestScoreboardConstants.MAX_BACKOFF_MILLIS);
+            backoff = Math.min(backoff * 2, MAX_BACKOFF_MILLIS);
         }
         throw new IllegalStateException("Failed to acquire Redis scoreboard lock for contest " + contestId + " user " + userId);
     }
@@ -220,11 +226,11 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
     }
 
     private boolean isProcessed(long contestId, long eventId) {
-        return redisClient.sIsMember(processedKey(contestId), Long.toString(eventId));
+        return redisClient.sIsMember(ContestScoreboardRedisKeys.processed(contestId), Long.toString(eventId));
     }
 
     private void markProcessed(long contestId, long eventId) {
-        redisClient.sAdd(processedKey(contestId), Long.toString(eventId));
+        redisClient.sAdd(ContestScoreboardRedisKeys.processed(contestId), Long.toString(eventId));
     }
 
     private long parseLong(String value) {
@@ -232,30 +238,6 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
             return 0L;
         }
         return Long.parseLong(value);
-    }
-
-    private String rankingKey(long contestId) {
-        return KEY_PREFIX + contestId + RANKING_SUFFIX;
-    }
-
-    private String summaryKey(long contestId, long userId) {
-        return KEY_PREFIX + contestId + USER_SEGMENT + userId + SUMMARY_SUFFIX;
-    }
-
-    private String problemKey(long contestId, long userId, long problemId) {
-        return KEY_PREFIX + contestId + USER_SEGMENT + userId + PROBLEM_SEGMENT + problemId;
-    }
-
-    private String userLockKey(long contestId, long userId) {
-        return userLockPrefix(contestId) + userId + LOCK_SUFFIX;
-    }
-
-    private String userLockPrefix(long contestId) {
-        return KEY_PREFIX + contestId + USER_SEGMENT;
-    }
-
-    private String processedKey(long contestId) {
-        return KEY_PREFIX + contestId + PROCESSED_SUFFIX;
     }
 
     private static final class ContestScoreboardSummaryFields {

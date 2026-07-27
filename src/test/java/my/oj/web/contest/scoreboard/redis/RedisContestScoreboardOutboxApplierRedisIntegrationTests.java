@@ -1,5 +1,7 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.redis;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
 import my.oj.web.submission.SubmissionResult;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -104,9 +106,9 @@ class RedisContestScoreboardOutboxApplierRedisIntegrationTests {
 
     @Test
     void requeuedCollisionGroupRecoversAfterSequenceReuse() {
-        ContestScoreboardOutboxPayload first = payload(3001L, 21L, SubmissionResult.ACCEPTED, 1);
-        ContestScoreboardOutboxPayload lost = payload(3002L, 22L, SubmissionResult.ACCEPTED, 2);
-        ContestScoreboardOutboxPayload afterRollback = payload(3003L, 23L, SubmissionResult.ACCEPTED, 3);
+        ContestScoreboardUpdate first = payload(3001L, 21L, SubmissionResult.ACCEPTED, 1);
+        ContestScoreboardUpdate lost = payload(3002L, 22L, SubmissionResult.ACCEPTED, 2);
+        ContestScoreboardUpdate afterRollback = payload(3003L, 23L, SubmissionResult.ACCEPTED, 3);
 
         assertThat(applier.apply(701L, first)).isEqualTo(1L);
         assertThat(applier.apply(702L, lost)).isEqualTo(2L);
@@ -190,25 +192,25 @@ class RedisContestScoreboardOutboxApplierRedisIntegrationTests {
         )).isZero();
     }
 
-    private ContestScoreboardOutboxPayload payload(Long submissionId,
+    private ContestScoreboardUpdate payload(Long submissionId,
                                                     SubmissionResult result,
                                                     int submittedMinute) {
         return payload(submissionId, PROBLEM_ID, result, submittedMinute);
     }
 
-    private ContestScoreboardOutboxPayload payload(Long submissionId,
+    private ContestScoreboardUpdate payload(Long submissionId,
                                                     Long problemId,
                                                     SubmissionResult result,
                                                     int submittedMinute) {
         return payload(CONTEST_ID, submissionId, problemId, result, submittedMinute);
     }
 
-    private ContestScoreboardOutboxPayload payload(Long contestId,
+    private ContestScoreboardUpdate payload(Long contestId,
                                                     Long submissionId,
                                                     Long problemId,
                                                     SubmissionResult result,
                                                     int submittedMinute) {
-        return new ContestScoreboardOutboxPayload(
+        return new ContestScoreboardUpdate(
                 submissionId,
                 contestId,
                 problemId,

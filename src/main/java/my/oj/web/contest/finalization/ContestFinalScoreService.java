@@ -3,7 +3,7 @@ package my.oj.web.contest.finalization;
 import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
 import my.oj.web.contest.scoreboard.ContestScoreboardService;
-import my.oj.web.contest.scoreboard.InMemoryContestScoreboardStore;
+import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardStore;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;

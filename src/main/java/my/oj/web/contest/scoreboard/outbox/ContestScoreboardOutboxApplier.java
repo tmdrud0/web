@@ -1,10 +1,12 @@
 package my.oj.web.contest.scoreboard.outbox;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+
 import java.util.List;
 
 public interface ContestScoreboardOutboxApplier {
 
-    Long apply(Long eventId, ContestScoreboardOutboxPayload payload);
+    Long apply(Long eventId, ContestScoreboardUpdate update);
 
     default List<ApplyResult> applyAll(List<ApplyRequest> requests) {
         if (requests == null || requests.isEmpty()) {
@@ -15,7 +17,7 @@ public interface ContestScoreboardOutboxApplier {
                     try {
                         return ApplyResult.success(
                                 request.eventId(),
-                                apply(request.eventId(), request.payload())
+                                apply(request.eventId(), request.update())
                         );
                     } catch (RuntimeException exception) {
                         return ApplyResult.failure(request.eventId(), errorMessage(exception));
@@ -32,25 +34,25 @@ public interface ContestScoreboardOutboxApplier {
         return cause.getClass().getSimpleName() + (message == null ? "" : ": " + message);
     }
 
-    record ApplyRequest(long eventId, ContestScoreboardOutboxPayload payload) {
+    record ApplyRequest(long eventId, ContestScoreboardUpdate update) {
         public ApplyRequest {
-            if (payload == null) {
-                throw new IllegalArgumentException("Scoreboard outbox payload is required");
+            if (update == null) {
+                throw new IllegalArgumentException("Scoreboard update is required");
             }
         }
     }
 
     record ApplyResult(long eventId, Long redisSequence, String errorMessage) {
 
-        static ApplyResult success(long eventId, Long redisSequence) {
+        public static ApplyResult success(long eventId, Long redisSequence) {
             return new ApplyResult(eventId, redisSequence, null);
         }
 
-        static ApplyResult failure(long eventId, String errorMessage) {
+        public static ApplyResult failure(long eventId, String errorMessage) {
             return new ApplyResult(eventId, null, errorMessage);
         }
 
-        boolean succeeded() {
+        public boolean succeeded() {
             return errorMessage == null;
         }
     }

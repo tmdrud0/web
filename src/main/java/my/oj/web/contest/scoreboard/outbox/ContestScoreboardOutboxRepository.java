@@ -17,8 +17,6 @@ public interface ContestScoreboardOutboxRepository extends JpaRepository<Contest
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     Optional<ContestScoreboardOutbox> findById(Long id);
 
-    Optional<ContestScoreboardOutbox> findByContestSubmissionId(Long contestSubmissionId);
-
     @Modifying
     @Query(value = """
             INSERT IGNORE INTO contest_submission_outbox (

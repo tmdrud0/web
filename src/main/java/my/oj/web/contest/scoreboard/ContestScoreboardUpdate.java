@@ -1,10 +1,13 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard;
 
 import my.oj.web.submission.SubmissionResult;
 
 import java.time.LocalDateTime;
 
-public record ContestScoreboardOutboxPayload(
+/**
+ * Immutable input for applying one contest judgement to the live scoreboard.
+ */
+public record ContestScoreboardUpdate(
         Long contestSubmissionId,
         Long contestId,
         Long problemId,
@@ -15,4 +18,3 @@ public record ContestScoreboardOutboxPayload(
         LocalDateTime judgedAt
 ) {
 }
-

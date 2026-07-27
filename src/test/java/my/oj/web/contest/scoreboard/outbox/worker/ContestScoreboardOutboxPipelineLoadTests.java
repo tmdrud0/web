@@ -1,4 +1,4 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.outbox.worker;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;

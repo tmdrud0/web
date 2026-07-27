@@ -1,5 +1,7 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.outbox.worker;
 
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutbox;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
 import jakarta.persistence.EntityManager;
 import my.oj.web.config.TestQuerydslConfig;
 import my.oj.web.contest.Contest;
@@ -32,11 +34,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 @ActiveProfiles("test")
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 @Import({
-        ContestScoreboardOutboxStore.class,
+        JdbcContestScoreboardOutboxQueue.class,
         ContestScoreboardOutboxProcessLock.class,
         TestQuerydslConfig.class
 })
-class ContestScoreboardOutboxStoreMySqlIntegrationTests {
+class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
 
     @Autowired
     private EntityManager entityManager;
@@ -45,7 +47,7 @@ class ContestScoreboardOutboxStoreMySqlIntegrationTests {
     private JdbcTemplate jdbcTemplate;
 
     @Autowired
-    private ContestScoreboardOutboxStore outboxStore;
+    private JdbcContestScoreboardOutboxQueue outboxQueue;
 
     @Autowired
     private ContestScoreboardOutboxProcessLock processLock;
@@ -55,8 +57,8 @@ class ContestScoreboardOutboxStoreMySqlIntegrationTests {
         ContestScoreboardOutbox outbox = persistPendingOutbox();
         Duration lease = Duration.ofSeconds(30);
 
-        List<ContestScoreboardOutboxStore.ClaimedEvent> firstClaim = outboxStore.claim(1, lease);
-        List<ContestScoreboardOutboxStore.ClaimedEvent> whileLeaseIsActive = outboxStore.claim(1, lease);
+        List<JdbcContestScoreboardOutboxQueue.ClaimedEvent> firstClaim = outboxQueue.claim(1, lease);
+        List<JdbcContestScoreboardOutboxQueue.ClaimedEvent> whileLeaseIsActive = outboxQueue.claim(1, lease);
 
         assertThat(firstClaim).hasSize(1);
         assertThat(firstClaim.get(0).eventId()).isEqualTo(outbox.getId());
@@ -73,18 +75,18 @@ class ContestScoreboardOutboxStoreMySqlIntegrationTests {
                 WHERE id = ?
                 """, outbox.getId());
 
-        List<ContestScoreboardOutboxStore.ClaimedEvent> reclaimed = outboxStore.claim(1, lease);
+        List<JdbcContestScoreboardOutboxQueue.ClaimedEvent> reclaimed = outboxQueue.claim(1, lease);
 
         assertThat(reclaimed).hasSize(1);
         assertThat(reclaimed.get(0).eventId()).isEqualTo(outbox.getId());
         assertThat(reclaimed.get(0).claimToken()).isNotEqualTo(firstClaim.get(0).claimToken());
 
-        ContestScoreboardOutboxStore.BatchCompletionResult staleCompletion = outboxStore.completeAll(
-                List.of(new ContestScoreboardOutboxStore.CompletedEvent(firstClaim.get(0), 70L)),
+        JdbcContestScoreboardOutboxQueue.BatchCompletionResult staleCompletion = outboxQueue.completeAll(
+                List.of(new JdbcContestScoreboardOutboxQueue.CompletedEvent(firstClaim.get(0), 70L)),
                 List.of()
         );
-        ContestScoreboardOutboxStore.BatchCompletionResult currentCompletion = outboxStore.completeAll(
-                List.of(new ContestScoreboardOutboxStore.CompletedEvent(reclaimed.get(0), 71L)),
+        JdbcContestScoreboardOutboxQueue.BatchCompletionResult currentCompletion = outboxQueue.completeAll(
+                List.of(new JdbcContestScoreboardOutboxQueue.CompletedEvent(reclaimed.get(0), 71L)),
                 List.of()
         );
 
@@ -106,15 +108,15 @@ class ContestScoreboardOutboxStoreMySqlIntegrationTests {
     void failedEventIsNotImmediatelyReclaimedButBecomesEligibleAfterBackoff() {
         ContestScoreboardOutbox outbox = persistPendingOutbox();
         Duration lease = Duration.ofSeconds(30);
-        ContestScoreboardOutboxStore.ClaimedEvent claimed = outboxStore.claim(1, lease).get(0);
+        JdbcContestScoreboardOutboxQueue.ClaimedEvent claimed = outboxQueue.claim(1, lease).get(0);
 
-        ContestScoreboardOutboxStore.BatchCompletionResult failure = outboxStore.completeAll(
+        JdbcContestScoreboardOutboxQueue.BatchCompletionResult failure = outboxQueue.completeAll(
                 List.of(),
-                List.of(new ContestScoreboardOutboxStore.FailedEvent(claimed, "redis unavailable"))
+                List.of(new JdbcContestScoreboardOutboxQueue.FailedEvent(claimed, "redis unavailable"))
         );
 
         assertThat(failure.failedApplied()).isOne();
-        assertThat(outboxStore.claim(1, lease)).isEmpty();
+        assertThat(outboxQueue.claim(1, lease)).isEmpty();
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT next_attempt_at IS NOT NULL FROM contest_submission_outbox WHERE id = ?",
                 Boolean.class,
@@ -127,9 +129,9 @@ class ContestScoreboardOutboxStoreMySqlIntegrationTests {
                 WHERE id = ?
                 """, outbox.getId());
 
-        assertThat(outboxStore.claim(1, lease))
+        assertThat(outboxQueue.claim(1, lease))
                 .singleElement()
-                .extracting(ContestScoreboardOutboxStore.ClaimedEvent::eventId)
+                .extracting(JdbcContestScoreboardOutboxQueue.ClaimedEvent::eventId)
                 .isEqualTo(outbox.getId());
     }
 

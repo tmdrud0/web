@@ -1,8 +1,10 @@
 package my.oj.web.contest;
 
 import my.oj.web.contest.scoreboard.ContestScoreboardStore;
-import my.oj.web.contest.scoreboard.InMemoryContestScoreboardStore;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdatePublisher;
+import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardStore;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
 import my.oj.web.contest.scoreboard.outbox.DirectContestScoreboardOutboxApplier;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
@@ -37,6 +39,8 @@ class ContestPipelineWiringTests {
     @Autowired
     ContestScoreboardOutboxApplier outboxApplier;
     @Autowired
+    ContestScoreboardUpdatePublisher scoreboardUpdatePublisher;
+    @Autowired
     ContestSubmissionDuplicateRegistry duplicateRegistry;
     @Autowired
     ContestSubmissionRateLimiter rateLimiter;
@@ -53,6 +57,7 @@ class ContestPipelineWiringTests {
     @Test
     void scoreboard_outbox_uses_direct_applier() {
         assertThat(outboxApplier).isInstanceOf(DirectContestScoreboardOutboxApplier.class);
+        assertThat(scoreboardUpdatePublisher).isInstanceOf(ContestScoreboardOutboxService.class);
     }
 
     @Test

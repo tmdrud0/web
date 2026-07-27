@@ -1,6 +1,7 @@
 package my.oj.web.contest.scoreboard.outbox;
 
 import my.oj.web.contest.scoreboard.ContestScoreboardService;
+import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardOutboxApplier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;

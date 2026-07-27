@@ -1,5 +1,6 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.outbox.worker;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.submission.SubmissionResult;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -27,7 +28,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-class ContestScoreboardOutboxStoreTests {
+class JdbcContestScoreboardOutboxQueueTests {
 
     @Test
     void claimLoadsPayloadAndMarksTheBatchWithOneLeaseToken() throws Exception {
@@ -60,20 +61,20 @@ class ContestScoreboardOutboxStoreTests {
         });
         when(jdbcTemplate.batchUpdate(anyString(), any(BatchPreparedStatementSetter.class)))
                 .thenReturn(new int[]{1});
-        ContestScoreboardOutboxStore store = new ContestScoreboardOutboxStore(
+        JdbcContestScoreboardOutboxQueue store = new JdbcContestScoreboardOutboxQueue(
                 jdbcTemplate,
                 transactionManager
         );
 
-        List<ContestScoreboardOutboxStore.ClaimedEvent> claimed = store.claim(
+        List<JdbcContestScoreboardOutboxQueue.ClaimedEvent> claimed = store.claim(
                 25,
                 Duration.ofSeconds(30)
         );
 
         assertThat(claimed).hasSize(1);
         assertThat(claimed.get(0).eventId()).isEqualTo(7L);
-        assertThat(claimed.get(0).payload().contestSubmissionId()).isEqualTo(1007L);
-        assertThat(claimed.get(0).payload().result()).isEqualTo(SubmissionResult.ACCEPTED);
+        assertThat(claimed.get(0).update().contestSubmissionId()).isEqualTo(1007L);
+        assertThat(claimed.get(0).update().result()).isEqualTo(SubmissionResult.ACCEPTED);
         assertThat(claimed.get(0).claimToken()).hasSize(36);
 
         ArgumentCaptor<String> queryCaptor = ArgumentCaptor.forClass(String.class);
@@ -110,16 +111,16 @@ class ContestScoreboardOutboxStoreTests {
         when(transactionManager.getTransaction(any(TransactionDefinition.class))).thenReturn(transactionStatus);
         when(jdbcTemplate.batchUpdate(anyString(), any(BatchPreparedStatementSetter.class)))
                 .thenReturn(new int[]{1}, new int[]{Statement.SUCCESS_NO_INFO});
-        ContestScoreboardOutboxStore store = new ContestScoreboardOutboxStore(
+        JdbcContestScoreboardOutboxQueue store = new JdbcContestScoreboardOutboxQueue(
                 jdbcTemplate,
                 transactionManager
         );
-        ContestScoreboardOutboxStore.ClaimedEvent completed = claimedEvent(1L, "completed-token");
-        ContestScoreboardOutboxStore.ClaimedEvent failed = claimedEvent(2L, "failed-token");
+        JdbcContestScoreboardOutboxQueue.ClaimedEvent completed = claimedEvent(1L, "completed-token");
+        JdbcContestScoreboardOutboxQueue.ClaimedEvent failed = claimedEvent(2L, "failed-token");
 
-        ContestScoreboardOutboxStore.BatchCompletionResult result = store.completeAll(
-                List.of(new ContestScoreboardOutboxStore.CompletedEvent(completed, 91L)),
-                List.of(new ContestScoreboardOutboxStore.FailedEvent(failed, "redis unavailable"))
+        JdbcContestScoreboardOutboxQueue.BatchCompletionResult result = store.completeAll(
+                List.of(new JdbcContestScoreboardOutboxQueue.CompletedEvent(completed, 91L)),
+                List.of(new JdbcContestScoreboardOutboxQueue.FailedEvent(failed, "redis unavailable"))
         );
 
         @SuppressWarnings("unchecked")
@@ -153,13 +154,13 @@ class ContestScoreboardOutboxStoreTests {
         when(transactionManager.getTransaction(any(TransactionDefinition.class))).thenReturn(transactionStatus);
         when(jdbcTemplate.batchUpdate(anyString(), any(BatchPreparedStatementSetter.class)))
                 .thenReturn(new int[]{0});
-        ContestScoreboardOutboxStore store = new ContestScoreboardOutboxStore(
+        JdbcContestScoreboardOutboxQueue store = new JdbcContestScoreboardOutboxQueue(
                 jdbcTemplate,
                 transactionManager
         );
 
-        ContestScoreboardOutboxStore.BatchCompletionResult result = store.completeAll(
-                List.of(new ContestScoreboardOutboxStore.CompletedEvent(
+        JdbcContestScoreboardOutboxQueue.BatchCompletionResult result = store.completeAll(
+                List.of(new JdbcContestScoreboardOutboxQueue.CompletedEvent(
                         claimedEvent(1L, "stale-token"),
                         91L
                 )),
@@ -170,10 +171,10 @@ class ContestScoreboardOutboxStoreTests {
         verify(transactionManager).commit(transactionStatus);
     }
 
-    private ContestScoreboardOutboxStore.ClaimedEvent claimedEvent(long eventId, String claimToken) {
-        return new ContestScoreboardOutboxStore.ClaimedEvent(
+    private JdbcContestScoreboardOutboxQueue.ClaimedEvent claimedEvent(long eventId, String claimToken) {
+        return new JdbcContestScoreboardOutboxQueue.ClaimedEvent(
                 eventId,
-                new ContestScoreboardOutboxPayload(
+                new ContestScoreboardUpdate(
                         1000L + eventId,
                         10L,
                         20L,

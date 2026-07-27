@@ -4,7 +4,7 @@ import my.oj.web.contest.scoreboard.ContestScoreboardService;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplierConfig;
 import my.oj.web.contest.scoreboard.outbox.DirectContestScoreboardOutboxApplier;
-import my.oj.web.contest.scoreboard.outbox.RedisContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardOutboxApplier;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistryConfig;
 import my.oj.web.contest.submission.support.InMemoryContestSubmissionDuplicateRegistry;

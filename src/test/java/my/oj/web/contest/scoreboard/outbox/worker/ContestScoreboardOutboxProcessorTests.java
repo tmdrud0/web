@@ -1,5 +1,10 @@
-package my.oj.web.contest.scoreboard.outbox;
+package my.oj.web.contest.scoreboard.outbox.worker;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutbox;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
+import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxStatus;
 import my.oj.web.submission.SubmissionResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -27,20 +32,20 @@ class ContestScoreboardOutboxProcessorTests {
     private ContestScoreboardOutboxApplier outboxApplier;
 
     @Mock
-    private ContestScoreboardOutboxStore outboxStore;
+    private JdbcContestScoreboardOutboxQueue outboxQueue;
 
     private ContestScoreboardOutboxProcessor processor;
 
     @BeforeEach
     void setUp() {
-        processor = new ContestScoreboardOutboxProcessor(outboxService, outboxApplier, outboxStore);
+        processor = new ContestScoreboardOutboxProcessor(outboxService, outboxApplier, outboxQueue);
     }
 
     @Test
     void processById_assignsSequenceReturnedByAtomicRedisApply() {
         ContestScoreboardOutbox outbox = pendingOutbox(1L, null);
         given(outboxService.lockById(1L)).willReturn(outbox);
-        given(outboxApplier.apply(1L, outbox.toPayload())).willReturn(55L);
+        given(outboxApplier.apply(1L, outbox.toUpdate())).willReturn(55L);
 
         boolean processed = processor.processById(1L);
 
@@ -49,18 +54,18 @@ class ContestScoreboardOutboxProcessorTests {
         assertThat(outbox.getStatus()).isEqualTo(ContestScoreboardOutboxStatus.COMPLETED);
         assertThat(outbox.getProcessedAt()).isNotNull();
 
-        ArgumentCaptor<ContestScoreboardOutboxPayload> payloadCaptor =
-                ArgumentCaptor.forClass(ContestScoreboardOutboxPayload.class);
-        verify(outboxApplier).apply(org.mockito.ArgumentMatchers.eq(1L), payloadCaptor.capture());
-        assertThat(payloadCaptor.getValue().contestSubmissionId()).isEqualTo(100L);
-        assertThat(payloadCaptor.getValue().result()).isEqualTo(SubmissionResult.ACCEPTED);
+        ArgumentCaptor<ContestScoreboardUpdate> updateCaptor =
+                ArgumentCaptor.forClass(ContestScoreboardUpdate.class);
+        verify(outboxApplier).apply(org.mockito.ArgumentMatchers.eq(1L), updateCaptor.capture());
+        assertThat(updateCaptor.getValue().contestSubmissionId()).isEqualTo(100L);
+        assertThat(updateCaptor.getValue().result()).isEqualTo(SubmissionResult.ACCEPTED);
     }
 
     @Test
     void processById_allowsDirectStoreWithoutRedisSequence() {
         ContestScoreboardOutbox outbox = pendingOutbox(2L, null);
         given(outboxService.lockById(2L)).willReturn(outbox);
-        given(outboxApplier.apply(2L, outbox.toPayload())).willReturn(null);
+        given(outboxApplier.apply(2L, outbox.toUpdate())).willReturn(null);
 
         boolean processed = processor.processById(2L);
 
@@ -73,7 +78,7 @@ class ContestScoreboardOutboxProcessorTests {
     void processById_marksFailedWhenAtomicApplyThrows() {
         ContestScoreboardOutbox outbox = pendingOutbox(3L, null);
         given(outboxService.lockById(3L)).willReturn(outbox);
-        given(outboxApplier.apply(3L, outbox.toPayload()))
+        given(outboxApplier.apply(3L, outbox.toUpdate()))
                 .willThrow(new IllegalStateException("redis down"));
 
         boolean processed = processor.processById(3L);
@@ -87,25 +92,25 @@ class ContestScoreboardOutboxProcessorTests {
     @Test
     void processBatchAppliesClaimedEventsAndCompletesSuccessesAndFailuresTogether() {
         Duration lease = Duration.ofSeconds(30);
-        ContestScoreboardOutboxPayload accepted = payload(1001L, SubmissionResult.ACCEPTED);
-        ContestScoreboardOutboxPayload failed = payload(1002L, SubmissionResult.WRONG_ANSWER);
-        ContestScoreboardOutboxStore.ClaimedEvent first =
-                new ContestScoreboardOutboxStore.ClaimedEvent(11L, accepted, "claim-token");
-        ContestScoreboardOutboxStore.ClaimedEvent second =
-                new ContestScoreboardOutboxStore.ClaimedEvent(12L, failed, "claim-token");
-        given(outboxStore.claim(50, lease)).willReturn(List.of(first, second));
+        ContestScoreboardUpdate accepted = payload(1001L, SubmissionResult.ACCEPTED);
+        ContestScoreboardUpdate failed = payload(1002L, SubmissionResult.WRONG_ANSWER);
+        JdbcContestScoreboardOutboxQueue.ClaimedEvent first =
+                new JdbcContestScoreboardOutboxQueue.ClaimedEvent(11L, accepted, "claim-token");
+        JdbcContestScoreboardOutboxQueue.ClaimedEvent second =
+                new JdbcContestScoreboardOutboxQueue.ClaimedEvent(12L, failed, "claim-token");
+        given(outboxQueue.claim(50, lease)).willReturn(List.of(first, second));
         given(outboxApplier.applyAll(org.mockito.ArgumentMatchers.anyList())).willReturn(List.of(
                 ContestScoreboardOutboxApplier.ApplyResult.success(11L, 101L),
                 ContestScoreboardOutboxApplier.ApplyResult.failure(12L, "wrong Redis key type")
         ));
-        given(outboxStore.completeAll(org.mockito.ArgumentMatchers.anyList(),
-                org.mockito.ArgumentMatchers.anyList()))
-                .willReturn(new ContestScoreboardOutboxStore.BatchCompletionResult(1, 1, 1, 1));
+        given(outboxQueue.completeAll(org.mockito.ArgumentMatchers.anyList(),
+                        org.mockito.ArgumentMatchers.anyList()))
+                .willReturn(new JdbcContestScoreboardOutboxQueue.BatchCompletionResult(1, 1, 1, 1));
 
         ContestScoreboardOutboxProcessor.BatchProcessResult result = processor.processBatch(50, lease);
 
         assertThat(result).isEqualTo(new ContestScoreboardOutboxProcessor.BatchProcessResult(2, 1, 1, 0));
-        verify(outboxStore).completeAll(
+        verify(outboxQueue).completeAll(
                 org.mockito.ArgumentMatchers.argThat(completed ->
                         completed.size() == 1
                                 && completed.get(0).event().eventId() == 11L
@@ -133,8 +138,8 @@ class ContestScoreboardOutboxProcessorTests {
         return outbox;
     }
 
-    private ContestScoreboardOutboxPayload payload(Long submissionId, SubmissionResult result) {
-        return new ContestScoreboardOutboxPayload(
+    private ContestScoreboardUpdate payload(Long submissionId, SubmissionResult result) {
+        return new ContestScoreboardUpdate(
                 submissionId,
                 10L,
                 20L,

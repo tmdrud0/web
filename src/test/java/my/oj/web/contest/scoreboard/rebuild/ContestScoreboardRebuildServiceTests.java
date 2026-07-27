@@ -1,5 +1,6 @@
-package my.oj.web.contest.scoreboard;
+package my.oj.web.contest.scoreboard.rebuild;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardService;
 import my.oj.web.contest.Contest;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;

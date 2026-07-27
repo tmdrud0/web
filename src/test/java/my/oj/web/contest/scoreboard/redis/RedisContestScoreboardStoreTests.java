@@ -1,5 +1,7 @@
-package my.oj.web.contest.scoreboard;
+package my.oj.web.contest.scoreboard.redis;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
+import my.oj.web.contest.scoreboard.ContestScoreboardSlice;
 import my.oj.web.submission.SubmissionResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;

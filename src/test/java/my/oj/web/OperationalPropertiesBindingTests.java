@@ -1,6 +1,6 @@
 package my.oj.web;
 
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxProperties;
+import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProperties;
 import my.oj.web.contest.submission.config.ContestSubmissionExecutorProperties;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultWriterProperties;
 import my.oj.web.contest.submission.messaging.ContestJudgeOutboxRelayProperties;

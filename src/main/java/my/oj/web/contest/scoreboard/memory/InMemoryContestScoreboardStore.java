@@ -1,5 +1,10 @@
-package my.oj.web.contest.scoreboard;
+package my.oj.web.contest.scoreboard.memory;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
+import my.oj.web.contest.scoreboard.ContestScoreboardPolicy;
+import my.oj.web.contest.scoreboard.ContestScoreboardSlice;
+import my.oj.web.contest.scoreboard.ContestScoreboardSnapshot;
+import my.oj.web.contest.scoreboard.ContestScoreboardStore;
 import my.oj.web.submission.SubmissionResult;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
@@ -44,7 +49,11 @@ public class InMemoryContestScoreboardStore implements ContestScoreboardStore {
         if (result == SubmissionResult.ACCEPTED) {
             problemState.accepted = true;
             problemState.acceptedTime = submittedTime;
-            long penalty = ContestScoreboardMath.computePenalty(state.contestStart, submittedTime, problemState.wrongAttempts);
+            long penalty = ContestScoreboardPolicy.computePenalty(
+                    state.contestStart,
+                    submittedTime,
+                    problemState.wrongAttempts
+            );
             userState.penalty += penalty;
             userState.solvedCount += 1;
         } else if (result != SubmissionResult.PENDING) {

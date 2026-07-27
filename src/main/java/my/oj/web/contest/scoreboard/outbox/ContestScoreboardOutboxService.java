@@ -1,49 +1,43 @@
 package my.oj.web.contest.scoreboard.outbox;
 
 import lombok.RequiredArgsConstructor;
-import my.oj.web.submission.SubmissionResult;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdatePublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
-import java.util.Optional;
 
 @Service
 @RequiredArgsConstructor
-public class ContestScoreboardOutboxService {
+public class ContestScoreboardOutboxService implements ContestScoreboardUpdatePublisher {
 
     private final ContestScoreboardOutboxRepository repository;
 
+    @Override
     @Transactional
-    public boolean insertPendingIfAbsent(Long contestSubmissionId,
-                                         Long contestId,
-                                         Long problemId,
-                                         Long userId,
-                                         LocalDateTime contestStart,
-                                         LocalDateTime submittedTime,
-                                         SubmissionResult result,
-                                         LocalDateTime judgedAt) {
+    public boolean publishIfAbsent(ContestScoreboardUpdate update) {
         return repository.insertPendingIfAbsent(
-                contestSubmissionId,
-                contestId,
-                problemId,
-                userId,
-                contestStart,
-                submittedTime,
-                judgedAt,
-                result.name(),
+                update.contestSubmissionId(),
+                update.contestId(),
+                update.problemId(),
+                update.userId(),
+                update.contestStart(),
+                update.submittedTime(),
+                update.judgedAt(),
+                update.result().name(),
                 LocalDateTime.now()
         ) == 1;
-    }
-
-    @Transactional(readOnly = true)
-    public Optional<ContestScoreboardOutbox> findByContestSubmissionId(Long contestSubmissionId) {
-        return repository.findByContestSubmissionId(contestSubmissionId);
     }
 
     @Transactional
     public ContestScoreboardOutbox lockById(Long id) {
         return repository.findById(id)
                 .orElseThrow(() -> new IllegalStateException("Contest scoreboard outbox not found: " + id));
+    }
+
+    @Transactional
+    public void deleteByContestId(Long contestId) {
+        repository.deleteByContestId(contestId);
     }
 }
