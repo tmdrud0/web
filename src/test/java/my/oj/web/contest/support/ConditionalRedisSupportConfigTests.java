@@ -8,7 +8,6 @@ import my.oj.web.contest.scoreboard.outbox.RedisContestScoreboardOutboxApplier;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistryConfig;
 import my.oj.web.contest.submission.support.InMemoryContestSubmissionDuplicateRegistry;
-import my.oj.web.contest.submission.support.NoopContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.RedisContestSubmissionDuplicateRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -63,14 +62,6 @@ class ConditionalRedisSupportConfigTests {
                     assertThat(context.getBean(ContestSubmissionDuplicateRegistry.class))
                             .isInstanceOf(RedisContestSubmissionDuplicateRegistry.class);
                 });
-    }
-
-    @Test
-    void dedupCanBeTurnedOffExplicitly() {
-        contextRunner
-                .withPropertyValues("contest.submission.dedup.store=none")
-                .run(context -> assertThat(context.getBean(ContestSubmissionDuplicateRegistry.class))
-                        .isInstanceOf(NoopContestSubmissionDuplicateRegistry.class));
     }
 
     /**

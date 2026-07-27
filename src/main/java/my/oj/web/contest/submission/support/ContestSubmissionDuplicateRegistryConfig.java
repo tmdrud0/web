@@ -22,9 +22,4 @@ public class ContestSubmissionDuplicateRegistryConfig {
         return new RedisContestSubmissionDuplicateRegistry(redisTemplate);
     }
 
-    @Bean
-    @ConditionalOnProperty(prefix = "contest.submission.dedup", name = "store", havingValue = "none")
-    ContestSubmissionDuplicateRegistry noopContestSubmissionDuplicateRegistry() {
-        return new NoopContestSubmissionDuplicateRegistry();
-    }
 }
