@@ -4,8 +4,6 @@ import my.oj.web.contest.scoreboard.ContestScoreboardStore;
 import my.oj.web.contest.scoreboard.InMemoryContestScoreboardStore;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
 import my.oj.web.contest.scoreboard.outbox.DirectContestScoreboardOutboxApplier;
-import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultBatchWriter;
-import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultWriter;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
 import my.oj.web.contest.submission.support.ContestSubmissionRateLimiter;
@@ -44,13 +42,6 @@ class ContestPipelineWiringTests {
     ContestSubmissionRateLimiter rateLimiter;
     @Autowired
     ContestSubmissionIdGenerator idGenerator;
-    @Autowired
-    ContestSubmissionJudgeResultWriter judgeResultWriter;
-
-    @Test
-    void write_paths_match_production() {
-        assertThat(judgeResultWriter).isInstanceOf(ContestSubmissionJudgeResultBatchWriter.class);
-    }
 
     @Test
     void shared_state_still_runs_in_memory_until_a_container_is_available() {

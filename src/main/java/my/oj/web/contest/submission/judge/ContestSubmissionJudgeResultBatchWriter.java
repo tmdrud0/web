@@ -4,7 +4,6 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import my.oj.web.contest.submission.core.ContestSubmissionJudgeProjection;
 import my.oj.web.submission.SubmissionResult;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
@@ -20,11 +19,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Component
-@ConditionalOnProperty(
-        prefix = "contest.submission.judge.result-writer",
-        name = "mode",
-        havingValue = "batch"
-)
 public class ContestSubmissionJudgeResultBatchWriter implements ContestSubmissionJudgeResultWriter {
 
     private final JdbcContestSubmissionJudgeResultBatchPersistence persistence;

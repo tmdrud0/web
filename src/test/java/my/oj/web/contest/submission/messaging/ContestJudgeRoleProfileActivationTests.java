@@ -20,20 +20,20 @@ import static org.mockito.Mockito.mock;
 class ContestJudgeRoleProfileActivationTests {
 
     @Test
-    void multiWebProfileStartsNoJudgeMessagingWorkers() {
+    void multiWebProfileStartsResultWriterWithoutJudgeMessagingWorkers() {
         try (ConfigurableApplicationContext context = runWithProfile("multi-web")) {
             assertThatMissing(context, ContestJudgeOutboxRelay.class);
             assertThatMissing(context, ContestJudgeRabbitListener.class);
-            assertThatMissing(context, ContestSubmissionJudgeResultBatchWriter.class);
+            assertThatPresent(context, ContestSubmissionJudgeResultBatchWriter.class);
         }
     }
 
     @Test
-    void multiBatchProfileStartsOnlyJudgeOutboxRelay() {
+    void multiBatchProfileStartsJudgeOutboxRelayAndResultWriter() {
         try (ConfigurableApplicationContext context = runWithProfile("multi-batch")) {
             assertThatPresent(context, ContestJudgeOutboxRelay.class);
             assertThatMissing(context, ContestJudgeRabbitListener.class);
-            assertThatMissing(context, ContestSubmissionJudgeResultBatchWriter.class);
+            assertThatPresent(context, ContestSubmissionJudgeResultBatchWriter.class);
         }
     }
 
