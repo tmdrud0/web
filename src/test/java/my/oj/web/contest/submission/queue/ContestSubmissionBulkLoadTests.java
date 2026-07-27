@@ -58,10 +58,6 @@ class ContestSubmissionBulkLoadTests {
                 "jdbc:mysql://localhost:3306/oj_codex_bulk_load_20260326"
                         + "?createDatabaseIfNotExist=true&rewriteBatchedStatements=true&cachePrepStmts=true"
         ));
-        registry.add("contest.submission.bulk.persistence-mode", () -> System.getenv().getOrDefault(
-                "CONTEST_SUBMISSION_BULK_PERSISTENCE_MODE",
-                "jpa"
-        ));
     }
 
     private static final int USER_COUNT = 1000;
