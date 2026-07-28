@@ -38,14 +38,20 @@ public interface ContestScoreboardOutboxRepository extends JpaRepository<Contest
             """)
     int requeueByRedisSequenceIn(@Param("sequences") Collection<Long> sequences);
 
+    /**
+     * The highest sequences on record, which is where a lost tail would sit. The caller
+     * compares them against the Redis allocator rather than filtering here, so the allocator
+     * can be read after this snapshot is taken - see
+     * {@code ContestScoreboardOutboxRecoveryService#requeueLostTail}.
+     */
     @Query("""
-            select o.id
+            select new my.oj.web.contest.scoreboard.outbox.SequencedOutboxRow(o.id, o.redisSequence)
             from ContestScoreboardOutbox o
-            where o.redisSequence > :redisSequence
+            where o.redisSequence is not null
               and o.status <> my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxStatus.PROCESSING
-            order by o.redisSequence asc, o.id asc
+            order by o.redisSequence desc, o.id desc
             """)
-    List<Long> findIdsAboveRedisSequence(@Param("redisSequence") Long redisSequence, Pageable pageable);
+    List<SequencedOutboxRow> findHighestRedisSequences(Pageable pageable);
 
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query("""

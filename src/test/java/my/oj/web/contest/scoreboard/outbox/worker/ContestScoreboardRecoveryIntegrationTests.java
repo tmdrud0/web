@@ -95,6 +95,28 @@ class ContestScoreboardRecoveryIntegrationTests {
         assertRequeued(lostB.getId());
     }
 
+    /**
+     * The allocator having moved past every recorded sequence is the normal case under load,
+     * not a lost tail.
+     */
+    @Test
+    void rowsTheAllocatorStillCoversAreLeftAlone() {
+        ContestScoreboardOutbox healthy = saveCompletedOutbox(2101L, 90L);
+        ContestScoreboardOutbox alsoHealthy = saveCompletedOutbox(2102L, 91L);
+        sequenceApplier.setCurrentSequence(95L);
+
+        int requeued = recoveryService.requeueLostTail(10);
+        entityManager.clear();
+
+        assertThat(requeued).isZero();
+        for (ContestScoreboardOutbox row : List.of(healthy, alsoHealthy)) {
+            ContestScoreboardOutbox reloaded = outboxRepository.findById(row.getId()).orElseThrow();
+            assertThat(reloaded.getStatus()).isEqualTo(ContestScoreboardOutboxStatus.COMPLETED);
+            assertThat(reloaded.getRedisSequence()).isEqualTo(row.getRedisSequence());
+            assertThat(reloaded.getProcessedAt()).isNotNull();
+        }
+    }
+
     private ContestScoreboardOutbox saveCompletedOutbox(Long submissionId, Long redisSequence) {
         ContestScoreboardOutbox outbox = ContestScoreboardOutbox.pending(
                 submissionId,
