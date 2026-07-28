@@ -1,11 +1,9 @@
 package my.oj.web.contest;
 
-import my.oj.web.contest.scoreboard.ContestScoreboardStore;
-import my.oj.web.contest.scoreboard.ContestScoreboardUpdatePublisher;
-import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardStore;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
-import my.oj.web.contest.scoreboard.outbox.DirectContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardReader;
+import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardReader;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
 import my.oj.web.contest.submission.support.ContestSubmissionRateLimiter;
@@ -35,11 +33,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ContestPipelineWiringTests {
 
     @Autowired
-    ContestScoreboardStore scoreboardStore;
+    ContestScoreboardReader scoreboardReader;
     @Autowired
-    ContestScoreboardOutboxApplier outboxApplier;
-    @Autowired
-    ContestScoreboardUpdatePublisher scoreboardUpdatePublisher;
+    ContestScoreboardApplier scoreboardApplier;
     @Autowired
     ContestSubmissionDuplicateRegistry duplicateRegistry;
     @Autowired
@@ -49,15 +45,14 @@ class ContestPipelineWiringTests {
 
     @Test
     void shared_state_still_runs_in_memory_until_a_container_is_available() {
-        assertThat(scoreboardStore).isInstanceOf(InMemoryContestScoreboardStore.class);
+        assertThat(scoreboardReader).isInstanceOf(InMemoryContestScoreboardReader.class);
         assertThat(duplicateRegistry).isInstanceOf(InMemoryContestSubmissionDuplicateRegistry.class);
         assertThat(rateLimiter).isInstanceOf(InMemoryContestSubmissionRateLimiter.class);
     }
 
     @Test
-    void scoreboard_outbox_uses_direct_applier() {
-        assertThat(outboxApplier).isInstanceOf(DirectContestScoreboardOutboxApplier.class);
-        assertThat(scoreboardUpdatePublisher).isInstanceOf(ContestScoreboardOutboxService.class);
+    void scoreboard_writes_go_through_the_in_memory_applier() {
+        assertThat(scoreboardApplier).isInstanceOf(InMemoryContestScoreboardApplier.class);
     }
 
     @Test

@@ -1,64 +1,15 @@
 package my.oj.web.contest.scoreboard.outbox;
 
-import jakarta.persistence.LockModeType;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.Collection;
 import java.util.List;
-import java.util.Optional;
 
 public interface ContestScoreboardOutboxRepository extends JpaRepository<ContestScoreboardOutbox, Long> {
-
-    @Lock(LockModeType.PESSIMISTIC_WRITE)
-    Optional<ContestScoreboardOutbox> findById(Long id);
-
-    @Modifying
-    @Query(value = """
-            INSERT IGNORE INTO contest_submission_outbox (
-                contest_submission_id,
-                contest_id,
-                problem_id,
-                user_id,
-                contest_start,
-                submitted_time,
-                judged_at,
-                result,
-                status,
-                created_at,
-                processed_at,
-                last_error_message,
-                redis_seq
-            )
-            VALUES (
-                :contestSubmissionId,
-                :contestId,
-                :problemId,
-                :userId,
-                :contestStart,
-                :submittedTime,
-                :judgedAt,
-                :result,
-                'PENDING',
-                :createdAt,
-                NULL,
-                NULL,
-                NULL
-            )
-            """, nativeQuery = true)
-    int insertPendingIfAbsent(@Param("contestSubmissionId") Long contestSubmissionId,
-                              @Param("contestId") Long contestId,
-                              @Param("problemId") Long problemId,
-                              @Param("userId") Long userId,
-                              @Param("contestStart") java.time.LocalDateTime contestStart,
-                              @Param("submittedTime") java.time.LocalDateTime submittedTime,
-                              @Param("judgedAt") java.time.LocalDateTime judgedAt,
-                              @Param("result") String result,
-                              @Param("createdAt") java.time.LocalDateTime createdAt);
 
     @Query("""
             select o.redisSequence
@@ -80,20 +31,27 @@ public interface ContestScoreboardOutboxRepository extends JpaRepository<Contest
                 o.lastErrorMessage = null,
                 o.claimToken = null,
                 o.claimedAt = null,
-                o.nextAttemptAt = null
+                o.nextAttemptAt = null,
+                o.dueAt = current_timestamp
             where o.redisSequence in :sequences
               and o.status <> my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxStatus.PROCESSING
             """)
     int requeueByRedisSequenceIn(@Param("sequences") Collection<Long> sequences);
 
+    /**
+     * The highest sequences on record, which is where a lost tail would sit. The caller
+     * compares them against the Redis allocator rather than filtering here, so the allocator
+     * can be read after this snapshot is taken - see
+     * {@code ContestScoreboardOutboxRecoveryService#requeueLostTail}.
+     */
     @Query("""
-            select o.id
+            select new my.oj.web.contest.scoreboard.outbox.SequencedOutboxRow(o.id, o.redisSequence)
             from ContestScoreboardOutbox o
-            where o.redisSequence > :redisSequence
+            where o.redisSequence is not null
               and o.status <> my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxStatus.PROCESSING
-            order by o.redisSequence asc, o.id asc
+            order by o.redisSequence desc, o.id desc
             """)
-    List<Long> findIdsAboveRedisSequence(@Param("redisSequence") Long redisSequence, Pageable pageable);
+    List<SequencedOutboxRow> findHighestRedisSequences(Pageable pageable);
 
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query("""
@@ -104,7 +62,8 @@ public interface ContestScoreboardOutboxRepository extends JpaRepository<Contest
                 o.lastErrorMessage = null,
                 o.claimToken = null,
                 o.claimedAt = null,
-                o.nextAttemptAt = null
+                o.nextAttemptAt = null,
+                o.dueAt = current_timestamp
             where o.id in :ids
               and o.redisSequence is not null
               and o.status <> my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxStatus.PROCESSING

@@ -12,30 +12,6 @@ import java.util.Optional;
 
 public interface ContestSubmissionResultRepository extends JpaRepository<ContestSubmissionResult, Long> {
 
-    @Modifying
-    @Query(value = """
-            INSERT IGNORE INTO contest_submission_result (
-                submission_id,
-                contest_id,
-                provisional_result,
-                provisional_judged_at,
-                final_result,
-                final_judged_at
-            )
-            VALUES (
-                :submissionId,
-                :contestId,
-                :provisionalResult,
-                :provisionalJudgedAt,
-                NULL,
-                NULL
-            )
-            """, nativeQuery = true)
-    int insertProvisionalIfAbsent(@Param("submissionId") Long submissionId,
-                                  @Param("contestId") Long contestId,
-                                  @Param("provisionalResult") String provisionalResult,
-                                  @Param("provisionalJudgedAt") java.time.LocalDateTime provisionalJudgedAt);
-
     @Query("""
             select csr.submission.id
             from ContestSubmissionResult csr

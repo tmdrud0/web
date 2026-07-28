@@ -26,6 +26,12 @@ public class JdbcContestSubmissionJudgeResultBatchPersistence {
             VALUES (?, ?, ?, ?, NULL, NULL)
             """;
 
+    /**
+     * {@code due_at} drives which rows the scoreboard worker claims and is compared against the
+     * database clock, so every writer stamps it with {@code CURRENT_TIMESTAMP(6)} rather than a
+     * JVM timestamp - otherwise a JVM in a different time zone makes rows claimable too early or
+     * never at all.
+     */
     private static final String OUTBOX_INSERT_SQL = """
             INSERT IGNORE INTO contest_submission_outbox (
                 contest_submission_id,
@@ -38,11 +44,12 @@ public class JdbcContestSubmissionJudgeResultBatchPersistence {
                 result,
                 status,
                 created_at,
+                due_at,
                 processed_at,
                 last_error_message,
                 redis_seq
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, NULL, NULL, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, CURRENT_TIMESTAMP(6), NULL, NULL, NULL)
             """;
 
     private final JdbcTemplate jdbcTemplate;

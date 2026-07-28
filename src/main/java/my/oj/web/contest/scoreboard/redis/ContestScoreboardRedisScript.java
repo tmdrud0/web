@@ -3,6 +3,19 @@ package my.oj.web.contest.scoreboard.redis;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 
+/**
+ * The whole write path for the live scoreboard, as one atomic script.
+ *
+ * <p>Deduplication keys off {@code contestSubmissionId} (ARGV[1]) rather than the outbox row
+ * id. {@code uk_cs_outbox_submission} makes those one-to-one, and keying off the submission
+ * lets a rebuild replay the same judgement without inventing an id space that could collide
+ * with the outbox's.
+ *
+ * <p>Two structures track a submission, and the difference matters. KEYS[2] maps submission to
+ * sequence and is global, so a sequence stays stable for the lifetime of the deployment. KEYS[6]
+ * records what has already been applied and is per-contest, so {@code reset} clears it and a
+ * rebuild re-applies every judgement onto empty standings while sequences stay put.
+ */
 final class ContestScoreboardRedisScript {
 
     static final String TEXT = """
@@ -27,11 +40,11 @@ final class ContestScoreboardRedisScript {
                         return parsed
                     end
 
-                    local contestMinutes = tonumber(ARGV[4])
-                    local wrongPenalty = tonumber(ARGV[5])
-                    local solvedWeight = tonumber(ARGV[6])
-                    local penaltyWeight = tonumber(ARGV[7])
-                    local userId = tonumber(ARGV[8])
+                    local contestMinutes = tonumber(ARGV[3])
+                    local wrongPenalty = tonumber(ARGV[4])
+                    local solvedWeight = tonumber(ARGV[5])
+                    local penaltyWeight = tonumber(ARGV[6])
+                    local userId = tonumber(ARGV[7])
                     if not contestMinutes or not wrongPenalty or not solvedWeight or not penaltyWeight or not userId then
                         return redis.error_reply('Invalid scoreboard numeric argument')
                     end
@@ -61,10 +74,10 @@ final class ContestScoreboardRedisScript {
                         end
                     end
 
-                    local alreadyProcessed = redis.call('sismember', KEYS[6], ARGV[2])
+                    local alreadyProcessed = redis.call('sismember', KEYS[6], ARGV[1])
                     if alreadyProcessed == 1 then
                         if not existingSequence then
-                            return redis.error_reply('Processed scoreboard event has no sequence mapping')
+                            return redis.error_reply('Processed scoreboard submission has no sequence mapping')
                         end
                         return tonumber(existingSequence)
                     end
@@ -93,17 +106,17 @@ final class ContestScoreboardRedisScript {
                         redis.call('hset', KEYS[2], ARGV[1], sequence)
                     end
 
-                    if ARGV[3] ~= 'PENDING' then
+                    if ARGV[2] ~= 'PENDING' then
                         if not initialized then
                             redis.call('hset', KEYS[4],
                                     'solved', '0',
                                     'penalty', '0',
                                     'initialized', '1')
-                            redis.call('zadd', KEYS[3], -userId, ARGV[8])
+                            redis.call('zadd', KEYS[3], -userId, ARGV[7])
                         end
 
                         if accepted ~= '1' then
-                            if ARGV[3] == 'ACCEPTED' then
+                            if ARGV[2] == 'ACCEPTED' then
                                 local penaltyIncrement = contestMinutes + wrongAttempts * wrongPenalty
                                 redis.call('hset', KEYS[5],
                                         'accepted', '1',
@@ -111,17 +124,17 @@ final class ContestScoreboardRedisScript {
                                 local solved = redis.call('hincrby', KEYS[4], 'solved', 1)
                                 local penalty = redis.call('hincrby', KEYS[4], 'penalty', penaltyIncrement)
                                 local score = solved * solvedWeight - penalty * penaltyWeight - userId
-                                redis.call('zadd', KEYS[3], score, ARGV[8])
+                                redis.call('zadd', KEYS[3], score, ARGV[7])
                             else
                                 redis.call('hset', KEYS[5], 'accepted', '0')
                                 redis.call('hincrby', KEYS[5], 'wrongAttempts', 1)
                                 local score = currentSolved * solvedWeight - currentPenalty * penaltyWeight - userId
-                                redis.call('zadd', KEYS[3], score, ARGV[8])
+                                redis.call('zadd', KEYS[3], score, ARGV[7])
                             end
                         end
                     end
 
-                    redis.call('sadd', KEYS[6], ARGV[2])
+                    redis.call('sadd', KEYS[6], ARGV[1])
                     return tonumber(sequence)
                     """;
 

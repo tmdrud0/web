@@ -20,6 +20,26 @@ class JdbcContestScoreboardOutboxQueue {
 
     private static final int MAX_ERROR_LENGTH = 500;
 
+    /**
+     * Retry delay in seconds: 1, 2, 4, ... capped at 300. {@code attempts} is already incremented
+     * by {@link #claim}, so the first failure waits one second.
+     */
+    private static final String RETRY_BACKOFF =
+            "TIMESTAMPADD(SECOND, LEAST(300, POW(2, LEAST(GREATEST(attempts - 1, 0), 9))), CURRENT_TIMESTAMP(6))";
+
+    /**
+     * A failed row becomes claimable again exactly when its backoff elapses, so {@code due_at} and
+     * {@code next_attempt_at} are the same instant - the latter is kept for observability.
+     */
+    private static final String FAIL_SQL = """
+            UPDATE contest_submission_outbox
+            SET status = 'FAILED', claim_token = NULL, claimed_at = NULL, processed_at = NULL,
+                next_attempt_at = %1$s,
+                due_at = %1$s,
+                last_error_message = ?
+            WHERE id = ? AND status = 'PROCESSING' AND claim_token = ?
+            """.formatted(RETRY_BACKOFF);
+
     private final JdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
 
@@ -38,16 +58,8 @@ class JdbcContestScoreboardOutboxQueue {
                             SELECT id, contest_submission_id, contest_id, problem_id, user_id,
                                    contest_start, submitted_time, result, judged_at
                             FROM contest_submission_outbox
-                            WHERE status = 'PENDING'
-                               OR (status = 'FAILED' AND (
-                                   next_attempt_at IS NULL
-                                   OR next_attempt_at <= CURRENT_TIMESTAMP(6)
-                               ))
-                               OR (status = 'PROCESSING' AND (
-                                   claimed_at IS NULL
-                                   OR claimed_at < TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6))
-                               ))
-                            ORDER BY COALESCE(next_attempt_at, claimed_at, created_at), created_at, id
+                            WHERE due_at <= CURRENT_TIMESTAMP(6)
+                            ORDER BY due_at, id
                             LIMIT ?
                             FOR UPDATE SKIP LOCKED
                             """,
@@ -68,7 +80,6 @@ class JdbcContestScoreboardOutboxQueue {
                                             : resultSet.getTimestamp("judged_at").toLocalDateTime()
                             )
                     ),
-                    -leaseMicros,
                     Math.max(1, batchSize)
             );
 
@@ -83,6 +94,7 @@ class JdbcContestScoreboardOutboxQueue {
             jdbcTemplate.batchUpdate("""
                     UPDATE contest_submission_outbox
                     SET status = 'PROCESSING', claim_token = ?, claimed_at = CURRENT_TIMESTAMP(6),
+                        due_at = TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)),
                         attempts = attempts + 1, next_attempt_at = NULL, last_error_message = NULL
                     WHERE id = ?
                     """, new BatchPreparedStatementSetter() {
@@ -90,7 +102,8 @@ class JdbcContestScoreboardOutboxQueue {
                 public void setValues(PreparedStatement statement, int index) throws SQLException {
                     ClaimedEvent event = events.get(index);
                     statement.setString(1, event.claimToken());
-                    statement.setLong(2, event.eventId());
+                    statement.setLong(2, leaseMicros);
+                    statement.setLong(3, event.eventId());
                 }
 
                 @Override
@@ -116,8 +129,8 @@ class JdbcContestScoreboardOutboxQueue {
                     : jdbcTemplate.batchUpdate("""
                             UPDATE contest_submission_outbox
                             SET status = 'COMPLETED', redis_seq = ?, processed_at = CURRENT_TIMESTAMP(6),
-                                claim_token = NULL, claimed_at = NULL, next_attempt_at = NULL,
-                                last_error_message = NULL
+                                claim_token = NULL, claimed_at = NULL, due_at = NULL,
+                                next_attempt_at = NULL, last_error_message = NULL
                             WHERE id = ? AND status = 'PROCESSING' AND claim_token = ?
                             """, new BatchPreparedStatementSetter() {
                         @Override
@@ -140,17 +153,7 @@ class JdbcContestScoreboardOutboxQueue {
 
             int[] failedCounts = safeFailed.isEmpty()
                     ? new int[0]
-                    : jdbcTemplate.batchUpdate("""
-                            UPDATE contest_submission_outbox
-                            SET status = 'FAILED', claim_token = NULL, claimed_at = NULL, processed_at = NULL,
-                                next_attempt_at = TIMESTAMPADD(
-                                    SECOND,
-                                    LEAST(300, POW(2, LEAST(GREATEST(attempts - 1, 0), 9))),
-                                    CURRENT_TIMESTAMP(6)
-                                ),
-                                last_error_message = ?
-                            WHERE id = ? AND status = 'PROCESSING' AND claim_token = ?
-                            """, new BatchPreparedStatementSetter() {
+                    : jdbcTemplate.batchUpdate(FAIL_SQL, new BatchPreparedStatementSetter() {
                         @Override
                         public void setValues(PreparedStatement statement, int index) throws SQLException {
                             FailedEvent event = safeFailed.get(index);

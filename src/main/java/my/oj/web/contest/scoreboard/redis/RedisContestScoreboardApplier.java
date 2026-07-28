@@ -2,9 +2,9 @@ package my.oj.web.contest.scoreboard.redis;
 
 import io.lettuce.core.RedisCommandExecutionException;
 import lombok.extern.slf4j.Slf4j;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardPolicy;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
 import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.connection.lettuce.LettuceConnection;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
@@ -13,18 +13,25 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 @Slf4j
-public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOutboxApplier {
+public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
 
     static final String SEQUENCE_KEY = ContestScoreboardRedisKeys.OUTBOX_SEQUENCE;
 
+    private static final int SCRIPT_KEY_COUNT = 6;
+
     private final StringRedisTemplate redisTemplate;
+    private final ContestRedisKeyValueClient redisClient;
     private volatile String scriptSha;
 
-    public RedisContestScoreboardOutboxApplier(StringRedisTemplate redisTemplate) {
+    public RedisContestScoreboardApplier(StringRedisTemplate redisTemplate,
+                                         ContestRedisKeyValueClient redisClient) {
         this.redisTemplate = redisTemplate;
+        this.redisClient = redisClient;
         if (redisTemplate.getConnectionFactory() instanceof LettuceConnectionFactory connectionFactory) {
             connectionFactory.setPipeliningFlushPolicy(
                     LettuceConnection.PipeliningFlushPolicy.flushOnClose()
@@ -39,7 +46,7 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
         Long sequence = redisTemplate.execute(
                 ContestScoreboardRedisScript.APPLY,
                 keys(update),
-                (Object[]) arguments(eventId, update)
+                (Object[]) arguments(update)
         );
         if (sequence == null) {
             throw new IllegalStateException("Redis scoreboard script returned no sequence");
@@ -63,8 +70,8 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
                     connection.scriptingCommands().evalSha(
                             loadedScriptSha,
                             ReturnType.INTEGER,
-                            6,
-                            serializedKeysAndArguments(request.eventId(), request.update())
+                            SCRIPT_KEY_COUNT,
+                            serializedKeysAndArguments(request.update())
                     );
                 }
                 return null;
@@ -108,7 +115,7 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
                         safeRequests.size(),
                         exception
                 );
-                return ContestScoreboardOutboxApplier.super.applyAll(safeRequests);
+                return ContestScoreboardApplier.super.applyAll(safeRequests);
             }
             log.warn(
                     "Redis scoreboard pipeline failed; deferring {} events for retry",
@@ -117,6 +124,28 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
             );
             return failedResults(safeRequests, errorMessage(exception));
         }
+    }
+
+    @Override
+    public long currentSequence() {
+        String value = redisTemplate.opsForValue().get(SEQUENCE_KEY);
+        if (value == null || value.isBlank()) {
+            return 0L;
+        }
+        return Long.parseLong(value);
+    }
+
+    /**
+     * Drops the contest's standings and its applied-submission set. The global sequence
+     * allocator and the submission-to-sequence map are deliberately left alone so a rebuild
+     * replays onto empty standings without renumbering anything.
+     */
+    @Override
+    public void reset(long contestId) {
+        Set<String> keys = new HashSet<>(redisClient.scan(ContestScoreboardRedisKeys.userPattern(contestId)));
+        keys.add(ContestScoreboardRedisKeys.ranking(contestId));
+        keys.add(ContestScoreboardRedisKeys.processed(contestId));
+        redisClient.delete(keys);
     }
 
     private static boolean hasCommandExecutionFailure(Throwable throwable) {
@@ -162,19 +191,10 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
         }
     }
 
-    @Override
-    public long currentSequence() {
-        String value = redisTemplate.opsForValue().get(SEQUENCE_KEY);
-        if (value == null || value.isBlank()) {
-            return 0L;
-        }
-        return Long.parseLong(value);
-    }
-
-    private byte[][] serializedKeysAndArguments(Long eventId, ContestScoreboardUpdate update) {
-        List<String> values = new ArrayList<>(14);
+    private byte[][] serializedKeysAndArguments(ContestScoreboardUpdate update) {
+        List<String> values = new ArrayList<>(SCRIPT_KEY_COUNT + 7);
         values.addAll(keys(update));
-        values.addAll(List.of(arguments(eventId, update)));
+        values.addAll(List.of(arguments(update)));
         return values.stream()
                 .map(value -> redisTemplate.getStringSerializer().serialize(value))
                 .toArray(byte[][]::new);
@@ -203,10 +223,9 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
         );
     }
 
-    private static String[] arguments(Long eventId, ContestScoreboardUpdate update) {
+    private static String[] arguments(ContestScoreboardUpdate update) {
         return new String[]{
                 Long.toString(update.contestSubmissionId()),
-                Long.toString(eventId),
                 update.result().name(),
                 Long.toString(ContestScoreboardPolicy.computeContestMinutes(
                         update.contestStart(),
@@ -218,5 +237,4 @@ public class RedisContestScoreboardOutboxApplier implements ContestScoreboardOut
                 Long.toString(update.userId())
         };
     }
-
 }

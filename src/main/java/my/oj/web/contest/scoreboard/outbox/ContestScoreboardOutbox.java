@@ -4,7 +4,6 @@ import jakarta.persistence.*;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
-import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.submission.SubmissionResult;
 
 import java.time.LocalDateTime;
@@ -71,6 +70,17 @@ public class ContestScoreboardOutbox {
     @Column(name = "next_attempt_at")
     private LocalDateTime nextAttemptAt;
 
+    /**
+     * When this row may next be claimed; {@code null} once it is completed. The worker selects
+     * solely on this column, so every write that makes a row claimable again has to set it.
+     *
+     * <p>It is compared against the database clock. Production writes go through SQL and stamp it
+     * with {@code CURRENT_TIMESTAMP(6)}; the JVM timestamp used here is only accurate when the two
+     * clocks share a time zone.
+     */
+    @Column(name = "due_at")
+    private LocalDateTime dueAt;
+
     public static ContestScoreboardOutbox pending(Long contestSubmissionId,
                                                   Long contestId,
                                                   Long problemId,
@@ -91,42 +101,15 @@ public class ContestScoreboardOutbox {
         outbox.judgedAt = judgedAt;
         outbox.status = ContestScoreboardOutboxStatus.PENDING;
         outbox.createdAt = LocalDateTime.now();
+        outbox.dueAt = outbox.createdAt;
         outbox.redisSequence = redisSequence;
         return outbox;
-    }
-
-    public ContestScoreboardUpdate toUpdate() {
-        return new ContestScoreboardUpdate(
-                contestSubmissionId,
-                contestId,
-                problemId,
-                userId,
-                contestStart,
-                submittedTime,
-                result,
-                judgedAt
-        );
-    }
-
-    public void assignRedisSequence(Long redisSequence) {
-        if (redisSequence == null) {
-            return;
-        }
-        this.redisSequence = redisSequence;
-    }
-
-    public boolean isProcessable() {
-        return status == ContestScoreboardOutboxStatus.PENDING || status == ContestScoreboardOutboxStatus.FAILED;
     }
 
     public void markSuccess(LocalDateTime processedAt) {
         this.status = ContestScoreboardOutboxStatus.COMPLETED;
         this.processedAt = processedAt;
         this.lastErrorMessage = null;
-    }
-
-    public void markFailed(String message) {
-        this.status = ContestScoreboardOutboxStatus.FAILED;
-        this.lastErrorMessage = message;
+        this.dueAt = null;
     }
 }

@@ -52,7 +52,6 @@ class JdbcContestScoreboardOutboxQueueTests {
         when(jdbcTemplate.query(
                 anyString(),
                 any(RowMapper.class),
-                eq(-30_000_000L),
                 eq(25)
         )).thenAnswer(invocation -> {
             @SuppressWarnings("unchecked")
@@ -81,25 +80,26 @@ class JdbcContestScoreboardOutboxQueueTests {
         verify(jdbcTemplate).query(
                 queryCaptor.capture(),
                 any(RowMapper.class),
-                eq(-30_000_000L),
                 eq(25)
         );
         assertThat(queryCaptor.getValue())
-                .contains("status = 'PENDING'")
-                .contains("status = 'FAILED'")
-                .contains("next_attempt_at <= CURRENT_TIMESTAMP(6)")
-                .contains("status = 'PROCESSING'")
-                .contains("TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6))")
-                .contains("FOR UPDATE SKIP LOCKED");
+                .contains("WHERE due_at <= CURRENT_TIMESTAMP(6)")
+                .contains("ORDER BY due_at, id")
+                .contains("FOR UPDATE SKIP LOCKED")
+                .doesNotContain("status =");
 
+        ArgumentCaptor<String> claimSqlCaptor = ArgumentCaptor.forClass(String.class);
         @SuppressWarnings("unchecked")
         ArgumentCaptor<BatchPreparedStatementSetter> setterCaptor =
                 ArgumentCaptor.forClass(BatchPreparedStatementSetter.class);
-        verify(jdbcTemplate).batchUpdate(anyString(), setterCaptor.capture());
+        verify(jdbcTemplate).batchUpdate(claimSqlCaptor.capture(), setterCaptor.capture());
+        assertThat(claimSqlCaptor.getValue())
+                .contains("due_at = TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6))");
         PreparedStatement claimStatement = mock(PreparedStatement.class);
         setterCaptor.getValue().setValues(claimStatement, 0);
         verify(claimStatement).setString(1, claimed.get(0).claimToken());
-        verify(claimStatement).setLong(2, 7L);
+        verify(claimStatement).setLong(2, 30_000_000L);
+        verify(claimStatement).setLong(3, 7L);
         verify(transactionManager).commit(transactionStatus);
     }
 
@@ -123,11 +123,17 @@ class JdbcContestScoreboardOutboxQueueTests {
                 List.of(new JdbcContestScoreboardOutboxQueue.FailedEvent(failed, "redis unavailable"))
         );
 
+        ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
         @SuppressWarnings("unchecked")
         ArgumentCaptor<BatchPreparedStatementSetter> setterCaptor =
                 ArgumentCaptor.forClass(BatchPreparedStatementSetter.class);
-        verify(jdbcTemplate, times(2)).batchUpdate(anyString(), setterCaptor.capture());
+        verify(jdbcTemplate, times(2)).batchUpdate(sqlCaptor.capture(), setterCaptor.capture());
         verify(transactionManager).commit(transactionStatus);
+
+        assertThat(sqlCaptor.getAllValues().get(0)).contains("due_at = NULL");
+        assertThat(sqlCaptor.getAllValues().get(1))
+                .contains("next_attempt_at = TIMESTAMPADD(")
+                .contains("due_at = TIMESTAMPADD(");
 
         PreparedStatement completedStatement = mock(PreparedStatement.class);
         setterCaptor.getAllValues().get(0).setValues(completedStatement, 0);

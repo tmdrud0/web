@@ -1,10 +1,10 @@
 package my.oj.web.contest.support;
 
-import my.oj.web.contest.scoreboard.ContestScoreboardService;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplierConfig;
-import my.oj.web.contest.scoreboard.outbox.DirectContestScoreboardOutboxApplier;
-import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardStoreConfig;
+import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.redis.ContestRedisKeyValueClient;
+import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplier;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistryConfig;
 import my.oj.web.contest.submission.support.InMemoryContestSubmissionDuplicateRegistry;
@@ -28,19 +28,18 @@ class ConditionalRedisSupportConfigTests {
 
     private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
             .withUserConfiguration(
-                    ContestScoreboardOutboxApplierConfig.class,
+                    ContestScoreboardStoreConfig.class,
                     ContestSubmissionDuplicateRegistryConfig.class,
-                    InMemoryContestSubmissionDuplicateRegistry.class,
-                    ScoreboardDependencies.class
+                    InMemoryContestSubmissionDuplicateRegistry.class
             );
 
     @Test
     void defaultsToTheInMemoryImplementations() {
         contextRunner.run(context -> {
-            assertThat(context).hasSingleBean(ContestScoreboardOutboxApplier.class);
+            assertThat(context).hasSingleBean(ContestScoreboardApplier.class);
             assertThat(context).hasSingleBean(ContestSubmissionDuplicateRegistry.class);
-            assertThat(context.getBean(ContestScoreboardOutboxApplier.class))
-                    .isInstanceOf(DirectContestScoreboardOutboxApplier.class);
+            assertThat(context.getBean(ContestScoreboardApplier.class))
+                    .isInstanceOf(InMemoryContestScoreboardApplier.class);
             assertThat(context.getBean(ContestSubmissionDuplicateRegistry.class))
                     .isInstanceOf(InMemoryContestSubmissionDuplicateRegistry.class);
         });
@@ -55,10 +54,10 @@ class ConditionalRedisSupportConfigTests {
                 )
                 .withUserConfiguration(RedisDependencies.class)
                 .run(context -> {
-                    assertThat(context).hasSingleBean(ContestScoreboardOutboxApplier.class);
+                    assertThat(context).hasSingleBean(ContestScoreboardApplier.class);
                     assertThat(context).hasSingleBean(ContestSubmissionDuplicateRegistry.class);
-                    assertThat(context.getBean(ContestScoreboardOutboxApplier.class))
-                            .isInstanceOf(RedisContestScoreboardOutboxApplier.class);
+                    assertThat(context.getBean(ContestScoreboardApplier.class))
+                            .isInstanceOf(RedisContestScoreboardApplier.class);
                     assertThat(context.getBean(ContestSubmissionDuplicateRegistry.class))
                             .isInstanceOf(RedisContestSubmissionDuplicateRegistry.class);
                 });
@@ -77,18 +76,9 @@ class ConditionalRedisSupportConfigTests {
                         "contest.submission.dedup.store=elsewhere"
                 )
                 .run(context -> {
-                    assertThat(context).doesNotHaveBean(ContestScoreboardOutboxApplier.class);
+                    assertThat(context).doesNotHaveBean(ContestScoreboardApplier.class);
                     assertThat(context).doesNotHaveBean(ContestSubmissionDuplicateRegistry.class);
                 });
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    static class ScoreboardDependencies {
-
-        @Bean
-        ContestScoreboardService contestScoreboardService() {
-            return mock(ContestScoreboardService.class);
-        }
     }
 
     @Configuration(proxyBeanMethods = false)
@@ -97,6 +87,11 @@ class ConditionalRedisSupportConfigTests {
         @Bean
         StringRedisTemplate stringRedisTemplate() {
             return mock(StringRedisTemplate.class);
+        }
+
+        @Bean
+        ContestRedisKeyValueClient contestRedisKeyValueClient() {
+            return mock(ContestRedisKeyValueClient.class);
         }
     }
 }

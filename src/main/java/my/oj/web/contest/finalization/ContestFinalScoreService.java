@@ -3,7 +3,8 @@ package my.oj.web.contest.finalization;
 import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
 import my.oj.web.contest.scoreboard.ContestScoreboardService;
-import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardStore;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboard;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
@@ -71,22 +72,23 @@ public class ContestFinalScoreService {
         // Ranking is derived by replaying every judgement and reading the accumulated
         // standings. That is scratch work, so it runs on a buffer scoped to this call
         // rather than on the live scoreboard, which readers are hitting concurrently.
-        ContestScoreboardService replay = new ContestScoreboardService(new InMemoryContestScoreboardStore());
+        InMemoryContestScoreboard replay = new InMemoryContestScoreboard();
         for (ContestSubmissionResult result : results) {
             ContestSubmission submission = result.getSubmission();
             SubmissionResult effective = resolveResult(result, useFinalResult);
             if (effective == null) {
                 continue;
             }
-            replay.recordJudgement(
-                    result.getId(),
+            replay.apply(new ContestScoreboardUpdate(
+                    submission.getId(),
                     contestId,
                     submission.getProblem().getId(),
                     submission.getUser().getId(),
                     submission.getContest().getStartTime(),
                     submission.getSubmittedTime(),
-                    effective
-            );
+                    effective,
+                    null
+            ));
         }
         return new ArrayList<>(replay.currentRanking(contestId));
     }

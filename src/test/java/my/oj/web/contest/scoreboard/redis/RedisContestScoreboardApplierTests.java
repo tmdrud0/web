@@ -1,7 +1,7 @@
 package my.oj.web.contest.scoreboard.redis;
 
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import io.lettuce.core.RedisCommandExecutionException;
 import my.oj.web.submission.SubmissionResult;
 import org.junit.jupiter.api.Test;
@@ -16,7 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.mock;
 
-class RedisContestScoreboardOutboxApplierTests {
+class RedisContestScoreboardApplierTests {
 
     @Test
     void connectionFailureFailsTheBatchWithoutStartingPerEventFallback() {
@@ -28,10 +28,10 @@ class RedisContestScoreboardOutboxApplierTests {
         )).willThrow(new RedisConnectionFailureException("redis unavailable"));
         CountingApplier applier = new CountingApplier(redisTemplate);
 
-        List<ContestScoreboardOutboxApplier.ApplyResult> results = applier.applyAll(requests());
+        List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(requests());
 
         assertThat(results).hasSize(2).allMatch(result -> !result.succeeded());
-        assertThat(results).extracting(ContestScoreboardOutboxApplier.ApplyResult::errorMessage)
+        assertThat(results).extracting(ContestScoreboardApplier.ApplyResult::errorMessage)
                 .allMatch(message -> message.contains("redis unavailable"));
         assertThat(applier.individualCalls).isZero();
     }
@@ -46,18 +46,41 @@ class RedisContestScoreboardOutboxApplierTests {
         )).willThrow(new RedisCommandExecutionException("ERR invalid key type"));
         CountingApplier applier = new CountingApplier(redisTemplate);
 
-        List<ContestScoreboardOutboxApplier.ApplyResult> results = applier.applyAll(requests());
+        List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(requests());
 
-        assertThat(results).hasSize(2).allMatch(ContestScoreboardOutboxApplier.ApplyResult::succeeded);
-        assertThat(results).extracting(ContestScoreboardOutboxApplier.ApplyResult::redisSequence)
+        assertThat(results).hasSize(2).allMatch(ContestScoreboardApplier.ApplyResult::succeeded);
+        assertThat(results).extracting(ContestScoreboardApplier.ApplyResult::sequence)
                 .containsExactly(1L, 2L);
         assertThat(applier.individualCalls).isEqualTo(2);
     }
 
-    private List<ContestScoreboardOutboxApplier.ApplyRequest> requests() {
+    @Test
+    void resetDropsOnlyTheContestsOwnKeys() {
+        InMemoryContestRedisKeyValueClient redisClient = new InMemoryContestRedisKeyValueClient();
+        RedisContestScoreboardApplier applier =
+                new RedisContestScoreboardApplier(mock(StringRedisTemplate.class), redisClient);
+        redisClient.zAdd(ContestScoreboardRedisKeys.ranking(7L), 1.0, "1001");
+        redisClient.hSet(ContestScoreboardRedisKeys.summary(7L, 1001L), "solved", "1");
+        redisClient.hSet(ContestScoreboardRedisKeys.problem(7L, 1001L, 11L), "accepted", "1");
+        redisClient.sAdd(ContestScoreboardRedisKeys.processed(7L), "5001");
+        redisClient.zAdd(ContestScoreboardRedisKeys.ranking(8L), 1.0, "1001");
+        redisClient.hSet(ContestScoreboardRedisKeys.OUTBOX_SUBMISSION_SEQUENCE, "5001", "1");
+
+        applier.reset(7L);
+
+        assertThat(redisClient.zCard(ContestScoreboardRedisKeys.ranking(7L))).isZero();
+        assertThat(redisClient.hGetAll(ContestScoreboardRedisKeys.summary(7L, 1001L))).isEmpty();
+        assertThat(redisClient.hGetAll(ContestScoreboardRedisKeys.problem(7L, 1001L, 11L))).isEmpty();
+        assertThat(redisClient.sIsMember(ContestScoreboardRedisKeys.processed(7L), "5001")).isFalse();
+        assertThat(redisClient.zCard(ContestScoreboardRedisKeys.ranking(8L))).isEqualTo(1L);
+        assertThat(redisClient.hGet(ContestScoreboardRedisKeys.OUTBOX_SUBMISSION_SEQUENCE, "5001"))
+                .isEqualTo("1");
+    }
+
+    private List<ContestScoreboardApplier.ApplyRequest> requests() {
         return List.of(
-                new ContestScoreboardOutboxApplier.ApplyRequest(1L, payload(1001L)),
-                new ContestScoreboardOutboxApplier.ApplyRequest(2L, payload(1002L))
+                new ContestScoreboardApplier.ApplyRequest(1L, payload(1001L)),
+                new ContestScoreboardApplier.ApplyRequest(2L, payload(1002L))
         );
     }
 
@@ -74,12 +97,12 @@ class RedisContestScoreboardOutboxApplierTests {
         );
     }
 
-    private static class CountingApplier extends RedisContestScoreboardOutboxApplier {
+    private static class CountingApplier extends RedisContestScoreboardApplier {
 
         private int individualCalls;
 
         private CountingApplier(StringRedisTemplate redisTemplate) {
-            super(redisTemplate);
+            super(redisTemplate, new InMemoryContestRedisKeyValueClient());
         }
 
         @Override

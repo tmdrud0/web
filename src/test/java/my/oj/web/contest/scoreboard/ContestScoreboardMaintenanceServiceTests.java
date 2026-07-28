@@ -13,19 +13,19 @@ import static org.mockito.Mockito.inOrder;
 class ContestScoreboardMaintenanceServiceTests {
 
     @Mock
-    private ContestScoreboardService scoreboardService;
+    private ContestScoreboardApplier scoreboardApplier;
     @Mock
     private ContestScoreboardOutboxService outboxService;
 
     @Test
     void clearLiveContestState_resetsProjectionBeforeDeletingPendingUpdates() {
         ContestScoreboardMaintenanceService maintenanceService =
-                new ContestScoreboardMaintenanceService(scoreboardService, outboxService);
+                new ContestScoreboardMaintenanceService(scoreboardApplier, outboxService);
 
         maintenanceService.clearLiveContestState(42L);
 
-        InOrder order = inOrder(scoreboardService, outboxService);
-        order.verify(scoreboardService).reset(42L);
+        InOrder order = inOrder(scoreboardApplier, outboxService);
+        order.verify(scoreboardApplier).reset(42L);
         order.verify(outboxService).deleteByContestId(42L);
     }
 }
