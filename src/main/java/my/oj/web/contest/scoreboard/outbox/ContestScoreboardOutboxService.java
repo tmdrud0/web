@@ -1,34 +1,14 @@
 package my.oj.web.contest.scoreboard.outbox;
 
 import lombok.RequiredArgsConstructor;
-import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
-import my.oj.web.contest.scoreboard.ContestScoreboardUpdatePublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDateTime;
-
 @Service
 @RequiredArgsConstructor
-public class ContestScoreboardOutboxService implements ContestScoreboardUpdatePublisher {
+public class ContestScoreboardOutboxService {
 
     private final ContestScoreboardOutboxRepository repository;
-
-    @Override
-    @Transactional
-    public boolean publishIfAbsent(ContestScoreboardUpdate update) {
-        return repository.insertPendingIfAbsent(
-                update.contestSubmissionId(),
-                update.contestId(),
-                update.problemId(),
-                update.userId(),
-                update.contestStart(),
-                update.submittedTime(),
-                update.judgedAt(),
-                update.result().name(),
-                LocalDateTime.now()
-        ) == 1;
-    }
 
     @Transactional
     public ContestScoreboardOutbox lockById(Long id) {

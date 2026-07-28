@@ -17,49 +17,6 @@ public interface ContestScoreboardOutboxRepository extends JpaRepository<Contest
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     Optional<ContestScoreboardOutbox> findById(Long id);
 
-    @Modifying
-    @Query(value = """
-            INSERT IGNORE INTO contest_submission_outbox (
-                contest_submission_id,
-                contest_id,
-                problem_id,
-                user_id,
-                contest_start,
-                submitted_time,
-                judged_at,
-                result,
-                status,
-                created_at,
-                processed_at,
-                last_error_message,
-                redis_seq
-            )
-            VALUES (
-                :contestSubmissionId,
-                :contestId,
-                :problemId,
-                :userId,
-                :contestStart,
-                :submittedTime,
-                :judgedAt,
-                :result,
-                'PENDING',
-                :createdAt,
-                NULL,
-                NULL,
-                NULL
-            )
-            """, nativeQuery = true)
-    int insertPendingIfAbsent(@Param("contestSubmissionId") Long contestSubmissionId,
-                              @Param("contestId") Long contestId,
-                              @Param("problemId") Long problemId,
-                              @Param("userId") Long userId,
-                              @Param("contestStart") java.time.LocalDateTime contestStart,
-                              @Param("submittedTime") java.time.LocalDateTime submittedTime,
-                              @Param("judgedAt") java.time.LocalDateTime judgedAt,
-                              @Param("result") String result,
-                              @Param("createdAt") java.time.LocalDateTime createdAt);
-
     @Query("""
             select o.redisSequence
             from ContestScoreboardOutbox o

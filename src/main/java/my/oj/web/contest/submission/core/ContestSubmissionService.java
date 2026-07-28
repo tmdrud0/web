@@ -2,13 +2,10 @@ package my.oj.web.contest.submission.core;
 
 import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.Contest;
-import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
-import my.oj.web.contest.scoreboard.ContestScoreboardUpdatePublisher;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
 import my.oj.web.problem.Problem;
 import my.oj.web.submission.CodeHashGenerator;
-import my.oj.web.submission.SubmissionResult;
 import my.oj.web.user.User;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -26,7 +23,6 @@ public class ContestSubmissionService {
 
     private final ContestSubmissionRepository repository;
     private final ContestSubmissionResultRepository resultRepository;
-    private final ContestScoreboardUpdatePublisher scoreboardUpdatePublisher;
     private final ContestSubmissionDuplicateRegistry duplicateRegistry;
     private final ContestSubmissionIdGenerator idGenerator;
     private final ContestSubmissionWriter submissionWriter;
@@ -102,32 +98,6 @@ public class ContestSubmissionService {
             );
             return result;
         });
-    }
-
-    @Transactional
-    public void applyProvisionalResult(ContestSubmissionJudgeProjection submission,
-                                       SubmissionResult result,
-                                       LocalDateTime judgedAt) {
-        int insertedResult = resultRepository.insertProvisionalIfAbsent(
-                submission.getSubmissionId(),
-                submission.getContestId(),
-                result.name(),
-                judgedAt
-        );
-        if (insertedResult == 0) {
-            return;
-        }
-
-        scoreboardUpdatePublisher.publishIfAbsent(new ContestScoreboardUpdate(
-                submission.getSubmissionId(),
-                submission.getContestId(),
-                submission.getProblemId(),
-                submission.getUserId(),
-                submission.getContestStart(),
-                submission.getSubmittedTime(),
-                result,
-                judgedAt
-        ));
     }
 
     public ContestSubmissionJudgeProjection getJudgeProjectionById(Long contestSubmissionId) {

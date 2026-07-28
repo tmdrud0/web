@@ -1,13 +1,10 @@
 package my.oj.web.contest.submission.core;
 
 import my.oj.web.contest.Contest;
-import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
-import my.oj.web.contest.scoreboard.ContestScoreboardUpdatePublisher;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionIdGenerator;
 import my.oj.web.problem.Problem;
 import my.oj.web.submission.CodeHashGenerator;
-import my.oj.web.submission.SubmissionResult;
 import my.oj.web.user.Streak;
 import my.oj.web.user.User;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,9 +38,6 @@ class ContestSubmissionServiceTests {
     private ContestSubmissionResultRepository resultRepository;
 
     @Mock
-    private ContestScoreboardUpdatePublisher scoreboardUpdatePublisher;
-
-    @Mock
     private ContestSubmissionDuplicateRegistry duplicateRegistry;
 
     @Mock
@@ -69,7 +63,6 @@ class ContestSubmissionServiceTests {
         contestSubmissionService = new ContestSubmissionService(
                 submissionRepository,
                 resultRepository,
-                scoreboardUpdatePublisher,
                 duplicateRegistry,
                 idGenerator,
                 submissionWriter
@@ -180,50 +173,4 @@ class ContestSubmissionServiceTests {
         verify(duplicateRegistry).purgeContest(100L);
     }
 
-    @Test
-    void applyProvisionalResult_skipsOutboxWhenProvisionalAlreadyRecorded() {
-        ContestSubmissionJudgeProjection submission = judgeProjection(999L);
-        given(resultRepository.insertProvisionalIfAbsent(999L, 100L, SubmissionResult.PARTIAL_ACCEPTED.name(), now))
-                .willReturn(0);
-
-        contestSubmissionService.applyProvisionalResult(submission, SubmissionResult.PARTIAL_ACCEPTED, now);
-
-        verify(scoreboardUpdatePublisher, never()).publishIfAbsent(any());
-        verifyNoInteractions(submissionRepository);
-    }
-
-    @Test
-    void applyProvisionalResult_insertsOutboxWhenProvisionalInserted() {
-        ContestSubmissionJudgeProjection submission = judgeProjection(1001L);
-        given(submission.getProblemId()).willReturn(200L);
-        given(submission.getUserId()).willReturn(10L);
-        given(submission.getSubmittedTime()).willReturn(now);
-        given(resultRepository.insertProvisionalIfAbsent(anyLong(), anyLong(), anyString(), any()))
-                .willReturn(1);
-        given(scoreboardUpdatePublisher.publishIfAbsent(any())).willReturn(true);
-
-        contestSubmissionService.applyProvisionalResult(submission, SubmissionResult.PARTIAL_ACCEPTED, now);
-
-        verify(resultRepository).insertProvisionalIfAbsent(1001L, 100L, SubmissionResult.PARTIAL_ACCEPTED.name(), now);
-        ArgumentCaptor<ContestScoreboardUpdate> updateCaptor = ArgumentCaptor.forClass(ContestScoreboardUpdate.class);
-        verify(scoreboardUpdatePublisher).publishIfAbsent(updateCaptor.capture());
-        assertThat(updateCaptor.getValue()).isEqualTo(new ContestScoreboardUpdate(
-                1001L,
-                100L,
-                200L,
-                10L,
-                null,
-                now,
-                SubmissionResult.PARTIAL_ACCEPTED,
-                now
-        ));
-        verifyNoInteractions(submissionRepository);
-    }
-
-    private ContestSubmissionJudgeProjection judgeProjection(Long submissionId) {
-        ContestSubmissionJudgeProjection projection = org.mockito.Mockito.mock(ContestSubmissionJudgeProjection.class);
-        given(projection.getSubmissionId()).willReturn(submissionId);
-        given(projection.getContestId()).willReturn(100L);
-        return projection;
-    }
 }
