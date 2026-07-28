@@ -44,6 +44,7 @@ class OjGoalLoadSimulation extends Simulation {
     .acceptHeader("application/json")
     .contentTypeHeader("application/json")
     .userAgentHeader("Gatling")
+    .shareConnections
 
   private val submitFeeder = Iterator.continually {
     val userId = Random.between(userIdStart, userIdEnd + 1)

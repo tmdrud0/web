@@ -28,6 +28,7 @@ class ContestScoreboardReadSimulation extends Simulation {
     .baseUrl(baseUrl)
     .acceptHeader("application/json")
     .userAgentHeader("Gatling")
+    .shareConnections
 
   private val feeder = Iterator.continually {
     Map("startRank" -> Random.between(minStartRank, maxStartRank + 1))
