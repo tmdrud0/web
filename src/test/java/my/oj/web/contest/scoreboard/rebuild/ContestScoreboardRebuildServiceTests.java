@@ -1,7 +1,8 @@
 package my.oj.web.contest.scoreboard.rebuild;
 
-import my.oj.web.contest.scoreboard.ContestScoreboardService;
 import my.oj.web.contest.Contest;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
@@ -14,6 +15,7 @@ import my.oj.web.user.User;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -29,110 +31,182 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 class ContestScoreboardRebuildServiceTests {
 
+    private static final long CONTEST_ID = 77L;
+
     @Mock
-    private ContestScoreboardService scoreboardService;
+    private ContestScoreboardApplier scoreboardApplier;
     @Mock
     private ContestSubmissionResultRepository resultRepository;
     @Mock
     private ContestSubmissionService contestSubmissionService;
 
-    private ContestSubmissionBatchExecutor batchExecutor;
     private ContestScoreboardRebuildService rebuildService;
+
+    private Contest contest;
+    private Problem problem;
+    private User user;
+    private ContestSubmission submission3;
+    private ContestSubmission submission5;
 
     @BeforeEach
     void setUp() {
-        batchExecutor = new ContestSubmissionBatchExecutor(new NoOpTransactionManager());
         rebuildService = new ContestScoreboardRebuildService(
-                scoreboardService,
+                scoreboardApplier,
                 resultRepository,
                 contestSubmissionService,
-                batchExecutor
+                new ContestSubmissionBatchExecutor(new NoOpTransactionManager())
         );
+
+        contest = new Contest("Contest");
+        ReflectionTestUtils.setField(contest, "id", CONTEST_ID);
+        ReflectionTestUtils.setField(contest, "startTime", LocalDateTime.of(2024, 1, 1, 9, 0));
+
+        problem = Problem.create("P1", contest, 1L);
+        ReflectionTestUtils.setField(problem, "id", 201L);
+        user = User.withState(100L, "user", "pass", 0L, new Streak());
+
+        submission3 = ContestSubmission.create(user, problem, "code3", "hash3", LocalDateTime.of(2024, 1, 1, 10, 5));
+        ReflectionTestUtils.setField(submission3, "id", 3L);
+        submission5 = ContestSubmission.create(user, problem, "code5", "hash5", LocalDateTime.of(2024, 1, 1, 10, 1));
+        ReflectionTestUtils.setField(submission5, "id", 5L);
     }
 
     @Test
     void rebuildFromContestResults_replaysSubmissionsInChronologicalOrder() {
-        Long contestId = 77L;
-        Contest contest = new Contest("Contest");
-        ReflectionTestUtils.setField(contest, "id", contestId);
-        ReflectionTestUtils.setField(contest, "startTime", LocalDateTime.of(2024, 1, 1, 9, 0));
+        stubBatches(Map.of(
+                3L, judged(submission3, SubmissionResult.WRONG_ANSWER),
+                5L, judged(submission5, SubmissionResult.ACCEPTED)
+        ));
+        when(scoreboardApplier.applyAll(anyList())).thenAnswer(invocation -> succeed(invocation.getArgument(0)));
 
-        Problem problem = Problem.create("P1", contest, 1L);
-        ReflectionTestUtils.setField(problem, "id", 201L);
-        User user = User.withState(100L, "user", "pass", 0L, new Streak());
+        rebuildService.rebuildFromContestResults(CONTEST_ID);
 
-        ContestSubmission submission3 = ContestSubmission.create(user, problem, "code3", "hash3", LocalDateTime.of(2024, 1, 1, 10, 5));
-        ReflectionTestUtils.setField(submission3, "id", 3L);
-        ContestSubmission submission5 = ContestSubmission.create(user, problem, "code5", "hash5", LocalDateTime.of(2024, 1, 1, 10, 1));
-        ReflectionTestUtils.setField(submission5, "id", 5L);
+        InOrder order = inOrder(scoreboardApplier);
+        order.verify(scoreboardApplier).reset(CONTEST_ID);
+        ArgumentCaptor<List<ContestScoreboardApplier.ApplyRequest>> captor = requestCaptor();
+        order.verify(scoreboardApplier).applyAll(captor.capture());
 
-        ContestSubmissionResult result3 = ContestSubmissionResult.pending(submission3);
-        result3.recordProvisional(SubmissionResult.WRONG_ANSWER, LocalDateTime.of(2024, 1, 1, 10, 6));
-        result3.recordFinal(SubmissionResult.WRONG_ANSWER, LocalDateTime.of(2024, 1, 1, 10, 6));
-        ReflectionTestUtils.setField(result3, "id", 3L);
+        assertThat(captor.getValue())
+                .extracting(ContestScoreboardApplier.ApplyRequest::update)
+                .extracting(
+                        ContestScoreboardUpdate::contestSubmissionId,
+                        ContestScoreboardUpdate::contestId,
+                        ContestScoreboardUpdate::problemId,
+                        ContestScoreboardUpdate::userId,
+                        ContestScoreboardUpdate::submittedTime,
+                        ContestScoreboardUpdate::result
+                )
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(
+                                5L, CONTEST_ID, problem.getId(), user.getId(),
+                                submission5.getSubmittedTime(), SubmissionResult.ACCEPTED),
+                        org.assertj.core.groups.Tuple.tuple(
+                                3L, CONTEST_ID, problem.getId(), user.getId(),
+                                submission3.getSubmittedTime(), SubmissionResult.WRONG_ANSWER)
+                );
+    }
 
-        ContestSubmissionResult result5 = ContestSubmissionResult.pending(submission5);
-        result5.recordProvisional(SubmissionResult.ACCEPTED, LocalDateTime.of(2024, 1, 1, 10, 2));
-        result5.recordFinal(SubmissionResult.ACCEPTED, LocalDateTime.of(2024, 1, 1, 10, 2));
-        ReflectionTestUtils.setField(result5, "id", 5L);
+    /**
+     * An unjudged submission carries no result to replay, and applying it anyway would record
+     * the submission as handled - the real judgement would then be skipped for good.
+     */
+    @Test
+    void rebuildFromContestResults_skipsSubmissionsThatHaveNotBeenJudged() {
+        stubBatches(Map.of(
+                3L, ContestSubmissionResult.pending(submission3),
+                5L, judged(submission5, SubmissionResult.ACCEPTED)
+        ));
+        when(scoreboardApplier.applyAll(anyList())).thenAnswer(invocation -> succeed(invocation.getArgument(0)));
 
+        rebuildService.rebuildFromContestResults(CONTEST_ID);
+
+        ArgumentCaptor<List<ContestScoreboardApplier.ApplyRequest>> captor = requestCaptor();
+        verify(scoreboardApplier).applyAll(captor.capture());
+        assertThat(captor.getValue())
+                .extracting(request -> request.update().contestSubmissionId())
+                .containsExactly(5L);
+    }
+
+    @Test
+    void rebuildFromContestResults_failsLoudlyWhenAnEventCannotBeApplied() {
+        stubBatches(Map.of(5L, judged(submission5, SubmissionResult.ACCEPTED)));
+        when(scoreboardApplier.applyAll(anyList())).thenAnswer(invocation -> {
+            List<ContestScoreboardApplier.ApplyRequest> requests = invocation.getArgument(0);
+            return requests.stream()
+                    .map(request -> ContestScoreboardApplier.ApplyResult.failure(
+                            request.eventId(), "wrong Redis key type"))
+                    .toList();
+        });
+
+        assertThatThrownBy(() -> rebuildService.rebuildFromContestResults(CONTEST_ID))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("wrong Redis key type");
+    }
+
+    @Test
+    void rebuildFromContestResults_doesNotCallTheApplierWhenThereIsNothingToReplay() {
+        when(resultRepository.findSubmissionIdsByContestId(eq(CONTEST_ID), isNull(), any()))
+                .thenReturn(List.of());
+
+        rebuildService.rebuildFromContestResults(CONTEST_ID);
+
+        verify(scoreboardApplier).reset(CONTEST_ID);
+        verify(scoreboardApplier, never()).applyAll(anyList());
+    }
+
+    private void stubBatches(Map<Long, ContestSubmissionResult> resultMap) {
         Map<Long, ContestSubmission> submissionMap = new ConcurrentHashMap<>();
         submissionMap.put(3L, submission3);
         submissionMap.put(5L, submission5);
-        Map<Long, ContestSubmissionResult> resultMap = Map.of(3L, result3, 5L, result5);
+        List<Long> ids = List.copyOf(resultMap.keySet());
 
-        when(resultRepository.findSubmissionIdsByContestId(eq(contestId), isNull(), any()))
-                .thenReturn(List.of(3L, 5L));
-        when(resultRepository.findSubmissionIdsByContestId(eq(contestId), eq(5L), any()))
-                .thenReturn(List.of());
-
+        // The follow-up page is left unstubbed: an empty list ends the batch loop.
+        when(resultRepository.findSubmissionIdsByContestId(eq(CONTEST_ID), isNull(), any()))
+                .thenReturn(ids);
         when(contestSubmissionService.findAllByIdsInOrder(anyList()))
                 .thenAnswer(invocation -> {
-                    List<Long> ids = invocation.getArgument(0);
-                    return ids.stream().map(submissionMap::get).toList();
+                    List<Long> batch = invocation.getArgument(0);
+                    return batch.stream().map(submissionMap::get).toList();
                 });
-
         when(resultRepository.findAllById(anyList()))
                 .thenAnswer(invocation -> {
-                    List<Long> ids = invocation.getArgument(0);
-                    return ids.stream()
-                            .map(resultMap::get)
-                            .toList();
+                    List<Long> batch = invocation.getArgument(0);
+                    return batch.stream().map(resultMap::get).filter(java.util.Objects::nonNull).toList();
                 });
+    }
 
-        rebuildService.rebuildFromContestResults(contestId);
+    private static ContestSubmissionResult judged(ContestSubmission submission, SubmissionResult result) {
+        ContestSubmissionResult judged = ContestSubmissionResult.pending(submission);
+        ReflectionTestUtils.setField(judged, "id", submission.getId());
+        judged.recordProvisional(result, LocalDateTime.of(2024, 1, 1, 10, 30));
+        judged.recordFinal(result, LocalDateTime.of(2024, 1, 1, 10, 30));
+        return judged;
+    }
 
-        InOrder inOrder = inOrder(scoreboardService);
-        inOrder.verify(scoreboardService).reset(contestId);
-        inOrder.verify(scoreboardService).recordJudgement(
-                eq(5L),
-                eq(contestId),
-                eq(problem.getId()),
-                eq(user.getId()),
-                eq(contest.getStartTime()),
-                eq(submission5.getSubmittedTime()),
-                eq(SubmissionResult.ACCEPTED)
-        );
-        inOrder.verify(scoreboardService).recordJudgement(
-                eq(3L),
-                eq(contestId),
-                eq(problem.getId()),
-                eq(user.getId()),
-                eq(contest.getStartTime()),
-                eq(submission3.getSubmittedTime()),
-                eq(SubmissionResult.WRONG_ANSWER)
-        );
-        inOrder.verifyNoMoreInteractions();
+    private static List<ContestScoreboardApplier.ApplyResult> succeed(
+            List<ContestScoreboardApplier.ApplyRequest> requests) {
+        return requests.stream()
+                .map(request -> ContestScoreboardApplier.ApplyResult.success(request.eventId(), request.eventId()))
+                .toList();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ArgumentCaptor<List<ContestScoreboardApplier.ApplyRequest>> requestCaptor() {
+        return ArgumentCaptor.forClass(List.class);
     }
 
     private static class NoOpTransactionManager implements PlatformTransactionManager {

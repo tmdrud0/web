@@ -3,11 +3,8 @@ package my.oj.web.contest.scoreboard.memory;
 import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
 import my.oj.web.contest.scoreboard.ContestScoreboardPolicy;
 import my.oj.web.contest.scoreboard.ContestScoreboardSlice;
-import my.oj.web.contest.scoreboard.ContestScoreboardSnapshot;
-import my.oj.web.contest.scoreboard.ContestScoreboardStore;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.submission.SubmissionResult;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -18,57 +15,70 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.atomic.AtomicLong;
 
-@Component
-@ConditionalOnProperty(prefix = "contest.scoreboard", name = "store", havingValue = "memory", matchIfMissing = true)
-public class InMemoryContestScoreboardStore implements ContestScoreboardStore {
+/**
+ * Live scoreboard held in process. {@link InMemoryContestScoreboardReader} and
+ * {@link InMemoryContestScoreboardApplier} are thin views over one of these, so both sides see
+ * the same state.
+ *
+ * <p>Also usable standalone as a scratch buffer for replaying judgements off to the side —
+ * see the final-score calculation.
+ */
+public class InMemoryContestScoreboard {
 
     private final Map<Long, ContestState> contests = new ConcurrentHashMap<>();
+    /**
+     * Mirrors the Redis sequence allocator: one number per submission, stable across retries
+     * and rebuilds, and never rewound by {@link #reset(long)}.
+     */
+    private final Map<Long, Long> submissionSequences = new ConcurrentHashMap<>();
+    private final AtomicLong sequenceAllocator = new AtomicLong();
 
-    @Override
-    public void recordJudgement(long eventId,
-                                long contestId,
-                                long problemId,
-                                long userId,
-                                LocalDateTime contestStart,
-                                LocalDateTime submittedTime,
-                                SubmissionResult result) {
-        ContestState state = getContestState(contestId, contestStart);
+    public long apply(ContestScoreboardUpdate update) {
+        long submissionId = update.contestSubmissionId();
+        long sequence = submissionSequences.computeIfAbsent(
+                submissionId,
+                id -> sequenceAllocator.incrementAndGet()
+        );
 
-        if (!state.processedEvents.add(eventId)) {
-            return;
+        ContestState state = getContestState(update.contestId(), update.contestStart());
+        if (!state.appliedSubmissions.add(submissionId)) {
+            return sequence;
         }
 
-        UserState userState = state.users.computeIfAbsent(userId, id -> new UserState());
-        ProblemState problemState = userState.problemStates.computeIfAbsent(problemId, id -> new ProblemState());
+        UserState userState = state.users.computeIfAbsent(update.userId(), id -> new UserState());
+        ProblemState problemState = userState.problemStates.computeIfAbsent(update.problemId(), id -> new ProblemState());
 
         if (problemState.accepted) {
-            return;
+            return sequence;
         }
 
-        if (result == SubmissionResult.ACCEPTED) {
+        if (update.result() == SubmissionResult.ACCEPTED) {
             problemState.accepted = true;
-            problemState.acceptedTime = submittedTime;
-            long penalty = ContestScoreboardPolicy.computePenalty(
+            problemState.acceptedTime = update.submittedTime();
+            userState.penalty += ContestScoreboardPolicy.computePenalty(
                     state.contestStart,
-                    submittedTime,
+                    update.submittedTime(),
                     problemState.wrongAttempts
             );
-            userState.penalty += penalty;
             userState.solvedCount += 1;
-        } else if (result != SubmissionResult.PENDING) {
+        } else if (update.result() != SubmissionResult.PENDING) {
             problemState.wrongAttempts += 1;
         }
 
-        state.updateUserScore(userId, userState);
+        state.updateUserScore(update.userId(), userState);
+        return sequence;
     }
 
-    @Override
-    public ContestScoreboardSnapshot snapshot(long contestId) {
-        return new ContestScoreboardSnapshot(contestId, slice(contestId, 1, Integer.MAX_VALUE).entries());
+    public long currentSequence() {
+        return sequenceAllocator.get();
     }
 
-    @Override
+    public void reset(long contestId) {
+        contests.remove(contestId);
+    }
+
     public ContestScoreboardSlice slice(long contestId, long startRank, int size) {
         long normalizedStart = Math.max(1, startRank);
         if (size <= 0) {
@@ -81,7 +91,6 @@ public class InMemoryContestScoreboardStore implements ContestScoreboardStore {
         return state.sliceFromRank(contestId, normalizedStart, size);
     }
 
-    @Override
     public Optional<ContestScoreboardSlice> rankingAroundUser(long contestId, long userId, int windowSize) {
         ContestState state = contests.get(contestId);
         if (state == null) {
@@ -90,15 +99,13 @@ public class InMemoryContestScoreboardStore implements ContestScoreboardStore {
         return state.sliceAroundUser(contestId, userId, windowSize);
     }
 
-    @Override
     public long totalParticipants(long contestId) {
         ContestState state = contests.get(contestId);
         return state != null ? state.participantCount() : 0L;
     }
 
-    @Override
-    public void reset(long contestId) {
-        contests.remove(contestId);
+    public List<ContestScoreboardEntry> currentRanking(long contestId) {
+        return slice(contestId, 1, Integer.MAX_VALUE).entries();
     }
 
     private ContestState getContestState(long contestId, LocalDateTime contestStart) {
@@ -109,7 +116,7 @@ public class InMemoryContestScoreboardStore implements ContestScoreboardStore {
 
     private static class ContestState {
         private final Map<Long, UserState> users = new ConcurrentHashMap<>();
-        private final Set<Long> processedEvents = ConcurrentHashMap.newKeySet();
+        private final Set<Long> appliedSubmissions = ConcurrentHashMap.newKeySet();
         private final NavigableSet<UserScore> ranking = new ConcurrentSkipListSet<>();
         private final Map<Long, UserScore> scoreIndex = new ConcurrentHashMap<>();
         private volatile LocalDateTime contestStart;

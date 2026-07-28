@@ -1,14 +1,10 @@
 package my.oj.web.contest.scoreboard.outbox.worker;
 
 import lombok.RequiredArgsConstructor;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutbox;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
-import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -16,27 +12,8 @@ import java.util.List;
 @RequiredArgsConstructor
 public class ContestScoreboardOutboxProcessor {
 
-    private final ContestScoreboardOutboxService outboxService;
-    private final ContestScoreboardOutboxApplier outboxApplier;
+    private final ContestScoreboardApplier scoreboardApplier;
     private final JdbcContestScoreboardOutboxQueue outboxQueue;
-
-    @Transactional
-    public boolean processById(Long outboxId) {
-        ContestScoreboardOutbox outbox = outboxService.lockById(outboxId);
-        if (!outbox.isProcessable()) {
-            return false;
-        }
-        try {
-            Long redisSequence = outboxApplier.apply(outbox.getId(), outbox.toUpdate());
-            LocalDateTime processedAt = LocalDateTime.now();
-            outbox.assignRedisSequence(redisSequence);
-            outbox.markSuccess(processedAt);
-            return true;
-        } catch (Exception ex) {
-            outbox.markFailed(ex.getMessage());
-            return false;
-        }
-    }
 
     public BatchProcessResult processBatch(int batchSize, Duration claimLease) {
         List<JdbcContestScoreboardOutboxQueue.ClaimedEvent> claimed = outboxQueue.claim(batchSize, claimLease);
@@ -44,22 +21,22 @@ public class ContestScoreboardOutboxProcessor {
             return BatchProcessResult.empty();
         }
 
-        List<ContestScoreboardOutboxApplier.ApplyRequest> requests = claimed.stream()
-                .map(event -> new ContestScoreboardOutboxApplier.ApplyRequest(
+        List<ContestScoreboardApplier.ApplyRequest> requests = claimed.stream()
+                .map(event -> new ContestScoreboardApplier.ApplyRequest(
                         event.eventId(),
                         event.update()
                 ))
                 .toList();
-        List<ContestScoreboardOutboxApplier.ApplyResult> applyResults;
+        List<ContestScoreboardApplier.ApplyResult> applyResults;
         try {
-            applyResults = outboxApplier.applyAll(requests);
+            applyResults = scoreboardApplier.applyAll(requests);
             if (applyResults == null) {
                 applyResults = List.of();
             }
         } catch (RuntimeException exception) {
             String error = exceptionMessage(exception);
             applyResults = requests.stream()
-                    .map(request -> ContestScoreboardOutboxApplier.ApplyResult.failure(
+                    .map(request -> ContestScoreboardApplier.ApplyResult.failure(
                             request.eventId(),
                             error
                     ))
@@ -78,7 +55,7 @@ public class ContestScoreboardOutboxProcessor {
                 continue;
             }
 
-            ContestScoreboardOutboxApplier.ApplyResult result = applyResults.get(index);
+            ContestScoreboardApplier.ApplyResult result = applyResults.get(index);
             if (result.eventId() != event.eventId()) {
                 failed.add(new JdbcContestScoreboardOutboxQueue.FailedEvent(
                         event,
@@ -87,7 +64,7 @@ public class ContestScoreboardOutboxProcessor {
             } else if (result.succeeded()) {
                 completed.add(new JdbcContestScoreboardOutboxQueue.CompletedEvent(
                         event,
-                        result.redisSequence()
+                        result.sequence()
                 ));
             } else {
                 failed.add(new JdbcContestScoreboardOutboxQueue.FailedEvent(event, result.errorMessage()));

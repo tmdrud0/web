@@ -49,6 +49,11 @@ class JdbcContestSubmissionJudgeResultBatchPersistenceTests {
         verify(outboxStatement).setLong(3, 20L);
         verify(outboxStatement).setLong(4, 30L);
         verify(outboxStatement).setString(8, SubmissionResult.PARTIAL_ACCEPTED.name());
+        // due_at comes from the database clock, not a bind parameter, because the worker compares
+        // it against CURRENT_TIMESTAMP(6).
+        assertThat(sqlCaptor.getAllValues().get(1))
+                .contains("due_at")
+                .contains("'PENDING', ?, CURRENT_TIMESTAMP(6)");
     }
 
     private static ContestSubmissionJudgeResultCommand command(Long submissionId, LocalDateTime judgedAt) {

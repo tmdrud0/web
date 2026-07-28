@@ -8,11 +8,11 @@ import org.springframework.stereotype.Service;
 @RequiredArgsConstructor
 public class ContestScoreboardMaintenanceService {
 
-    private final ContestScoreboardService scoreboardService;
+    private final ContestScoreboardApplier scoreboardApplier;
     private final ContestScoreboardOutboxService outboxService;
 
     public void clearLiveContestState(Long contestId) {
-        scoreboardService.reset(contestId);
+        scoreboardApplier.reset(contestId);
         outboxService.deleteByContestId(contestId);
     }
 }

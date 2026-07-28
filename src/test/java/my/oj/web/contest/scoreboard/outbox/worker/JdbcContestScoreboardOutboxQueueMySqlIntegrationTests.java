@@ -69,9 +69,11 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
                 outbox.getId()
         )).isEqualTo("PROCESSING");
 
+        // Age the row past its lease: claimed a minute ago, so the lease lapsed 30 seconds back.
         jdbcTemplate.update("""
                 UPDATE contest_submission_outbox
-                SET claimed_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 MINUTE)
+                SET claimed_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 MINUTE),
+                    due_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 30 SECOND)
                 WHERE id = ?
                 """, outbox.getId());
 
@@ -102,6 +104,11 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
                 String.class,
                 outbox.getId()
         )).isEqualTo("COMPLETED");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT due_at IS NULL FROM contest_submission_outbox WHERE id = ?",
+                Boolean.class,
+                outbox.getId()
+        )).isTrue();
     }
 
     @Test
@@ -125,7 +132,8 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
 
         jdbcTemplate.update("""
                 UPDATE contest_submission_outbox
-                SET next_attempt_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 SECOND)
+                SET next_attempt_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 SECOND),
+                    due_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 SECOND)
                 WHERE id = ?
                 """, outbox.getId());
 
@@ -203,6 +211,13 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
         );
         entityManager.persist(outbox);
         entityManager.flush();
+        // The production insert stamps due_at from the database clock; do the same here so the
+        // fixture stays claimable when the JVM and MySQL run in different time zones.
+        jdbcTemplate.update("""
+                UPDATE contest_submission_outbox
+                SET created_at = CURRENT_TIMESTAMP(6), due_at = CURRENT_TIMESTAMP(6)
+                WHERE id = ?
+                """, outbox.getId());
         return outbox;
     }
 }

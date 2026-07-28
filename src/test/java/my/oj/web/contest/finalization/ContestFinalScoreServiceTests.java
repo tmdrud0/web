@@ -3,7 +3,9 @@ package my.oj.web.contest.finalization;
 import my.oj.web.contest.Contest;
 import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
 import my.oj.web.contest.scoreboard.ContestScoreboardService;
-import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardStore;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboard;
+import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardReader;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
@@ -35,6 +37,7 @@ class ContestFinalScoreServiceTests {
     private ContestFinalScoreRepository finalScoreRepository;
 
     /** A real scoreboard, not a mock, so mutations to it are observable. */
+    private InMemoryContestScoreboard liveBoard;
     private ContestScoreboardService liveScoreboard;
     private ContestFinalScoreService finalScoreService;
 
@@ -43,7 +46,8 @@ class ContestFinalScoreServiceTests {
 
     @BeforeEach
     void setUp() {
-        liveScoreboard = new ContestScoreboardService(new InMemoryContestScoreboardStore());
+        liveBoard = new InMemoryContestScoreboard();
+        liveScoreboard = new ContestScoreboardService(new InMemoryContestScoreboardReader(liveBoard));
         finalScoreService = new ContestFinalScoreService(resultRepository, finalScoreRepository, liveScoreboard);
 
         contestStart = LocalDateTime.of(2025, 9, 19, 9, 0);
@@ -100,15 +104,16 @@ class ContestFinalScoreServiceTests {
 
     /** A user who is on the live board but not among the results being finalized. */
     private void seedLiveScoreboard() {
-        liveScoreboard.recordJudgement(
+        liveBoard.apply(new ContestScoreboardUpdate(
                 777L,
                 CONTEST_ID,
                 10L,
                 BYSTANDER_USER_ID,
                 contestStart,
                 LocalDateTime.of(2025, 9, 19, 10, 0),
-                SubmissionResult.ACCEPTED
-        );
+                SubmissionResult.ACCEPTED,
+                null
+        ));
         assertThat(liveScoreboard.currentRanking(CONTEST_ID)).hasSize(1);
     }
 

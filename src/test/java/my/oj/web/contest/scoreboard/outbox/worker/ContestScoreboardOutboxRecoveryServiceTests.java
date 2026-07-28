@@ -1,6 +1,6 @@
 package my.oj.web.contest.scoreboard.outbox.worker;
 
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -25,7 +25,7 @@ class ContestScoreboardOutboxRecoveryServiceTests {
     private ContestScoreboardOutboxRepository outboxRepository;
 
     @Mock
-    private ContestScoreboardOutboxApplier outboxApplier;
+    private ContestScoreboardApplier outboxApplier;
 
     private ContestScoreboardOutboxRecoveryService recoveryService;
 

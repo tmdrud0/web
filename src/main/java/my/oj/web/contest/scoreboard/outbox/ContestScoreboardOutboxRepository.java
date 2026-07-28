@@ -1,21 +1,15 @@
 package my.oj.web.contest.scoreboard.outbox;
 
-import jakarta.persistence.LockModeType;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.Collection;
 import java.util.List;
-import java.util.Optional;
 
 public interface ContestScoreboardOutboxRepository extends JpaRepository<ContestScoreboardOutbox, Long> {
-
-    @Lock(LockModeType.PESSIMISTIC_WRITE)
-    Optional<ContestScoreboardOutbox> findById(Long id);
 
     @Query("""
             select o.redisSequence
@@ -37,7 +31,8 @@ public interface ContestScoreboardOutboxRepository extends JpaRepository<Contest
                 o.lastErrorMessage = null,
                 o.claimToken = null,
                 o.claimedAt = null,
-                o.nextAttemptAt = null
+                o.nextAttemptAt = null,
+                o.dueAt = current_timestamp
             where o.redisSequence in :sequences
               and o.status <> my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxStatus.PROCESSING
             """)
@@ -61,7 +56,8 @@ public interface ContestScoreboardOutboxRepository extends JpaRepository<Contest
                 o.lastErrorMessage = null,
                 o.claimToken = null,
                 o.claimedAt = null,
-                o.nextAttemptAt = null
+                o.nextAttemptAt = null,
+                o.dueAt = current_timestamp
             where o.id in :ids
               and o.redisSequence is not null
               and o.status <> my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxStatus.PROCESSING

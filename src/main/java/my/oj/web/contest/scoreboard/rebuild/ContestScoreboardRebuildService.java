@@ -1,7 +1,8 @@
 package my.oj.web.contest.scoreboard.rebuild;
 
 import lombok.RequiredArgsConstructor;
-import my.oj.web.contest.scoreboard.ContestScoreboardService;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
@@ -24,13 +25,13 @@ public class ContestScoreboardRebuildService {
 
     private static final int REBUILD_BATCH_SIZE = 1_000;
 
-    private final ContestScoreboardService scoreboardService;
+    private final ContestScoreboardApplier scoreboardApplier;
     private final ContestSubmissionResultRepository resultRepository;
     private final ContestSubmissionService contestSubmissionService;
     private final ContestSubmissionBatchExecutor batchExecutor;
 
     public void rebuildFromContestResults(Long contestId) {
-        scoreboardService.reset(contestId);
+        scoreboardApplier.reset(contestId);
 
         batchExecutor.processBatches(
                 contestId,
@@ -58,34 +59,58 @@ public class ContestScoreboardRebuildService {
                 .comparing(ContestSubmission::getSubmittedTime, Comparator.nullsLast(Comparator.naturalOrder()))
                 .thenComparing(ContestSubmission::getId));
 
+        List<ContestScoreboardApplier.ApplyRequest> requests = new ArrayList<>(submissions.size());
         for (ContestSubmission submission : submissions) {
-            ContestSubmissionResult result = resultMap.get(submission.getId());
-            SubmissionResult effectiveResult = resolveResult(result);
+            SubmissionResult effectiveResult = resolveResult(resultMap.get(submission.getId()));
+            // An unjudged submission has nothing to contribute, and applying it would mark the
+            // submission as handled - the real judgement would then be skipped for good.
+            if (effectiveResult == null) {
+                continue;
+            }
             LocalDateTime contestStart = submission.getContest() != null
                     ? submission.getContest().getStartTime()
                     : null;
-            scoreboardService.recordJudgement(
+            requests.add(new ContestScoreboardApplier.ApplyRequest(
                     submission.getId(),
-                    contestId,
-                    submission.getProblem().getId(),
-                    submission.getUser().getId(),
-                    contestStart,
-                    submission.getSubmittedTime(),
-                    effectiveResult
+                    new ContestScoreboardUpdate(
+                            submission.getId(),
+                            contestId,
+                            submission.getProblem().getId(),
+                            submission.getUser().getId(),
+                            contestStart,
+                            submission.getSubmittedTime(),
+                            effectiveResult,
+                            null
+                    )
+            ));
+        }
+        if (requests.isEmpty()) {
+            return;
+        }
+
+        List<ContestScoreboardApplier.ApplyResult> results = scoreboardApplier.applyAll(requests);
+        String failure = results.stream()
+                .filter(result -> !result.succeeded())
+                .map(ContestScoreboardApplier.ApplyResult::errorMessage)
+                .findFirst()
+                .orElse(null);
+        if (failure != null) {
+            throw new IllegalStateException(
+                    "Failed to replay contest " + contestId + " onto the scoreboard: " + failure
             );
         }
     }
 
+    /**
+     * @return the result to replay, or {@code null} when the submission has not been judged
+     */
     private SubmissionResult resolveResult(ContestSubmissionResult result) {
         if (result == null) {
-            return SubmissionResult.PENDING;
+            return null;
         }
         if (result.getFinalResult() != null) {
             return result.getFinalResult();
         }
-        if (result.getProvisionalResult() != null) {
-            return result.getProvisionalResult();
-        }
-        return SubmissionResult.PENDING;
+        return result.getProvisionalResult();
     }
 }

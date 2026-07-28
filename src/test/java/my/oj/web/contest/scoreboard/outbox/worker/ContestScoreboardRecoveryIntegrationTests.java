@@ -2,7 +2,7 @@ package my.oj.web.contest.scoreboard.outbox.worker;
 
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutbox;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxStatus;
 import jakarta.persistence.EntityManager;
@@ -117,6 +117,8 @@ class ContestScoreboardRecoveryIntegrationTests {
         assertThat(outbox.getRedisSequence()).isNull();
         assertThat(outbox.getProcessedAt()).isNull();
         assertThat(outbox.getLastErrorMessage()).isNull();
+        // Requeued rows are invisible to the worker unless due_at is restored along with the status.
+        assertThat(outbox.getDueAt()).isNotNull();
     }
 
     @TestConfiguration
@@ -128,7 +130,7 @@ class ContestScoreboardRecoveryIntegrationTests {
         }
     }
 
-    static class MutableSequenceApplier implements ContestScoreboardOutboxApplier {
+    static class MutableSequenceApplier implements ContestScoreboardApplier {
 
         private long currentSequence;
 
@@ -140,6 +142,11 @@ class ContestScoreboardRecoveryIntegrationTests {
         @Override
         public long currentSequence() {
             return currentSequence;
+        }
+
+        @Override
+        public void reset(long contestId) {
+            throw new UnsupportedOperationException("Not used by recovery tests");
         }
 
         void setCurrentSequence(long currentSequence) {

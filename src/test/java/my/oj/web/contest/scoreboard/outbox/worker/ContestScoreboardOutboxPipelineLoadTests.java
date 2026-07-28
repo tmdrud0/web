@@ -199,8 +199,8 @@ class ContestScoreboardOutboxPipelineLoadTests {
         jdbcTemplate.batchUpdate("""
                 INSERT INTO contest_submission_outbox (
                     contest_submission_id, contest_id, problem_id, user_id,
-                    contest_start, submitted_time, judged_at, result, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+                    contest_start, submitted_time, judged_at, result, status, created_at, due_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, CURRENT_TIMESTAMP(6))
                 """, outboxes);
     }
 
