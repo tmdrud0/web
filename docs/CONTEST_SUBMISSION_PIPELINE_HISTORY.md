@@ -1,6 +1,6 @@
 # 대회 제출 파이프라인 설계 및 개선 기록
 
-> 최종 갱신: 2026-07-22  
+> 최종 갱신: 2026-07-30  
 > 작업 브랜치: `codex/rabbitmq-contest-judge`  
 > 문서 목적: 과거의 설계 판단부터 현재 구현, 성능 측정, 미해결 문제까지 한 문서에서 다시 파악하고 LLM에 인수인계하기 위한 기록
 
@@ -39,6 +39,7 @@ HTTP 제출
 - RabbitMQ consumer ACK는 채점 결과와 scoreboard outbox의 DB commit 이후에만 발생한다.
 - 채점 서버의 긴 꼬리 지연은 `prefetch=1`과 다수 consumer로 서로 격리한다.
 - Redis scoreboard는 파생 상태이며 DB outbox로 재구성할 수 있어야 한다.
+- 채점 완료 순서는 제출 순서와 다르므로 scoreboard 반영은 순서와 중복에 무관해야 한다. 라이브 값과 rebuild 값이 같은 데이터에서 일치하는 것이 기준이다.
 - 최신 부하 테스트에서 MySQL batch insert나 RabbitMQ보다 HTTP 경로의 동기 Redis 호출과 응답 completion 단계가 먼저 병목이 됐다.
 
 현재 가장 중요한 미해결 문제는 다음 두 가지다.
@@ -516,10 +517,11 @@ listener concurrency가 64이고 각 listener가 결과 commit을 기다리므�
 
 주요 코드:
 
-- [`ContestScoreboardOutboxStore`](../src/main/java/my/oj/web/contest/scoreboard/outbox/ContestScoreboardOutboxStore.java)
-- [`ContestScoreboardOutboxProcessor`](../src/main/java/my/oj/web/contest/scoreboard/outbox/ContestScoreboardOutboxProcessor.java)
-- [`RedisContestScoreboardOutboxApplier`](../src/main/java/my/oj/web/contest/scoreboard/outbox/RedisContestScoreboardOutboxApplier.java)
-- [`ContestScoreboardOutboxRecoveryService`](../src/main/java/my/oj/web/contest/scoreboard/outbox/ContestScoreboardOutboxRecoveryService.java)
+- [`JdbcContestScoreboardOutboxQueue`](../src/main/java/my/oj/web/contest/scoreboard/outbox/worker/JdbcContestScoreboardOutboxQueue.java)
+- [`ContestScoreboardOutboxProcessor`](../src/main/java/my/oj/web/contest/scoreboard/outbox/worker/ContestScoreboardOutboxProcessor.java)
+- [`RedisContestScoreboardOutboxApplier`](../src/main/java/my/oj/web/contest/scoreboard/redis/RedisContestScoreboardOutboxApplier.java)
+- [`ContestScoreboardRedisScript`](../src/main/java/my/oj/web/contest/scoreboard/redis/ContestScoreboardRedisScript.java)
+- [`ContestScoreboardOutboxRecoveryService`](../src/main/java/my/oj/web/contest/scoreboard/outbox/worker/ContestScoreboardOutboxRecoveryService.java)
 
 상태 전이:
 
@@ -548,7 +550,124 @@ PENDING or retryable FAILED or expired PROCESSING
 
 pipeline은 하나의 큰 원자적 transaction이 아니다. network round trip을 줄이지만 각 Lua script는 Redis에서 순서대로 독립 실행된다. 한 event의 script 원자성은 유지된다.
 
-여러 Batch 인스턴스가 동시에 scoreboard 순서를 바꾸지 않도록 MySQL named lock을 사용해 현재는 한 worker만 scoreboard batch를 처리한다.
+### 4.10.1 순서 의존성 제거 — commutative scoreboard 갱신
+
+2026-07-30까지 scoreboard 상태는 누적 방식이었다. (user, problem)마다 `accepted` 플래그와
+`wrongAttempts` 카운터를 두고, ACCEPTED가 오면 그 시점의 카운터로 penalty를 확정한 뒤
+`accepted='1'`을 세웠다. 이후 도착한 event는 `accepted ~= '1'` 분기에서 통째로 버려졌다.
+
+이 방식은 event가 제출 순서대로 도착한다고 가정한다. 그러나 채점 지연은 제출마다 다르므로
+(설계 전제: 평균 10ms, p999 2초 — §1.2) `contest_submission_outbox.created_at` 순서는 제출
+순서와 다르다. 다음이 실제로 틀린 값을 만들었다.
+
+```text
+t=10분  WRONG 제출     → 채점 2초
+t=12분  ACCEPTED 제출  → 채점 10ms
+```
+
+ACCEPTED가 먼저 적용되어 penalty가 `12 + 0 * 5 = 12`로 확정되고, 뒤늦게 온 WRONG은 버려져
+`wrongAttempts`도 늘지 않았다. 반면 rebuild 경로는 `submittedTime, id` 순으로 replay하므로
+같은 데이터에서 `12 + 1 * 5 = 17`을 냈다. 즉 대회 중 사용자가 본 순위와 최종 순위가
+달라질 수 있었다.
+
+해결은 누적을 버리고 **재계산**으로 바꾼 것이다. problem hash가 제출 사실 자체를
+submissionId 키로 보관하고, event마다 그 problem의 기여도를 처음부터 다시 계산한다.
+
+`contest:scoreboard:{contestId}:user:{userId}:problem:{problemId}`
+
+| 필드 | 의미 |
+|---|---|
+| `a:min` | 지금까지 본 ACCEPTED 중 가장 이른 것의 `contestMinutes` |
+| `a:sid` | 그 ACCEPTED의 `contestSubmissionId` (같은 분 tie-break) |
+| `w:<submissionId>` | 그 WRONG 제출의 `contestMinutes` |
+| `c:solved` | 이 problem이 summary에 기여 중인 solved |
+| `c:penalty` | 이 problem이 summary에 기여 중인 penalty |
+
+적용 절차는 다음과 같다.
+
+1. `PENDING`은 점수를 반영하지 않고 sequence만 처리한다.
+2. ACCEPTED는 `(minutes, submissionId)`가 기존 `(a:min, a:sid)`보다 작을 때만 갱신한다.
+   WRONG류는 `w:<submissionId>`를 쓰므로 중복 도착이 자동 흡수된다.
+3. `a:min`이 없으면 기여도는 0이고, 있으면 solved 1과
+   `a:min + (a보다 이른 w 개수) * PENALTY_PER_WRONG_MINUTES`다.
+4. summary에는 `c:solved`, `c:penalty`와의 **차이만** `HINCRBY`한다.
+5. `c:*`를 새 기여도로 덮어쓰고 ranking zset score를 다시 쓴다.
+
+tie-break를 `(minutes, submissionId)` 튜플로 둔 이유는 같은 분에 WRONG과 ACCEPTED가 있을 때
+결과가 도착 순서에 좌우되지 않게 하는 것이다. submissionId는 Snowflake라 시간 단조 증가한다.
+Lua는 submissionId를 숫자로 비교하지 않고 십진 문자열로 비교한다. Lua number는 double이고
+Snowflake ID는 정확한 정수 표현 한계인 53비트를 넘기 때문이다.
+
+같은 규칙이 세 곳에 있고 함께 바뀌었다. 하나만 바꾸면 경로별로 다른 scoreboard가 나온다.
+
+| 구현 | 파일 | 쓰이는 경로 |
+|---|---|---|
+| Lua | [`ContestScoreboardRedisScript`](../src/main/java/my/oj/web/contest/scoreboard/redis/ContestScoreboardRedisScript.java) | 라이브 outbox 반영 |
+| Java (Redis) | [`RedisContestScoreboardStore`](../src/main/java/my/oj/web/contest/scoreboard/redis/RedisContestScoreboardStore.java) | rebuild (`store=redis`) |
+| Java (메모리) | [`InMemoryContestScoreboardStore`](../src/main/java/my/oj/web/contest/scoreboard/memory/InMemoryContestScoreboardStore.java) | `store=memory` 프로필, 최종 점수 replay |
+
+Java 두 구현은 [`ContestScoreboardPolicy.computeProblemContribution`](../src/main/java/my/oj/web/contest/scoreboard/ContestScoreboardPolicy.java)을 공유한다.
+Lua는 Java 상수를 참조할 수 없으므로 penalty·score 가중치를 지금처럼 ARGV로 받는 계약을
+유지했고, 필드 이름은 `ContestScoreboardRedisFields`와 Lua 양쪽에 있다.
+
+부수 효과와 운영 주의사항:
+
+- **problem hash 메모리가 제출 수만큼 늘어난다.** 이전에는 (user, problem)당 2필드
+  고정이었다. 지금은 wrong 제출마다 `w:<submissionId>` 필드가 하나씩 쌓인다.
+  `redis:7-alpine` 단일 컨테이너에서 `MEMORY USAGE`로 측정한 값은 다음과 같다
+  (`a00d4d6`, 기본 `hash-max-listpack-entries=512`, 17~19자리 submissionId).
+
+  | problem hash 상태 | bytes |
+  |---|---|
+  | 이전 schema (`accepted`, `wrongAttempts`) | 88 |
+  | 새 schema, 정답 + wrong 0건 | 112 |
+  | 새 schema, 정답 + wrong 5건 | 240 |
+  | 새 schema, 정답 + wrong 20건 | 696 |
+  | 새 schema, 정답 + wrong 100건 | 2,616 |
+  | 새 schema, 정답 + wrong 200건 | 5,176 |
+
+  wrong 제출 하나가 약 25바이트, (user, problem) 하나의 고정분이 88 → 112바이트다.
+  §15 기준선의 참가자 9,364명이 문제 5개에 각각 wrong 3건을 냈다고 보면 약 14만 필드,
+  3~4MB가 추가된다. Redis `maxmemory`가 384mb이고 정책이 `noeviction`이므로
+  (`docs/ENVIRONMENT.md`) 대회 종료 후 `reset` 시점을 지키는 것이 이전보다 중요해졌다.
+  한 (user, problem)이 512필드를 넘으면 listpack에서 hashtable로 바뀌어 필드당 비용이
+  뛰지만, 같은 문제에 wrong 512건은 현재 rate limit 아래에서 현실적인 값이 아니다.
+- **필드 schema가 바뀌었으므로 배포 시 진행 중인 대회의 scoreboard는 rebuild가 필요하다.**
+  기존 `accepted`/`wrongAttempts`만으로는 확정된 penalty의 근거(정답 제출 시각)를 복원할 수
+  없어 자동 이전이 불가능하다. 새 코드는 옛 필드를 무시하므로, 이전 상태가 남은 채 새
+  event가 오면 solved가 중복 계산된다.
+- PENDING event는 이제 메모리 구현에서도 사용자를 0/0으로 board에 올리지 않는다.
+  라이브 Redis 경로가 원래 하던 동작에 맞췄다.
+
+이 성질을 고정한 테스트:
+
+| 테스트 | 확인하는 것 |
+|---|---|
+| `ContestScoreboardStoreCommutativityTests` | Java 두 구현에 대해 무작위 순열 25개의 결과 동일, 위 회귀 시나리오 penalty 17, 중복 전달·재적용 멱등성, PENDING 무반영 |
+| `RedisContestScoreboardOutboxApplierRedisIntegrationTests` | Lua에 대해 같은 성질과 problem hash 필드, 뒤늦은 더 이른 ACCEPTED가 solve 시각을 교체하는 동작 |
+| `ContestScoreboardLiveVersusRebuildRedisIntegrationTests` | 같은 제출·결과 집합에서 outbox 경로와 `rebuildFromContestResults` 결과 일치 |
+
+### 4.10.2 worker named lock 제거
+
+이전에는 여러 Batch 인스턴스가 scoreboard 적용 순서를 섞지 못하도록 MySQL `GET_LOCK`
+named lock으로 한 worker만 batch를 처리했다. 순서 의존성이 사라졌으므로 이 lock은 정합성이
+아니라 처리량 상한으로만 남아 제거했다. 동시 실행을 지키는 것은 다음 네 가지다.
+
+- claim은 `FOR UPDATE SKIP LOCKED`라서 한 row가 두 worker에게 가지 않는다.
+- 완료는 `status = 'PROCESSING' AND claim_token = ?` 조건이라 lease가 만료된 worker가
+  다른 worker의 row를 완료 처리할 수 없다.
+- 한 event의 Redis 반영은 여전히 Lua script 안에서 원자적이고, 결과는 적용 순서와 무관하다.
+- sequence는 `INCR`로 발급되므로 worker가 늘어도 중복 sequence가 생기지 않는다.
+
+`recoverRedisState`는 lock을 잡지 않는다. requeue 쿼리 전부가 `status <> PROCESSING`
+조건을 가지므로 처리 중인 claim을 빼앗지 않고, 두 인스턴스가 같은 requeue를 실행하면 두 번째는
+`redis_seq`가 이미 null이라 0건을 갱신한다. 최악의 경우 같은 scan을 두 번 하거나 lock wait이
+생기고, 다음 tick이 다시 시도한다.
+
+`JdbcContestScoreboardOutboxQueueMySqlIntegrationTests`는 worker 4개가 같은 queue에서 claim할
+때 같은 row가 두 번 나가지 않음을, `ContestScoreboardConcurrentWorkerRedisIntegrationTests`는
+worker 4개가 함께 drain한 최종 scoreboard가 단일 worker 결과와 같음을 확인한다. 두 테스트는
+Redis/MySQL이 필요하므로 실행 조건은 `docs/ENVIRONMENT.md` §8을 따른다.
 
 ## 5. Redis scoreboard 복구 설계
 
@@ -571,6 +690,12 @@ Redis Lua script는 다음을 함께 처리한다.
 - ranking sorted set 갱신
 
 이미 처리한 event면 기존 sequence를 반환하고 scoreboard를 다시 더하지 않는다.
+
+이 계약은 §4.10.1 전환에서 그대로 유지했다. sequence 발급, `contestSubmissionId -> redis_seq`
+매핑, 처리한 event에 기존 sequence를 반환하는 동작, `currentSequence()`는 모두 이전과 같다.
+달라진 것은 처리 marker가 없어졌을 때의 결과다. 이전에는 marker를 잃으면 같은 event가 다시
+더해져 점수가 중복됐지만, 지금은 재적용이 같은 기여도를 다시 계산하므로 결과가 변하지 않는다.
+즉 processed set은 이제 정합성의 유일한 방어선이 아니라 불필요한 작업을 줄이는 장치다.
 
 DB outbox에도 Redis가 반환한 `redis_seq`를 저장한다.
 
@@ -598,6 +723,13 @@ Redis가 과거 RDB snapshot으로 일관되게 rollback되면 다음 신호가 
 이런 선택적 손상은 sequence 충돌이나 lost-tail 신호가 나타나지 않을 수 있으므로 자동 복구가 완전하지 않다. 이 경우 contest 단위 전체 rebuild 또는 명시적 replay 명령이 필요하다.
 
 또한 자연 복구는 새 event 유입과 주기적인 recovery scan 속도에 영향을 받는다. 대회 최종화 시점에는 DB 결과를 기준으로 별도 정합성 확인 또는 전체 rebuild가 여전히 필요하다.
+
+§4.10.1 이후 이 한계의 성격이 하나 바뀌었다. 이전에는 잘못된 순서로 replay되면 rebuild 결과가
+라이브 값과 달라져 "어느 쪽이 맞는지"부터 판단해야 했다. 지금은 두 경로가 같은 규칙을
+쓰므로 replay는 순서와 횟수에 무관하고, 복구는 "누락된 event를 다시 흘려보내는" 문제로만
+남는다. 이 동등성은
+[`ContestScoreboardLiveVersusRebuildRedisIntegrationTests`](../src/test/java/my/oj/web/contest/scoreboard/rebuild/ContestScoreboardLiveVersusRebuildRedisIntegrationTests.java)가
+고정한다.
 
 ## 6. 성능 개선 과정과 측정값
 
@@ -770,16 +902,24 @@ DB bulk 지표:
 - Rabbit listener는 result와 scoreboard outbox DB commit 후에만 정상 반환하고 ACK된다.
 - publish 또는 consume 중복은 DB PK/unique와 `INSERT IGNORE`로 흡수한다.
 - scoreboard event 하나의 Redis 반영은 Lua script 안에서 원자적이다.
+- scoreboard 반영은 적용 순서와 중복 횟수에 무관하다. 같은 제출·결과 집합이면 항상 같은
+  solved/penalty가 된다 (§4.10.1).
+- 같은 데이터에 대해 라이브 scoreboard와 rebuild 결과가 일치한다.
+- scoreboard outbox worker를 여러 인스턴스에서 동시에 실행해도 결과가 단일 worker와 같다
+  (§4.10.2).
 - scoreboard outbox claim은 lease token으로 stale completion을 막는다.
 - scoreboard 실패는 exponential backoff 후 재시도된다.
 
 ### 8.2 보장하지 않는 것
 
-- exactly-once delivery
+- exactly-once delivery. 다만 scoreboard 정합성은 더 이상 이 보장에 의존하지 않는다.
+  중복 전달과 순서 뒤바뀜이 모두 같은 결과로 수렴한다 (§4.10.1에서 §8.1로 이동).
 - HTTP 실패가 곧 DB 미저장을 의미한다는 보장
 - DB commit 전 JVM queue의 영속성
 - cross-node 동시 동일 제출을 항상 정상 duplicate 응답으로 변환하는 것
 - 임의의 Redis key 일부만 선택적으로 사라진 경우의 완전 자동 복구
+- 이전 problem hash schema에서 새 schema로의 자동 이전. 배포 시 진행 중인 대회는 rebuild가
+  필요하다 (§4.10.1)
 - Rabbit 한 노드만 실행한 로컬 환경에서 실제 quorum HA
 - 실제 judge API p999 2초 조건의 처리량
 - 재채점과 여러 judge run 이력
@@ -855,12 +995,21 @@ estimated_drain_seconds = backlog_count / recent_sustainable_throughput
 
 ### 9.6 scoreboard 확장
 
-현재 MySQL named lock으로 scoreboard batch worker 하나만 실제 적용한다. backlog가 커지면 다음 순서로 검토한다.
+named lock을 제거했으므로 scoreboard batch worker는 여러 인스턴스에서 동시에 실행할 수 있다
+(§4.10.2). 순서 보존을 위한 contest 단위 lock이나 partitioning은 더 이상 필요하지 않다.
+남은 과제는 다음이다.
 
-1. batch/pipeline 크기와 Redis latency 확인
-2. contest ID 기준 lock 및 worker partitioning
-3. contest별 순서 요구와 서로 다른 contest의 병렬 적용 분리
-4. 명시적 contest rebuild 도구 추가
+1. batch/pipeline 크기와 Redis latency 확인. worker를 늘리기 전에 단일 worker가 어디서
+   막히는지 먼저 본다.
+2. claim 쿼리의 `ORDER BY COALESCE(next_attempt_at, claimed_at, created_at), created_at, id`
+   단순화. 순서 의존성이 사라져 이 정렬 키는 공정성 용도만 남았다. 별도 커밋과 `EXPLAIN`
+   검증으로 진행한다.
+3. 대회 종료 후 problem hash의 `w:*` 필드 정리 시점. 새 schema에서 이 필드가 제출 수만큼
+   쌓이므로 `reset`/archive 정책이 메모리 상한과 직접 연결된다 (§4.10.1 측정값).
+4. 명시적 contest rebuild 도구 추가. 지금은 `ContestScoreboardRebuildService`를 호출하는
+   운영 진입점이 없다. schema 변경 배포와 선택적 key 손상 복구 양쪽에 필요하다.
+5. worker를 2개 이상 상시 운영할 경우의 Redis 연결 수와 pipeline 크기 재확인. Lua script는
+   pipeline마다 dedicated connection을 쓴다.
 
 ## 10. 운영 지표와 알림
 
@@ -916,6 +1065,7 @@ estimated_drain_seconds = backlog_count / recent_sustainable_throughput
 - Lua 오류, fallback 횟수
 - duplicate `redis_seq`, lost-tail requeue 수
 - 최종 scoreboard와 DB 결과 정합성 검사 결과
+- problem hash의 `w:*` 필드 총량과 Redis `used_memory` (§4.10.1에서 제출 수에 비례해 늘어난다)
 
 ## 11. 용어 정리
 
@@ -967,9 +1117,12 @@ CDC를 도입해도 다음은 사라지지 않는다.
 5. [`ContestJudgeOutboxRelay`](../src/main/java/my/oj/web/contest/submission/messaging/ContestJudgeOutboxRelay.java)
 6. [`ContestJudgeRabbitConfiguration`](../src/main/java/my/oj/web/contest/submission/messaging/ContestJudgeRabbitConfiguration.java)
 7. [`ContestSubmissionJudgeResultBatchWriter`](../src/main/java/my/oj/web/contest/submission/judge/ContestSubmissionJudgeResultBatchWriter.java)
-8. [`ContestScoreboardOutboxProcessor`](../src/main/java/my/oj/web/contest/scoreboard/outbox/ContestScoreboardOutboxProcessor.java)
-9. [`RedisContestScoreboardOutboxApplier`](../src/main/java/my/oj/web/contest/scoreboard/outbox/RedisContestScoreboardOutboxApplier.java)
-10. [`ContestScoreboardOutboxRecoveryService`](../src/main/java/my/oj/web/contest/scoreboard/outbox/ContestScoreboardOutboxRecoveryService.java)
+8. [`ContestScoreboardOutboxProcessor`](../src/main/java/my/oj/web/contest/scoreboard/outbox/worker/ContestScoreboardOutboxProcessor.java)
+9. [`RedisContestScoreboardOutboxApplier`](../src/main/java/my/oj/web/contest/scoreboard/redis/RedisContestScoreboardOutboxApplier.java)
+10. [`ContestScoreboardOutboxRecoveryService`](../src/main/java/my/oj/web/contest/scoreboard/outbox/worker/ContestScoreboardOutboxRecoveryService.java)
+
+scoreboard 규칙을 손볼 때는 §4.10.1의 세 구현 표를 먼저 본다. Lua, Java(Redis), Java(메모리)가
+같은 규칙을 갖고 있으므로 하나만 바꾸면 경로별로 다른 scoreboard가 나온다.
 
 현재 작업 트리는 큰 미커밋 변경을 포함한다. 브랜치의 마지막 commit만 보고 RabbitMQ 구현이 이미 commit됐다고 가정하면 안 된다. 파일을 수정하기 전에 `git status`, 실제 profile, 실행 중인 container와 포트를 확인해야 한다.
 

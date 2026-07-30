@@ -86,6 +86,7 @@ flowchart LR
 - RabbitMQ·Redis 같은 외부 시스템 코드는 해당 기능의 infrastructure 역할로 한정한다.
 - profile 조건과 운영 설정 key는 역할 계약이므로 리팩터링 중 임의로 바꾸지 않는다.
 - 동시성 실행기와 queue의 종료 정책 변경은 단순 구조 이동과 분리해 검증한다.
+- scoreboard 반영은 적용 순서와 중복 횟수에 무관해야 한다. 같은 규칙이 Lua, Java(Redis), Java(메모리) 세 곳에 있으므로 함께 바꾼다. 배경은 `CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §4.10.1이다.
 
 ## 5. 설정과 실행 파일
 
