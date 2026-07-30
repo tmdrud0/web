@@ -62,9 +62,6 @@ class ContestScoreboardOutboxPipelineLoadTests {
     @Autowired
     private ContestScoreboardOutboxProcessor processor;
 
-    @Autowired
-    private ContestScoreboardOutboxProcessLock processLock;
-
     @AfterEach
     void tearDown() {
         flushRedis();
@@ -89,9 +86,8 @@ class ContestScoreboardOutboxPipelineLoadTests {
         int stale = 0;
         int batches = 0;
         while (true) {
-            ContestScoreboardOutboxProcessor.BatchProcessResult result = processLock.executeIfAcquired(
-                    () -> processor.processBatch(BATCH_SIZE, Duration.ofSeconds(30))
-            ).orElseThrow(() -> new IllegalStateException("Scoreboard process lock was unexpectedly busy"));
+            ContestScoreboardOutboxProcessor.BatchProcessResult result =
+                    processor.processBatch(BATCH_SIZE, Duration.ofSeconds(30));
             if (result.claimed() == 0) {
                 break;
             }
