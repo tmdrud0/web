@@ -669,6 +669,49 @@ named lock으로 한 worker만 batch를 처리했다. 순서 의존성이 사라
 worker 4개가 함께 drain한 최종 scoreboard가 단일 worker 결과와 같음을 확인한다. 두 테스트는
 Redis/MySQL이 필요하므로 실행 조건은 `docs/ENVIRONMENT.md` §8을 따른다.
 
+### 4.10.3 claim 쿼리를 인덱스 순서대로 읽게 바꾸기
+
+순서 의존성이 사라진 뒤 claim 쿼리의 정렬 키를 다시 봤다. 기존 쿼리는 세 status를 OR로 묶고
+`ORDER BY COALESCE(next_attempt_at, claimed_at, created_at), created_at, id`로 정렬했다.
+
+측정은 운영과 같은 DDL·인덱스를 가진 일회용 `oj_explain` 스키마(50만 행, FK만 제외)에서 했다.
+직전 커밋 `27a2cc8`, `innodb_buffer_pool_size=128M`, 테이블 181MB 기준이다.
+
+| 상황 | 계획 | 시간 |
+|---|---|---|
+| 적격 6천 건 | `idx_cs_outbox_claim` range scan 7,000행 → **filesort 6,000행** | 17.6ms |
+| 적격 20.4만 건 | **풀 테이블 스캔 50만행** → filter 204,500행 → 정렬 | 112ms |
+
+두 가지가 문제였다. 정렬 입력이 batch 크기가 아니라 **적격 행 전체**라서 500건을 얻으려고 6,000건을
+정렬했고, 백로그가 커지면 optimizer가 인덱스를 아예 버리고 풀 스캔으로 떨어졌다. poll interval이
+200ms인데 배출이 가장 급한 상황에서 행을 고르는 데만 주기의 절반을 쓰는 형태였다.
+
+`COALESCE`만 걷어내는 것으로는 해결되지 않는다. `ORDER BY created_at, id`로 바꿔도 여전히
+filesort(14.2ms)였다. status에 대한 3중 OR라 인덱스 레인지 하나로는 정렬된 순서가 나오지 않는다.
+
+그래서 status마다 별도 쿼리로 쪼갰다. **새 인덱스는 필요 없었다.** V13/V14가 이미 맞는 인덱스를
+만들어 뒀는데 OR 쿼리라 정렬에 쓰지 못하고 있었을 뿐이다.
+
+| lane | 쓰는 인덱스 | 계획 | 시간 (백로그 20.4만) |
+|---|---|---|---|
+| `status='PENDING'` | `idx_cs_outbox_status_created` | index lookup, 정렬 없음 | 400행 0.50ms |
+| `status='FAILED'` + backoff 만료 | `idx_cs_outbox_retry` | range scan, 정렬 없음 | 50행 0.17ms |
+| `status='PROCESSING'` + lease 만료 | `idx_cs_outbox_claim` | range scan, 정렬 없음 | 50행 0.43ms |
+
+세 lane 합쳐 batch 500건에 약 1.1ms다. 같은 조건에서 112ms였으니 약 100배다. `IS NULL` 분기도
+레인지에 그대로 들어간다(`NULL <= next_attempt_at <= ...`).
+
+정렬이 정합성과 무관해졌으므로 batch 안의 순서는 이제 **공정성 정책**일 뿐이다. 두 recovery
+lane(만료 lease, 재시도)이 먼저 실행되지만 각각 batch의 1/10로 제한된다. PENDING이 계속 가득
+차도 재시도가 굶지 않고, 반대로 영구 실패 row가 쌓여도 새 작업을 막지 못한다.
+
+**격리 수준을 함께 바꿔야 했다.** 쪼갠 직후 동시성 테스트 두 개가 claim의 `UPDATE`에서
+deadlock으로 실패했다. REPEATABLE READ는 locking read가 훑은 범위마다 gap lock을 잡는데, claim이
+인덱스 범위 세 곳을 읽고 나서 row를 그 범위들 사이로 옮기기 때문에 두 worker가 서로의 gap에
+insert하려는 순환이 생긴다. claim/complete transaction만 READ COMMITTED로 내렸다. 여기서
+repeatable read가 필요한 곳은 없다. row 소유권은 `claim_token`이 정하고 worker끼리는 이미
+`SKIP LOCKED`로 겹치지 않는다. `binlog_format`은 `ROW`라 복제 안전성도 문제되지 않는다.
+
 ## 5. Redis scoreboard 복구 설계
 
 ### 5.1 `outbox.id`만으로 복구하지 않은 이유
@@ -999,17 +1042,16 @@ named lock을 제거했으므로 scoreboard batch worker는 여러 인스턴스�
 (§4.10.2). 순서 보존을 위한 contest 단위 lock이나 partitioning은 더 이상 필요하지 않다.
 남은 과제는 다음이다.
 
-1. batch/pipeline 크기와 Redis latency 확인. worker를 늘리기 전에 단일 worker가 어디서
-   막히는지 먼저 본다.
-2. claim 쿼리의 `ORDER BY COALESCE(next_attempt_at, claimed_at, created_at), created_at, id`
-   단순화. 순서 의존성이 사라져 이 정렬 키는 공정성 용도만 남았다. 별도 커밋과 `EXPLAIN`
-   검증으로 진행한다.
-3. 대회 종료 후 problem hash의 `w:*` 필드 정리 시점. 새 schema에서 이 필드가 제출 수만큼
+1. batch/pipeline 크기와 Redis latency 확인. claim은 더 이상 병목이 아니므로(§4.10.3) 다음
+   측정 대상은 Redis pipeline이다.
+2. 대회 종료 후 problem hash의 `w:*` 필드 정리 시점. 새 schema에서 이 필드가 제출 수만큼
    쌓이므로 `reset`/archive 정책이 메모리 상한과 직접 연결된다 (§4.10.1 측정값).
-4. 명시적 contest rebuild 도구 추가. 지금은 `ContestScoreboardRebuildService`를 호출하는
+3. 명시적 contest rebuild 도구 추가. 지금은 `ContestScoreboardRebuildService`를 호출하는
    운영 진입점이 없다. schema 변경 배포와 선택적 key 손상 복구 양쪽에 필요하다.
-5. worker를 2개 이상 상시 운영할 경우의 Redis 연결 수와 pipeline 크기 재확인. Lua script는
+4. worker를 2개 이상 상시 운영할 경우의 Redis 연결 수와 pipeline 크기 재확인. Lua script는
    pipeline마다 dedicated connection을 쓴다.
+5. `COMPLETED` outbox row의 archive/purge (§9.4). §4.10.3에서 claim 자체는 인덱스만 읽지만,
+   테이블이 계속 커지면 인덱스 깊이와 백업·복구 시간이 늘어난다.
 
 ## 10. 운영 지표와 알림
 
