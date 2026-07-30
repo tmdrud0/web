@@ -115,6 +115,15 @@ class ContestScoreboardLiveVersusRebuildRedisIntegrationTests {
                 Long.class
         );
         assertThat(pending).as("every scoreboard outbox row is applied").isZero();
+        // Guards against a row being completed by something other than this drain — a
+        // scheduler left running in another cached Spring context, for instance.
+        assertThat(redisTemplate.opsForSet().size("contest:scoreboard:" + contestId + ":processed"))
+                .as("every completed event reached this Redis scoreboard")
+                .isEqualTo(jdbcTemplate.queryForObject(
+                        "SELECT COUNT(*) FROM contest_submission_outbox WHERE contest_id = ?",
+                        Long.class,
+                        contestId
+                ));
     }
 
     /**
