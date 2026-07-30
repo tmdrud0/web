@@ -15,6 +15,7 @@ public class DirectContestScoreboardOutboxApplier implements ContestScoreboardOu
     public Long apply(Long eventId, ContestScoreboardUpdate update) {
         scoreboardService.recordJudgement(
                 eventId,
+                update.contestSubmissionId(),
                 update.contestId(),
                 update.problemId(),
                 update.userId(),

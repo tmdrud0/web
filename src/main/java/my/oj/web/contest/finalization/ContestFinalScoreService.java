@@ -80,6 +80,7 @@ public class ContestFinalScoreService {
             }
             replay.recordJudgement(
                     result.getId(),
+                    submission.getId(),
                     contestId,
                     submission.getProblem().getId(),
                     submission.getUser().getId(),

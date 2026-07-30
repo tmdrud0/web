@@ -102,6 +102,7 @@ class ContestFinalScoreServiceTests {
     private void seedLiveScoreboard() {
         liveScoreboard.recordJudgement(
                 777L,
+                777L,
                 CONTEST_ID,
                 10L,
                 BYSTANDER_USER_ID,

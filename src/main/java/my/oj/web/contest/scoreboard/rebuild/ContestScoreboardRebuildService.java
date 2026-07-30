@@ -66,6 +66,7 @@ public class ContestScoreboardRebuildService {
                     : null;
             scoreboardService.recordJudgement(
                     submission.getId(),
+                    submission.getId(),
                     contestId,
                     submission.getProblem().getId(),
                     submission.getUser().getId(),

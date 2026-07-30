@@ -15,13 +15,23 @@ public class ContestScoreboardService {
     private final ContestScoreboardStore store;
 
     public void recordJudgement(long eventId,
+                                long contestSubmissionId,
                                 long contestId,
                                 long problemId,
                                 long userId,
                                 LocalDateTime contestStart,
                                 LocalDateTime submittedTime,
                                 SubmissionResult result) {
-        store.recordJudgement(eventId, contestId, problemId, userId, contestStart, submittedTime, result);
+        store.recordJudgement(
+                eventId,
+                contestSubmissionId,
+                contestId,
+                problemId,
+                userId,
+                contestStart,
+                submittedTime,
+                result
+        );
     }
 
     public List<ContestScoreboardEntry> currentRanking(long contestId) {

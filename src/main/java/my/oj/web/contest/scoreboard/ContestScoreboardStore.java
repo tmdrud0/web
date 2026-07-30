@@ -8,7 +8,14 @@ import java.util.Optional;
 
 public interface ContestScoreboardStore {
 
+    /**
+     * Applies one judgement. {@code eventId} deduplicates repeated delivery of the same
+     * judgement; {@code contestSubmissionId} identifies the attempt itself and breaks ties
+     * between attempts made in the same contest minute. Applying a set of judgements in any
+     * order, and any number of times, must reach the same scoreboard state.
+     */
     void recordJudgement(long eventId,
+                         long contestSubmissionId,
                          long contestId,
                          long problemId,
                          long userId,

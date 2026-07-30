@@ -11,6 +11,7 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -35,6 +36,7 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
 
     @Override
     public void recordJudgement(long eventId,
+                                long contestSubmissionId,
                                 long contestId,
                                 long problemId,
                                 long userId,
@@ -49,7 +51,7 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
             if (isProcessed(contestId, eventId)) {
                 return;
             }
-            applyJudgement(contestId, problemId, userId, contestStart, submittedTime, result);
+            applyJudgement(contestSubmissionId, contestId, problemId, userId, contestStart, submittedTime, result);
             markProcessed(contestId, eventId);
         });
     }
@@ -125,12 +127,19 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
     private ContestScoreboardEntry toEntry(long contestId, String userIdStr) {
         long userId = Long.parseLong(userIdStr);
         Map<String, String> summary = redisClient.hGetAll(ContestScoreboardRedisKeys.summary(contestId, userId));
-        long solved = parseLong(summary.get(ContestScoreboardSummaryFields.SOLVED));
-        long penalty = parseLong(summary.get(ContestScoreboardSummaryFields.PENALTY));
+        long solved = parseLong(summary.get(ContestScoreboardRedisFields.SUMMARY_SOLVED));
+        long penalty = parseLong(summary.get(ContestScoreboardRedisFields.SUMMARY_PENALTY));
         return new ContestScoreboardEntry(userId, (int) solved, penalty);
     }
 
-    private void applyJudgement(long contestId,
+    /**
+     * Records one attempt and rewrites what its problem contributes to the user summary.
+     * The contribution is recomputed from every attempt stored for the problem, so applying
+     * the same judgements in another order — or twice — reaches the same state. Mirrors
+     * {@link ContestScoreboardRedisScript}.
+     */
+    private void applyJudgement(long contestSubmissionId,
+                                long contestId,
                                 long problemId,
                                 long userId,
                                 LocalDateTime contestStart,
@@ -143,45 +152,53 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
 
         ensureUserInitialized(rankingKey, summaryKey, userIdStr, userId);
 
-        String accepted = redisClient.hGet(problemKey, ContestScoreboardProblemFields.ACCEPTED);
-        if (ContestScoreboardProblemFields.ACCEPTED_FLAG.equals(accepted)) {
-            return;
-        }
+        long contestMinutes = ContestScoreboardPolicy.computeContestMinutes(contestStart, submittedTime);
+        ProblemAttempts attempts = ProblemAttempts.from(redisClient.hGetAll(problemKey));
 
         if (result == SubmissionResult.ACCEPTED) {
-            long wrongAttempts = parseLong(redisClient.hGet(problemKey, ContestScoreboardProblemFields.WRONG_ATTEMPTS));
-            long penaltyIncrement = ContestScoreboardPolicy.computePenalty(
-                    contestStart,
-                    submittedTime,
-                    wrongAttempts
-            );
-
-            redisClient.hSet(problemKey, ContestScoreboardProblemFields.ACCEPTED, ContestScoreboardProblemFields.ACCEPTED_FLAG);
-            redisClient.hSet(problemKey, ContestScoreboardProblemFields.WRONG_ATTEMPTS, Long.toString(wrongAttempts));
-
-            long solved = redisClient.hIncrBy(summaryKey, ContestScoreboardSummaryFields.SOLVED, 1L);
-            long penalty = redisClient.hIncrBy(summaryKey, ContestScoreboardSummaryFields.PENALTY, penaltyIncrement);
-            updateRanking(rankingKey, userIdStr, solved, penalty, userId);
+            if (attempts.recordAcceptedIfEarliest(contestMinutes, contestSubmissionId)) {
+                redisClient.hSet(problemKey, ContestScoreboardRedisFields.ACCEPTED_MINUTES, Long.toString(contestMinutes));
+                redisClient.hSet(problemKey, ContestScoreboardRedisFields.ACCEPTED_SUBMISSION_ID, Long.toString(contestSubmissionId));
+            }
         } else {
-            redisClient.hSet(problemKey, ContestScoreboardProblemFields.ACCEPTED, ContestScoreboardProblemFields.NOT_ACCEPTED_FLAG);
-            redisClient.hIncrBy(problemKey, ContestScoreboardProblemFields.WRONG_ATTEMPTS, 1L);
-            Map<String, String> summary = redisClient.hGetAll(summaryKey);
-            long solved = parseLong(summary.get(ContestScoreboardSummaryFields.SOLVED));
-            long penalty = parseLong(summary.get(ContestScoreboardSummaryFields.PENALTY));
-            updateRanking(rankingKey, userIdStr, solved, penalty, userId);
+            attempts.recordWrong(contestSubmissionId, contestMinutes);
+            redisClient.hSet(
+                    problemKey,
+                    ContestScoreboardRedisFields.wrongAttempt(contestSubmissionId),
+                    Long.toString(contestMinutes)
+            );
         }
+
+        ContestScoreboardPolicy.ProblemContribution contribution = attempts.contribution();
+        long solvedDelta = contribution.solved() - attempts.contributedSolved();
+        long penaltyDelta = contribution.penalty() - attempts.contributedPenalty();
+
+        Map<String, String> summary = redisClient.hGetAll(summaryKey);
+        long solved = parseLong(summary.get(ContestScoreboardRedisFields.SUMMARY_SOLVED));
+        long penalty = parseLong(summary.get(ContestScoreboardRedisFields.SUMMARY_PENALTY));
+        if (solvedDelta != 0L) {
+            solved = redisClient.hIncrBy(summaryKey, ContestScoreboardRedisFields.SUMMARY_SOLVED, solvedDelta);
+        }
+        if (penaltyDelta != 0L) {
+            penalty = redisClient.hIncrBy(summaryKey, ContestScoreboardRedisFields.SUMMARY_PENALTY, penaltyDelta);
+        }
+        if (solvedDelta != 0L || penaltyDelta != 0L) {
+            redisClient.hSet(problemKey, ContestScoreboardRedisFields.CONTRIBUTED_SOLVED, Long.toString(contribution.solved()));
+            redisClient.hSet(problemKey, ContestScoreboardRedisFields.CONTRIBUTED_PENALTY, Long.toString(contribution.penalty()));
+        }
+        updateRanking(rankingKey, userIdStr, solved, penalty, userId);
     }
 
     private void ensureUserInitialized(String rankingKey,
                                        String summaryKey,
                                        String userId,
                                        long userIdNumeric) {
-        if (redisClient.hGet(summaryKey, ContestScoreboardSummaryFields.INITIALIZED) != null) {
+        if (redisClient.hGet(summaryKey, ContestScoreboardRedisFields.SUMMARY_INITIALIZED) != null) {
             return;
         }
-        redisClient.hSet(summaryKey, ContestScoreboardSummaryFields.SOLVED, "0");
-        redisClient.hSet(summaryKey, ContestScoreboardSummaryFields.PENALTY, "0");
-        redisClient.hSet(summaryKey, ContestScoreboardSummaryFields.INITIALIZED, ContestScoreboardProblemFields.ACCEPTED_FLAG);
+        redisClient.hSet(summaryKey, ContestScoreboardRedisFields.SUMMARY_SOLVED, "0");
+        redisClient.hSet(summaryKey, ContestScoreboardRedisFields.SUMMARY_PENALTY, "0");
+        redisClient.hSet(summaryKey, ContestScoreboardRedisFields.SUMMARY_INITIALIZED, ContestScoreboardRedisFields.INITIALIZED_FLAG);
         updateRanking(rankingKey, userId, 0L, 0L, userIdNumeric);
     }
 
@@ -240,16 +257,73 @@ public class RedisContestScoreboardStore implements ContestScoreboardStore {
         return Long.parseLong(value);
     }
 
-    private static final class ContestScoreboardSummaryFields {
-        private static final String INITIALIZED = "initialized";
-        private static final String SOLVED = "solved";
-        private static final String PENALTY = "penalty";
-    }
+    /** Every attempt stored for one (user, problem), plus what that problem last contributed. */
+    private static final class ProblemAttempts {
 
-    private static final class ContestScoreboardProblemFields {
-        private static final String WRONG_ATTEMPTS = "wrongAttempts";
-        private static final String ACCEPTED = "accepted";
-        private static final String ACCEPTED_FLAG = "1";
-        private static final String NOT_ACCEPTED_FLAG = "0";
+        private final Map<Long, Long> wrongMinutesBySubmissionId = new HashMap<>();
+        private Long acceptedMinutes;
+        private Long acceptedSubmissionId;
+        private long contributedSolved;
+        private long contributedPenalty;
+
+        private static ProblemAttempts from(Map<String, String> fields) {
+            ProblemAttempts attempts = new ProblemAttempts();
+            for (Map.Entry<String, String> field : fields.entrySet()) {
+                String name = field.getKey();
+                switch (name) {
+                    case ContestScoreboardRedisFields.ACCEPTED_MINUTES ->
+                            attempts.acceptedMinutes = Long.parseLong(field.getValue());
+                    case ContestScoreboardRedisFields.ACCEPTED_SUBMISSION_ID ->
+                            attempts.acceptedSubmissionId = Long.parseLong(field.getValue());
+                    case ContestScoreboardRedisFields.CONTRIBUTED_SOLVED ->
+                            attempts.contributedSolved = Long.parseLong(field.getValue());
+                    case ContestScoreboardRedisFields.CONTRIBUTED_PENALTY ->
+                            attempts.contributedPenalty = Long.parseLong(field.getValue());
+                    default -> {
+                        if (name.startsWith(ContestScoreboardRedisFields.WRONG_PREFIX)) {
+                            attempts.wrongMinutesBySubmissionId.put(
+                                    Long.parseLong(name.substring(ContestScoreboardRedisFields.WRONG_PREFIX.length())),
+                                    Long.parseLong(field.getValue())
+                            );
+                        }
+                    }
+                }
+            }
+            return attempts;
+        }
+
+        private boolean recordAcceptedIfEarliest(long contestMinutes, long contestSubmissionId) {
+            if (acceptedMinutes != null && !ContestScoreboardPolicy.isEarlierAttempt(
+                    contestMinutes,
+                    contestSubmissionId,
+                    acceptedMinutes,
+                    acceptedSubmissionId
+            )) {
+                return false;
+            }
+            acceptedMinutes = contestMinutes;
+            acceptedSubmissionId = contestSubmissionId;
+            return true;
+        }
+
+        private void recordWrong(long contestSubmissionId, long contestMinutes) {
+            wrongMinutesBySubmissionId.put(contestSubmissionId, contestMinutes);
+        }
+
+        private ContestScoreboardPolicy.ProblemContribution contribution() {
+            return ContestScoreboardPolicy.computeProblemContribution(
+                    acceptedMinutes,
+                    acceptedSubmissionId,
+                    wrongMinutesBySubmissionId
+            );
+        }
+
+        private long contributedSolved() {
+            return contributedSolved;
+        }
+
+        private long contributedPenalty() {
+            return contributedPenalty;
+        }
     }
 }

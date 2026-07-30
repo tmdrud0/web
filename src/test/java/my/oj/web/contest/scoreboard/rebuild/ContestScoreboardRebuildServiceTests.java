@@ -116,6 +116,7 @@ class ContestScoreboardRebuildServiceTests {
         inOrder.verify(scoreboardService).reset(contestId);
         inOrder.verify(scoreboardService).recordJudgement(
                 eq(5L),
+                eq(5L),
                 eq(contestId),
                 eq(problem.getId()),
                 eq(user.getId()),
@@ -124,6 +125,7 @@ class ContestScoreboardRebuildServiceTests {
                 eq(SubmissionResult.ACCEPTED)
         );
         inOrder.verify(scoreboardService).recordJudgement(
+                eq(3L),
                 eq(3L),
                 eq(contestId),
                 eq(problem.getId()),
