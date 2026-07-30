@@ -143,6 +143,20 @@ class ContestScoreboardConcurrentWorkerRedisIntegrationTests {
             executor.shutdownNow();
         }
         assertThat(unappliedEvents()).as("every scoreboard outbox row is applied").isZero();
+        // Guards against a row being completed by something other than these workers — a
+        // scheduler left running in another cached Spring context, for instance.
+        assertThat(redisTemplate.opsForSet().size("contest:scoreboard:" + contestId + ":processed"))
+                .as("every completed event reached this Redis scoreboard")
+                .isEqualTo(seededEvents());
+    }
+
+    private long seededEvents() {
+        Long count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM contest_submission_outbox WHERE contest_id = ?",
+                Long.class,
+                contestId
+        );
+        return count == null ? 0L : count;
     }
 
     private long unappliedEvents() {
