@@ -8,6 +8,8 @@ import my.oj.web.contest.Contest;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.problem.Problem;
 import my.oj.web.submission.SubmissionResult;
+import my.oj.web.testsupport.ContestScoreboardTestData;
+import my.oj.web.testsupport.ContestScoreboardTestData.SeededContest;
 import my.oj.web.user.User;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -24,7 +26,6 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -43,6 +44,8 @@ import static org.assertj.core.api.Assertions.assertThat;
         TestQuerydslConfig.class
 })
 class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
+
+    private static final LocalDateTime CONTEST_START = LocalDateTime.of(2026, 3, 10, 12, 0);
 
     @Autowired
     private EntityManager entityManager;
@@ -156,10 +159,11 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
     void concurrentWorkersNeverClaimTheSameRowTwice() throws Exception {
         int rowCount = 24;
         int workerCount = 4;
-        String suffix = UUID.randomUUID().toString();
         Duration lease = Duration.ofSeconds(30);
+        SeededContest seeded = ContestScoreboardTestData.seedContest(
+                jdbcTemplate, "scoreboard-concurrent-claim", CONTEST_START, 1, 1);
         try {
-            List<Long> outboxIds = commitPendingOutboxRows(suffix, rowCount);
+            List<Long> outboxIds = commitPendingOutboxRows(seeded, rowCount);
 
             CountDownLatch startTogether = new CountDownLatch(1);
             ExecutorService executor = Executors.newFixedThreadPool(workerCount);
@@ -199,96 +203,31 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
             assertThat(jdbcTemplate.queryForObject("""
                     SELECT COUNT(*) FROM contest_submission_outbox
                     WHERE contest_id = ? AND status = 'PROCESSING'
-                    """, Long.class, contestIdOf(suffix)))
+                    """, Long.class, seeded.contestId()))
                     .isEqualTo(rowCount);
         } finally {
-            deleteCommittedRows(suffix);
+            ContestScoreboardTestData.deleteContest(jdbcTemplate, seeded.contestId());
         }
     }
 
-    private List<Long> commitPendingOutboxRows(String suffix, int rowCount) {
-        LocalDateTime contestStart = LocalDateTime.of(2026, 3, 10, 12, 0);
-        jdbcTemplate.update(
-                "INSERT INTO contest (name, start_time, end_time) VALUES (?, ?, ?)",
-                "scoreboard-concurrent-" + suffix,
-                contestStart,
-                contestStart.plusHours(2)
-        );
-        Long contestId = contestIdOf(suffix);
-        jdbcTemplate.update(
-                "INSERT INTO problem (name, contest_id, contest_num) VALUES (?, ?, 1)",
-                "scoreboard-concurrent-" + suffix,
-                contestId
-        );
-        Long problemId = jdbcTemplate.queryForObject(
-                "SELECT id FROM problem WHERE name = ?",
-                Long.class,
-                "scoreboard-concurrent-" + suffix
-        );
-        jdbcTemplate.update(
-                "INSERT INTO `user` (name, pass) VALUES (?, ?)",
-                "scoreboard-concurrent-" + suffix,
-                "pass"
-        );
-        Long userId = jdbcTemplate.queryForObject(
-                "SELECT id FROM `user` WHERE name = ?",
-                Long.class,
-                "scoreboard-concurrent-" + suffix
-        );
-
-        List<Object[]> submissions = new ArrayList<>(rowCount);
-        List<Object[]> outboxes = new ArrayList<>(rowCount);
+    private List<Long> commitPendingOutboxRows(SeededContest seeded, int rowCount) {
+        List<ContestScoreboardTestData.Attempt> attempts = new ArrayList<>(rowCount);
         for (int index = 0; index < rowCount; index++) {
-            long submissionId = 930_000_000_000_000_000L + index;
-            LocalDateTime submittedAt = contestStart.plusMinutes(index);
-            submissions.add(new Object[]{
-                    submissionId, contestId, problemId, userId, submittedAt,
-                    "code", String.format(Locale.ROOT, "%060x%04x", index, suffix.hashCode() & 0xFFFF)
-            });
-            outboxes.add(new Object[]{
-                    submissionId, contestId, problemId, userId, contestStart, submittedAt,
-                    submittedAt.plusSeconds(1), SubmissionResult.ACCEPTED.name(), submittedAt.plusSeconds(1)
-            });
+            attempts.add(new ContestScoreboardTestData.Attempt(
+                    930_000_000_000_000_000L + index,
+                    seeded.problemIds().get(0),
+                    seeded.userIds().get(0),
+                    index,
+                    index + 1,
+                    SubmissionResult.ACCEPTED
+            ));
         }
-        jdbcTemplate.batchUpdate("""
-                INSERT INTO contest_submission (
-                    id, contest_id, problem_id, user_id, submitted_time, code, code_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, submissions);
-        jdbcTemplate.batchUpdate("""
-                INSERT INTO contest_submission_outbox (
-                    contest_submission_id, contest_id, problem_id, user_id,
-                    contest_start, submitted_time, judged_at, result, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
-                """, outboxes);
+        ContestScoreboardTestData.insertAttempts(jdbcTemplate, seeded.contestId(), CONTEST_START, attempts, false);
         return jdbcTemplate.queryForList(
                 "SELECT id FROM contest_submission_outbox WHERE contest_id = ? ORDER BY id",
                 Long.class,
-                contestId
+                seeded.contestId()
         );
-    }
-
-    private Long contestIdOf(String suffix) {
-        return jdbcTemplate.queryForObject(
-                "SELECT id FROM contest WHERE name = ?",
-                Long.class,
-                "scoreboard-concurrent-" + suffix
-        );
-    }
-
-    private void deleteCommittedRows(String suffix) {
-        String name = "scoreboard-concurrent-" + suffix;
-        jdbcTemplate.update("""
-                DELETE FROM contest_submission_outbox
-                WHERE contest_id IN (SELECT id FROM contest WHERE name = ?)
-                """, name);
-        jdbcTemplate.update("""
-                DELETE FROM contest_submission
-                WHERE contest_id IN (SELECT id FROM contest WHERE name = ?)
-                """, name);
-        jdbcTemplate.update("DELETE FROM problem WHERE name = ?", name);
-        jdbcTemplate.update("DELETE FROM `user` WHERE name = ?", name);
-        jdbcTemplate.update("DELETE FROM contest WHERE name = ?", name);
     }
 
     private ContestScoreboardOutbox persistPendingOutbox() {

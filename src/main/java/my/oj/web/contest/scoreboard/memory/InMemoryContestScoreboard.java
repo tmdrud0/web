@@ -4,11 +4,11 @@ import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
 import my.oj.web.contest.scoreboard.ContestScoreboardPolicy;
 import my.oj.web.contest.scoreboard.ContestScoreboardSlice;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
+import my.oj.web.contest.scoreboard.ProblemAttempts;
 import my.oj.web.submission.SubmissionResult;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableSet;
@@ -58,28 +58,24 @@ public class InMemoryContestScoreboard {
 
         UserState userState = state.users.computeIfAbsent(update.userId(), id -> new UserState());
         synchronized (userState) {
-            ProblemState problemState = userState.problemStates.computeIfAbsent(
+            ProblemAttempts attempts = userState.problemAttempts.computeIfAbsent(
                     update.problemId(),
-                    id -> new ProblemState()
+                    id -> new ProblemAttempts()
             );
             long contestMinutes = ContestScoreboardPolicy.computeContestMinutes(
                     state.contestStart,
                     update.submittedTime()
             );
             if (update.result() == SubmissionResult.ACCEPTED) {
-                problemState.recordAcceptedIfEarliest(contestMinutes, submissionId);
+                attempts.recordAccepted(contestMinutes, submissionId);
             } else {
-                problemState.recordWrong(submissionId, contestMinutes);
+                attempts.recordWrong(submissionId, contestMinutes);
             }
 
             // Only the difference against what this problem contributed before is applied.
-            ContestScoreboardPolicy.ProblemContribution contribution = problemState.contribution();
-            int solvedDelta = (int) (contribution.solved() - problemState.contributedSolved);
-            long penaltyDelta = contribution.penalty() - problemState.contributedPenalty;
-            userState.solvedCount += solvedDelta;
-            userState.penalty += penaltyDelta;
-            problemState.contributedSolved = contribution.solved();
-            problemState.contributedPenalty = contribution.penalty();
+            ProblemAttempts.ContributionChange change = attempts.applyContribution();
+            userState.solvedCount += (int) change.solvedDelta();
+            userState.penalty += change.penaltyDelta();
         }
 
         state.updateUserScore(update.userId(), userState);
@@ -228,43 +224,9 @@ public class InMemoryContestScoreboard {
     }
 
     private static class UserState {
-        private final Map<Long, ProblemState> problemStates = new ConcurrentHashMap<>();
+        private final Map<Long, ProblemAttempts> problemAttempts = new ConcurrentHashMap<>();
         private int solvedCount;
         private long penalty;
-    }
-
-    /** Every attempt seen for one (user, problem), plus what that problem last contributed. */
-    private static class ProblemState {
-        private final Map<Long, Long> wrongMinutesBySubmissionId = new HashMap<>();
-        private Long acceptedMinutes;
-        private Long acceptedSubmissionId;
-        private long contributedSolved;
-        private long contributedPenalty;
-
-        private void recordAcceptedIfEarliest(long contestMinutes, long contestSubmissionId) {
-            if (acceptedMinutes != null && !ContestScoreboardPolicy.isEarlierAttempt(
-                    contestMinutes,
-                    contestSubmissionId,
-                    acceptedMinutes,
-                    acceptedSubmissionId
-            )) {
-                return;
-            }
-            acceptedMinutes = contestMinutes;
-            acceptedSubmissionId = contestSubmissionId;
-        }
-
-        private void recordWrong(long contestSubmissionId, long contestMinutes) {
-            wrongMinutesBySubmissionId.put(contestSubmissionId, contestMinutes);
-        }
-
-        private ContestScoreboardPolicy.ProblemContribution contribution() {
-            return ContestScoreboardPolicy.computeProblemContribution(
-                    acceptedMinutes,
-                    acceptedSubmissionId,
-                    wrongMinutesBySubmissionId
-            );
-        }
     }
 
     private static final class UserScore implements Comparable<UserScore> {
