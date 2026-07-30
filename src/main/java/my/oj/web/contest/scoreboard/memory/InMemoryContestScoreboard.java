@@ -8,6 +8,7 @@ import my.oj.web.submission.SubmissionResult;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableSet;
@@ -35,6 +36,11 @@ public class InMemoryContestScoreboard {
     private final Map<Long, Long> submissionSequences = new ConcurrentHashMap<>();
     private final AtomicLong sequenceAllocator = new AtomicLong();
 
+    /**
+     * Records one attempt and rewrites what its problem contributes to the user totals.
+     * Recomputing from every attempt seen for the problem makes the result independent of
+     * judgement arrival order.
+     */
     public long apply(ContestScoreboardUpdate update) {
         long submissionId = update.contestSubmissionId();
         long sequence = submissionSequences.computeIfAbsent(
@@ -46,25 +52,34 @@ public class InMemoryContestScoreboard {
         if (!state.appliedSubmissions.add(submissionId)) {
             return sequence;
         }
-
-        UserState userState = state.users.computeIfAbsent(update.userId(), id -> new UserState());
-        ProblemState problemState = userState.problemStates.computeIfAbsent(update.problemId(), id -> new ProblemState());
-
-        if (problemState.accepted) {
+        if (update.result() == SubmissionResult.PENDING) {
             return sequence;
         }
 
-        if (update.result() == SubmissionResult.ACCEPTED) {
-            problemState.accepted = true;
-            problemState.acceptedTime = update.submittedTime();
-            userState.penalty += ContestScoreboardPolicy.computePenalty(
-                    state.contestStart,
-                    update.submittedTime(),
-                    problemState.wrongAttempts
+        UserState userState = state.users.computeIfAbsent(update.userId(), id -> new UserState());
+        synchronized (userState) {
+            ProblemState problemState = userState.problemStates.computeIfAbsent(
+                    update.problemId(),
+                    id -> new ProblemState()
             );
-            userState.solvedCount += 1;
-        } else if (update.result() != SubmissionResult.PENDING) {
-            problemState.wrongAttempts += 1;
+            long contestMinutes = ContestScoreboardPolicy.computeContestMinutes(
+                    state.contestStart,
+                    update.submittedTime()
+            );
+            if (update.result() == SubmissionResult.ACCEPTED) {
+                problemState.recordAcceptedIfEarliest(contestMinutes, submissionId);
+            } else {
+                problemState.recordWrong(submissionId, contestMinutes);
+            }
+
+            // Only the difference against what this problem contributed before is applied.
+            ContestScoreboardPolicy.ProblemContribution contribution = problemState.contribution();
+            int solvedDelta = (int) (contribution.solved() - problemState.contributedSolved);
+            long penaltyDelta = contribution.penalty() - problemState.contributedPenalty;
+            userState.solvedCount += solvedDelta;
+            userState.penalty += penaltyDelta;
+            problemState.contributedSolved = contribution.solved();
+            problemState.contributedPenalty = contribution.penalty();
         }
 
         state.updateUserScore(update.userId(), userState);
@@ -218,10 +233,38 @@ public class InMemoryContestScoreboard {
         private long penalty;
     }
 
+    /** Every attempt seen for one (user, problem), plus what that problem last contributed. */
     private static class ProblemState {
-        private int wrongAttempts;
-        private boolean accepted;
-        private LocalDateTime acceptedTime;
+        private final Map<Long, Long> wrongMinutesBySubmissionId = new HashMap<>();
+        private Long acceptedMinutes;
+        private Long acceptedSubmissionId;
+        private long contributedSolved;
+        private long contributedPenalty;
+
+        private void recordAcceptedIfEarliest(long contestMinutes, long contestSubmissionId) {
+            if (acceptedMinutes != null && !ContestScoreboardPolicy.isEarlierAttempt(
+                    contestMinutes,
+                    contestSubmissionId,
+                    acceptedMinutes,
+                    acceptedSubmissionId
+            )) {
+                return;
+            }
+            acceptedMinutes = contestMinutes;
+            acceptedSubmissionId = contestSubmissionId;
+        }
+
+        private void recordWrong(long contestSubmissionId, long contestMinutes) {
+            wrongMinutesBySubmissionId.put(contestSubmissionId, contestMinutes);
+        }
+
+        private ContestScoreboardPolicy.ProblemContribution contribution() {
+            return ContestScoreboardPolicy.computeProblemContribution(
+                    acceptedMinutes,
+                    acceptedSubmissionId,
+                    wrongMinutesBySubmissionId
+            );
+        }
     }
 
     private static final class UserScore implements Comparable<UserScore> {

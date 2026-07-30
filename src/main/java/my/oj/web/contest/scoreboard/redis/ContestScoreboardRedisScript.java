@@ -18,6 +18,17 @@ import org.springframework.data.redis.core.script.RedisScript;
  */
 final class ContestScoreboardRedisScript {
 
+    /**
+     * Applies one judgement to the live scoreboard atomically.
+     *
+     * <p>The problem hash stores every attempt (see {@link ContestScoreboardRedisFields}) and the
+     * summary contribution of that problem is recomputed from scratch on every event, so the
+     * outcome does not depend on the order in which judgements arrive. Only the difference
+     * against the previously recorded contribution is applied to the summary.
+     *
+     * <p>Sequence allocation, the {@code contestSubmissionId -> redis_seq} mapping and the
+     * processed-event marker are unchanged: the recovery worker depends on them.
+     */
     static final String TEXT = """
                     local function assertKeyType(key, expectedType)
                         local actualType = redis.call('type', key)['ok']
@@ -40,6 +51,26 @@ final class ContestScoreboardRedisScript {
                         return parsed
                     end
 
+                    local function parseSubmissionId(value, fieldName)
+                        if not string.match(value, '^%d+$') then
+                            error('Invalid submission id value for ' .. fieldName)
+                        end
+                        return value
+                    end
+
+                    -- Orders attempts by (contestMinutes, submissionId). Snowflake IDs need more
+                    -- than the 53 bits a Lua number carries exactly, so they are compared as
+                    -- decimal strings: shorter is smaller, equal length compares lexicographically.
+                    local function isEarlierAttempt(minutes, submissionId, otherMinutes, otherSubmissionId)
+                        if minutes ~= otherMinutes then
+                            return minutes < otherMinutes
+                        end
+                        if #submissionId ~= #otherSubmissionId then
+                            return #submissionId < #otherSubmissionId
+                        end
+                        return submissionId < otherSubmissionId
+                    end
+
                     local contestMinutes = tonumber(ARGV[3])
                     local wrongPenalty = tonumber(ARGV[4])
                     local solvedWeight = tonumber(ARGV[5])
@@ -48,6 +79,10 @@ final class ContestScoreboardRedisScript {
                     if not contestMinutes or not wrongPenalty or not solvedWeight or not penaltyWeight or not userId then
                         return redis.error_reply('Invalid scoreboard numeric argument')
                     end
+                    if not string.match(ARGV[1], '^%d+$') then
+                        return redis.error_reply('Invalid scoreboard submission id argument')
+                    end
+                    local submissionId = ARGV[1]
 
                     assertKeyType(KEYS[1], 'string')
                     assertKeyType(KEYS[2], 'hash')
@@ -83,22 +118,41 @@ final class ContestScoreboardRedisScript {
                     end
 
                     local initialized = redis.call('hget', KEYS[4], 'initialized')
-                    local accepted = redis.call('hget', KEYS[5], 'accepted')
                     if initialized and initialized ~= '1' then
                         return redis.error_reply('Invalid scoreboard initialized flag')
                     end
-                    if accepted and accepted ~= '0' and accepted ~= '1' then
-                        return redis.error_reply('Invalid scoreboard accepted flag')
-                    end
-                    local wrongAttempts = parseInteger(
-                            redis.call('hget', KEYS[5], 'wrongAttempts'),
-                            'wrongAttempts')
                     local currentSolved = parseInteger(
                             redis.call('hget', KEYS[4], 'solved'),
                             'solved')
                     local currentPenalty = parseInteger(
                             redis.call('hget', KEYS[4], 'penalty'),
                             'penalty')
+
+                    local acceptedMinutes = nil
+                    local acceptedSubmissionId = nil
+                    local contributedSolved = 0
+                    local contributedPenalty = 0
+                    local wrongMinutes = {}
+                    local problemState = redis.call('hgetall', KEYS[5])
+                    for index = 1, #problemState, 2 do
+                        local field = problemState[index]
+                        local value = problemState[index + 1]
+                        if field == 'a:min' then
+                            acceptedMinutes = parseInteger(value, 'a:min')
+                        elseif field == 'a:sid' then
+                            acceptedSubmissionId = parseSubmissionId(value, 'a:sid')
+                        elseif field == 'c:solved' then
+                            contributedSolved = parseInteger(value, 'c:solved')
+                        elseif field == 'c:penalty' then
+                            contributedPenalty = parseInteger(value, 'c:penalty')
+                        elseif string.sub(field, 1, 2) == 'w:' then
+                            wrongMinutes[string.sub(field, 3)] = parseInteger(value, field)
+                        end
+                    end
+                    if (acceptedMinutes and not acceptedSubmissionId)
+                            or (acceptedSubmissionId and not acceptedMinutes) then
+                        return redis.error_reply('Incomplete scoreboard accepted attempt state')
+                    end
 
                     local sequence = existingSequence
                     if not sequence then
@@ -115,23 +169,54 @@ final class ContestScoreboardRedisScript {
                             redis.call('zadd', KEYS[3], -userId, ARGV[7])
                         end
 
-                        if accepted ~= '1' then
-                            if ARGV[2] == 'ACCEPTED' then
-                                local penaltyIncrement = contestMinutes + wrongAttempts * wrongPenalty
+                        if ARGV[2] == 'ACCEPTED' then
+                            if not acceptedMinutes or isEarlierAttempt(
+                                    contestMinutes, submissionId,
+                                    acceptedMinutes, acceptedSubmissionId) then
+                                acceptedMinutes = contestMinutes
+                                acceptedSubmissionId = submissionId
                                 redis.call('hset', KEYS[5],
-                                        'accepted', '1',
-                                        'wrongAttempts', tostring(wrongAttempts))
-                                local solved = redis.call('hincrby', KEYS[4], 'solved', 1)
-                                local penalty = redis.call('hincrby', KEYS[4], 'penalty', penaltyIncrement)
-                                local score = solved * solvedWeight - penalty * penaltyWeight - userId
-                                redis.call('zadd', KEYS[3], score, ARGV[7])
-                            else
-                                redis.call('hset', KEYS[5], 'accepted', '0')
-                                redis.call('hincrby', KEYS[5], 'wrongAttempts', 1)
-                                local score = currentSolved * solvedWeight - currentPenalty * penaltyWeight - userId
-                                redis.call('zadd', KEYS[3], score, ARGV[7])
+                                        'a:min', tostring(contestMinutes),
+                                        'a:sid', submissionId)
                             end
+                        else
+                            wrongMinutes[submissionId] = contestMinutes
+                            redis.call('hset', KEYS[5], 'w:' .. submissionId, tostring(contestMinutes))
                         end
+
+                        local newSolved = 0
+                        local newPenalty = 0
+                        if acceptedMinutes then
+                            newSolved = 1
+                            local wrongBefore = 0
+                            for wrongSubmissionId, minutes in pairs(wrongMinutes) do
+                                if isEarlierAttempt(
+                                        minutes, wrongSubmissionId,
+                                        acceptedMinutes, acceptedSubmissionId) then
+                                    wrongBefore = wrongBefore + 1
+                                end
+                            end
+                            newPenalty = acceptedMinutes + wrongBefore * wrongPenalty
+                        end
+
+                        local solvedDelta = newSolved - contributedSolved
+                        local penaltyDelta = newPenalty - contributedPenalty
+                        local solved = currentSolved
+                        local penalty = currentPenalty
+                        if solvedDelta ~= 0 then
+                            solved = redis.call('hincrby', KEYS[4], 'solved', solvedDelta)
+                        end
+                        if penaltyDelta ~= 0 then
+                            penalty = redis.call('hincrby', KEYS[4], 'penalty', penaltyDelta)
+                        end
+                        if solvedDelta ~= 0 or penaltyDelta ~= 0 then
+                            redis.call('hset', KEYS[5],
+                                    'c:solved', tostring(newSolved),
+                                    'c:penalty', tostring(newPenalty))
+                        end
+
+                        local score = solved * solvedWeight - penalty * penaltyWeight - userId
+                        redis.call('zadd', KEYS[3], score, ARGV[7])
                     end
 
                     redis.call('sadd', KEYS[6], ARGV[1])
