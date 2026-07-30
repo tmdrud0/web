@@ -4,6 +4,7 @@ import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardStore;
 import my.oj.web.contest.scoreboard.redis.FakeContestRedisKeyValueClient;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardStore;
 import my.oj.web.submission.SubmissionResult;
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
@@ -34,10 +35,10 @@ class ContestScoreboardStoreCommutativityTests {
     private static final long PROBLEM_ID = 11L;
     private static final LocalDateTime CONTEST_START = LocalDateTime.of(2026, 3, 10, 10, 0);
 
-    static Stream<Named> stores() {
+    static Stream<Named<Supplier<ContestScoreboardStore>>> stores() {
         return Stream.of(
-                new Named("memory", InMemoryContestScoreboardStore::new),
-                new Named("redis", () -> new RedisContestScoreboardStore(new FakeContestRedisKeyValueClient()))
+                Named.of("memory", InMemoryContestScoreboardStore::new),
+                Named.of("redis", () -> new RedisContestScoreboardStore(new FakeContestRedisKeyValueClient()))
         );
     }
 
@@ -48,19 +49,19 @@ class ContestScoreboardStoreCommutativityTests {
      */
     @ParameterizedTest(name = "{0}")
     @MethodSource("stores")
-    void lateWrongAttemptStillCostsPenaltyWhenTheAcceptedArrivedFirst(Named named) {
-        ContestScoreboardStore store = named.create();
+    void lateWrongAttemptStillCostsPenaltyWhenTheAcceptedArrivedFirst(Supplier<ContestScoreboardStore> store) {
+        ContestScoreboardStore board = store.get();
 
-        record(store, 1L, event(1_001L, 12, SubmissionResult.ACCEPTED));
-        record(store, 2L, event(1_002L, 10, SubmissionResult.WRONG_ANSWER));
+        record(board, 1L, event(1_001L, 12, SubmissionResult.ACCEPTED));
+        record(board, 2L, event(1_002L, 10, SubmissionResult.WRONG_ANSWER));
 
-        assertThat(store.currentRanking(CONTEST_ID))
+        assertThat(board.currentRanking(CONTEST_ID))
                 .containsExactly(new ContestScoreboardEntry(USER_ID, 1, 17L));
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("stores")
-    void arrivalOrderDoesNotChangeTheFinalScoreboard(Named named) {
+    void arrivalOrderDoesNotChangeTheFinalScoreboard(Supplier<ContestScoreboardStore> stores) {
         List<Event> events = List.of(
                 event(2_001L, 3, SubmissionResult.WRONG_ANSWER),
                 event(2_002L, 10, SubmissionResult.WRONG_ANSWER),
@@ -74,14 +75,14 @@ class ContestScoreboardStoreCommutativityTests {
                 event(2_010L, 6, 99L, USER_ID + 1, SubmissionResult.WRONG_ANSWER)
         );
 
-        List<ContestScoreboardEntry> expected = applyAll(named, events);
+        List<ContestScoreboardEntry> expected = applyAll(stores, events);
 
         Random random = new Random(20260730L);
         for (int permutation = 0; permutation < 25; permutation++) {
             List<Event> shuffled = new ArrayList<>(events);
             Collections.shuffle(shuffled, random);
 
-            assertThat(applyAll(named, shuffled))
+            assertThat(applyAll(stores, shuffled))
                     .as("permutation %d: %s", permutation, submissionIdsOf(shuffled))
                     .isEqualTo(expected);
         }
@@ -89,7 +90,7 @@ class ContestScoreboardStoreCommutativityTests {
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("stores")
-    void liveApplyOrderMatchesAReplayInSubmissionOrder(Named named) {
+    void liveApplyOrderMatchesAReplayInSubmissionOrder(Supplier<ContestScoreboardStore> stores) {
         List<Event> submissionOrder = List.of(
                 event(3_001L, 4, SubmissionResult.WRONG_ANSWER),
                 event(3_002L, 9, SubmissionResult.WRONG_ANSWER),
@@ -108,70 +109,71 @@ class ContestScoreboardStoreCommutativityTests {
                 submissionOrder.get(1)
         );
 
-        assertThat(applyAll(named, judgedOrder)).isEqualTo(applyAll(named, submissionOrder));
+        assertThat(applyAll(stores, judgedOrder)).isEqualTo(applyAll(stores, submissionOrder));
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("stores")
-    void redeliveringTheSameEventLeavesTheScoreUnchanged(Named named) {
-        ContestScoreboardStore store = named.create();
+    void redeliveringTheSameEventLeavesTheScoreUnchanged(Supplier<ContestScoreboardStore> store) {
+        ContestScoreboardStore board = store.get();
         Event wrong = event(4_001L, 6, SubmissionResult.WRONG_ANSWER);
         Event accepted = event(4_002L, 18, SubmissionResult.ACCEPTED);
 
-        record(store, 41L, wrong);
-        record(store, 42L, accepted);
-        List<ContestScoreboardEntry> afterFirstDelivery = store.currentRanking(CONTEST_ID);
+        record(board, 41L, wrong);
+        record(board, 42L, accepted);
+        List<ContestScoreboardEntry> afterFirstDelivery = board.currentRanking(CONTEST_ID);
 
-        record(store, 41L, wrong);
-        record(store, 42L, accepted);
+        record(board, 41L, wrong);
+        record(board, 42L, accepted);
 
         assertThat(afterFirstDelivery).containsExactly(new ContestScoreboardEntry(USER_ID, 1, 23L));
-        assertThat(store.currentRanking(CONTEST_ID)).isEqualTo(afterFirstDelivery);
+        assertThat(board.currentRanking(CONTEST_ID)).isEqualTo(afterFirstDelivery);
     }
 
     /** Re-applying the same attempt under a fresh event ID must not double count it either. */
     @ParameterizedTest(name = "{0}")
     @MethodSource("stores")
-    void reapplyingAnAttemptUnderANewEventIdLeavesTheScoreUnchanged(Named named) {
-        ContestScoreboardStore store = named.create();
+    void reapplyingAnAttemptUnderANewEventIdLeavesTheScoreUnchanged(Supplier<ContestScoreboardStore> store) {
+        ContestScoreboardStore board = store.get();
         Event wrong = event(5_001L, 6, SubmissionResult.WRONG_ANSWER);
         Event accepted = event(5_002L, 18, SubmissionResult.ACCEPTED);
 
-        record(store, 51L, wrong);
-        record(store, 52L, accepted);
+        record(board, 51L, wrong);
+        record(board, 52L, accepted);
 
-        record(store, 53L, accepted);
-        record(store, 54L, wrong);
+        record(board, 53L, accepted);
+        record(board, 54L, wrong);
 
-        assertThat(store.currentRanking(CONTEST_ID))
+        assertThat(board.currentRanking(CONTEST_ID))
                 .containsExactly(new ContestScoreboardEntry(USER_ID, 1, 23L));
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("stores")
-    void pendingEventScoresNothing(Named named) {
-        ContestScoreboardStore store = named.create();
+    void pendingEventScoresNothing(Supplier<ContestScoreboardStore> store) {
+        ContestScoreboardStore board = store.get();
 
-        record(store, 61L, event(6_001L, 5, SubmissionResult.PENDING));
+        record(board, 61L, event(6_001L, 5, SubmissionResult.PENDING));
 
-        assertThat(store.currentRanking(CONTEST_ID)).isEmpty();
-        assertThat(store.totalParticipants(CONTEST_ID)).isZero();
+        assertThat(board.currentRanking(CONTEST_ID)).isEmpty();
+        assertThat(board.totalParticipants(CONTEST_ID)).isZero();
 
-        record(store, 62L, event(6_002L, 7, SubmissionResult.WRONG_ANSWER));
-        record(store, 63L, event(6_003L, 9, SubmissionResult.PENDING));
-        record(store, 64L, event(6_004L, 11, SubmissionResult.ACCEPTED));
+        record(board, 62L, event(6_002L, 7, SubmissionResult.WRONG_ANSWER));
+        record(board, 63L, event(6_003L, 9, SubmissionResult.PENDING));
+        record(board, 64L, event(6_004L, 11, SubmissionResult.ACCEPTED));
 
-        assertThat(store.currentRanking(CONTEST_ID))
+        assertThat(board.currentRanking(CONTEST_ID))
                 .containsExactly(new ContestScoreboardEntry(USER_ID, 1, 16L));
     }
 
-    private static List<ContestScoreboardEntry> applyAll(Named named, List<Event> events) {
-        ContestScoreboardStore store = named.create();
+    private static List<ContestScoreboardEntry> applyAll(Supplier<ContestScoreboardStore> stores,
+                                                         List<Event> events) {
+        ContestScoreboardStore board = stores.get();
         long eventId = 1L;
         for (Event event : events) {
-            record(store, eventId++, event);
+            record(board, eventId++, event);
         }
-        return store.currentRanking(CONTEST_ID);
+        return board.currentRanking(CONTEST_ID);
     }
 
     private static void record(ContestScoreboardStore store, long eventId, Event event) {
@@ -217,15 +219,4 @@ class ContestScoreboardStoreCommutativityTests {
                          SubmissionResult result) {
     }
 
-    private record Named(String name, Supplier<ContestScoreboardStore> factory) {
-
-        ContestScoreboardStore create() {
-            return factory.get();
-        }
-
-        @Override
-        public String toString() {
-            return name;
-        }
-    }
 }

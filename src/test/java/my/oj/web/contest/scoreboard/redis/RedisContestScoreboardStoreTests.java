@@ -50,21 +50,8 @@ class RedisContestScoreboardStoreTests {
         assertThat(store.snapshot(contestId).entries()).isEmpty();
     }
 
-    @Test
-    void duplicateEventDoesNotAffectRanking() {
-        long contestId = 13L;
-        LocalDateTime start = LocalDateTime.of(2024, 7, 1, 9, 0);
-
-        store.recordJudgement(100L, 100L, contestId, 41L, 5555L, start, start.plusMinutes(4), SubmissionResult.WRONG_ANSWER);
-        store.recordJudgement(101L, 101L, contestId, 41L, 5555L, start, start.plusMinutes(7), SubmissionResult.ACCEPTED);
-
-        List<ContestScoreboardEntry> before = store.currentRanking(contestId);
-
-        store.recordJudgement(101L, 101L, contestId, 41L, 5555L, start, start.plusMinutes(7), SubmissionResult.ACCEPTED);
-        store.recordJudgement(100L, 100L, contestId, 41L, 5555L, start, start.plusMinutes(4), SubmissionResult.WRONG_ANSWER);
-
-        assertThat(store.currentRanking(contestId)).containsExactlyElementsOf(before);
-    }
+    // Duplicate delivery, arrival order and PENDING are covered for both store implementations
+    // by ContestScoreboardStoreCommutativityTests.
 
     @Test
     void topRankingRespectsRequestedSize() {

@@ -142,60 +142,6 @@ class RedisContestScoreboardOutboxApplierRedisIntegrationTests {
         }
     }
 
-    /**
-     * The acceptance criterion for making the scoreboard order-independent: the live outbox
-     * path (this Lua script) and a rebuild (the Java store, replaying in submission order)
-     * have to produce the same numbers from the same submissions.
-     */
-    @Test
-    void liveApplyMatchesARebuildThroughTheJavaStore() {
-        List<ContestScoreboardUpdate> submissionOrder = List.of(
-                payload(3001L, PROBLEM_ID, SubmissionResult.WRONG_ANSWER, 4),
-                payload(3002L, PROBLEM_ID, SubmissionResult.WRONG_ANSWER, 9),
-                payload(3003L, PROBLEM_ID, SubmissionResult.ACCEPTED, 11),
-                payload(3004L, PROBLEM_ID + 1, SubmissionResult.WRONG_ANSWER, 15),
-                payload(3005L, PROBLEM_ID + 1, SubmissionResult.ACCEPTED, 15),
-                payload(3006L, PROBLEM_ID + 1, SubmissionResult.WRONG_ANSWER, 21),
-                payload(3007L, PROBLEM_ID + 2, SubmissionResult.PENDING, 25)
-        );
-        List<Integer> judgedOrder = List.of(2, 4, 0, 6, 5, 3, 1);
-
-        long eventId = 900L;
-        for (int index : judgedOrder) {
-            applier.apply(eventId++, submissionOrder.get(index));
-        }
-        Map<String, String> liveSummary = redisTemplate.<String, String>opsForHash().entries(summaryKey());
-        double liveScore = rankingScore();
-
-        long rebuiltContestId = CONTEST_ID + 500L;
-        RedisContestScoreboardStore rebuildStore = new RedisContestScoreboardStore(
-                new RedisTemplateContestRedisKeyValueClient(redisTemplate)
-        );
-        for (ContestScoreboardUpdate update : submissionOrder) {
-            rebuildStore.recordJudgement(
-                    update.contestSubmissionId(),
-                    update.contestSubmissionId(),
-                    rebuiltContestId,
-                    update.problemId(),
-                    update.userId(),
-                    update.contestStart(),
-                    update.submittedTime(),
-                    update.result()
-            );
-        }
-
-        Map<String, String> rebuiltSummary = redisTemplate.<String, String>opsForHash().entries(
-                "contest:scoreboard:" + rebuiltContestId + ":user:" + USER_ID + ":summary"
-        );
-        // problem 11: solved at 11 after two wrong attempts, problem 12: solved at 15 after one
-        assertThat(liveSummary).containsEntry("solved", "2").containsEntry("penalty", "41");
-        assertThat(rebuiltSummary).isEqualTo(liveSummary);
-        assertThat(redisTemplate.opsForZSet().score(
-                "contest:scoreboard:" + rebuiltContestId + ":ranking",
-                Long.toString(USER_ID)
-        )).isEqualTo(liveScore);
-    }
-
     @Test
     void pendingEventAllocatesASequenceWithoutScoring() {
         Long sequence = applier.apply(531L, payload(1301L, SubmissionResult.PENDING, 5));

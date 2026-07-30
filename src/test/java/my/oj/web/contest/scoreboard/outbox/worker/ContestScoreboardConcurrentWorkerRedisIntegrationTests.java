@@ -3,12 +3,14 @@ package my.oj.web.contest.scoreboard.outbox.worker;
 import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
 import my.oj.web.contest.scoreboard.ContestScoreboardService;
 import my.oj.web.submission.SubmissionResult;
+import my.oj.web.testsupport.ContestScoreboardTestData;
+import my.oj.web.testsupport.ContestScoreboardTestData.Attempt;
+import my.oj.web.testsupport.ContestScoreboardTestData.SeededContest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
@@ -20,8 +22,6 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
-import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -50,6 +50,7 @@ class ContestScoreboardConcurrentWorkerRedisIntegrationTests {
     private static final int BATCH_SIZE = 10;
     private static final Duration CLAIM_LEASE = Duration.ofSeconds(30);
     private static final Duration DRAIN_TIMEOUT = Duration.ofSeconds(30);
+    private static final LocalDateTime CONTEST_START = LocalDateTime.of(2026, 3, 10, 12, 0);
 
     @DynamicPropertySource
     static void redisProperties(DynamicPropertyRegistry registry) {
@@ -69,41 +70,30 @@ class ContestScoreboardConcurrentWorkerRedisIntegrationTests {
     @Autowired
     private ContestScoreboardService scoreboardService;
 
-    private Long contestId;
+    private SeededContest contest;
 
     @AfterEach
     void tearDown() {
-        if (contestId == null) {
+        if (contest == null) {
             return;
         }
-        scoreboardService.reset(contestId);
-        List<Long> userIds = jdbcTemplate.queryForList(
-                "SELECT DISTINCT user_id FROM contest_submission WHERE contest_id = ?",
-                Long.class,
-                contestId
-        );
-        jdbcTemplate.update("DELETE FROM contest_submission_outbox WHERE contest_id = ?", contestId);
-        jdbcTemplate.update("DELETE FROM contest_submission WHERE contest_id = ?", contestId);
-        jdbcTemplate.update("DELETE FROM problem WHERE contest_id = ?", contestId);
-        jdbcTemplate.update("DELETE FROM contest WHERE id = ?", contestId);
-        for (Long userId : userIds) {
-            jdbcTemplate.update("DELETE FROM `user` WHERE id = ?", userId);
-        }
-        contestId = null;
-        flushRedis();
+        scoreboardService.reset(contest.contestId());
+        ContestScoreboardTestData.deleteContest(jdbcTemplate, contest.contestId());
+        contest = null;
+        ContestScoreboardTestData.flushRedis(redisTemplate);
     }
 
     @Test
     void fourWorkersDrainingTogetherReachTheSameScoreboardAsOne() throws Exception {
-        flushRedis();
+        ContestScoreboardTestData.flushRedis(redisTemplate);
         seedContest();
 
         drainWith(1);
-        List<ContestScoreboardEntry> singleWorkerRanking = scoreboardService.currentRanking(contestId);
+        List<ContestScoreboardEntry> singleWorkerRanking = scoreboardService.currentRanking(contest.contestId());
 
         replayFromScratch();
         drainWith(WORKER_COUNT);
-        List<ContestScoreboardEntry> concurrentRanking = scoreboardService.currentRanking(contestId);
+        List<ContestScoreboardEntry> concurrentRanking = scoreboardService.currentRanking(contest.contestId());
 
         assertThat(singleWorkerRanking).isNotEmpty();
         assertThat(concurrentRanking).isEqualTo(singleWorkerRanking);
@@ -111,13 +101,13 @@ class ContestScoreboardConcurrentWorkerRedisIntegrationTests {
 
     /** Clears the applied scoreboard and puts every event back on the queue. */
     private void replayFromScratch() {
-        scoreboardService.reset(contestId);
+        scoreboardService.reset(contest.contestId());
         jdbcTemplate.update("""
                 UPDATE contest_submission_outbox
                 SET status = 'PENDING', redis_seq = NULL, processed_at = NULL, claim_token = NULL,
                     claimed_at = NULL, next_attempt_at = NULL, last_error_message = NULL
                 WHERE contest_id = ?
-                """, contestId);
+                """, contest.contestId());
     }
 
     private void drainWith(int workerCount) throws Exception {
@@ -145,26 +135,13 @@ class ContestScoreboardConcurrentWorkerRedisIntegrationTests {
         assertThat(unappliedEvents()).as("every scoreboard outbox row is applied").isZero();
         // Guards against a row being completed by something other than these workers — a
         // scheduler left running in another cached Spring context, for instance.
-        assertThat(redisTemplate.opsForSet().size("contest:scoreboard:" + contestId + ":processed"))
+        assertThat(redisTemplate.opsForSet().size(ContestScoreboardTestData.processedKey(contest.contestId())))
                 .as("every completed event reached this Redis scoreboard")
-                .isEqualTo(seededEvents());
-    }
-
-    private long seededEvents() {
-        Long count = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM contest_submission_outbox WHERE contest_id = ?",
-                Long.class,
-                contestId
-        );
-        return count == null ? 0L : count;
+                .isEqualTo(ContestScoreboardTestData.seededEvents(jdbcTemplate, contest.contestId()));
     }
 
     private long unappliedEvents() {
-        Long count = jdbcTemplate.queryForObject("""
-                SELECT COUNT(*) FROM contest_submission_outbox
-                WHERE contest_id = ? AND status <> 'COMPLETED'
-                """, Long.class, contestId);
-        return count == null ? 0L : count;
+        return ContestScoreboardTestData.unappliedEvents(jdbcTemplate, contest.contestId());
     }
 
     /**
@@ -172,85 +149,31 @@ class ContestScoreboardConcurrentWorkerRedisIntegrationTests {
      * order that differs from the submission order.
      */
     private void seedContest() {
-        String suffix = UUID.randomUUID().toString();
-        String name = "scoreboard-concurrent-worker-" + suffix;
-        LocalDateTime contestStart = LocalDateTime.of(2026, 3, 10, 12, 0);
-        jdbcTemplate.update(
-                "INSERT INTO contest (name, start_time, end_time) VALUES (?, ?, ?)",
-                name,
-                contestStart,
-                contestStart.plusHours(3)
-        );
-        contestId = jdbcTemplate.queryForObject("SELECT id FROM contest WHERE name = ?", Long.class, name);
+        contest = ContestScoreboardTestData.seedContest(
+                jdbcTemplate, "scoreboard-concurrent-worker", CONTEST_START, 3, 3);
 
-        List<Long> problemIds = new ArrayList<>();
-        for (int index = 1; index <= 3; index++) {
-            jdbcTemplate.update(
-                    "INSERT INTO problem (name, contest_id, contest_num) VALUES (?, ?, ?)",
-                    name + "-problem-" + index,
-                    contestId,
-                    index
-            );
-            problemIds.add(jdbcTemplate.queryForObject(
-                    "SELECT id FROM problem WHERE name = ?",
-                    Long.class,
-                    name + "-problem-" + index
-            ));
-        }
-        List<Long> userIds = new ArrayList<>();
-        for (int index = 1; index <= 3; index++) {
-            jdbcTemplate.update("INSERT INTO `user` (name, pass) VALUES (?, ?)", name + "-user-" + index, "pass");
-            userIds.add(jdbcTemplate.queryForObject(
-                    "SELECT id FROM `user` WHERE name = ?",
-                    Long.class,
-                    name + "-user-" + index
-            ));
-        }
-
-        List<Object[]> submissions = new ArrayList<>();
-        List<Object[]> outboxes = new ArrayList<>();
+        List<Attempt> attempts = new ArrayList<>();
         long submissionId = 940_000_000_000_000_000L;
         int sequence = 0;
-        for (Long userId : userIds) {
-            for (Long problemId : problemIds) {
+        for (Long userId : contest.userIds()) {
+            for (Long problemId : contest.problemIds()) {
                 for (int attempt = 0; attempt < 3; attempt++) {
                     int submittedMinute = 5 + attempt * 4 + sequence % 7;
                     // The accepted attempt is judged first even though it was submitted last.
                     int judgedMinute = attempt == 2 ? submittedMinute : submittedMinute + 6;
-                    SubmissionResult result = attempt == 2
-                            ? SubmissionResult.ACCEPTED
-                            : SubmissionResult.WRONG_ANSWER;
-                    LocalDateTime submittedAt = contestStart.plusMinutes(submittedMinute);
-                    LocalDateTime judgedAt = contestStart.plusMinutes(judgedMinute);
-                    submissions.add(new Object[]{
-                            submissionId, contestId, problemId, userId, submittedAt,
-                            "code", String.format(Locale.ROOT, "%064x", submissionId)
-                    });
-                    outboxes.add(new Object[]{
-                            submissionId, contestId, problemId, userId, contestStart, submittedAt,
-                            judgedAt, result.name(), judgedAt
-                    });
-                    submissionId++;
+                    attempts.add(new Attempt(
+                            submissionId++,
+                            problemId,
+                            userId,
+                            submittedMinute,
+                            judgedMinute,
+                            attempt == 2 ? SubmissionResult.ACCEPTED : SubmissionResult.WRONG_ANSWER
+                    ));
                     sequence++;
                 }
             }
         }
-        jdbcTemplate.batchUpdate("""
-                INSERT INTO contest_submission (
-                    id, contest_id, problem_id, user_id, submitted_time, code, code_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, submissions);
-        jdbcTemplate.batchUpdate("""
-                INSERT INTO contest_submission_outbox (
-                    contest_submission_id, contest_id, problem_id, user_id,
-                    contest_start, submitted_time, judged_at, result, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
-                """, outboxes);
-    }
-
-    private void flushRedis() {
-        try (RedisConnection connection = redisTemplate.getConnectionFactory().getConnection()) {
-            connection.serverCommands().flushDb();
-        }
+        ContestScoreboardTestData.insertAttempts(
+                jdbcTemplate, contest.contestId(), CONTEST_START, attempts, false);
     }
 }
