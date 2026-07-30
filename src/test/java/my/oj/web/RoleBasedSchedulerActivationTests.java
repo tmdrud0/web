@@ -1,7 +1,6 @@
 package my.oj.web;
 
 import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProcessor;
-import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProcessLock;
 import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProperties;
 import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxRecoveryService;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
@@ -116,11 +115,6 @@ class RoleBasedSchedulerActivationTests {
         @Bean
         ContestScoreboardOutboxRecoveryService contestScoreboardOutboxRecoveryService() {
             return mock(ContestScoreboardOutboxRecoveryService.class);
-        }
-
-        @Bean
-        ContestScoreboardOutboxProcessLock contestScoreboardOutboxProcessLock() {
-            return mock(ContestScoreboardOutboxProcessLock.class);
         }
 
         @Bean
