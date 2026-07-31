@@ -45,8 +45,10 @@ class OperationalPropertiesBindingTests {
             assertThat(judgeRelay.claimTimeout()).isEqualTo(Duration.ofSeconds(30));
             assertThat(judgeRelay.confirmTimeout()).isEqualTo(Duration.ofSeconds(10));
             assertThat(bulk.batchSize()).isEqualTo(100);
-            assertThat(bulk.workerCount()).isEqualTo(1);
-            assertThat(bulk.maxInFlight()).isEqualTo(2000);
+            assertThat(bulk.workerCount()).isEqualTo(4);
+            assertThat(bulk.maxInFlight()).isEqualTo(800);
+            assertThat(bulk.maxInFlight())
+                    .isGreaterThanOrEqualTo(bulk.batchSize() * bulk.workerCount());
             assertThat(completion.threadCount()).isEqualTo(8);
             assertThat(completion.queueCapacity()).isEqualTo(256);
             assertThat(resultWriter.batchSize()).isEqualTo(16);
