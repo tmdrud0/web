@@ -12,10 +12,15 @@ import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactor
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Random;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.entry;
 
 @EnabledIfSystemProperty(named = "redisIntegration", matches = "true")
 class RedisContestScoreboardApplierRedisIntegrationTests {
@@ -59,8 +64,14 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
         assertThat(repeatedSequence).isEqualTo(2L);
         assertThat(restoredSequence).isEqualTo(2L);
         assertThat(applier.currentSequence()).isEqualTo(2L);
-        assertThat(redisTemplate.opsForHash().get(problemKey(), "wrongAttempts")).isEqualTo("1");
-        assertThat(redisTemplate.opsForHash().get(problemKey(), "accepted")).isEqualTo("1");
+        assertThat(redisTemplate.<String, String>opsForHash().entries(problemKey()))
+                .containsOnly(
+                        entry("w:1001", "2"),
+                        entry("a:min", "10"),
+                        entry("a:sid", "1002"),
+                        entry("c:solved", "1"),
+                        entry("c:penalty", "15")
+                );
         assertThat(redisTemplate.opsForHash().get(summaryKey(), "solved")).isEqualTo("1");
         assertThat(redisTemplate.opsForHash().get(summaryKey(), "penalty")).isEqualTo("15");
         assertThat(redisTemplate.opsForSet().members(processedKey()))
@@ -102,6 +113,79 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
         assertThat(rebuilt).isEqualTo(1L);
         assertThat(redisTemplate.opsForHash().get(summaryKey(), "solved")).isEqualTo("1");
     }
+    /**
+     * The regression this schema exists for: judging latency varies per submission, so an
+     * ACCEPTED submitted at minute 12 can be applied before a WRONG submitted at minute 10.
+     * The wrong attempt still has to cost its five penalty minutes.
+     */
+    @Test
+    void lateWrongAttemptStillCostsPenaltyWhenTheAcceptedArrivedFirst() {
+        applier.apply(511L, payload(1101L, SubmissionResult.ACCEPTED, 12));
+        applier.apply(512L, payload(1102L, SubmissionResult.WRONG_ANSWER, 10));
+
+        assertThat(redisTemplate.opsForHash().get(summaryKey(), "solved")).isEqualTo("1");
+        assertThat(redisTemplate.opsForHash().get(summaryKey(), "penalty")).isEqualTo("17");
+        assertThat(redisTemplate.opsForZSet().score(rankingKey(), Long.toString(USER_ID)))
+                .isEqualTo(1L * 1_000_000_000L - 17L * 1_000L - USER_ID);
+    }
+
+    @Test
+    void anEarlierAcceptedArrivingLateReplacesTheRecordedSolveTime() {
+        applier.apply(521L, payload(1201L, SubmissionResult.WRONG_ANSWER, 4));
+        applier.apply(522L, payload(1203L, SubmissionResult.ACCEPTED, 20));
+        assertThat(redisTemplate.opsForHash().get(summaryKey(), "penalty")).isEqualTo("25");
+
+        applier.apply(523L, payload(1202L, SubmissionResult.ACCEPTED, 9));
+
+        assertThat(redisTemplate.opsForHash().get(summaryKey(), "solved")).isEqualTo("1");
+        assertThat(redisTemplate.opsForHash().get(summaryKey(), "penalty")).isEqualTo("14");
+        assertThat(redisTemplate.opsForHash().get(problemKey(), "a:sid")).isEqualTo("1202");
+    }
+
+    @Test
+    void applyOrderDoesNotChangeTheFinalScoreboard() {
+        List<ContestScoreboardUpdate> events = List.of(
+                payload(2001L, PROBLEM_ID, SubmissionResult.WRONG_ANSWER, 3),
+                payload(2002L, PROBLEM_ID, SubmissionResult.WRONG_ANSWER, 10),
+                payload(2003L, PROBLEM_ID, SubmissionResult.ACCEPTED, 12),
+                payload(2004L, PROBLEM_ID, SubmissionResult.WRONG_ANSWER, 14),
+                payload(2005L, PROBLEM_ID, SubmissionResult.ACCEPTED, 20),
+                payload(2006L, PROBLEM_ID + 1, SubmissionResult.WRONG_ANSWER, 15),
+                payload(2007L, PROBLEM_ID + 1, SubmissionResult.ACCEPTED, 15),
+                payload(2008L, PROBLEM_ID + 2, SubmissionResult.RUNTIME_ERROR, 30)
+        );
+
+        Map<String, String> expectedSummary = applyInOrder(events);
+        double expectedScore = rankingScore();
+        assertThat(expectedSummary).containsEntry("solved", "2").containsEntry("penalty", "42");
+
+        Random random = new Random(20260730L);
+        for (int permutation = 0; permutation < 20; permutation++) {
+            List<ContestScoreboardUpdate> shuffled = new ArrayList<>(events);
+            Collections.shuffle(shuffled, random);
+
+            Map<String, String> summary = applyInOrder(shuffled);
+
+            assertThat(summary)
+                    .as("permutation %d: %s", permutation, submissionIdsOf(shuffled))
+                    .isEqualTo(expectedSummary);
+            assertThat(rankingScore()).isEqualTo(expectedScore);
+        }
+    }
+
+    @Test
+    void pendingEventAllocatesASequenceWithoutScoring() {
+        Long sequence = applier.apply(531L, payload(1301L, SubmissionResult.PENDING, 5));
+
+        assertThat(sequence).isEqualTo(1L);
+        assertThat(applier.currentSequence()).isEqualTo(1L);
+        assertThat(redisTemplate.opsForSet().members(processedKey())).containsExactly("1301");
+        assertThat(redisTemplate.opsForHash().get("contest:scoreboard:outbox:submission", "1301"))
+                .isEqualTo("1");
+        assertThat(redisTemplate.opsForHash().size(summaryKey())).isZero();
+        assertThat(redisTemplate.opsForHash().size(problemKey())).isZero();
+        assertThat(redisTemplate.opsForZSet().size(rankingKey())).isZero();
+    }
 
     @Test
     void wrongKeyTypeIsRejectedBeforeAnySequenceOrScoreboardWrite() {
@@ -121,14 +205,14 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
 
     @Test
     void malformedScoreboardFieldIsRejectedBeforeSequenceAllocation() {
-        redisTemplate.opsForHash().put(problemKey(), "wrongAttempts", "not-an-integer");
+        redisTemplate.opsForHash().put(problemKey(), "c:penalty", "not-an-integer");
 
         assertThatThrownBy(() -> applier.apply(
                 602L,
                 payload(2002L, SubmissionResult.ACCEPTED, 10)
         )).isInstanceOf(RuntimeException.class)
                 .cause()
-                .hasMessageContaining("Invalid integer value for wrongAttempts");
+                .hasMessageContaining("Invalid integer value for c:penalty");
 
         assertThat(redisTemplate.opsForValue().get(RedisContestScoreboardApplier.SEQUENCE_KEY)).isNull();
         assertThat(redisTemplate.opsForHash().size("contest:scoreboard:outbox:submission")).isZero();
@@ -222,6 +306,26 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
         assertThat(redisTemplate.opsForSet().size(
                 "contest:scoreboard:" + invalidContestId + ":processed"
         )).isZero();
+    }
+
+    /** Applies every event to a freshly flushed database and returns the resulting summary. */
+    private Map<String, String> applyInOrder(List<ContestScoreboardUpdate> events) {
+        flushDatabase();
+        long eventId = 1L;
+        for (ContestScoreboardUpdate event : events) {
+            applier.apply(eventId++, event);
+        }
+        return redisTemplate.<String, String>opsForHash().entries(summaryKey());
+    }
+
+    private double rankingScore() {
+        Double score = redisTemplate.opsForZSet().score(rankingKey(), Long.toString(USER_ID));
+        assertThat(score).as("ranking score for user %d", USER_ID).isNotNull();
+        return score;
+    }
+
+    private static List<Long> submissionIdsOf(List<ContestScoreboardUpdate> events) {
+        return events.stream().map(ContestScoreboardUpdate::contestSubmissionId).toList();
     }
 
     private ContestScoreboardUpdate payload(Long submissionId,

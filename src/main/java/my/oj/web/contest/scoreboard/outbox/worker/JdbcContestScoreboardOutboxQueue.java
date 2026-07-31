@@ -6,6 +6,7 @@ import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.sql.PreparedStatement;
@@ -46,6 +47,11 @@ class JdbcContestScoreboardOutboxQueue {
     JdbcContestScoreboardOutboxQueue(JdbcTemplate jdbcTemplate, PlatformTransactionManager transactionManager) {
         this.jdbcTemplate = jdbcTemplate;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        // REPEATABLE READ takes gap locks while the claim query walks the due_at range. Several
+        // workers can then deadlock while moving their claimed rows out of that range. Claiming
+        // only needs row locks because SKIP LOCKED and the claim token provide the ownership
+        // guarantees.
+        this.transactionTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
     }
 
     List<ClaimedEvent> claim(int batchSize, Duration lease) {

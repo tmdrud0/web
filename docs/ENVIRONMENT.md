@@ -136,9 +136,22 @@ Gatling은 Windows의 저장소 루트 `C:\Users\Home\spring\web\web`에서 실�
 
 ## 8. 실행 구성 검증
 
+`test` profile은 `jdbc:mysql://localhost:3306/oj_test`(root/1234)를 사용하고 Flyway가 schema를
+만든다. 이 MySQL이 없으면 `@DataJpaTest`와 `@SpringBootTest` 클래스가 ApplicationContext 로딩
+단계에서 실패한다. compose의 `oj-mysql`은 호스트 포트를 열지 않으므로 테스트용 인스턴스는
+별도로 준비한다.
+
+Redis가 필요한 테스트는 기본적으로 skip이고 `-DredisIntegration=true`로 켠다. 포트는
+`-DredisPort`이며 기본값은 16379다. 부하 테스트는 `load-test` 태그로 제외되어 있고
+`-DincludeLoadTests=true`와 각 클래스의 환경변수(`INCLUDE_SCOREBOARD_LOAD_TEST`,
+`INCLUDE_MYSQL_LOAD_TEST`, `INCLUDE_MYSQL_BATCH_VERIFICATION`)를 함께 지정해야 실행된다.
+
 ```powershell
+docker run -d --name oj-test-mysql -p 3306:3306 -e MYSQL_ROOT_PASSWORD=1234 -e MYSQL_DATABASE=oj_test mysql:8.0
+docker run -d --name oj-test-redis -p 16379:6379 redis:7-alpine
+
 .\gradlew.bat bootJar
-.\gradlew.bat test
+.\gradlew.bat test -DredisIntegration=true
 docker compose config
 docker compose up -d --build
 docker compose ps

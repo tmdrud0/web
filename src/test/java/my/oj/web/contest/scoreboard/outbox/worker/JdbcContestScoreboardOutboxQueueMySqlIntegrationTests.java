@@ -8,6 +8,8 @@ import my.oj.web.contest.Contest;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.problem.Problem;
 import my.oj.web.submission.SubmissionResult;
+import my.oj.web.testsupport.ContestScoreboardTestData;
+import my.oj.web.testsupport.ContestScoreboardTestData.SeededContest;
 import my.oj.web.user.User;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -16,11 +18,15 @@ import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -35,10 +41,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 @Import({
         JdbcContestScoreboardOutboxQueue.class,
-        ContestScoreboardOutboxProcessLock.class,
         TestQuerydslConfig.class
 })
 class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
+
+    private static final LocalDateTime CONTEST_START = LocalDateTime.of(2026, 3, 10, 12, 0);
 
     @Autowired
     private EntityManager entityManager;
@@ -48,9 +55,6 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
 
     @Autowired
     private JdbcContestScoreboardOutboxQueue outboxQueue;
-
-    @Autowired
-    private ContestScoreboardOutboxProcessLock processLock;
 
     @Test
     void expiredLeaseCanBeReclaimedAndRejectsThePreviousWorkerCompletion() {
@@ -143,36 +147,87 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
                 .isEqualTo(outbox.getId());
     }
 
+    /**
+     * There is no worker-level lock any more, so several workers claim from the same queue at
+     * once. {@code FOR UPDATE SKIP LOCKED} has to hand every row to exactly one of them.
+     *
+     * <p>Runs outside the test transaction: the seeded rows have to be committed before other
+     * connections can claim them.
+     */
     @Test
-    void namedLockAllowsOnlyOneScoreboardBatchWorkerAcrossConnections() throws Exception {
-        CountDownLatch firstEntered = new CountDownLatch(1);
-        CountDownLatch releaseFirst = new CountDownLatch(1);
-        ExecutorService executor = Executors.newSingleThreadExecutor();
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    void concurrentWorkersNeverClaimTheSameRowTwice() throws Exception {
+        int rowCount = 24;
+        int workerCount = 4;
+        Duration lease = Duration.ofSeconds(30);
+        SeededContest seeded = ContestScoreboardTestData.seedContest(
+                jdbcTemplate, "scoreboard-concurrent-claim", CONTEST_START, 1, 1);
         try {
-            Future<Optional<String>> first = executor.submit(() -> processLock.executeIfAcquired(() -> {
-                firstEntered.countDown();
-                try {
-                    if (!releaseFirst.await(5, TimeUnit.SECONDS)) {
-                        throw new IllegalStateException("Timed out waiting to release the scoreboard process lock");
-                    }
-                } catch (InterruptedException exception) {
-                    Thread.currentThread().interrupt();
-                    throw new IllegalStateException("Interrupted while holding the scoreboard process lock", exception);
+            List<Long> outboxIds = commitPendingOutboxRows(seeded, rowCount);
+
+            CountDownLatch startTogether = new CountDownLatch(1);
+            ExecutorService executor = Executors.newFixedThreadPool(workerCount);
+            List<Long> claimedIds = new ArrayList<>();
+            Set<String> claimTokens = new HashSet<>();
+            try {
+                List<Future<List<JdbcContestScoreboardOutboxQueue.ClaimedEvent>>> claims = new ArrayList<>();
+                for (int worker = 0; worker < workerCount; worker++) {
+                    claims.add(executor.submit(() -> {
+                        startTogether.await(5, TimeUnit.SECONDS);
+                        List<JdbcContestScoreboardOutboxQueue.ClaimedEvent> claimed = new ArrayList<>();
+                        // Each worker keeps claiming until the queue hands it nothing.
+                        while (true) {
+                            List<JdbcContestScoreboardOutboxQueue.ClaimedEvent> batch = outboxQueue.claim(5, lease);
+                            if (batch.isEmpty()) {
+                                return claimed;
+                            }
+                            claimed.addAll(batch);
+                        }
+                    }));
                 }
-                return "first";
-            }));
-            assertThat(firstEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                startTogether.countDown();
 
-            Optional<String> blocked = processLock.executeIfAcquired(() -> "second");
-            assertThat(blocked).isEmpty();
+                for (Future<List<JdbcContestScoreboardOutboxQueue.ClaimedEvent>> claim : claims) {
+                    for (JdbcContestScoreboardOutboxQueue.ClaimedEvent event : claim.get(30, TimeUnit.SECONDS)) {
+                        claimedIds.add(event.eventId());
+                        claimTokens.add(event.claimToken());
+                    }
+                }
+            } finally {
+                executor.shutdownNow();
+            }
 
-            releaseFirst.countDown();
-            assertThat(first.get(5, TimeUnit.SECONDS)).contains("first");
-            assertThat(processLock.executeIfAcquired(() -> "third")).contains("third");
+            assertThat(claimedIds).doesNotHaveDuplicates();
+            assertThat(claimedIds).containsExactlyInAnyOrderElementsOf(outboxIds);
+            assertThat(claimTokens).as("each claim batch carries its own lease token").hasSizeGreaterThan(1);
+            assertThat(jdbcTemplate.queryForObject("""
+                    SELECT COUNT(*) FROM contest_submission_outbox
+                    WHERE contest_id = ? AND status = 'PROCESSING'
+                    """, Long.class, seeded.contestId()))
+                    .isEqualTo(rowCount);
         } finally {
-            releaseFirst.countDown();
-            executor.shutdownNow();
+            ContestScoreboardTestData.deleteContest(jdbcTemplate, seeded.contestId());
         }
+    }
+
+    private List<Long> commitPendingOutboxRows(SeededContest seeded, int rowCount) {
+        List<ContestScoreboardTestData.Attempt> attempts = new ArrayList<>(rowCount);
+        for (int index = 0; index < rowCount; index++) {
+            attempts.add(new ContestScoreboardTestData.Attempt(
+                    930_000_000_000_000_000L + index,
+                    seeded.problemIds().get(0),
+                    seeded.userIds().get(0),
+                    index,
+                    index + 1,
+                    SubmissionResult.ACCEPTED
+            ));
+        }
+        ContestScoreboardTestData.insertAttempts(jdbcTemplate, seeded.contestId(), CONTEST_START, attempts, false);
+        return jdbcTemplate.queryForList(
+                "SELECT id FROM contest_submission_outbox WHERE contest_id = ? ORDER BY id",
+                Long.class,
+                seeded.contestId()
+        );
     }
 
     private ContestScoreboardOutbox persistPendingOutbox() {

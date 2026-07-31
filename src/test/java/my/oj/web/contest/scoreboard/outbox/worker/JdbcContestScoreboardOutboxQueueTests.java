@@ -100,6 +100,11 @@ class JdbcContestScoreboardOutboxQueueTests {
         verify(claimStatement).setString(1, claimed.get(0).claimToken());
         verify(claimStatement).setLong(2, 30_000_000L);
         verify(claimStatement).setLong(3, 7L);
+        ArgumentCaptor<TransactionDefinition> transactionDefinition =
+                ArgumentCaptor.forClass(TransactionDefinition.class);
+        verify(transactionManager).getTransaction(transactionDefinition.capture());
+        assertThat(transactionDefinition.getValue().getIsolationLevel())
+                .isEqualTo(TransactionDefinition.ISOLATION_READ_COMMITTED);
         verify(transactionManager).commit(transactionStatus);
     }
 
