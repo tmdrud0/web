@@ -1,6 +1,6 @@
 # 대회 제출 파이프라인 설계 및 개선 기록
 
-> 최종 갱신: 2026-07-30  
+> 최종 갱신: 2026-07-30
 > 작업 브랜치: `codex/rabbitmq-contest-judge`  
 > 문서 목적: 과거의 설계 판단부터 현재 구현, 성능 측정, 미해결 문제까지 한 문서에서 다시 파악하고 LLM에 인수인계하기 위한 기록
 
@@ -519,7 +519,7 @@ listener concurrency가 64이고 각 listener가 결과 commit을 기다리므�
 
 - [`JdbcContestScoreboardOutboxQueue`](../src/main/java/my/oj/web/contest/scoreboard/outbox/worker/JdbcContestScoreboardOutboxQueue.java)
 - [`ContestScoreboardOutboxProcessor`](../src/main/java/my/oj/web/contest/scoreboard/outbox/worker/ContestScoreboardOutboxProcessor.java)
-- [`RedisContestScoreboardOutboxApplier`](../src/main/java/my/oj/web/contest/scoreboard/redis/RedisContestScoreboardOutboxApplier.java)
+- [`RedisContestScoreboardApplier`](../src/main/java/my/oj/web/contest/scoreboard/redis/RedisContestScoreboardApplier.java)
 - [`ContestScoreboardRedisScript`](../src/main/java/my/oj/web/contest/scoreboard/redis/ContestScoreboardRedisScript.java)
 - [`ContestScoreboardOutboxRecoveryService`](../src/main/java/my/oj/web/contest/scoreboard/outbox/worker/ContestScoreboardOutboxRecoveryService.java)
 
@@ -602,11 +602,12 @@ Snowflake ID는 정확한 정수 표현 한계인 53비트를 넘기 때문이�
 
 | 구현 | 파일 | 쓰이는 경로 |
 |---|---|---|
-| Lua | [`ContestScoreboardRedisScript`](../src/main/java/my/oj/web/contest/scoreboard/redis/ContestScoreboardRedisScript.java) | 라이브 outbox 반영 |
-| Java (Redis) | [`RedisContestScoreboardStore`](../src/main/java/my/oj/web/contest/scoreboard/redis/RedisContestScoreboardStore.java) | rebuild (`store=redis`) |
-| Java (메모리) | [`InMemoryContestScoreboardStore`](../src/main/java/my/oj/web/contest/scoreboard/memory/InMemoryContestScoreboardStore.java) | `store=memory` 프로필, 최종 점수 replay |
+| Lua (Redis) | [`ContestScoreboardRedisScript`](../src/main/java/my/oj/web/contest/scoreboard/redis/ContestScoreboardRedisScript.java) | live outbox 반영과 Redis rebuild |
+| Java (메모리) | [`InMemoryContestScoreboard`](../src/main/java/my/oj/web/contest/scoreboard/memory/InMemoryContestScoreboard.java) | `store=memory` 프로필, 최종 점수 replay |
 
-Java 두 구현은 [`ContestScoreboardPolicy.computeProblemContribution`](../src/main/java/my/oj/web/contest/scoreboard/ContestScoreboardPolicy.java)을 공유한다.
+Java 메모리 구현은 [`ProblemAttempts`](../src/main/java/my/oj/web/contest/scoreboard/ProblemAttempts.java)와
+[`ContestScoreboardPolicy.computeProblemContribution`](../src/main/java/my/oj/web/contest/scoreboard/ContestScoreboardPolicy.java)을 사용한다.
+Redis live와 rebuild는 모두 같은 `ContestScoreboardApplier`를 거쳐 Lua 규칙을 공유한다.
 Lua는 Java 상수를 참조할 수 없으므로 penalty·score 가중치를 지금처럼 ARGV로 받는 계약을
 유지했고, 필드 이름은 `ContestScoreboardRedisFields`와 Lua 양쪽에 있다.
 
@@ -643,8 +644,8 @@ Lua는 Java 상수를 참조할 수 없으므로 penalty·score 가중치를 지
 
 | 테스트 | 확인하는 것 |
 |---|---|
-| `ContestScoreboardStoreCommutativityTests` | Java 두 구현에 대해 무작위 순열 25개의 결과 동일, 위 회귀 시나리오 penalty 17, 중복 전달·재적용 멱등성, PENDING 무반영 |
-| `RedisContestScoreboardOutboxApplierRedisIntegrationTests` | Lua에 대해 같은 성질과 problem hash 필드, 뒤늦은 더 이른 ACCEPTED가 solve 시각을 교체하는 동작 |
+| `InMemoryContestScoreboardCommutativityTests` | 메모리 구현에서 무작위 순열 25개의 결과 동일, 위 회귀 시나리오 penalty 17, 중복 전달·재적용 멱등성, PENDING 무반영 |
+| `RedisContestScoreboardApplierRedisIntegrationTests` | Lua에 대해 같은 성질과 problem hash 필드, 뒤늦은 더 이른 ACCEPTED가 solve 시각을 교체하는 동작 |
 | `ContestScoreboardLiveVersusRebuildRedisIntegrationTests` | 같은 제출·결과 집합에서 outbox 경로와 `rebuildFromContestResults` 결과 일치 |
 
 ### 4.10.2 worker named lock 제거
@@ -685,7 +686,7 @@ Redis Lua script는 다음을 함께 처리한다.
 
 - 전역 sequence counter 증가
 - `contestSubmissionId -> redis_seq` hash 저장
-- contest별 processed event ID set 확인/기록
+- contest별 processed submission ID set 확인/기록
 - user/problem scoreboard 상태 갱신
 - ranking sorted set 갱신
 
@@ -1001,9 +1002,8 @@ named lock을 제거했으므로 scoreboard batch worker는 여러 인스턴스�
 
 1. batch/pipeline 크기와 Redis latency 확인. worker를 늘리기 전에 단일 worker가 어디서
    막히는지 먼저 본다.
-2. claim 쿼리의 `ORDER BY COALESCE(next_attempt_at, claimed_at, created_at), created_at, id`
-   단순화. 순서 의존성이 사라져 이 정렬 키는 공정성 용도만 남았다. 별도 커밋과 `EXPLAIN`
-   검증으로 진행한다.
+2. claim 쿼리는 `due_at, id` 인덱스를 사용한다. backlog가 커질 때도 `EXPLAIN`으로
+   `idx_cs_outbox_due` range scan과 LIMIT 조기 종료가 유지되는지 확인한다.
 3. 대회 종료 후 problem hash의 `w:*` 필드 정리 시점. 새 schema에서 이 필드가 제출 수만큼
    쌓이므로 `reset`/archive 정책이 메모리 상한과 직접 연결된다 (§4.10.1 측정값).
 4. 명시적 contest rebuild 도구 추가. 지금은 `ContestScoreboardRebuildService`를 호출하는
@@ -1118,10 +1118,10 @@ CDC를 도입해도 다음은 사라지지 않는다.
 6. [`ContestJudgeRabbitConfiguration`](../src/main/java/my/oj/web/contest/submission/messaging/ContestJudgeRabbitConfiguration.java)
 7. [`ContestSubmissionJudgeResultBatchWriter`](../src/main/java/my/oj/web/contest/submission/judge/ContestSubmissionJudgeResultBatchWriter.java)
 8. [`ContestScoreboardOutboxProcessor`](../src/main/java/my/oj/web/contest/scoreboard/outbox/worker/ContestScoreboardOutboxProcessor.java)
-9. [`RedisContestScoreboardOutboxApplier`](../src/main/java/my/oj/web/contest/scoreboard/redis/RedisContestScoreboardOutboxApplier.java)
+9. [`RedisContestScoreboardApplier`](../src/main/java/my/oj/web/contest/scoreboard/redis/RedisContestScoreboardApplier.java)
 10. [`ContestScoreboardOutboxRecoveryService`](../src/main/java/my/oj/web/contest/scoreboard/outbox/worker/ContestScoreboardOutboxRecoveryService.java)
 
-scoreboard 규칙을 손볼 때는 §4.10.1의 세 구현 표를 먼저 본다. Lua, Java(Redis), Java(메모리)가
+scoreboard 규칙을 손볼 때는 §4.10.1의 구현 표를 먼저 본다. Redis Lua와 Java 메모리 구현이
 같은 규칙을 갖고 있으므로 하나만 바꾸면 경로별로 다른 scoreboard가 나온다.
 
 현재 작업 트리는 큰 미커밋 변경을 포함한다. 브랜치의 마지막 commit만 보고 RabbitMQ 구현이 이미 commit됐다고 가정하면 안 된다. 파일을 수정하기 전에 `git status`, 실제 profile, 실행 중인 container와 포트를 확인해야 한다.
