@@ -30,8 +30,7 @@ public class SubmissionService {
     private final ContestSubmissionRateLimiter contestSubmissionRateLimiter;
 
     public SubmissionReceipt submit(SubmitSubmissionCommand cmd) {
-        User user = userRepository.findById(cmd.userId())
-                .orElseThrow(() -> new IllegalStateException("User not found: " + cmd.userId()));
+        User user = userRepository.getReferenceById(cmd.userId());
         Problem problem = problemRepository.findWithContestById(cmd.problemId())
                 .orElseThrow(() -> new IllegalStateException("Problem not found: " + cmd.problemId()));
         LocalDateTime submittedTime = LocalDateTime.now();
@@ -61,8 +60,7 @@ public class SubmissionService {
     }
 
     public CompletionStage<SubmissionReceipt> submitAsync(SubmitSubmissionCommand cmd) {
-        User user = userRepository.findById(cmd.userId())
-                .orElseThrow(() -> new IllegalStateException("User not found: " + cmd.userId()));
+        User user = userRepository.getReferenceById(cmd.userId());
         Problem problem = problemRepository.findWithContestById(cmd.problemId())
                 .orElseThrow(() -> new IllegalStateException("Problem not found: " + cmd.problemId()));
         LocalDateTime submittedTime = LocalDateTime.now();

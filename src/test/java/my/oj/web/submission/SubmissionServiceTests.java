@@ -65,7 +65,7 @@ class SubmissionServiceTests {
         user = User.withState(5L, "bob", "pw", 0L, new Streak());
         problem = Problem.create("Prob", null, null);
         ReflectionTestUtils.setField(problem, "id", 9L);
-        when(userRepository.findById(5L)).thenReturn(Optional.of(user));
+        when(userRepository.getReferenceById(5L)).thenReturn(user);
         lenient().when(problemRepository.findWithContestById(9L)).thenReturn(Optional.of(problem));
     }
 
@@ -84,6 +84,8 @@ class SubmissionServiceTests {
         assertThat(eventCaptor.getValue().submissionId()).isEqualTo(101L);
         assertThat(eventCaptor.getValue().origin()).isEqualTo(SubmissionOrigin.NORMAL);
         verifyNoInteractions(contestSubmissionRateLimiter);
+        verify(userRepository).getReferenceById(5L);
+        verify(userRepository, never()).findById(anyLong());
     }
 
     @Test
