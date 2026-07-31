@@ -1,7 +1,7 @@
 # 대회 제출 파이프라인 설계 및 개선 기록
 
-> 최종 갱신: 2026-07-30
-> 작업 브랜치: `codex/rabbitmq-contest-judge`  
+> 최종 갱신: 2026-07-31
+> 작업 브랜치: `codex/scoreboard-commutative-port`
 > 문서 목적: 과거의 설계 판단부터 현재 구현, 성능 측정, 미해결 문제까지 한 문서에서 다시 파악하고 LLM에 인수인계하기 위한 기록
 
 ## 0. 먼저 읽을 요약
@@ -40,12 +40,16 @@ HTTP 제출
 - 채점 서버의 긴 꼬리 지연은 `prefetch=1`과 다수 consumer로 서로 격리한다.
 - Redis scoreboard는 파생 상태이며 DB outbox로 재구성할 수 있어야 한다.
 - 채점 완료 순서는 제출 순서와 다르므로 scoreboard 반영은 순서와 중복에 무관해야 한다. 라이브 값과 rebuild 값이 같은 데이터에서 일치하는 것이 기준이다.
-- 최신 부하 테스트에서 MySQL batch insert나 RabbitMQ보다 HTTP 경로의 동기 Redis 호출과 응답 completion 단계가 먼저 병목이 됐다.
+- 2026-07-31 리팩터링에서 제출 경로의 동기 Redis dedup 호출과 user/problem 반복 조회를 제거했다.
+- 제출 admission은 `max-in-flight` semaphore로 제한하며, 현재 공통 설정은
+  `4 workers × batch 100`, `max-in-flight=800`이다.
+- completion executor는 실측 최대 queue depth 2를 근거로 4 threads + queue 64로 줄였다.
 
-현재 가장 중요한 미해결 문제는 다음 두 가지다.
+현재 가장 중요한 검증 과제는 다음 두 가지다.
 
-1. 제출 배치 큐가 무제한 `ConcurrentLinkedQueue`라서 전역 backpressure가 없다.
-2. 중복 확인 `HGET`과 DB 저장 후 `HSET + EXPIRE`가 동기 Redis 호출이라 Tomcat 및 completion 스레드를 막는다.
+1. 새 설정에서 평균 chunk가 기존 58보다 커지고 성공 처리량 천장 약 2,500 TPS가 유지되는지
+   분리된 부하 생성기로 다시 측정한다.
+2. Snowflake worker ID의 인스턴스별 유일성을 배포 검증으로 강제한다.
 
 ## 1. 문제 정의와 가정
 
@@ -288,7 +292,7 @@ Docker Compose 기준 역할은 다음과 같다.
 | Batch | `multi-batch` | judge outbox relay, scoreboard outbox 반영/복구 |
 | Judge 1, 2 | `multi-judge` | Rabbit 소비, 채점, 결과/outbox batch 저장 |
 | MySQL | MySQL 8.0 | 원본, unique 제약, 두 종류 outbox |
-| Redis | Redis 7 | session, rate limit, 제출 dedup cache, scoreboard |
+| Redis | Redis 7 | session, rate limit, scoreboard |
 | RabbitMQ | RabbitMQ 4.1 | 채점 work queue와 DLQ |
 
 관련 설정:
@@ -351,22 +355,23 @@ flowchart LR
 
 흐름:
 
-1. Tomcat 요청 스레드에서 user와 problem을 조회한다.
-2. Redis rate limit을 확인한다.
-3. 코드 hash를 계산하고 Redis dedup hash를 `HGET`한다.
-4. Snowflake ID를 예약한다.
+1. user는 JPA reference만 만들고 SELECT하지 않는다.
+2. problem과 contest는 bounded in-memory cache에서 읽는다. cache miss일 때만 DB를 조회한다.
+3. Redis 또는 in-memory rate limit을 확인한다.
+4. 코드 hash를 계산하고 Snowflake ID를 예약한다.
 5. `ContestSubmissionBulkWriter`의 queue에 request와 `CompletableFuture`를 넣는다.
 6. batch worker가 최대 100건을 꺼낸다.
-7. 한 transaction에서 `contest_submission`과 `contest_judge_outbox`를 JDBC batch insert한다.
-8. transaction commit 후 completion executor가 Future를 완료한다.
-9. Future 후속 단계에서 Redis dedup hash를 `HSET`하고 TTL을 `EXPIRE`한다.
-10. Future가 끝나면 HTTP 응답 또는 redirect를 보낸다.
+7. 한 transaction에서 `contest_submission`을 `INSERT IGNORE`로 JDBC batch insert한다.
+8. 예약 ID와 dedup key를 조회해 새 삽입, 정상 중복, 설명할 수 없는 누락을 판별한다.
+9. 새로 삽입된 ID만 `contest_judge_outbox`에 넣는다.
+10. transaction commit 후 completion executor가 Future를 완료한다.
+11. Future가 끝나면 HTTP 응답 또는 redirect를 보낸다.
 
 HTTP controller가 `CompletionStage`를 반환하므로 제출 queue에 들어간 이후에는 Tomcat 요청 스레드를 계속 점유하지 않는다. 하지만 응답이 끝난 것은 아니다. Servlet async context, HTTP connection, Future와 관련 객체는 DB 저장 및 후속 completion이 끝날 때까지 살아 있다.
 
 현재 사용자에게 보이는 의미:
 
-- HTTP 성공: 제출 DB transaction이 commit됐고 현재 구현에서는 dedup cache 등록까지 성공했다.
+- HTTP 성공: 제출 DB transaction이 commit됐으며, 중복이면 기존 submission ID가 확정됐다.
 - HTTP 실패 또는 timeout: DB commit 여부를 단정할 수 없다.
 - DB commit 후 응답 전에 프로세스가 죽으면 사용자는 실패/timeout을 보지만 제출은 존재할 수 있다.
 
@@ -374,19 +379,21 @@ HTTP controller가 `CompletionStage`를 반환하므로 제출 queue에 들어�
 
 ### 4.4 제출 중복 처리
 
-현재 중복 방지는 세 겹이다.
+현재 중복 방지는 두 겹과 사후 정합성 판별로 구성된다.
 
-1. Redis dedup registry로 일반적인 중복을 빠르게 찾는다.
-2. 같은 JVM batch chunk 안에서는 `(contest, problem, user, codeHash)` map으로 중복을 합친다.
-3. MySQL unique key `uk_cs_code_hash`가 최종 중복 row 생성을 막는다.
+1. 같은 JVM batch chunk 안에서는 `(contest, problem, user, codeHash)` map으로 중복을 합친다.
+2. MySQL unique key `uk_cs_code_hash`가 cross-node 중복 row 생성을 막는다.
+3. `INSERT IGNORE` 직후 예약 ID 및 dedup key를 조회해 요청별 결과를 확정한다.
 
-Redis는 최적화일 뿐 최종 권위가 아니다. 현재 구현에는 중요한 경계 조건이 남아 있다.
+Redis dedup registry의 `HGET`, `HSET`, `EXPIRE`는 제출 임계 경로에서 제거했다. MySQL이
+중복의 유일한 권위이며, `rewriteBatchedStatements=true`는 유지한다. Connector/J의
+`SUCCESS_NO_INFO(-2)` 반환값으로는 무시된 행을 구분할 수 없으므로 다음 조회 결과로 판별한다.
 
-- 서로 다른 Web 인스턴스가 같은 코드를 거의 동시에 받고 둘 다 Redis miss를 볼 수 있다.
-- 둘 다 다른 batch에서 일반 `INSERT`를 시도하면 한쪽 unique 충돌이 해당 batch transaction 전체를 rollback시킬 수 있다.
-- DB는 중복 row를 막지만, 충돌한 요청을 기존 submission ID를 반환하는 정상 중복 응답으로 바꾸는 처리는 아직 완성되지 않았다.
-
-향후에는 unique 충돌을 정상 결과로 매핑하면서 batch 전체 rollback을 피하는 전략이 필요하다. 단순 `INSERT IGNORE`는 다른 데이터 오류까지 숨길 수 있으므로 적용 범위를 신중히 정해야 한다.
+- 예약 ID가 요청의 key와 함께 존재하면 새 삽입이다.
+- 예약 ID가 없고 같은 dedup key의 행이 있으면 정상 중복이며 기존 ID를 응답한다.
+- 둘 다 아니면 FK 위반, 데이터 잘림 등 설명할 수 없는 무시이므로
+  `ContestSubmissionBatchConsistencyException`을 던져 transaction 전체를 rollback한다.
+- 예약 ID가 다른 key의 행을 가리키면 Snowflake PK 충돌 가능성이므로 역시 fail-fast한다.
 
 ### 4.5 Snowflake ID
 
@@ -397,6 +404,7 @@ Redis는 최적화일 뿐 최종 권위가 아니다. 현재 구현에는 중요
 - 같은 millisecond sequence: 12비트
 - 인스턴스별 worker ID가 반드시 달라야 한다.
 - 시계가 과거로 이동하면 현재 구현은 예외를 발생시키고 fail-fast한다.
+- 예약 ID가 다른 제출에 이미 쓰인 경우 batch 정합성 조회도 이를 검출하고 fail-fast한다.
 
 최신 테스트에서 clock rollback 오류는 발생하지 않았다. 운영에서는 worker ID 배포 관리와 시간 동기화가 필요하다.
 
@@ -872,10 +880,10 @@ DB bulk 지표:
 | 단계 | 실제 대기 위치 | 영속성 | 제한 및 포화 동작 |
 |---|---|---|---|
 | 서버 연결 전 | client connection pool, OS/TCP accept queue | 없음 | 넘치면 connect 실패 또는 timeout |
-| Web 동기 전처리 | Tomcat worker가 DB/Redis 응답을 기다림 | 없음 | worker가 차면 새 요청이 앞단에서 대기 |
-| DB 저장 전 | `ContestSubmissionBulkWriter`의 `ConcurrentLinkedQueue` | 없음 | 현재 무제한, 지속 과부하 시 heap 증가 |
+| Web 동기 전처리 | Tomcat worker가 problem cache miss/rate limit 응답을 기다림 | 없음 | user SELECT와 Redis dedup 왕복은 제거됨 |
+| DB 저장 전 | `ContestSubmissionBulkWriter`의 `ConcurrentLinkedQueue` + semaphore | 없음 | `max-in-flight=800`으로 처리+대기 요청을 제한하고 초과 요청은 503 |
 | 비동기 HTTP | Servlet async context, socket, Future | 없음 | 응답 전까지 connection과 객체 유지 |
-| DB 저장 후 응답 전 | completion executor 16 threads + queue 256 batch tasks/Web | 없음 | queue가 차면 CallerRuns가 DB bulk worker를 막음 |
+| DB 저장 후 응답 전 | completion executor 4 threads + queue 64 batch tasks/Web | 없음 | queue가 차면 CallerRuns가 DB bulk worker를 막으므로 여유 용량 유지 |
 | Rabbit publish 전 | `contest_judge_outbox`의 PENDING/PUBLISHING rows | MySQL 영속 | DB 용량과 relay drain rate만큼 축적 |
 | Judge 대기 | Rabbit live queue의 ready messages | quorum queue 영속 | judge보다 유입이 빠르면 broker disk 사용 증가 |
 | Judge 처리 중 | 최대 약 64 unacked messages | Rabbit 관리 | `concurrency=64`, `prefetch=1` |
@@ -883,15 +891,18 @@ DB bulk 지표:
 | Scoreboard 대기 | `contest_submission_outbox` PENDING/FAILED rows | MySQL 영속 | Redis보다 결과 유입이 빠르면 row와 lag 증가 |
 | 최종 실패 | Rabbit dead-letter queue | quorum queue 영속 | 운영자가 재처리/폐기하지 않으면 계속 증가 |
 
-이번 1000 TPS 실행에서 관찰된 위치:
+과거 1000 TPS 실행에서 관찰된 위치:
 
 - 제출 bulk queue: Web별 최대 약 100건으로 작았다.
 - completion queue: Web별 최대 37~39개의 batch task가 대기했다.
 - Tomcat 요청 스레드: 제출 queue에 넣기 전 동기 Redis `HGET`에서 많이 대기했다.
-- HTTP async in-flight: DB 저장과 dedup cache 등록을 기다리는 동안 증가했다.
+- HTTP async in-flight: DB 저장과 동기 dedup cache 등록을 기다리는 동안 증가했다.
 - Rabbit 및 scoreboard durable backlog: 최종적으로 모두 drain됐다.
 
-지속 과부하 시 가장 위험한 지점은 DB commit 전의 무제한 JVM queue다. 이 상태에서 JVM이 죽으면 아직 DB에 들어가지 않은 제출은 사라지고, heap이 먼저 고갈될 수 있다.
+이 관측 이후 admission semaphore를 추가했다. 2026-07-31 기준선에서는
+`max-in-flight=256`이 정확히 상한에서 멈췄고 rejected submission 수와 HTTP 503 수가
+일치했다. 현재 설정은 full batch 효율을 위해 800으로 조정했지만, DB commit 전 요청이
+비영속이라는 성질은 같다. 차이는 유실·heap 위험의 최대 범위가 설정값으로 제한된다는 점이다.
 
 ## 8. 현재 보장하는 것과 보장하지 않는 것
 
@@ -902,6 +913,9 @@ DB bulk 지표:
 - relay는 Rabbit publisher ACK와 mandatory return을 확인한 뒤에만 `PUBLISHED`로 기록한다.
 - Rabbit listener는 result와 scoreboard outbox DB commit 후에만 정상 반환하고 ACK된다.
 - publish 또는 consume 중복은 DB PK/unique와 `INSERT IGNORE`로 흡수한다.
+- cross-node 동일 제출 race는 batch 전체 rollback 없이 기존 submission ID의 정상 중복 응답으로 변환한다.
+- `INSERT IGNORE`가 FK 위반 등 중복 이외의 이유로 행을 누락하면 정합성 예외로 실패한다.
+- 제출 admission은 `max-in-flight`로 제한되고 초과 요청은 503으로 거절된다.
 - scoreboard event 하나의 Redis 반영은 Lua script 안에서 원자적이다.
 - scoreboard 반영은 적용 순서와 중복 횟수에 무관하다. 같은 제출·결과 집합이면 항상 같은
   solved/penalty가 된다 (§4.10.1).
@@ -917,43 +931,29 @@ DB bulk 지표:
   중복 전달과 순서 뒤바뀜이 모두 같은 결과로 수렴한다 (§4.10.1에서 §8.1로 이동).
 - HTTP 실패가 곧 DB 미저장을 의미한다는 보장
 - DB commit 전 JVM queue의 영속성
-- cross-node 동시 동일 제출을 항상 정상 duplicate 응답으로 변환하는 것
 - 임의의 Redis key 일부만 선택적으로 사라진 경우의 완전 자동 복구
 - 이전 problem hash schema에서 새 schema로의 자동 이전. 배포 시 진행 중인 대회는 rebuild가
   필요하다 (§4.10.1)
 - Rabbit 한 노드만 실행한 로컬 환경에서 실제 quorum HA
 - 실제 judge API p999 2초 조건의 처리량
 - 재채점과 여러 judge run 이력
-- 무제한 제출 burst에 대한 전역 admission control
+- 배치 worker 프로세스가 DB commit 전에 죽었을 때 in-flight 요청을 복구하는 것
 
 ## 9. 현재 남은 기술 과제
 
-### 9.1 최우선: 제출 dedup Redis를 critical path에서 줄이기
+### 9.1 완료: 제출 dedup Redis를 critical path에서 제거
 
-현재:
+2026-07-31 적용:
 
-- 요청 전 `HGET`은 Tomcat thread에서 동기 실행된다.
-- DB commit 후 `HSET`과 `EXPIRE`는 completion thread에서 두 번의 동기 왕복으로 실행된다.
-- cache 등록 실패가 이미 commit된 HTTP 요청을 실패로 바꿀 수 있다.
+- 요청 전 `HGET`을 제거했다.
+- DB commit 후 `HSET + EXPIRE`도 제거했다. 읽는 경로가 없으므로 best-effort 등록도 남기지 않았다.
+- DB unique 충돌은 `INSERT IGNORE` 후 정합성 조회로 기존 submission ID에 매핑한다.
 
-검토 순서:
+### 9.2 완료: 전역 backpressure
 
-1. `HSET + EXPIRE`를 Lua 또는 pipeline으로 한 번에 실행한다.
-2. DB commit 후 cache 등록을 HTTP 성공의 필수 조건에서 제외하고 best-effort 비동기로 바꾼다.
-3. 요청 전 `HGET`을 비동기 Redis API로 바꾸거나 제거한다.
-4. DB unique 충돌을 기존 submission 조회/반환으로 안전하게 변환한다.
-
-단순히 Redis 호출을 다른 executor로 옮기면 Tomcat thread는 풀리지만 전체 in-flight와 메모리는 여전히 늘 수 있다. 최종적으로는 remote cache miss가 제출 수락 처리량을 제한하지 않게 만드는 것이 목적이다.
-
-### 9.2 전역 backpressure
-
-현재 제출 queue는 무제한이다. 다음 정책이 필요하다.
-
-- queue 또는 in-flight permit을 명시적으로 제한
-- 제한 초과 시 `503 Service Unavailable + Retry-After`
-- 사용자별 rate limit 초과는 `429 Too Many Requests`
-- DB commit 전에는 성공으로 응답하지 않음
-- async request timeout과 client retry/idempotency 정책 명시
+`ContestSubmissionBulkWriter`가 in-flight permit을 명시적으로 제한한다. 제한 초과는
+`503 Service Unavailable + Retry-After`, 사용자별 rate limit은 429로 구분한다.
+DB commit 전에는 성공으로 응답하지 않는다.
 
 backpressure 지표는 queue 개수 하나보다 예상 drain time이 더 중요하다.
 
@@ -992,7 +992,7 @@ estimated_drain_seconds = backlog_count / recent_sustainable_throughput
 - clock rollback 감지와 배포 정책
 - Hikari pool 총합이 MySQL `max_connections`를 넘지 않게 역할별 pool 크기 조절
 - outbox status/created_at/claimed_at index의 실제 cardinality와 query plan 확인
-- 큰 batch 하나의 실패가 다른 정상 row에 미치는 rollback 범위 축소
+- 설명할 수 없는 `INSERT IGNORE` 누락과 Snowflake PK 충돌 알림
 
 ### 9.6 scoreboard 확장
 
@@ -1022,7 +1022,8 @@ named lock을 제거했으므로 scoreboard batch worker는 여러 인스턴스�
 - 제출 bulk `pendingCount`, oldest queue age, chunk size와 처리시간
 - completion active threads, queue depth, queue delay, task elapsed
 - `completionCallerRunsCount`
-- dedup Redis HGET/HSET/EXPIRE latency와 error
+- `currentInFlight`, `maxInFlight`, `rejectedSubmissionCount`
+- DB duplicate 응답 수와 `ContestSubmissionBatchConsistencyException`
 
 ### 10.2 JVM
 
@@ -1128,11 +1129,10 @@ scoreboard 규칙을 손볼 때는 §4.10.1의 구현 표를 먼저 본다. Redi
 
 다음 구현 우선순위는 Rabbit worker 수나 Hikari pool 확대가 아니다.
 
-1. dedup Redis critical path 개선
-2. 제출 queue 전역 backpressure
-3. cross-node duplicate race의 정상 응답 처리
-4. 실제 judge latency 분포를 넣은 분리 환경 부하 테스트
-5. 3노드 Rabbit 장애 테스트와 운영 정책
+1. 새 `max-in-flight=800` 설정의 chunk 크기와 2,500 TPS 처리량 회귀 측정
+2. 실제 judge latency 분포를 넣은 분리 환경 부하 테스트
+3. Snowflake worker ID 배포 검증과 정합성 예외 알림
+4. 3노드 Rabbit 장애 테스트와 운영 정책
 
 ## 14. 최종 결론
 
@@ -1142,7 +1142,9 @@ RabbitMQ는 Kafka의 저장 효율과 replay 기능을 포기하는 대신, `pre
 
 DB outbox를 함께 사용해 제출 수락의 영속성과 메시지 전달을 분리했고, publisher confirm과 consumer ACK 양쪽의 불확실성은 멱등 DB write로 흡수했다. 결과적으로 과거 DB claim/heartbeat/sweeper를 judge 작업 자체에서 제거할 수 있었다. 다만 outbox relay의 claim lease는 여전히 필요하다.
 
-현재 성능 한계는 RabbitMQ가 아니라 그보다 앞선 HTTP 경로다. 동기 Redis dedup 호출과 무제한 JVM queue를 정리하지 않고 worker, Tomcat thread, Hikari pool만 늘리면 더 많은 in-flight와 메모리 사용을 허용할 뿐 안정적인 1000 TPS 시스템이 되지는 않는다.
+현재 성능 한계는 RabbitMQ가 아니라 그보다 앞선 HTTP/DB 저장 경로다. 동기 Redis dedup과
+반복 user/problem 조회는 제거했고 admission도 bounded 상태다. 다음 판단은 worker나 Hikari
+pool을 더 늘리기 전에 새 설정의 chunk 크기, MySQL 처리량, 503 시작점을 다시 측정한 뒤 내려야 한다.
 
 ## 15. 고정 자원 기준선 재설정 — bounded admission과 web×2 Gatling
 
@@ -1167,3 +1169,31 @@ RabbitMQ → judge×2 → Redis scoreboard 경로를 격리 스택으로 측정�
 부하기는 Gradle daemon과 분리한 Windows Gatling JVM으로 실행한다. 따라서 부하기 GC와
 서버 병목을 구분할 수 있고, 모든 측정은 `docs/ENVIRONMENT.md`와 측정 시점 커밋 해시를
 함께 참조해야 한다.
+
+위 256건은 당시 측정 기준선이다. 2026-07-31에는 4 workers가 100건 full batch를 동시에
+처리할 수 있도록 공통 설정을 800으로 조정했다.
+
+## 16. 제출 수락 경로 리팩터링 — DB 정합성 판별과 전처리 제거
+
+2026-07-31 단일 perf 인스턴스 기준선은 성공 처리량 약 2,500 TPS, 평균 chunk 58이었다.
+`max-in-flight=256`은 약 1,900 TPS부터 정확한 503 backpressure로 동작했다. completion은
+16 threads + queue 256 설정에서 최대 queue depth 2, CallerRuns 0, 최대 queue delay 2ms로
+과잉이었다.
+
+적용한 변경:
+
+1. 제출 insert를 `INSERT IGNORE`로 바꾸되 JDBC update count를 신뢰하지 않고, 예약 ID와
+   dedup key의 배치 후 조회로 새 삽입/정상 중복/설명 불가 누락을 분류한다.
+2. Redis dedup 사전조회와 사후 등록을 모두 제출 임계 경로에서 제거한다.
+3. user는 `getReferenceById`로 바꿔 SELECT를 없앤다. 존재하지 않는 user FK는 배치 정합성
+   예외로 확인했으며 조용히 유실되지 않는다.
+4. problem+contest는 TTL 60초, 최대 10,000개 in-memory cache를 사용한다. 대회 종료 시각을
+   넘으면 TTL과 무관하게 재조회하고, 최종화 완료 시 해당 대회의 cache를 즉시 축출한다.
+   문제 수정 경로는 `evictProblem`을 호출해야 한다.
+5. bulk 공통 설정은 `batch-size=100`, `worker-count=4`, `max-in-flight=800`이다. 이는 처리
+   중 4개 full batch와 대기 중 4개 full batch를 수용한다.
+6. completion 공통 설정은 4 threads + queue 64다. 실측보다 충분한 headroom을 남기면서
+   CallerRuns가 DB worker에 전파될 가능성을 낮춘다.
+
+`rewriteBatchedStatements=true`는 유지했다. 기능·통합 테스트는 통과했으며, 평균 chunk가
+58보다 커지는지와 2,500 TPS 천장이 유지되는지는 분리 부하 테스트로 다시 확인해야 한다.
