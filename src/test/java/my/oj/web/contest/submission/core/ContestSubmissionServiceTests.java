@@ -16,7 +16,6 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.LocalDateTime;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
@@ -26,7 +25,6 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.never;
 
 @ExtendWith(MockitoExtension.class)
 class ContestSubmissionServiceTests {
@@ -71,8 +69,6 @@ class ContestSubmissionServiceTests {
 
     @Test
     void create_savesNewSubmission_WhenUnique() {
-        given(duplicateRegistry.findDuplicateSubmissionId(anyLong(), anyLong(), anyLong(), anyString()))
-                .willReturn(Optional.empty());
         given(idGenerator.nextId()).willReturn(500L);
         ContestSubmission saved = ContestSubmission.create(user, problem, "print(1)", CodeHashGenerator.generate("print(1)"), now);
         ReflectionTestUtils.setField(saved, "id", 500L);
@@ -87,13 +83,11 @@ class ContestSubmissionServiceTests {
         verify(submissionWriter).save(captor.capture());
         assertThat(captor.getValue().problemId()).isEqualTo(200L);
         assertThat(captor.getValue().reservedSubmissionId()).isEqualTo(500L);
-        verify(duplicateRegistry).registerSubmission(eq(100L), eq(200L), eq(10L), eq(CodeHashGenerator.generate("print(1)")), eq(500L));
+        verifyNoInteractions(duplicateRegistry);
     }
 
     @Test
     void create_returnsDuplicate_WhenWriterDetectsDuplicate() {
-        given(duplicateRegistry.findDuplicateSubmissionId(anyLong(), anyLong(), anyLong(), anyString()))
-                .willReturn(Optional.empty());
         given(idGenerator.nextId()).willReturn(777L);
         ContestSubmission existing = ContestSubmission.create(user, problem, "print(1)", CodeHashGenerator.generate("print(1)"), now.minusMinutes(1));
         ReflectionTestUtils.setField(existing, "id", 777L);
@@ -105,12 +99,11 @@ class ContestSubmissionServiceTests {
         assertThat(result.duplicate()).isTrue();
         assertThat(result.submission().getId()).isEqualTo(777L);
         verify(submissionWriter).save(any());
+        verifyNoInteractions(duplicateRegistry);
     }
 
     @Test
     void createAsync_completesOnlyAfterWriterCommit() {
-        given(duplicateRegistry.findDuplicateSubmissionId(anyLong(), anyLong(), anyLong(), anyString()))
-                .willReturn(Optional.empty());
         given(idGenerator.nextId()).willReturn(501L);
 
         CompletableFuture<ContestSubmissionService.ContestSubmissionCreateResult> writerFuture =
@@ -121,7 +114,7 @@ class ContestSubmissionServiceTests {
                 contestSubmissionService.createAsync(user, problem, "print(2)", now);
 
         assertThat(stage.toCompletableFuture()).isNotDone();
-        verify(duplicateRegistry, never()).registerSubmission(anyLong(), anyLong(), anyLong(), anyString(), anyLong());
+        verifyNoInteractions(duplicateRegistry);
 
         ContestSubmission saved = ContestSubmission.create(
                 user, problem, "print(2)", CodeHashGenerator.generate("print(2)"), now
@@ -130,9 +123,7 @@ class ContestSubmissionServiceTests {
         writerFuture.complete(new ContestSubmissionService.ContestSubmissionCreateResult(saved, false));
 
         assertThat(stage.toCompletableFuture().join().submission().getId()).isEqualTo(501L);
-        verify(duplicateRegistry).registerSubmission(
-                eq(100L), eq(200L), eq(10L), eq(CodeHashGenerator.generate("print(2)")), eq(501L)
-        );
+        verifyNoInteractions(duplicateRegistry);
     }
 
     @Test
@@ -146,22 +137,26 @@ class ContestSubmissionServiceTests {
     }
 
     @Test
-    void create_returnsRedisCachedDuplicateWithoutSaving() {
-        ContestSubmission existing = ContestSubmission.create(user, problem, "print(1)", "hash", now.minusMinutes(1));
-        ReflectionTestUtils.setField(existing, "id", 888L);
-
-        given(duplicateRegistry.findDuplicateSubmissionId(eq(100L), eq(200L), eq(10L), anyString()))
-                .willReturn(Optional.of(888L));
-        given(submissionRepository.findById(888L)).willReturn(Optional.of(existing));
+    void createDoesNotConsultRedisDedupBeforeWriting() {
+        given(idGenerator.nextId()).willReturn(888L);
+        ContestSubmission saved = ContestSubmission.create(
+                user,
+                problem,
+                "print(1)",
+                CodeHashGenerator.generate("print(1)"),
+                now
+        );
+        saved.assignId(888L);
+        given(submissionWriter.save(any())).willReturn(
+                new ContestSubmissionService.ContestSubmissionCreateResult(saved, false)
+        );
 
         ContestSubmissionService.ContestSubmissionCreateResult result =
                 contestSubmissionService.create(user, problem, "print(1)", now);
 
-        assertThat(result.duplicate()).isTrue();
         assertThat(result.submission().getId()).isEqualTo(888L);
-        verify(submissionRepository).findById(888L);
-        verifyNoInteractions(submissionWriter);
-        verify(duplicateRegistry).registerSubmission(eq(100L), eq(200L), eq(10L), eq(CodeHashGenerator.generate("print(1)")), eq(888L));
+        verify(submissionWriter).save(any());
+        verifyNoInteractions(submissionRepository, duplicateRegistry);
     }
 
     @Test

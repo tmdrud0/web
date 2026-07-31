@@ -13,7 +13,6 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.Collection;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
@@ -34,16 +33,6 @@ public class ContestSubmissionService {
         }
 
         String canonicalHash = CodeHashGenerator.generate(code);
-        Optional<ContestSubmission> cachedDuplicate =
-                duplicateRegistry.findDuplicateSubmissionId(contest.getId(), problem.getId(), user.getId(), canonicalHash)
-                        .flatMap(repository::findById)
-                        .filter(existing -> code.equals(existing.getCode()));
-        if (cachedDuplicate.isPresent()) {
-            ContestSubmission duplicate = cachedDuplicate.get();
-            duplicateRegistry.registerSubmission(contest.getId(), problem.getId(), user.getId(), canonicalHash, duplicate.getId());
-            return new ContestSubmissionCreateResult(duplicate, true);
-        }
-
         ContestSubmissionWriteRequest request = new ContestSubmissionWriteRequest(
                 contest.getId(),
                 problem.getId(),
@@ -52,9 +41,7 @@ public class ContestSubmissionService {
                 canonicalHash,
                 submittedTime
         ).withReservedSubmissionId(idGenerator.nextId());
-        ContestSubmissionCreateResult result = submissionWriter.save(request);
-        duplicateRegistry.registerSubmission(contest.getId(), problem.getId(), user.getId(), canonicalHash, result.submission().getId());
-        return result;
+        return submissionWriter.save(request);
     }
 
     public CompletionStage<ContestSubmissionCreateResult> createAsync(
@@ -71,18 +58,6 @@ public class ContestSubmissionService {
         }
 
         String canonicalHash = CodeHashGenerator.generate(code);
-        Optional<ContestSubmission> cachedDuplicate =
-                duplicateRegistry.findDuplicateSubmissionId(contest.getId(), problem.getId(), user.getId(), canonicalHash)
-                        .flatMap(repository::findById)
-                        .filter(existing -> code.equals(existing.getCode()));
-        if (cachedDuplicate.isPresent()) {
-            ContestSubmission duplicate = cachedDuplicate.get();
-            duplicateRegistry.registerSubmission(
-                    contest.getId(), problem.getId(), user.getId(), canonicalHash, duplicate.getId()
-            );
-            return CompletableFuture.completedFuture(new ContestSubmissionCreateResult(duplicate, true));
-        }
-
         ContestSubmissionWriteRequest request = new ContestSubmissionWriteRequest(
                 contest.getId(),
                 problem.getId(),
@@ -92,12 +67,7 @@ public class ContestSubmissionService {
                 submittedTime
         ).withReservedSubmissionId(idGenerator.nextId());
 
-        return submissionWriter.saveAsync(request).thenApply(result -> {
-            duplicateRegistry.registerSubmission(
-                    contest.getId(), problem.getId(), user.getId(), canonicalHash, result.submission().getId()
-            );
-            return result;
-        });
+        return submissionWriter.saveAsync(request);
     }
 
     public ContestSubmissionJudgeProjection getJudgeProjectionById(Long contestSubmissionId) {
