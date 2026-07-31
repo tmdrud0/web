@@ -7,6 +7,7 @@ import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
+import my.oj.web.contest.submission.support.ContestSubmissionProblemCache;
 import my.oj.web.problem.Problem;
 import my.oj.web.submission.SubmissionResult;
 import my.oj.web.submission.accepted.AcceptedSubmission;
@@ -49,6 +50,8 @@ class ContestFinalizationServiceTests {
     private ContestSubmissionResultRepository resultRepository;
     @Mock
     private ContestSubmissionService contestSubmissionService;
+    @Mock
+    private ContestSubmissionProblemCache problemCache;
     @Mock
     private ContestFinalizationBatchRepository batchRepository;
     @Mock
@@ -121,6 +124,7 @@ class ContestFinalizationServiceTests {
         verify(finalScoreService).rebuildScores(contestId, ContestFinalScoreStatus.FINAL, results);
         verify(contestRepository).save(contest);
         verify(contestSubmissionService).purgeContest(contestId);
+        verify(problemCache).evictContest(contestId);
         verify(scoreboardMaintenanceService).clearLiveContestState(contestId);
 
         ArgumentCaptor<List<ContestFinalizationBatchRepository.SubmissionRow>> submissionsCaptor = ArgumentCaptor.forClass(List.class);

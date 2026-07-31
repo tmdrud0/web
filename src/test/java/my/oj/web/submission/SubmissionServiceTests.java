@@ -1,9 +1,9 @@
 package my.oj.web.submission;
 
 import my.oj.web.contest.Contest;
+import my.oj.web.contest.submission.support.ContestSubmissionProblemCache;
 import my.oj.web.contest.submission.support.ContestSubmissionRateLimiter;
 import my.oj.web.problem.Problem;
-import my.oj.web.problem.ProblemRepository;
 import my.oj.web.submission.dto.SubmissionReceipt;
 import my.oj.web.submission.dto.SubmitSubmissionCommand;
 import my.oj.web.submission.event.SubmissionSubmittedEvent;
@@ -43,7 +43,7 @@ class SubmissionServiceTests {
     private UserRepository userRepository;
 
     @Mock
-    private ProblemRepository problemRepository;
+    private ContestSubmissionProblemCache problemCache;
 
     @Mock
     private SubmissionStoreStrategySelector storeSelector;
@@ -66,7 +66,7 @@ class SubmissionServiceTests {
         problem = Problem.create("Prob", null, null);
         ReflectionTestUtils.setField(problem, "id", 9L);
         when(userRepository.getReferenceById(5L)).thenReturn(user);
-        lenient().when(problemRepository.findWithContestById(9L)).thenReturn(Optional.of(problem));
+        lenient().when(problemCache.findById(9L)).thenReturn(Optional.of(problem));
     }
 
     @Test
@@ -106,7 +106,7 @@ class SubmissionServiceTests {
         ReflectionTestUtils.setField(contest, "id", 77L);
         Problem contestProblem = Problem.create("Contest Prob", contest, 1L);
         ReflectionTestUtils.setField(contestProblem, "id", 10L);
-        when(problemRepository.findWithContestById(10L)).thenReturn(Optional.of(contestProblem));
+        when(problemCache.findById(10L)).thenReturn(Optional.of(contestProblem));
         when(storeSelector.onContest(eq(contestProblem), any(LocalDateTime.class))).thenReturn(true);
         when(contestSubmissionRateLimiter.tryAcquire(77L, 5L)).thenReturn(Optional.of(Duration.ofMillis(1400)));
 
@@ -125,7 +125,7 @@ class SubmissionServiceTests {
         ReflectionTestUtils.setField(contest, "id", 88L);
         Problem contestProblem = Problem.create("Contest Prob", contest, 1L);
         ReflectionTestUtils.setField(contestProblem, "id", 11L);
-        when(problemRepository.findWithContestById(11L)).thenReturn(Optional.of(contestProblem));
+        when(problemCache.findById(11L)).thenReturn(Optional.of(contestProblem));
         when(storeSelector.onContest(eq(contestProblem), any(LocalDateTime.class))).thenReturn(true);
         when(contestSubmissionRateLimiter.tryAcquire(88L, 5L)).thenReturn(Optional.empty());
         when(storeSelector.store(any(Submission.class))).thenThrow(new IllegalStateException("db error"));
@@ -144,7 +144,7 @@ class SubmissionServiceTests {
         ReflectionTestUtils.setField(contest, "id", 89L);
         Problem contestProblem = Problem.create("Contest Prob", contest, 1L);
         ReflectionTestUtils.setField(contestProblem, "id", 12L);
-        when(problemRepository.findWithContestById(12L)).thenReturn(Optional.of(contestProblem));
+        when(problemCache.findById(12L)).thenReturn(Optional.of(contestProblem));
         when(storeSelector.onContest(eq(contestProblem), any(LocalDateTime.class))).thenReturn(true);
         when(contestSubmissionRateLimiter.tryAcquire(89L, 5L)).thenReturn(Optional.empty());
 
@@ -172,7 +172,7 @@ class SubmissionServiceTests {
         ReflectionTestUtils.setField(contest, "id", 90L);
         Problem contestProblem = Problem.create("Contest Prob", contest, 1L);
         ReflectionTestUtils.setField(contestProblem, "id", 13L);
-        when(problemRepository.findWithContestById(13L)).thenReturn(Optional.of(contestProblem));
+        when(problemCache.findById(13L)).thenReturn(Optional.of(contestProblem));
         when(storeSelector.onContest(eq(contestProblem), any(LocalDateTime.class))).thenReturn(true);
         when(contestSubmissionRateLimiter.tryAcquire(90L, 5L)).thenReturn(Optional.empty());
 
