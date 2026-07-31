@@ -5,8 +5,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 
 @ConfigurationProperties("contest.submission.completion")
 public record ContestSubmissionCompletionProperties(
-        @DefaultValue("8") int threadCount,
-        @DefaultValue("256") int queueCapacity
+        @DefaultValue("4") int threadCount,
+        @DefaultValue("64") int queueCapacity
 ) {
 
     public int effectiveThreadCount() {

@@ -49,8 +49,9 @@ class OperationalPropertiesBindingTests {
             assertThat(bulk.maxInFlight()).isEqualTo(800);
             assertThat(bulk.maxInFlight())
                     .isGreaterThanOrEqualTo(bulk.batchSize() * bulk.workerCount());
-            assertThat(completion.threadCount()).isEqualTo(8);
-            assertThat(completion.queueCapacity()).isEqualTo(256);
+            assertThat(completion.threadCount()).isEqualTo(4);
+            assertThat(completion.queueCapacity()).isEqualTo(64);
+            assertThat(completion.queueCapacity()).isGreaterThan(completion.threadCount());
             assertThat(resultWriter.batchSize()).isEqualTo(16);
             assertThat(resultWriter.workerCount()).isEqualTo(1);
             assertThat(resultWriter.queueCapacity()).isEqualTo(256);
