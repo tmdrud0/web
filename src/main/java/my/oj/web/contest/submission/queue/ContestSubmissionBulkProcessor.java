@@ -41,24 +41,59 @@ public class ContestSubmissionBulkProcessor {
         List<ContestSubmissionService.ContestSubmissionCreateResult> responses = new ArrayList<>(requests.size());
         List<ContestSubmission> toPersist = new ArrayList<>();
         Map<DedupKey, ContestSubmission> pendingByKey = new LinkedHashMap<>();
+        List<PendingResult> pendingResults = new ArrayList<>(requests.size());
 
         for (ContestSubmissionWriteRequest request : requests) {
             DedupKey key = DedupKey.from(request);
             ContestSubmission queuedDuplicate = pendingByKey.get(key);
             if (queuedDuplicate != null) {
-                responses.add(new ContestSubmissionService.ContestSubmissionCreateResult(queuedDuplicate, true));
+                pendingResults.add(new PendingResult(queuedDuplicate, true));
                 continue;
             }
 
             ContestSubmission submission = createSubmission(request);
             toPersist.add(submission);
             pendingByKey.put(key, submission);
-            responses.add(new ContestSubmissionService.ContestSubmissionCreateResult(submission, false));
+            pendingResults.add(new PendingResult(submission, false));
         }
 
         if (!toPersist.isEmpty()) {
-            batchPersistence.insertAll(toPersist);
-            judgeOutboxWriter.enqueueAll(toPersist.stream().map(ContestSubmission::getId).toList());
+            ContestSubmissionBatchInsertResult insertResult = batchPersistence.insertAll(toPersist);
+            Map<Long, ContestSubmissionService.ContestSubmissionCreateResult> resultsByReservedId =
+                    new LinkedHashMap<>();
+            List<Long> insertedSubmissionIds = new ArrayList<>();
+            for (ContestSubmission submission : toPersist) {
+                ContestSubmissionBatchInsertResult.Resolution resolution =
+                        insertResult.resolutionFor(submission.getId());
+                ContestSubmission resolvedSubmission = resolution.duplicate()
+                        ? ContestSubmission.placeholder(resolution.submissionId())
+                        : submission;
+                resultsByReservedId.put(
+                        submission.getId(),
+                        new ContestSubmissionService.ContestSubmissionCreateResult(
+                                resolvedSubmission,
+                                resolution.duplicate()
+                        )
+                );
+                if (!resolution.duplicate()) {
+                    insertedSubmissionIds.add(resolution.submissionId());
+                }
+            }
+            for (PendingResult pendingResult : pendingResults) {
+                ContestSubmissionService.ContestSubmissionCreateResult persisted =
+                        resultsByReservedId.get(pendingResult.submission().getId());
+                if (persisted == null) {
+                    throw new IllegalStateException(
+                            "Missing persisted contest submission result for reserved id "
+                                    + pendingResult.submission().getId()
+                    );
+                }
+                responses.add(new ContestSubmissionService.ContestSubmissionCreateResult(
+                        persisted.submission(),
+                        pendingResult.queuedDuplicate() || persisted.duplicate()
+                ));
+            }
+            judgeOutboxWriter.enqueueAll(insertedSubmissionIds);
             entityManager.clear();
         }
 
@@ -94,5 +129,8 @@ public class ContestSubmissionBulkProcessor {
                     request.codeHash()
             );
         }
+    }
+
+    private record PendingResult(ContestSubmission submission, boolean queuedDuplicate) {
     }
 }
