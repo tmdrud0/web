@@ -142,15 +142,14 @@ public class JdbcContestSubmissionBatchPersistence implements ContestSubmissionB
         }
 
         Map<Long, ContestSubmissionBatchInsertResult.Resolution> resolutions = new LinkedHashMap<>();
+        List<Long> occupiedReservedIds = new ArrayList<>();
         List<Long> unexplainedMissingIds = new ArrayList<>();
         for (ContestSubmission submission : submissions) {
             StoredSubmissionRow storedAtReservedId = storedById.get(submission.getId());
             if (storedAtReservedId != null) {
                 if (!storedAtReservedId.matches(submission)) {
-                    throw new ContestSubmissionBatchConsistencyException(
-                            "Reserved contest submission id " + submission.getId()
-                                    + " is occupied by a different submission"
-                    );
+                    occupiedReservedIds.add(submission.getId());
+                    continue;
                 }
                 resolutions.put(
                         submission.getId(),
@@ -171,13 +170,34 @@ public class JdbcContestSubmissionBatchPersistence implements ContestSubmissionB
             unexplainedMissingIds.add(submission.getId());
         }
 
-        if (!unexplainedMissingIds.isEmpty()) {
+        // Both branches are collected rather than thrown on sight so the writer learns every bad
+        // row from one attempt and only has to retry the remainder once.
+        if (!occupiedReservedIds.isEmpty() || !unexplainedMissingIds.isEmpty()) {
+            List<Long> offendingIds = new ArrayList<>(occupiedReservedIds);
+            offendingIds.addAll(unexplainedMissingIds);
             throw new ContestSubmissionBatchConsistencyException(
-                    "INSERT IGNORE omitted contest submissions without a matching duplicate: "
-                            + unexplainedMissingIds
+                    describeConsistencyFailure(occupiedReservedIds, unexplainedMissingIds),
+                    offendingIds
             );
         }
         return new ContestSubmissionBatchInsertResult(resolutions);
+    }
+
+    private static String describeConsistencyFailure(List<Long> occupiedReservedIds,
+                                                     List<Long> unexplainedMissingIds) {
+        StringBuilder message = new StringBuilder();
+        if (!occupiedReservedIds.isEmpty()) {
+            message.append("Reserved contest submission ids occupied by a different submission: ")
+                    .append(occupiedReservedIds);
+        }
+        if (!unexplainedMissingIds.isEmpty()) {
+            if (!message.isEmpty()) {
+                message.append("; ");
+            }
+            message.append("INSERT IGNORE omitted contest submissions without a matching duplicate: ")
+                    .append(unexplainedMissingIds);
+        }
+        return message.toString();
     }
 
     private static List<ContestSubmission> unresolvedSubmissions(List<ContestSubmission> submissions,

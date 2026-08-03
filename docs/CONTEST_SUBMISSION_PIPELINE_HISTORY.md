@@ -915,6 +915,8 @@ DB bulk 지표:
 - publish 또는 consume 중복은 DB PK/unique와 `INSERT IGNORE`로 흡수한다.
 - cross-node 동일 제출 race는 batch 전체 rollback 없이 기존 submission ID의 정상 중복 응답으로 변환한다.
 - `INSERT IGNORE`가 FK 위반 등 중복 이외의 이유로 행을 누락하면 정합성 예외로 실패한다.
+- 그 정합성 실패는 원인이 된 제출만 실패시키고 같은 chunk의 나머지는 1회 재시도로 살린다.
+  예약 ID를 특정할 수 없는 경우(배치 내 예약 ID 중복 = ID 생성기 결함)에만 chunk 전체가 실패한다.
 - 제출 admission은 `max-in-flight`로 제한되고 초과 요청은 503으로 거절된다.
 - scoreboard event 하나의 Redis 반영은 Lua script 안에서 원자적이다.
 - scoreboard 반영은 적용 순서와 중복 횟수에 무관하다. 같은 제출·결과 집합이면 항상 같은
@@ -1187,6 +1189,13 @@ RabbitMQ → judge×2 → Redis scoreboard 경로를 격리 스택으로 측정�
 2. Redis dedup 사전조회와 사후 등록을 모두 제출 임계 경로에서 제거한다.
 3. user는 `getReferenceById`로 바꿔 SELECT를 없앤다. 존재하지 않는 user FK는 배치 정합성
    예외로 확인했으며 조용히 유실되지 않는다.
+   전처리의 `findById`는 잘못된 userId를 요청 1건 단위로 막는 문지기를 겸하고 있었다. 이를
+   없애면서 검증 시점이 batch insert로 옮겨갔고, 정합성 예외 하나가 chunk 100건을 전부
+   실패시켰다. 그래서 `ContestSubmissionBatchConsistencyException`이 문제가 된 예약 ID를
+   싣고, `ContestSubmissionBulkWriter`가 그 제출만 실패시킨 뒤 나머지를 1회 재실행한다.
+   rollback으로 insert가 모두 취소됐고 예약 ID는 요청마다 고정이므로 재실행은 안전하다.
+   재시도에서는 격리를 끄기 때문에 chunk당 시도는 최대 2회로 묶인다. batch 내 dedup 병합
+   때문에 dedup key가 같은 제출은 보고된 ID에 나타나지 않으므로 함께 실패시킨다.
 4. problem+contest는 TTL 60초, 최대 10,000개 in-memory cache를 사용한다. 대회 종료 시각을
    넘으면 TTL과 무관하게 재조회하고, 최종화 완료 시 해당 대회의 cache를 즉시 축출한다.
    문제 수정 경로는 `evictProblem`을 호출해야 한다.

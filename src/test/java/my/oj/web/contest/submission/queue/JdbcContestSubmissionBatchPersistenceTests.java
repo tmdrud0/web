@@ -121,6 +121,40 @@ class JdbcContestSubmissionBatchPersistenceTests {
                 .hasMessageContaining("occupied by a different submission");
     }
 
+    @Test
+    void classifyReportsEveryOffendingReservedIdInOneAttempt() {
+        ContestSubmission occupied = submission(40L, "hash");
+        ContestSubmission omitted = submission(41L, "other-hash");
+
+        assertThatThrownBy(() -> JdbcContestSubmissionBatchPersistence.classify(
+                List.of(occupied, omitted),
+                List.of(new JdbcContestSubmissionBatchPersistence.StoredSubmissionRow(
+                        40L, 10L, 20L, 30L, "different-hash"
+                )),
+                List.of()
+        ))
+                .isInstanceOfSatisfying(
+                        ContestSubmissionBatchConsistencyException.class,
+                        failure -> assertThat(failure.offendingSubmissionIds()).containsExactly(40L, 41L)
+                );
+    }
+
+    @Test
+    void classifyLeavesOffendingIdsEmptyWhenTheBatchRepeatsAReservedId() {
+        ContestSubmission first = submission(40L, "hash");
+        ContestSubmission repeated = submission(40L, "other-hash");
+
+        assertThatThrownBy(() -> JdbcContestSubmissionBatchPersistence.classify(
+                List.of(first, repeated),
+                List.of(),
+                List.of()
+        ))
+                .isInstanceOfSatisfying(
+                        ContestSubmissionBatchConsistencyException.class,
+                        failure -> assertThat(failure.offendingSubmissionIds()).isEmpty()
+                );
+    }
+
     private ContestSubmission submission(long submissionId, String codeHash) {
         Contest contest = new Contest("Contest");
         ReflectionTestUtils.setField(contest, "id", 10L);
