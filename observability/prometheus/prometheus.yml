@@ -1,0 +1,66 @@
+# Scrape interval must be well under the load-test hold window or a run produces a
+# single sample and no usable curve. The documented runs in docs/ENVIRONMENT.md hold
+# for 10s, so 5s is the ceiling here; prefer 60s+ holds when reading these dashboards.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 15s
+  external_labels:
+    stack: oj
+
+# Alert rules land here once backlog drain-time metrics exist (pipeline history, 9.2).
+
+scrape_configs:
+  # The five application JVMs. Actuator listens on 9000 on every role
+  # (application-multi-server.properties); nginx only proxies 8080, so this port is
+  # reachable inside the compose network and nowhere else.
+  - job_name: oj-app
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["web-1:9000"]
+        labels: { node: web-1 }
+      - targets: ["web-2:9000"]
+        labels: { node: web-2 }
+      - targets: ["batch-1:9000"]
+        labels: { node: batch-1 }
+      - targets: ["judge-1:9000"]
+        labels: { node: judge-1 }
+      - targets: ["judge-2:9000"]
+        labels: { node: judge-2 }
+
+  # rabbitmq_prometheus ships enabled in the official image and listens on 15692.
+  - job_name: rabbitmq
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+        labels: { node: rabbitmq }
+
+  # Exporters query the systems they observe, so their cost lands inside the app's
+  # resource budget rather than the observability budget. Kept at 10s for that reason.
+  - job_name: mysql
+    scrape_interval: 10s
+    static_configs:
+      - targets: ["mysqld-exporter:9104"]
+        labels: { node: mysql }
+
+  - job_name: redis
+    scrape_interval: 10s
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+        labels: { node: redis }
+
+  - job_name: nginx
+    scrape_interval: 10s
+    static_configs:
+      - targets: ["nginx-exporter:9113"]
+        labels: { node: nginx }
+
+  # Container CPU/memory against the compose limits, including CFS throttling.
+  - job_name: cadvisor
+    scrape_interval: 10s
+    static_configs:
+      - targets: ["cadvisor:8080"]
+
+  - job_name: prometheus
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["localhost:9090"]

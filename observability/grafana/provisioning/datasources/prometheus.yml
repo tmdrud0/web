@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: oj-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Match prometheus.yml global scrape_interval so $__rate_interval resolves
+      # sensibly on short load-test windows.
+      timeInterval: 5s
+      httpMethod: POST

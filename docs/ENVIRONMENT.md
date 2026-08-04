@@ -30,13 +30,17 @@ Gatling은 Windows 호스트에서 실행하고 서버·미들웨어는 Docker D
 
 ```ini
 [wsl2]
-processors=8
-memory=10GB
+processors=12
+memory=14GB
 swap=0
 localhostForwarding=true
 ```
 
-재시작 후 `docker info` 실측값은 8 CPU, 10,428,743,680 bytes다.
+재시작 후 `docker info` 실측값은 12 CPU, 14,655,561,728 bytes다.
+
+관측 스택 도입 전 예산은 8 CPU / 10GB였고 실측값은 10,428,743,680 bytes였다. 앱과 관측
+스택의 상한 합(§3)이 이 예산을 넘으므로 올렸다. 앱 스택의 상한은 그대로이므로 앱 단독
+실행 조건은 변하지 않는다.
 
 적용 순서는 반드시 다음과 같다.
 
@@ -56,8 +60,14 @@ localhostForwarding=true
 | rabbitmq | 1 | 0.75 | 1024M | 해당 없음 |
 | nginx | 1 | 0.25 | 128M | 해당 없음 |
 | **Compose 합계** | **9** | **7.5** | **9344M** | |
-| **관측 스택 예약** | | **0.5** | 별도 결정 | 다음 단계에서 사용 |
-| **WSL CPU 예산** | | **8.0** | **10GB** | 상한 합이 VM 예산을 넘지 않음 |
+| **관측 스택** | 6 | **2.1** | **1984M** | `compose.observability.yaml`. 내역은 `observability/README.md` §2 |
+| **앱 + 관측 총합** | **15** | **9.6** | **11328M** | 관측 스택을 함께 띄울 때 |
+| **WSL 예산** | | **12.0** | **14GB** | 상한 합이 VM 예산을 넘지 않음 |
+
+컨테이너 상한은 예약이 아니라 상한이다. WSL 예산이 총합을 덮는 한 관측 스택은 앱의 CPU와
+메모리를 빼앗지 않으므로, `compose.yaml`의 앱 자원 상한은 관측 스택 도입 전후로 동일하게
+유지한다. 다만 스크레이프 직렬화 비용, exporter가 MySQL·Redis·Nginx에 던지는 질의, Prometheus
+TSDB와 MySQL이 공유하는 디스크 I/O는 앱 예산 안에서 발생한다.
 
 JDK의 컨테이너 기본 최대 힙 비율은 25%이므로 애플리케이션 역할에는 `MaxRAMPercentage=60`을 명시한다. 나머지 40%는 metaspace, thread stack, direct buffer 등 비힙 메모리와 안전 여유다. Dockerfile에는 별도의 JVM 메모리 옵션이 없다.
 

@@ -143,6 +143,7 @@ services:
       SPRING_PROFILES_ACTIVE: ${WEB1_PROFILES:-multi-web}
       <<: *spring-environment
       CONTEST_SUBMISSION_WORKER_ID: 1
+      OJ_ROLE: web
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
     ports:
       - "8081:8080"
@@ -161,6 +162,7 @@ services:
       SPRING_PROFILES_ACTIVE: ${WEB2_PROFILES:-multi-web}
       <<: *spring-environment
       CONTEST_SUBMISSION_WORKER_ID: 2
+      OJ_ROLE: web
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
     ports:
       - "8082:8080"
@@ -179,6 +181,7 @@ services:
       SPRING_PROFILES_ACTIVE: ${BATCH1_PROFILES:-multi-batch}
       <<: [*spring-environment, *rabbitmq-environment]
       CONTEST_SUBMISSION_WORKER_ID: 100
+      OJ_ROLE: batch
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
     healthcheck: *worker-healthcheck
     deploy:
@@ -195,6 +198,7 @@ services:
       SPRING_PROFILES_ACTIVE: ${JUDGE1_PROFILES:-multi-judge}
       <<: [*spring-environment, *rabbitmq-environment]
       CONTEST_SUBMISSION_WORKER_ID: 200
+      OJ_ROLE: judge
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
     healthcheck: *worker-healthcheck
     deploy:
@@ -211,6 +215,7 @@ services:
       SPRING_PROFILES_ACTIVE: ${JUDGE2_PROFILES:-multi-judge}
       <<: [*spring-environment, *rabbitmq-environment]
       CONTEST_SUBMISSION_WORKER_ID: 201
+      OJ_ROLE: judge
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
     healthcheck: *worker-healthcheck
     deploy:
