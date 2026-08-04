@@ -14,10 +14,11 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 /**
- * Publishes this container's cgroup v2 CPU quota, CPU throttling counters and memory
- * usage against its limit.
+ * Publishes this container's cgroup v2 CPU quota, CPU throttling counters, memory usage
+ * against its limit and OOM kill count.
  *
  * <p>cAdvisor is the usual source for these. It cannot label containers on Docker
  * Desktop: it resolves each container's read-write layer under
@@ -29,6 +30,15 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>Throttling is the first thing to check when reading any measurement taken under
  * the fixed resource baseline: a container sitting at its CPU quota invalidates
  * conclusions about application-level bottlenecks.
+ *
+ * <p>Memory headroom is reported as a working set rather than as {@code memory.current},
+ * which counts reclaimable page cache and therefore pins to the limit on any container
+ * doing file I/O. The {@code oom_kill} counter beside it is the kernel's own tally rather
+ * than an inference, but it only reaches kills this process outlives: when the victim is
+ * the JVM the container ends with it, the increment falls after the last scrape and is
+ * never collected, and the replacement container starts a fresh cgroup at zero. A zero
+ * there is therefore not evidence that no OOM happened - process restarts are what catch
+ * that case.
  */
 @Component
 public class CgroupResourceMetrics implements MeterBinder {
@@ -41,7 +51,10 @@ public class CgroupResourceMetrics implements MeterBinder {
     private final Path cpuStat;
     private final Path cpuMax;
     private final Path memoryCurrent;
+    private final Path memoryStat;
+    private final Path memoryEvents;
     private final Path memoryMax;
+    private final LongSupplier clockMillis;
     private final AtomicReference<Snapshot> cached = new AtomicReference<>(Snapshot.EMPTY);
 
     public CgroupResourceMetrics() {
@@ -49,10 +62,17 @@ public class CgroupResourceMetrics implements MeterBinder {
     }
 
     CgroupResourceMetrics(Path cgroupRoot) {
+        this(cgroupRoot, System::currentTimeMillis);
+    }
+
+    CgroupResourceMetrics(Path cgroupRoot, LongSupplier clockMillis) {
         this.cpuStat = cgroupRoot.resolve("cpu.stat");
         this.cpuMax = cgroupRoot.resolve("cpu.max");
         this.memoryCurrent = cgroupRoot.resolve("memory.current");
+        this.memoryStat = cgroupRoot.resolve("memory.stat");
+        this.memoryEvents = cgroupRoot.resolve("memory.events");
         this.memoryMax = cgroupRoot.resolve("memory.max");
+        this.clockMillis = clockMillis;
     }
 
     @Override
@@ -83,17 +103,31 @@ public class CgroupResourceMetrics implements MeterBinder {
                 .register(registry);
         Gauge.builder("cgroup.memory.usage", this, self -> self.snapshot().memoryUsedBytes())
                 .baseUnit("bytes")
-                .description("Current memory charged to this container's cgroup")
+                .description("Memory charged to this container's cgroup, page cache included and "
+                        + "nothing deducted for what the kernel can reclaim. Compare against the "
+                        + "limit only through cgroup.memory.working_set")
+                .register(registry);
+        Gauge.builder("cgroup.memory.working_set", this, self -> self.snapshot().memoryWorkingSetBytes())
+                .baseUnit("bytes")
+                .description("memory.current minus inactive_file, the definition cAdvisor, docker "
+                        + "stats and kubelet all report. The kernel reclaims that cache before it "
+                        + "kills anything, so this is the part a limit increase has to cover")
                 .register(registry);
         Gauge.builder("cgroup.memory.limit", this, self -> self.snapshot().memoryLimitBytes())
                 .baseUnit("bytes")
                 .description("Memory limit for this container. -1 when unlimited")
                 .register(registry);
+        FunctionCounter.builder("cgroup.memory.oom_kills", this, self -> self.snapshot().oomKills())
+                .description("Processes the kernel OOM killer has killed in this cgroup, from "
+                        + "memory.events. Only counts kills this process outlives: a kill of the "
+                        + "JVM itself ends the container before the increment can be scraped, and "
+                        + "the replacement counts from zero in a new cgroup")
+                .register(registry);
     }
 
     private Snapshot snapshot() {
         Snapshot current = cached.get();
-        long now = System.currentTimeMillis();
+        long now = clockMillis.getAsLong();
         if (now - current.readAtMillis() < CACHE_MILLIS) {
             return current;
         }
@@ -108,25 +142,56 @@ public class CgroupResourceMetrics implements MeterBinder {
      */
     private Snapshot read(long now, Snapshot previous) {
         try {
-            Map<String, Long> stat = readCpuStat();
+            Map<String, Long> cpu = readKeyedLongs(cpuStat);
+            Map<String, Long> memory = readKeyedLongsQuietly(memoryStat);
+            Map<String, Long> events = readKeyedLongsQuietly(memoryEvents);
+            double usedBytes = readLongOrDefault(memoryCurrent, 0L);
             return new Snapshot(
                     now,
-                    stat.getOrDefault("usage_usec", 0L) / 1_000_000.0,
-                    stat.getOrDefault("nr_periods", 0L),
-                    stat.getOrDefault("nr_throttled", 0L),
-                    stat.getOrDefault("throttled_usec", 0L) / 1_000_000.0,
+                    counterSeconds(cpu, "usage_usec", previous.usedSeconds()),
+                    counter(cpu, "nr_periods", previous.periods()),
+                    counter(cpu, "nr_throttled", previous.throttledPeriods()),
+                    counterSeconds(cpu, "throttled_usec", previous.throttledSeconds()),
                     readCpuLimitCores(),
-                    readLongOrDefault(memoryCurrent, 0L),
-                    readMemoryLimitBytes());
+                    usedBytes,
+                    workingSetBytes(usedBytes, memory),
+                    readMemoryLimitBytes(),
+                    counter(events, "oom_kill", previous.oomKills()));
         } catch (IOException | RuntimeException e) {
             log.debug("cgroup read failed; keeping previous values", e);
             return previous.readAt(now);
         }
     }
 
-    private Map<String, Long> readCpuStat() throws IOException {
+    /**
+     * A file can read cleanly and still not carry the field: cpu.stat omits the throttling
+     * counters when no quota is set, and memory.events is absent on kernels without the
+     * memory controller's event interface. Defaulting to zero there would step around the
+     * carry-forward contract that the read failure path exists to honour.
+     */
+    private static double counter(Map<String, Long> stat, String field, double previous) {
+        Long value = stat.get(field);
+        return value == null ? previous : value;
+    }
+
+    private static double counterSeconds(Map<String, Long> stat, String field, double previous) {
+        Long micros = stat.get(field);
+        return micros == null ? previous : micros / 1_000_000.0;
+    }
+
+    /**
+     * inactive_file is what the kernel drops first under pressure, so removing it leaves
+     * roughly the memory a limit increase would actually have to cover. memory.current on
+     * its own sticks to the limit on any container doing file I/O and never falls back.
+     */
+    private static double workingSetBytes(double usedBytes, Map<String, Long> memoryStat) {
+        return Math.max(0.0, usedBytes - memoryStat.getOrDefault("inactive_file", 0L));
+    }
+
+    /** cpu.stat, memory.stat and memory.events share the same "key value" line format. */
+    private Map<String, Long> readKeyedLongs(Path path) throws IOException {
         Map<String, Long> values = new HashMap<>();
-        for (String line : Files.readAllLines(cpuStat)) {
+        for (String line : Files.readAllLines(path)) {
             int separator = line.indexOf(' ');
             if (separator <= 0) {
                 continue;
@@ -134,10 +199,22 @@ public class CgroupResourceMetrics implements MeterBinder {
             try {
                 values.put(line.substring(0, separator), Long.parseLong(line.substring(separator + 1).trim()));
             } catch (NumberFormatException ignored) {
-                // cpu.stat gains fields across kernel versions. Skip anything non-numeric.
+                // These files gain fields across kernel versions. Skip anything non-numeric.
             }
         }
         return values;
+    }
+
+    /**
+     * For the optional files. Failing the whole read would discard the CPU values that did
+     * come back; an empty map hands each field to its carry-forward instead.
+     */
+    private Map<String, Long> readKeyedLongsQuietly(Path path) {
+        try {
+            return readKeyedLongs(path);
+        } catch (IOException e) {
+            return Map.of();
+        }
     }
 
     /** {@code cpu.max} holds "quota period", or "max period" when no quota is set. */
@@ -171,13 +248,16 @@ public class CgroupResourceMetrics implements MeterBinder {
                             double throttledSeconds,
                             double limitCores,
                             double memoryUsedBytes,
-                            double memoryLimitBytes) {
+                            double memoryWorkingSetBytes,
+                            double memoryLimitBytes,
+                            double oomKills) {
 
-        private static final Snapshot EMPTY = new Snapshot(0L, 0.0, 0.0, 0.0, 0.0, UNLIMITED, 0.0, UNLIMITED);
+        private static final Snapshot EMPTY =
+                new Snapshot(0L, 0.0, 0.0, 0.0, 0.0, UNLIMITED, 0.0, 0.0, UNLIMITED, 0.0);
 
         private Snapshot readAt(long now) {
             return new Snapshot(now, usedSeconds, periods, throttledPeriods, throttledSeconds,
-                    limitCores, memoryUsedBytes, memoryLimitBytes);
+                    limitCores, memoryUsedBytes, memoryWorkingSetBytes, memoryLimitBytes, oomKills);
         }
     }
 }

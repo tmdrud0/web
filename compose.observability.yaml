@@ -73,9 +73,13 @@ services:
           cpus: "0.5"
           memory: 512M
 
-  # Container CPU/memory against the compose limits. This is the one that answers
-  # "did web-1 hit its 1.0 CPU ceiling" via container_cpu_cfs_throttled_seconds_total,
-  # which is the central question for every fixed-baseline measurement in this repo.
+  # Container CPU/memory for MySQL, Redis, RabbitMQ and nginx - the containers with no
+  # JVM of their own to report from. It cannot name them: Docker Desktop's containerd
+  # image store defeats cAdvisor's container registration, so its series arrive keyed by
+  # id="/docker/<hash>" with no name label. The five application instances therefore do
+  # not come from here at all; CgroupResourceMetrics reads cgroup v2 from inside each JVM
+  # and answers "did web-1 hit its 1.0 CPU ceiling" with the same role/node labels as
+  # every other application metric. See observability/README.md section 7.
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: oj-cadvisor

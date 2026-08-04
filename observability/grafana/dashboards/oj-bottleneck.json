@@ -23,7 +23,7 @@
       "id": 1,
       "type": "timeseries",
       "title": "CPU throttling (app tier)",
-      "description": "Seconds of runnable time denied per second by the CFS quota, read from cgroup v2 inside each JVM. Anything above zero means the container is at its compose CPU limit, which invalidates any conclusion about application-level bottlenecks. cAdvisor cannot label containers on Docker Desktop, so this comes from the application itself.",
+      "description": "Seconds of runnable time denied per second by the CFS quota, read from cgroup v2 inside each JVM because cAdvisor cannot label containers on Docker Desktop. Non-zero is the normal state here rather than a finding: README section 8 measured 61-78% of periods throttled on all instances at idle, and JVM startup is CPU-hungry by nature. What matters is whether the rate holds through a load run, because a run spent at the quota measured the CPU ceiling and not an application bottleneck.",
       "gridPos": { "h": 8, "w": 6, "x": 0, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
@@ -83,7 +83,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "Memory usage / limit (app tier)",
-      "description": "Approaching 1.0 precedes an OOM kill. batch-1 was raised to 1024M for exactly this reason (ENVIRONMENT.md 8.1). This is the whole cgroup charge, not just JVM heap, which is what the kernel actually kills on.",
+      "description": "Working set is memory.current minus inactive_file, the definition cAdvisor, docker stats and kubelet all use. The subtracted page cache is what the kernel reclaims first, so counting it would hold any container doing file I/O near 1.0 regardless of load and never fall back. What is left still spans the whole cgroup rather than JVM heap alone: off-heap buffers, metaspace, thread stacks and whatever file cache the kernel has not reclaimed all land here.",
       "gridPos": { "h": 8, "w": 6, "x": 12, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
@@ -109,7 +109,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (node) (cgroup_memory_usage_bytes) / sum by (node) (cgroup_memory_limit_bytes)",
+          "expr": "sum by (node) (cgroup_memory_working_set_bytes) / sum by (node) (cgroup_memory_limit_bytes)",
           "legendFormat": "{{node}}"
         }
       ]
@@ -142,11 +142,126 @@
       ]
     },
     {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Throttled period ratio (app tier)",
+      "description": "Share of CFS periods in which the container was denied runnable time. This is the number observability/README.md section 8 quotes (61-78% at idle on first boot), so it belongs on the dashboard rather than only in prose. Seconds-per-second next door says how much time was lost; this says how often it happened, which is the figure that stays comparable across containers with different quotas.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node) (rate(cgroup_cpu_throttled_periods_total[$__rate_interval])) / sum by (node) (rate(cgroup_cpu_periods_total[$__rate_interval]))",
+          "legendFormat": "{{node}}"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "OOM kills over the selected range (app tier)",
+      "description": "Kernel OOM kills counted by the cgroup itself, from memory.events, so unlike the pressure gauges next door this is an event rather than an estimate. Its reach is narrow though: when the victim is the JVM the container ends with it, the increment lands after the last scrape and is never collected, and the replacement container counts from zero in a fresh cgroup. Only a kill of some other process in the cgroup shows up here. batch-1 in ENVIRONMENT.md 8.1 was the JVM case, so this panel would have stayed at zero throughout it. Non-zero invalidates the run it appears in; zero is not evidence that no OOM happened - read JVM restarts alongside it.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node) (increase(cgroup_memory_oom_kills_total[$__range]))",
+          "legendFormat": "{{node}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "JVM restarts over the selected range (app tier)",
+      "description": "Changes in process_start_time_seconds, one per restart. This is the signal that actually catches a JVM OOM here: the kill takes the container down before its own oom_kill increment can be scraped, so the restart is the only trace that survives. It does not say why the process restarted - a manual recreate counts too - but any non-zero value invalidates the run, because a JVM that restarted mid-measurement was not measuring the same thing on both sides of it.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node) (changes(process_start_time_seconds{job=\"oj-app\"}[$__range]))",
+          "legendFormat": "{{node}}",
+          "instant": true
+        }
+      ]
+    },
+    {
       "id": 200,
       "type": "row",
       "title": "Submission HTTP (web role)",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
       "panels": []
     },
     {
@@ -154,7 +269,7 @@
       "type": "timeseries",
       "title": "Latency percentiles (web-1 + web-2)",
       "description": "Computed from histogram buckets, so this is a true percentile over both instances combined. The perf snapshot API could only report per-JVM average and max.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -190,7 +305,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "Request rate by outcome",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 10 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 18 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -217,7 +332,7 @@
       "type": "timeseries",
       "title": "Backpressure responses (429 / 503)",
       "description": "429 is the per-user rate limit, 503 is the global admission ceiling (max-in-flight). Separating them is the point of pipeline history 9.2 - they mean different things and must not be read as one error rate.",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 10 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 18 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -244,14 +359,14 @@
       "type": "row",
       "title": "JVM",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
       "panels": []
     },
     {
       "id": 7,
       "type": "timeseries",
       "title": "Heap used",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 19 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -277,7 +392,7 @@
       "id": 8,
       "type": "timeseries",
       "title": "GC pause time per second",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 19 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -303,7 +418,7 @@
       "id": 9,
       "type": "timeseries",
       "title": "Live threads",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 19 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -330,7 +445,7 @@
       "type": "row",
       "title": "MySQL and Hikari",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
       "panels": []
     },
     {
@@ -338,7 +453,7 @@
       "type": "timeseries",
       "title": "Hikari threads awaiting a connection",
       "description": "Sustained non-zero means the pool, not the database, is the constraint. Pool sizes across all five roles must stay under MySQL max_connections=500 (pipeline history 9.5).",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 28 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -364,7 +479,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Hikari active connections",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 28 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -390,7 +505,7 @@
       "id": 12,
       "type": "timeseries",
       "title": "MySQL threads running / connected",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 28 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -422,7 +537,7 @@
       "type": "row",
       "title": "RabbitMQ",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
       "panels": []
     },
     {
@@ -430,7 +545,7 @@
       "type": "timeseries",
       "title": "Messages ready (judge backlog)",
       "description": "Aggregated across queues. Per-queue breakdown needs the /metrics/detailed endpoint. Read this together with drain rate, not as an absolute count (pipeline history 10.4).",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 45 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -461,7 +576,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Publish / deliver / ack rate",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 45 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {

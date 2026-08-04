@@ -11,9 +11,9 @@ global:
 # Alert rules land here once backlog drain-time metrics exist (pipeline history, 9.2).
 
 scrape_configs:
-  # The five application JVMs. Actuator listens on 9000 on every role
-  # (application-multi-server.properties); nginx only proxies 8080, so this port is
-  # reachable inside the compose network and nowhere else.
+  # The five application JVMs. Actuator listens on 9000 on every role, set globally in
+  # application.properties so it survives any profile combination; nginx only proxies
+  # 8080, so this port is reachable inside the compose network and nowhere else.
   - job_name: oj-app
     metrics_path: /actuator/prometheus
     static_configs:
