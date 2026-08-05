@@ -5,7 +5,9 @@ import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxPropert
 import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxRecoveryService;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
 import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxScheduler;
+import my.oj.web.observability.ContestOutboxBacklogMetrics;
 import my.oj.web.observability.ContestOutboxDrainMetrics;
+import my.oj.web.observability.ContestOutboxMetricsProperties;
 import my.oj.web.user.rank.streak.StreakRankBatchScheduler;
 import my.oj.web.user.rank.streak.StreakRankBatchService;
 import org.junit.jupiter.api.Test;
@@ -22,12 +24,21 @@ import org.springframework.core.env.Profiles;
 import static org.mockito.Mockito.mock;
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * ContestOutboxBacklogMetrics is asserted here alongside the schedulers because the same
+ * question decides all of them: which role runs this. It matters more for the backlog poller
+ * than for the rest. An outbox backlog belongs to the table, not to the process reading it, so
+ * a second instance publishing it does not add a second view - it makes sum(), the correct
+ * operation for every other application metric in this repository, report twice the real
+ * backlog. The failure is a wrong number on a dashboard rather than an error anywhere.
+ */
 class RoleBasedSchedulerActivationTests {
 
     private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
             .withUserConfiguration(
                     TestDependencies.class,
                     ContestScoreboardOutboxScheduler.class,
+                    ContestOutboxBacklogMetrics.class,
                     StreakRankBatchScheduler.class
             );
 
@@ -38,6 +49,7 @@ class RoleBasedSchedulerActivationTests {
             assertThatProfileIsActive(context, "web-role");
             assertThatMissing(context, ContestScoreboardOutboxScheduler.class);
             assertThatMissing(context, StreakRankBatchScheduler.class);
+            assertThatMissing(context, ContestOutboxBacklogMetrics.class);
         }
     }
 
@@ -52,6 +64,7 @@ class RoleBasedSchedulerActivationTests {
             assertThat(properties.batchSize()).isEqualTo(500);
             assertThat(properties.recoveryBatchSize()).isEqualTo(10);
             assertThat(properties.claimTimeout()).isEqualTo(java.time.Duration.ofSeconds(30));
+            assertThatPresent(context, ContestOutboxBacklogMetrics.class);
         }
     }
 
@@ -62,6 +75,7 @@ class RoleBasedSchedulerActivationTests {
             assertThatProfileIsActive(context, "judge-role");
             assertThatMissing(context, ContestScoreboardOutboxScheduler.class);
             assertThatMissing(context, StreakRankBatchScheduler.class);
+            assertThatMissing(context, ContestOutboxBacklogMetrics.class);
         }
     }
 
@@ -71,6 +85,7 @@ class RoleBasedSchedulerActivationTests {
                 .run(context -> {
                     assertThatPresent(context, ContestScoreboardOutboxScheduler.class);
                     assertThatPresent(context, StreakRankBatchScheduler.class);
+                    assertThatPresent(context, ContestOutboxBacklogMetrics.class);
                 });
     }
 
@@ -105,8 +120,16 @@ class RoleBasedSchedulerActivationTests {
     }
 
     @Configuration(proxyBeanMethods = false)
-    @EnableConfigurationProperties(ContestScoreboardOutboxProperties.class)
+    @EnableConfigurationProperties({
+            ContestScoreboardOutboxProperties.class,
+            ContestOutboxMetricsProperties.class
+    })
     static class TestDependencies {
+
+        @Bean
+        org.springframework.jdbc.core.JdbcTemplate jdbcTemplate() {
+            return mock(org.springframework.jdbc.core.JdbcTemplate.class);
+        }
 
         @Bean
         ContestScoreboardOutboxProcessor contestScoreboardOutboxProcessor() {
@@ -139,6 +162,7 @@ class RoleBasedSchedulerActivationTests {
     @Import({
             TestDependencies.class,
             ContestScoreboardOutboxScheduler.class,
+            ContestOutboxBacklogMetrics.class,
             StreakRankBatchScheduler.class
     })
     static class ProfileTestConfiguration {
