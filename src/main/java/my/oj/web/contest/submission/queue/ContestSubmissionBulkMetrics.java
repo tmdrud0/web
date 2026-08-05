@@ -13,6 +13,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAccumulator;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.IntSupplier;
 
 /**
  * Records the submission pipeline's internal state twice, for two readers that need different
@@ -26,9 +27,18 @@ import java.util.concurrent.atomic.LongAdder;
  * continuously across every web instance. Nothing in that set can be an average or a per-instance
  * maximum, because neither aggregates across web-1 and web-2: latency is carried by timer
  * histograms so a percentile can be computed over the summed buckets, and depth is carried by
- * last-value gauges so a peak comes from {@code max_over_time()} at query time.
+ * gauges that read the live objects, so a peak comes from {@code max_over_time()} at query time.
  * {@link #reset()} deliberately does not touch them - a counter falling back to zero reads as a
  * process restart and resets {@code rate()}.
+ *
+ * <p>The {@code max*} accumulators exist because a snapshot read once per run cannot observe a
+ * peak any other way. A five-second scrape can, so none of them is exported and none is mirrored
+ * into a field for the gauges to read: the gauges call into the writer and the completion
+ * executor at scrape time. The cost is that a spike shorter than the scrape interval is missed by
+ * the gauges while the accumulators still catch it, which is accepted because a series that sums
+ * across instances is worth more in operation than a per-JVM maximum that does not. Recovering a
+ * sub-scrape peak in aggregatable form would mean publishing the record-time value as a
+ * DistributionSummary; nothing needs that yet.
  */
 @Component
 public class ContestSubmissionBulkMetrics implements MeterBinder {
@@ -79,9 +89,14 @@ public class ContestSubmissionBulkMetrics implements MeterBinder {
     private final AtomicInteger currentInFlight = new AtomicInteger();
     private final LongAccumulator maxInFlight = new LongAccumulator(Math::max, 0L);
 
-    /** Last-value state behind the gauges. Not part of the snapshot; see the class comment. */
-    private final AtomicInteger inFlightLimit = new AtomicInteger();
-    private final AtomicInteger lastCompletionQueueDepth = new AtomicInteger();
+    /**
+     * The live objects the gauges read. Volatile because {@link #bindTo(MeterRegistry)} and the
+     * two bind calls below race: Spring binds MeterBinder beans when it creates the registry,
+     * which may be before or after the writer and the dispatcher are constructed. Reading these
+     * inside the gauge lambdas rather than at registration time makes the order irrelevant.
+     */
+    private volatile SubmissionQueueState submissionQueue = SubmissionQueueState.UNBOUND;
+    private volatile CompletionExecutorState completionExecutor = CompletionExecutorState.UNBOUND;
 
     /**
      * A composite registry with no children discards every recording, so the meters exist before
@@ -90,26 +105,82 @@ public class ContestSubmissionBulkMetrics implements MeterBinder {
      */
     private volatile Meters meters = Meters.of(new CompositeMeterRegistry());
 
+    /**
+     * Hands the bulk writer's live state to the gauges. Suppliers rather than values: a gauge that
+     * published what was true when a chunk last finished would sit frozen through exactly the
+     * event worth seeing, a queue growing while no worker completes.
+     *
+     * @param inFlight admitted but not yet committed, so {@code inFlightLimit - inFlight} is the
+     *                 remaining admission headroom before submissions are shed with 503
+     */
+    public void bindSubmissionQueue(IntSupplier pendingCount,
+                                    IntSupplier activeWorkers,
+                                    IntSupplier inFlight,
+                                    int workerLimit,
+                                    int inFlightLimit) {
+        this.submissionQueue =
+                new SubmissionQueueState(pendingCount, activeWorkers, inFlight, workerLimit, inFlightLimit);
+    }
+
+    /**
+     * Hands the completion executor's live state to the gauges. {@code ThreadPoolExecutor} already
+     * tracks both numbers, so nothing needs to be mirrored into a field to publish them.
+     */
+    public void bindCompletionExecutor(IntSupplier queueDepth,
+                                       IntSupplier activeThreads,
+                                       int queueCapacity,
+                                       int threadCount) {
+        this.completionExecutor =
+                new CompletionExecutorState(queueDepth, activeThreads, queueCapacity, threadCount);
+    }
+
+    /**
+     * Every depth gauge here ships the configured ceiling beside it, so a panel is a ratio and no
+     * dashboard has to hardcode a value from application.properties. The ceilings are constants
+     * between deploys; publishing them as gauges is what keeps a config change visible.
+     */
     @Override
     public void bindTo(MeterRegistry registry) {
-        Gauge.builder("contest.submission.in_flight", currentInFlight, AtomicInteger::get)
+        Gauge.builder("contest.submission.in_flight", this, self -> self.submissionQueue.inFlight().getAsInt())
                 .description("Submissions admitted but not yet committed to the database. Compare "
                         + "against contest.submission.in_flight.limit; the difference is the "
                         + "admission headroom before requests are shed with 503")
                 .register(registry);
-        Gauge.builder("contest.submission.in_flight.limit", inFlightLimit, AtomicInteger::get)
+        Gauge.builder("contest.submission.in_flight.limit", this, self -> self.submissionQueue.inFlightLimit())
                 .description("Configured max-in-flight admission ceiling for this instance")
                 .register(registry);
-        Gauge.builder("contest.submission.bulk.queue.depth", lastPendingAfter, AtomicInteger::get)
-                .description("Submissions waiting for a bulk worker to pick them up. A last value "
-                        + "rather than a peak: take the peak with max_over_time(), which a "
+        Gauge.builder("contest.submission.bulk.queue.depth", this,
+                        self -> self.submissionQueue.pendingCount().getAsInt())
+                .description("Submissions waiting for a bulk worker to pick them up. An instant "
+                        + "value rather than a peak: take the peak with max_over_time(), which a "
                         + "per-instance maximum could not give across web-1 and web-2")
                 .register(registry);
-        Gauge.builder("contest.submission.completion.queue.depth", lastCompletionQueueDepth, AtomicInteger::get)
+        Gauge.builder("contest.submission.bulk.active.workers", this,
+                        self -> self.submissionQueue.activeWorkers().getAsInt())
+                .description("Bulk workers currently persisting a chunk. At the worker limit with "
+                        + "a non-empty queue, the DB write stage is the constraint")
+                .register(registry);
+        Gauge.builder("contest.submission.bulk.workers.limit", this, self -> self.submissionQueue.workerLimit())
+                .description("Configured bulk worker count for this instance")
+                .register(registry);
+        Gauge.builder("contest.submission.completion.queue.depth", this,
+                        self -> self.completionExecutor.queueDepth().getAsInt())
                 .description("Batch completion tasks queued behind the completion executor. Once "
                         + "this reaches the queue capacity the rejection handler runs the task on "
                         + "the calling thread, which stalls the bulk worker - see "
                         + "contest.submission.completion.caller_runs")
+                .register(registry);
+        Gauge.builder("contest.submission.completion.queue.capacity", this,
+                        self -> self.completionExecutor.queueCapacity())
+                .description("Configured completion executor queue capacity for this instance")
+                .register(registry);
+        Gauge.builder("contest.submission.completion.active", this,
+                        self -> self.completionExecutor.activeThreads().getAsInt())
+                .description("Completion executor threads currently completing submission futures")
+                .register(registry);
+        Gauge.builder("contest.submission.completion.threads", this,
+                        self -> self.completionExecutor.threadCount())
+                .description("Configured completion executor thread count for this instance")
                 .register(registry);
 
         this.meters = Meters.of(registry);
@@ -120,14 +191,9 @@ public class ContestSubmissionBulkMetrics implements MeterBinder {
         meters.rejected().increment();
     }
 
-    public void recordInFlight(int inFlight, int pendingCount) {
+    public void recordInFlight(int inFlight) {
         currentInFlight.set(inFlight);
         maxInFlight.accumulate(inFlight);
-        lastPendingAfter.set(pendingCount);
-    }
-
-    public void recordInFlightLimit(int limit) {
-        inFlightLimit.set(limit);
     }
 
     public void recordSuccess(int chunkSize, long elapsedMillis, int pendingBefore, int pendingAfter, int activeWorkers) {
@@ -180,7 +246,6 @@ public class ContestSubmissionBulkMetrics implements MeterBinder {
     public void recordCompletionExecutorState(int queueDepth, int activeWorkers) {
         maxCompletionQueueDepth.accumulate(queueDepth);
         maxActiveCompletionWorkers.accumulate(activeWorkers);
-        lastCompletionQueueDepth.set(queueDepth);
     }
 
     public void recordCompletionCallerRuns() {
@@ -247,6 +312,30 @@ public class ContestSubmissionBulkMetrics implements MeterBinder {
         rejectedSubmissionCount.reset();
         currentInFlight.set(0);
         maxInFlight.reset();
+    }
+
+    /** @param inFlightLimit and {@code workerLimit} are fixed for the life of the process */
+    private record SubmissionQueueState(IntSupplier pendingCount,
+                                        IntSupplier activeWorkers,
+                                        IntSupplier inFlight,
+                                        int workerLimit,
+                                        int inFlightLimit) {
+
+        /**
+         * Reads zero everywhere until the writer wires itself. Only reachable in a context that
+         * registers this bean without a writer, which is a unit test rather than a running role.
+         */
+        private static final SubmissionQueueState UNBOUND =
+                new SubmissionQueueState(() -> 0, () -> 0, () -> 0, 0, 0);
+    }
+
+    private record CompletionExecutorState(IntSupplier queueDepth,
+                                           IntSupplier activeThreads,
+                                           int queueCapacity,
+                                           int threadCount) {
+
+        private static final CompletionExecutorState UNBOUND =
+                new CompletionExecutorState(() -> 0, () -> 0, 0, 0);
     }
 
     private record Meters(Timer chunk,

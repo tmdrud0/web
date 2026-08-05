@@ -41,6 +41,14 @@ public class ContestSubmissionCompletionDispatcher {
                 }
         );
         this.executor.prestartAllCoreThreads();
+        // Read at scrape time straight off the executor, which already tracks both numbers. The
+        // queue capacity comes from properties because ArrayBlockingQueue reports only what is
+        // left, and remainingCapacity() + size() is two reads of a queue that moves between them.
+        metrics.bindCompletionExecutor(
+                () -> executor.getQueue().size(),
+                executor::getActiveCount,
+                properties.effectiveQueueCapacity(),
+                effectiveThreadCount);
     }
 
     public void dispatch(int submissionCount, Runnable completion) {

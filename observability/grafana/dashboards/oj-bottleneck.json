@@ -366,14 +366,26 @@
       "id": 19,
       "type": "timeseries",
       "title": "Admission occupancy vs ceiling",
-      "description": "Submissions admitted but not yet committed, against the configured max-in-flight ceiling summed over both web instances. The gap is the headroom before requests are shed with 503. Both are last-value gauges rather than per-instance maxima, which do not aggregate: wrap the expression in max_over_time() to read a peak.",
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 27 },
+      "description": "Submissions admitted but not yet committed, against the configured max-in-flight ceiling, summed over both web instances. The gap is the headroom before requests are shed with 503; occupancy touching the ceiling means 503s are going out right now, which the panel below counts. Read at scrape time from the writer's semaphore rather than from a value stored when a chunk last finished, so it keeps moving while every worker is blocked. It is an instant value, not a peak: wrap it in max_over_time() for that, which a per-instance maximum could not have given across web-1 and web-2. The dashed line is the 800 this dashboard was written against and the ceiling series is what the processes actually enforce - the two separating means the config moved.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "min": 0,
-          "custom": { "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" }
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "thresholdsStyle": { "mode": "dashed" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 800 }
+            ]
+          }
         },
         "overrides": [
           {
@@ -404,7 +416,7 @@
       "type": "timeseries",
       "title": "Chunk persist latency (web-1 + web-2)",
       "description": "Time to commit one chunk of submissions and their judge outbox rows, from histogram buckets so the percentile is true over both instances combined. This is the DB-write stage on its own; the HTTP latency panel above it also carries queueing, completion dispatch and the response.",
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 27 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -440,8 +452,8 @@
       "id": 21,
       "type": "timeseries",
       "title": "In-JVM queue depth",
-      "description": "The two non-durable queues of the pipeline history section 7 table. Neither survives a JVM exit, which is why the admission ceiling bounds them rather than any persistence. The completion queue is capped at contest.submission.completion.queue-capacity; reaching it hands the task back to the calling bulk worker, which is the caller-runs series next door.",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 27 },
+      "description": "The two non-durable queues of the pipeline history section 7 table. Neither survives a JVM exit, which is why the admission ceiling bounds them rather than any persistence. Both are read off the live queues at scrape time. The completion queue reaching its capacity hands the task back to the calling bulk worker, which is the caller-runs series below. The bulk queue has no ceiling of its own: max-in-flight is what bounds it, so read it against the admission panel rather than against a limit here.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -465,6 +477,11 @@
           "refId": "B",
           "expr": "sum(contest_submission_completion_queue_depth)",
           "legendFormat": "awaiting completion"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(contest_submission_completion_queue_capacity)",
+          "legendFormat": "completion capacity"
         }
       ]
     },
@@ -473,7 +490,7 @@
       "type": "timeseries",
       "title": "Load shed and back-pressure",
       "description": "Three different failures that a single error rate would blur together. Shed submissions are the admission ceiling working as designed and are answered with 503. Caller-runs means the completion executor is full and is stalling a bulk DB worker. Failed submissions are chunks that did not persist, and unlike the other two nothing about them is by design.",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 27 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -506,18 +523,65 @@
       ]
     },
     {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Worker occupancy",
+      "description": "How many threads of each fixed pool are busy, against the pool size, summed over both web instances. Both come off the live objects at scrape time - the writer's own counter and ThreadPoolExecutor.getActiveCount(). Bulk workers pinned at their limit with a non-empty queue means the database write stage is the constraint; completion threads pinned at theirs is what precedes the queue filling and caller-runs starting. Neither can be read from a per-JVM maximum, which is why the snapshot's maxActiveWorkers never made it here.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*limit" },
+            "properties": [{ "id": "custom.fillOpacity", "value": 0 }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(contest_submission_bulk_active_workers)",
+          "legendFormat": "bulk workers busy"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(contest_submission_bulk_workers_limit)",
+          "legendFormat": "bulk worker limit"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(contest_submission_completion_active)",
+          "legendFormat": "completion threads busy"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(contest_submission_completion_threads)",
+          "legendFormat": "completion thread limit"
+        }
+      ]
+    },
+    {
       "id": 300,
       "type": "row",
       "title": "JVM",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
       "panels": []
     },
     {
       "id": 7,
       "type": "timeseries",
       "title": "Heap used",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 44 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -543,7 +607,7 @@
       "id": 8,
       "type": "timeseries",
       "title": "GC pause time per second",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 44 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -569,7 +633,7 @@
       "id": 9,
       "type": "timeseries",
       "title": "Live threads",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 44 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -596,7 +660,7 @@
       "type": "row",
       "title": "MySQL and Hikari",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 },
       "panels": []
     },
     {
@@ -604,7 +668,7 @@
       "type": "timeseries",
       "title": "Hikari threads awaiting a connection",
       "description": "Sustained non-zero means the pool, not the database, is the constraint. Pool sizes across all five roles must stay under MySQL max_connections=500 (pipeline history 9.5).",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 45 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 53 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -630,7 +694,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Hikari active connections",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 45 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 53 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -656,7 +720,7 @@
       "id": 12,
       "type": "timeseries",
       "title": "MySQL threads running / connected",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 45 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 53 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -688,7 +752,7 @@
       "type": "row",
       "title": "Outbox backlog (batch role)",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 53 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 61 },
       "panels": []
     },
     {
@@ -696,7 +760,7 @@
       "type": "timeseries",
       "title": "Rows waiting in each outbox",
       "description": "The two positions in the pipeline history section 7 table that hold load in MySQL with no ceiling. Every other queue in that table is bounded - by the admission semaphore, by a fixed executor queue, or by the broker - so a run that overruns capacity settles here. PUBLISHED and COMPLETED rows are deliberately not counted: they are not backlog, and counting them would tie the query cost to table size, which has no purge policy yet (pipeline history 9.4). Read alongside drain rate, never as an absolute. Published by batch-1 alone, since a table's backlog is not a per-process quantity.",
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 54 },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -723,7 +787,7 @@
       "type": "timeseries",
       "title": "Head-of-line lag",
       "description": "How long the row at the head of each outbox has been claimable without being claimed, measured on the MySQL clock against the same column the worker claims on. This is the half a drain-rate estimate cannot see: one row stuck at the front while the rest of the backlog drains normally leaves the estimate healthy and moves this instead. Zero also means an empty outbox, so read it next to the row counts.",
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 54 },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -750,7 +814,7 @@
       "type": "timeseries",
       "title": "Drain and retry rate",
       "description": "Rows per second reaching a terminal state, against rows put back for another attempt. Only applied updates are counted: a claim whose lease had already expired changed no row and left the event in the backlog. A retry rate rising against a flat drain rate is a stuck pipeline rather than a slow one, and the two are indistinguishable from the backlog count alone.",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 54 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -782,7 +846,7 @@
       "type": "timeseries",
       "title": "Estimated drain time",
       "description": "backlog / recent drain rate, the figure pipeline history 9.2 asks for: a queue depth on its own says nothing about whether a contest can wait for it. From the recording rule in observability/prometheus/rules/oj-pipeline.yml, which is also what the drain-time alert fires on. No line at all means the backlog is empty. A line pinned at the top means the backlog is not moving - the rule leaves that as +Inf on purpose rather than papering over a division by zero.",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 54 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -816,7 +880,7 @@
       "type": "row",
       "title": "RabbitMQ",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 62 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 70 },
       "panels": []
     },
     {
@@ -824,7 +888,7 @@
       "type": "timeseries",
       "title": "Messages ready (judge backlog)",
       "description": "Aggregated across queues. Per-queue breakdown needs the /metrics/detailed endpoint. Read this together with drain rate, not as an absolute count (pipeline history 10.4).",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 63 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 71 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -855,7 +919,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Publish / deliver / ack rate",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 63 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 71 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {

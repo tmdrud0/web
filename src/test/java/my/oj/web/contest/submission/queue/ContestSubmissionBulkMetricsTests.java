@@ -9,6 +9,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -59,14 +60,61 @@ class ContestSubmissionBulkMetricsTests {
         assertThat(timer("contest.submission.bulk.chunk").count()).isEqualTo(1);
     }
 
+    /**
+     * The point of the whole gauge set: a scrape reads the live objects. Registering the value
+     * that was true at bind time, or caching one taken when a chunk last finished, would leave
+     * every depth frozen through the event worth watching.
+     */
     @Test
-    void tracksAdmissionOccupancyAgainstItsCeiling() {
-        metrics.recordInFlightLimit(800);
-        metrics.recordInFlight(612, 37);
+    void gaugesReadTheirSourcesAtScrapeTimeRatherThanAtBindTime() {
+        AtomicInteger pending = new AtomicInteger(0);
+        AtomicInteger activeWorkers = new AtomicInteger(0);
+        AtomicInteger inFlight = new AtomicInteger(0);
+        AtomicInteger completionQueue = new AtomicInteger(0);
+        AtomicInteger completionActive = new AtomicInteger(0);
+        metrics.bindSubmissionQueue(pending::get, activeWorkers::get, inFlight::get, 4, 800);
+        metrics.bindCompletionExecutor(completionQueue::get, completionActive::get, 64, 4);
+
+        assertThat(gauge("contest.submission.in_flight")).isZero();
+
+        pending.set(37);
+        activeWorkers.set(4);
+        inFlight.set(612);
+        completionQueue.set(19);
+        completionActive.set(3);
 
         assertThat(gauge("contest.submission.in_flight")).isEqualTo(612.0);
-        assertThat(gauge("contest.submission.in_flight.limit")).isEqualTo(800.0);
         assertThat(gauge("contest.submission.bulk.queue.depth")).isEqualTo(37.0);
+        assertThat(gauge("contest.submission.bulk.active.workers")).isEqualTo(4.0);
+        assertThat(gauge("contest.submission.completion.queue.depth")).isEqualTo(19.0);
+        assertThat(gauge("contest.submission.completion.active")).isEqualTo(3.0);
+    }
+
+    /** Every depth ships its ceiling so a panel is a ratio and no dashboard hardcodes a config value. */
+    @Test
+    void publishesTheConfiguredCeilingBesideEveryDepth() {
+        metrics.bindSubmissionQueue(() -> 0, () -> 0, () -> 0, 4, 800);
+        metrics.bindCompletionExecutor(() -> 0, () -> 0, 64, 4);
+
+        assertThat(gauge("contest.submission.in_flight.limit")).isEqualTo(800.0);
+        assertThat(gauge("contest.submission.bulk.workers.limit")).isEqualTo(4.0);
+        assertThat(gauge("contest.submission.completion.queue.capacity")).isEqualTo(64.0);
+        assertThat(gauge("contest.submission.completion.threads")).isEqualTo(4.0);
+    }
+
+    /**
+     * Binding happens in the writer's and the dispatcher's constructors, which Spring may run
+     * either side of the registry being created. A gauge registered before the source arrives
+     * has to still find it.
+     */
+    @Test
+    void picksUpASourceBoundAfterTheRegistry() {
+        assertThat(gauge("contest.submission.in_flight.limit")).isZero();
+
+        metrics.bindSubmissionQueue(() -> 7, () -> 0, () -> 0, 4, 800);
+
+        assertThat(gauge("contest.submission.in_flight.limit")).isEqualTo(800.0);
+        assertThat(gauge("contest.submission.bulk.queue.depth")).isEqualTo(7.0);
     }
 
     @Test
@@ -77,6 +125,12 @@ class ContestSubmissionBulkMetricsTests {
         assertThat(registry.get("contest.submission.rejected").counter().count()).isEqualTo(2.0);
     }
 
+    /**
+     * Queueing and work are separate meters because they fail for different reasons: delay grows
+     * when the executor is behind, elapsed grows when completing a batch of futures got slower.
+     * The executor depth that arrives on the same call goes only to the snapshot's accumulator -
+     * the gauge for it reads the executor itself.
+     */
     @Test
     void separatesCompletionQueueDelayFromCompletionWork() {
         metrics.recordCompletion(100, 40L, 6L, 12, 4, false);
@@ -85,7 +139,7 @@ class ContestSubmissionBulkMetricsTests {
                 .isEqualTo(40.0);
         assertThat(timer("contest.submission.completion.task").totalTime(TimeUnit.MILLISECONDS))
                 .isEqualTo(6.0);
-        assertThat(gauge("contest.submission.completion.queue.depth")).isEqualTo(12.0);
+        assertThat(metrics.snapshot().maxCompletionQueueDepth()).isEqualTo(12);
         assertThat(registry.get("contest.submission.completion.failures").counter().count()).isZero();
     }
 
@@ -144,7 +198,14 @@ class ContestSubmissionBulkMetricsTests {
                 .contains("contest_submission_bulk_submissions_total")
                 .contains("contest_submission_rejected_total")
                 .contains("contest_submission_in_flight")
+                .contains("contest_submission_in_flight_limit")
                 .contains("contest_submission_bulk_queue_depth")
+                .contains("contest_submission_bulk_active_workers")
+                .contains("contest_submission_bulk_workers_limit")
+                .contains("contest_submission_completion_queue_depth")
+                .contains("contest_submission_completion_queue_capacity")
+                .contains("contest_submission_completion_active")
+                .contains("contest_submission_completion_threads")
                 .contains("contest_submission_completion_queue_delay_seconds_bucket")
                 .contains("contest_submission_completion_caller_runs_total");
     }

@@ -50,12 +50,16 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
         this.workerCount = properties.effectiveWorkerCount();
         this.maxInFlight = properties.effectiveMaxInFlight();
         this.inFlightPermits = new Semaphore(maxInFlight);
-        metrics.recordInFlightLimit(maxInFlight);
         this.executor = Executors.newFixedThreadPool(this.workerCount, r -> {
             Thread thread = new Thread(r, "contest-submission-bulk");
             thread.setDaemon(true);
             return thread;
         });
+        // The gauges read these at scrape time. Nothing is pushed: a value captured when a chunk
+        // finished would stop moving in the case worth watching, a queue filling while every
+        // worker is stuck.
+        metrics.bindSubmissionQueue(
+                pendingCount::get, activeWorkers::get, this::currentInFlight, workerCount, maxInFlight);
     }
 
     @Override
@@ -73,11 +77,9 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
                 metrics.recordRejectedSubmission();
                 return CompletableFuture.failedFuture(new ContestSubmissionOverloadedException());
             }
+            metrics.recordInFlight(currentInFlight());
             queue.add(new PendingSubmission(request, future));
-            // Reported after the enqueue so the queue depth gauge rises as submissions arrive.
-            // Reporting it only when a chunk finishes would leave the gauge frozen at a low value
-            // in exactly the case worth seeing: a queue growing while no worker completes.
-            metrics.recordInFlight(currentInFlight(), pendingCount.incrementAndGet());
+            pendingCount.incrementAndGet();
         }
         triggerFlushIfNecessary();
         return future;
@@ -308,7 +310,7 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
 
     private void releaseChunk(List<PendingSubmission> chunk) {
         inFlightPermits.release(chunk.size());
-        metrics.recordInFlight(currentInFlight(), pendingCount.get());
+        metrics.recordInFlight(currentInFlight());
     }
 
     private void executeDrain(Runnable drain) {
@@ -327,7 +329,7 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
             inFlightPermits.release();
             pending.future().completeExceptionally(new ContestSubmissionOverloadedException());
         }
-        metrics.recordInFlight(currentInFlight(), pendingCount.get());
+        metrics.recordInFlight(currentInFlight());
     }
 
     private int currentInFlight() {

@@ -68,8 +68,9 @@ class PipelineMetricNamesTests {
 
         ContestSubmissionBulkMetrics bulk = new ContestSubmissionBulkMetrics();
         bulk.bindTo(registry);
-        bulk.recordInFlightLimit(800);
-        bulk.recordInFlight(1, 1);
+        bulk.bindSubmissionQueue(() -> 1, () -> 1, () -> 1, 4, 800);
+        bulk.bindCompletionExecutor(() -> 1, () -> 1, 64, 4);
+        bulk.recordInFlight(1);
         bulk.recordSuccess(100, 12L, 100, 0, 4);
         bulk.recordFailure(1, 1L, 0, 0, 4);
         bulk.recordRejectedSubmission();

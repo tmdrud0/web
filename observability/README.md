@@ -223,7 +223,7 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
   live queue를 분리해서 보려면 이 작업이 선행돼야 한다.
 - **스크레이프 주기와 부하 실행 길이.** 5s 주기에서 10초 hold 실행은 표본이 두어 개뿐이라
   곡선이 되지 않는다. 이 대시보드로 판단하려면 hold를 60초 이상으로 늘려야 한다.
-- **backlog 게이지는 값이 오래됐을 수 있다.** §10의 폴러는 5초마다 질의하고 게이지는 그
+- **backlog 게이지는 값이 오래됐을 수 있다.** 이 문서 §10의 폴러는 5초마다 질의하고 게이지는 그
   결과를 읽는다. 스크레이프 경로에서 DB를 건드리지 않기 위한 구조이므로, 게이지는 최대
   폴링 주기만큼 과거다. 질의가 실패하면 게이지는 **0으로 떨어지지 않고 직전 값을 유지한다.**
   0은 "backlog가 없다"는 뜻이라 실패 상황에서 정확히 반대로 읽히기 때문이다. 그래서 "backlog가
@@ -233,14 +233,14 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
 - **backlog 개수는 상한에서 잘린다.** 질의는 파생 테이블의 `LIMIT`로 스캔을 묶는다
   (`contest.outbox.metrics.max-counted-rows`, 기본 100000). backlog가 상한을 넘으면 게이지는
   상한값을 보고하므로 **실제보다 작은 값**이다. 모든 알림 임계값은 상한보다 한참 아래이므로
-  잘린 값이 알림을 가리지는 못한다. 측정값은 §10에 있다.
+  잘린 값이 알림을 가리지는 못한다. 측정값은 이 문서 §10에 있다.
 - **judge outbox의 head lag는 PENDING만 본다.** `PUBLISHING`에서 멈춘 행은 개수에는 잡히지만
   나이에는 잡히지 않는다. relay가 lease 만료 후 그 행을 다시 claim하면서 상태를 계속
   `PUBLISHING`으로 두기 때문이다. scoreboard outbox는 `due_at` 하나로 세 상태를 모두 덮으므로
   이 구멍이 없다.
-- **아직 없는 지표.** §9·§10으로
+- **아직 없는 지표.** 이 문서 §9·§10으로
   `docs/CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §10.1의 제출 파이프라인 항목과 §10.3의 outbox
-  항목은 채워졌다. 남은 것은 §10.1의 async in-flight·Tomcat accept queue·중복 응답 수와
+  항목은 채워졌다. 남은 것은 같은 문서 §10.1의 async in-flight·Tomcat accept queue·중복 응답 수와
   `ContestSubmissionBatchConsistencyException` 카운트, §10.5의 judge API latency histogram,
   listener retry/DLQ 이동 수, result writer queue depth, Redis pipeline latency, Lua 오류와
   `w:*` 필드 총량이다. 이들은 judge 역할과 Redis 경로에 있어 이번 작업 범위 밖이다.
@@ -291,34 +291,66 @@ throttling은 정상이다. 다만 **부하 실행 중에도 이 비율이 유�
 |---|---|---|
 | 읽는 주기 | 실행 1회당 1번 | 5초마다 계속 |
 | 범위 | JVM 하나 | web-1 + web-2 |
-| 형태 | 평균, 프로세스별 max | Timer 히스토그램, last-value 게이지 |
+| 형태 | 평균, 프로세스별 max | Timer 히스토그램, 살아 있는 객체를 읽는 게이지 |
 | `reset()` | 실행 사이에 초기화 | **건드리지 않는다** |
 
 `reset()`이 meter를 건드리지 않는 이유는 카운터가 0으로 떨어지면 Prometheus가 프로세스
 재시작으로 읽고 `rate()`를 끊기 때문이다. f94de98의 carry-forward와 같은 이유다.
+
+### 9.1 이벤트 계열
 
 | meter | 종류 | 노출 이름 |
 |---|---|---|
 | `contest.submission.bulk.chunk` | Timer + 버킷 | `contest_submission_bulk_chunk_seconds_*` |
 | `contest.submission.bulk.submissions` | Counter (`outcome`) | `contest_submission_bulk_submissions_total` |
 | `contest.submission.rejected` | Counter | `contest_submission_rejected_total` |
-| `contest.submission.in_flight` | Gauge | `contest_submission_in_flight` |
-| `contest.submission.in_flight.limit` | Gauge | `contest_submission_in_flight_limit` |
-| `contest.submission.bulk.queue.depth` | Gauge | `contest_submission_bulk_queue_depth` |
 | `contest.submission.completion.queue.delay` | Timer + 버킷 | `contest_submission_completion_queue_delay_seconds_*` |
 | `contest.submission.completion.task` | Timer + 버킷 | `contest_submission_completion_task_seconds_*` |
-| `contest.submission.completion.queue.depth` | Gauge | `contest_submission_completion_queue_depth` |
 | `contest.submission.completion.failures` | Counter | `contest_submission_completion_failures_total` |
 | `contest.submission.completion.caller_runs` | Counter | `contest_submission_completion_caller_runs_total` |
 
-스냅샷에 있던 `maxPendingBefore`·`maxChunkElapsedMillis`·`maxCompletionQueueDepth` 같은
-프로세스별 max는 하나도 옮기지 않았다. 인스턴스 간 합산이 불가능하다. 최댓값이 필요하면
-게이지에 `max_over_time()`을 씌운다. 질의 시점에 창을 고르므로 프로세스별 누적 max보다
-정확하다.
+### 9.2 현재 상태 게이지
 
-`bulk.queue.depth` 게이지는 chunk가 끝날 때가 아니라 **제출이 큐에 들어갈 때마다** 갱신된다.
-chunk 완료 시점에만 기록하면, 워커가 아무것도 끝내지 못하는 동안 큐가 자라는 — 정확히 보고
-싶은 — 상황에서 게이지가 낮은 값에 얼어붙는다.
+살아 있는 객체를 **스크레이프 시점에** 읽는다. 어디선가 기록해 둔 값을 내보내지 않는다.
+
+| meter | 읽는 대상 | 노출 이름 |
+|---|---|---|
+| `contest.submission.in_flight` | `maxInFlight - inFlightPermits.availablePermits()` | `contest_submission_in_flight` |
+| `contest.submission.in_flight.limit` | `max-in-flight` 설정값 | `contest_submission_in_flight_limit` |
+| `contest.submission.bulk.queue.depth` | writer의 `pendingCount` | `contest_submission_bulk_queue_depth` |
+| `contest.submission.bulk.active.workers` | writer의 `activeWorkers` | `contest_submission_bulk_active_workers` |
+| `contest.submission.bulk.workers.limit` | `worker-count` 설정값 | `contest_submission_bulk_workers_limit` |
+| `contest.submission.completion.queue.depth` | `executor.getQueue().size()` | `contest_submission_completion_queue_depth` |
+| `contest.submission.completion.queue.capacity` | `completion.queue-capacity` 설정값 | `contest_submission_completion_queue_capacity` |
+| `contest.submission.completion.active` | `executor.getActiveCount()` | `contest_submission_completion_active` |
+| `contest.submission.completion.threads` | `completion.thread-count` 설정값 | `contest_submission_completion_threads` |
+
+**깊이 게이지에는 항상 설정 상한을 함께 낸다.** 그래야 패널이 비율이 되고, 대시보드가
+`application.properties`의 값을 하드코딩하지 않는다. 상한은 배포 사이에 변하지 않는 상수지만,
+게이지로 내보내는 것이 설정 변경을 눈에 보이게 만드는 유일한 방법이다.
+
+`in_flight`가 `in_flight.limit`에 붙으면 그 순간 503이 나가고 있다는 뜻이다. 남은 여유분은
+두 값의 차이다.
+
+### 9.3 왜 기록 시점 값이 아니라 살아 있는 객체를 읽는가
+
+writer의 `pendingCount`·`activeWorkers`·`inFlightPermits`와 completion executor는 이미
+폴링 가능한 상태다. 기록 시점 값을 필드에 넣어두고 내보내면, chunk가 하나도 끝나지 않는
+동안 — 정확히 보고 싶은 상황에서 — 게이지가 낮은 값에 얼어붙는다.
+
+스냅샷의 max* 누산기 8개(`maxPendingBefore`, `maxPendingAfter`, `maxActiveWorkers`,
+`maxCompletionQueueDepth`, `maxActiveCompletionWorkers`, `maxInFlight` 등)는 **실행 1회당
+한 번 읽는 스냅샷이 시간에 걸친 최댓값을 관측할 방법이 그것뿐이라서** 존재한다. 5초 주기
+스크레이프가 생기면 그 이유가 사라진다. `max_over_time(...[5m])`이 임의 구간의 최댓값을
+주고, 인스턴스별로도 합산으로도 준다. 그래서 하나도 내보내지 않았다.
+
+**트레이드오프: 5초보다 짧은 스파이크는 게이지가 놓치고 누산기는 잡는다.** 이걸 감수하는
+이유는 합산 불가능한 JVM별 max보다 합산 가능한 시계열이 운영에서 낫기 때문이다. 정말
+sub-scrape 피크가 필요해지면 기록 시점 값을 `DistributionSummary`로 올려 합산 가능한 형태로
+되찾을 수 있다. 지금은 필요한 곳이 없다.
+
+max* 누산기는 아직 지우지 않았다. perf 엔드포인트가 그대로 쓰고 있고
+`/perf/contest/submission-bulk-stats` 응답은 바뀌지 않았다.
 
 ## 10. outbox backlog 지표
 
@@ -351,7 +383,8 @@ judge-role에 있다.
 
 ### 왜 질의에 상한을 두는가
 
-두 outbox 모두 terminal 행(`PUBLISHED`, `COMPLETED`)의 purge 정책이 없다(§9.4). 그래서
+두 outbox 모두 terminal 행(`PUBLISHED`, `COMPLETED`)의 purge 정책이 없다
+(파이프라인 히스토리 §9.4). 그래서
 전체를 세는 질의는 backlog가 아니라 테이블 크기에 비례한다. 질의는 non-terminal 상태만
 보고, 파생 테이블 `LIMIT`로 스캔 자체를 묶는다.
 
@@ -394,7 +427,8 @@ DB 시계를 섞지 않기 위해서다. scoreboard 쪽은 worker가 claim할 �
 | `OjAppInstanceDown` | `up{job="oj-app"} == 0` | 1m | critical |
 | `OjAppInstanceRestarted` | 10분 내 `process_start_time_seconds` 변화 | — | critical |
 
-`estimated_drain_seconds = backlog_count / recent_sustainable_throughput`(§9.2)는 recording
+`estimated_drain_seconds = backlog_count / recent_sustainable_throughput`(파이프라인 히스토리
+§9.2)는 recording
 rule 3개로 들어갔다. 대시보드 패널과 알림이 같은 규칙을 읽으므로 정의가 하나다.
 
 drain rate가 0이면 결과는 `+Inf`다. 나누기를 방어하지 않은 것은 의도다. 움직이지 않는
