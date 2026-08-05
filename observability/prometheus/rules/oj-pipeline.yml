@@ -7,7 +7,13 @@
 #
 # There is deliberately no CPU throttling alert. README section 8 recorded 61-78% of CFS periods
 # throttled on every instance at idle, so any threshold low enough to be meaningful would fire
-# permanently. Throttling is read off the dashboard when interpreting a run, not paged on.
+# permanently.
+#
+# Every contest_submission_* expression is scoped with role="web". Those meters register on all
+# five roles, because the beans behind them have to exist for any role's context to start, so an
+# unscoped sum reaches batch-1, judge-1 and judge-2 as well. Their counters sit at zero, which
+# makes an unscoped rate() numerically right by accident rather than by aiming at anything.
+# contest_outbox_* is not scoped and must not be: batch-1 is its only publisher. Throttling is read off the dashboard when interpreting a run, not paged on.
 
 groups:
   - name: oj-outbox-drain
@@ -81,7 +87,7 @@ groups:
       # minutes of it is: the ceiling exists to protect the JVM from unbounded in-flight requests,
       # and reaching it continuously means demand is above what this deployment can accept.
       - alert: ContestSubmissionShedding
-        expr: sum(rate(contest_submission_rejected_total[1m])) > 0
+        expr: sum(rate(contest_submission_rejected_total{role="web"}[1m])) > 0
         for: 2m
         labels:
           severity: warning
@@ -96,7 +102,7 @@ groups:
       # DB worker's own thread - so while it happens the stage that persists submissions is
       # blocked doing something else.
       - alert: ContestSubmissionCompletionSaturated
-        expr: sum(rate(contest_submission_completion_caller_runs_total[5m])) > 0
+        expr: sum(rate(contest_submission_completion_caller_runs_total{role="web"}[5m])) > 0
         for: 5m
         labels:
           severity: warning

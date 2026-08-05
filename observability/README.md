@@ -7,8 +7,14 @@
 ## 1. 실행
 
 ```powershell
+.\gradlew.bat bootJar
 docker compose -f compose.yaml -f compose.observability.yaml up -d --build
 ```
+
+`bootJar`를 먼저 돌려야 한다. `Dockerfile`은 `build/libs/`의 jar를 복사할 뿐이므로
+`--build`만으로는 소스 변경이 반영되지 않는다. 이 경우 이미지는 새로 만들어지고 컨테이너는
+`healthy`가 되며 스크레이프도 200을 주는데, 새 지표만 조용히 없다. `docs/ENVIRONMENT.md` §8의
+순서와 같다.
 
 | 접속 | 주소 | 비고 |
 |---|---|---|
@@ -184,6 +190,17 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
    존재한다.
 8. Prometheus `Status > Runtime & Build Information`의 Alertmanagers에 `alertmanager:9093`이
    보이는지 본다. 비어 있으면 규칙은 평가되지만 발화가 아무 데도 가지 않는다.
+9. 제출 파이프라인 상한이 실제 상한과 맞는지 본다. 이 지표들은 다섯 역할 전부에서 나오므로
+   (§9.4) 역할을 지정하지 않으면 2.5배가 된다.
+
+   | 질의 | 기대값 |
+   |---|---:|
+   | `sum(contest_submission_in_flight_limit{role="web"})` | 1600 |
+   | `sum(contest_submission_bulk_workers_limit{role="web"})` | 8 |
+   | `sum(contest_submission_completion_queue_capacity{role="web"})` | 128 |
+   | `sum(contest_submission_completion_threads{role="web"})` | 8 |
+
+   `{role="web"}`을 빼면 각각 4000·20·320·20이 나온다. 이 차이가 보이면 정상이다.
 
 ## 7. 알려진 제약
 
@@ -290,7 +307,8 @@ throttling은 정상이다. 다만 **부하 실행 중에도 이 비율이 유�
 | | perf 스냅샷 | Prometheus |
 |---|---|---|
 | 읽는 주기 | 실행 1회당 1번 | 5초마다 계속 |
-| 범위 | JVM 하나 | web-1 + web-2 |
+| 내보내는 범위 | JVM 하나 | **다섯 역할 전부** (§9.4) |
+| 읽는 범위 | JVM 하나 | web-1 + web-2 (`{role="web"}`) |
 | 형태 | 평균, 프로세스별 max | Timer 히스토그램, 살아 있는 객체를 읽는 게이지 |
 | `reset()` | 실행 사이에 초기화 | **건드리지 않는다** |
 
@@ -351,6 +369,46 @@ sub-scrape 피크가 필요해지면 기록 시점 값을 `DistributionSummary`�
 
 max* 누산기는 아직 지우지 않았다. perf 엔드포인트가 그대로 쓰고 있고
 `/perf/contest/submission-bulk-stats` 응답은 바뀌지 않았다.
+
+### 9.4 왜 다섯 역할 전부에서 나오는가, 그리고 읽을 때 `{role="web"}`이 필요한 이유
+
+§9.1과 §9.2의 meter는 **다섯 역할 전부에서 등록된다.** `ContestSubmissionBulkWriter`와
+`ContestSubmissionCompletionDispatcher`가 조건 없는 `@Component`이고, 어떤 역할이든
+컨텍스트가 뜨려면 이 빈들이 있어야 하기 때문이다. batch-1과 judge 인스턴스에서 실측한 값이다.
+
+| 지표 | 전체 sum() | `{role="web"}` |
+|---|---:|---:|
+| `contest_submission_in_flight_limit` | 4000 | **1600** |
+| `contest_submission_bulk_workers_limit` | 20 | **8** |
+| `contest_submission_completion_queue_capacity` | 320 | **128** |
+| `contest_submission_completion_threads` | 20 | **8** |
+
+깊이 게이지는 그 역할들에서 0이라 무해하다. **틀리는 것은 설정 상한 4개다.** 분자는 맞고
+분모만 2.5배가 되므로, web-1과 web-2가 각각 800에 붙어 503을 흘리는 완전 포화 순간에
+Admission 패널은 1600 대 4000, 여유 60%로 읽힌다. 유휴 상태에서는 0/4000이라 멀쩡해 보이고
+부하가 걸려야 어긋나는데, 하필 `ContestSubmissionShedding` 알림이 운영자를 그 패널로 보낸다.
+
+그래서 **대시보드와 규칙의 `contest_submission_*` 질의 전부에 `{role="web"}`을 붙였다.**
+상한 4개만이 아니라 게이지 9개와 Timer/Counter까지 전부다 — 지금 나머지 숫자가 맞는 것은
+그 역할들이 우연히 0이기 때문이지 질의가 대상을 지정해서가 아니다.
+
+**빈 등록을 조건부로 바꾸지 않았다.** 검토하고 기각한 이유는 다음과 같다.
+
+- writer와 dispatcher는 어떤 역할이든 컨텍스트가 뜨려면 존재해야 한다.
+- `compose.yaml`은 프로필 조합을 열어두므로(§3) web-role이 제출을 받는 유일한 역할이라는
+  보장이 없다. 등록을 역할에 묶으면 조합에 따라 지표가 조용히 사라진다. 이 리포는 이미 같은
+  모양의 침묵 실패(관리 포트)를 f94de98에서 겪었다.
+- 깊이 게이지는 §10의 outbox backlog와 달리 **진짜 인스턴스별 상태**다. 게시 자체는 옳고
+  틀린 것은 읽는 쪽이다.
+
+`application-web-role.properties`에 outbox backlog에 대해 적어둔 "다섯 인스턴스가 같은
+시계열을 내면 합산이 다섯 배가 된다"와 같은 함정의 다른 형태다. outbox는 테이블의 성질을
+프로세스마다 중복 게시하는 문제라 **게시를 한 곳으로 묶어** 해결했고, 이쪽은 인스턴스별 상태를
+올바르게 게시하는데 읽는 쪽이 대상을 좁히지 않는 문제라 **질의에서 좁혀** 해결했다. 진단이
+같아 보여도 처방이 반대인 이유가 이것이다.
+
+`contest_outbox_*`에는 `{role="web"}`을 붙이면 안 된다. batch-1이 유일한 게시자이므로
+아무것도 선택되지 않는다. 두 방향 모두 `PipelineMetricNamesTests`가 고정한다.
 
 ## 10. outbox backlog 지표
 

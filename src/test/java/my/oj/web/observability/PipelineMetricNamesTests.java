@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -42,6 +43,12 @@ class PipelineMetricNamesTests {
      */
     private static final Pattern SERIES = Pattern.compile("(?<![:\\w])contest_[a-z0-9_]+");
 
+    /** A series name with the label selector that follows it, if it has one. */
+    private static final Pattern SUBMISSION_SELECTOR =
+            Pattern.compile("(?<![:\\w])(contest_submission_[a-z0-9_]+)(\\{[^}]*\\})?");
+    private static final Pattern OUTBOX_SELECTOR =
+            Pattern.compile("(?<![:\\w])(contest_outbox_[a-z0-9_]+)(\\{[^}]*\\})?");
+
     @Test
     void dashboardQueriesOnlySeriesTheApplicationExports() throws IOException {
         assertExported(seriesIn(readDashboardExpressions()), DASHBOARD);
@@ -50,6 +57,56 @@ class PipelineMetricNamesTests {
     @Test
     void alertRulesQueryOnlySeriesTheApplicationExports() throws IOException {
         assertExported(seriesIn(Files.readString(RULES)), RULES);
+    }
+
+    /**
+     * The submission pipeline meters register on all five roles: the writer and the completion
+     * dispatcher are unconditional beans, because every role's context needs them to start. So a
+     * query that names no role reaches batch-1, judge-1 and judge-2 as well as web-1 and web-2.
+     *
+     * <p>Depths stay at zero on those roles, which makes an unscoped sum look right while the
+     * pipeline is idle. The configured ceilings do not: an unscoped
+     * sum(contest_submission_in_flight_limit) reads 4000 against a real ceiling of 1600, so the
+     * admission panel shows 60% headroom at the moment both web instances are saturated and
+     * shedding. Measured on the running stack, not inferred.
+     */
+    @Test
+    void everySubmissionQueryNamesTheRoleItMeans() throws IOException {
+        assertScopedToWeb(readDashboardExpressions(), DASHBOARD);
+        assertScopedToWeb(readRuleExpressions(), RULES);
+    }
+
+    /**
+     * The mirror image. contest_outbox_* has one publisher, batch-1, so scoping it to the web role
+     * would select nothing at all - a panel that silently returns no data rather than a wrong
+     * number.
+     */
+    @Test
+    void outboxQueriesAreNotScopedToTheWebRole() throws IOException {
+        for (String expressions : List.of(readDashboardExpressions(), readRuleExpressions())) {
+            Matcher matcher = OUTBOX_SELECTOR.matcher(expressions);
+            while (matcher.find()) {
+                assertThat(selectorOf(matcher))
+                        .as("%s is scoped to the web role, which never publishes it", matcher.group(1))
+                        .doesNotContain("role=\"web\"");
+            }
+        }
+    }
+
+    private void assertScopedToWeb(String text, Path source) {
+        Matcher matcher = SUBMISSION_SELECTOR.matcher(text);
+        int checked = 0;
+        while (matcher.find()) {
+            checked++;
+            assertThat(selectorOf(matcher))
+                    .as("%s reads %s without naming a role, so it also sums batch-1, judge-1 and "
+                            + "judge-2, where these meters register too", source, matcher.group(1))
+                    .contains("role=");
+        }
+        assertThat(checked)
+                .as("no contest_submission_* selector found in %s - the extraction stopped matching",
+                        source)
+                .isPositive();
     }
 
     private void assertExported(Set<String> series, Path source) {
@@ -95,6 +152,21 @@ class PipelineMetricNamesTests {
             names.add(matcher.group());
         }
         return names;
+    }
+
+    /** An absent selector is the failure this is looking for, so it reads as an empty one. */
+    private static String selectorOf(Matcher matcher) {
+        return matcher.group(2) == null ? "" : matcher.group(2);
+    }
+
+    /**
+     * Expressions only. The annotations in the rules file name series in prose to point an
+     * operator at the right panel, and prose does not select anything.
+     */
+    private static String readRuleExpressions() throws IOException {
+        return Files.readAllLines(RULES).stream()
+                .filter(line -> line.trim().startsWith("expr:"))
+                .reduce("", (all, line) -> all + line + '\n');
     }
 
     private static String readDashboardExpressions() throws IOException {

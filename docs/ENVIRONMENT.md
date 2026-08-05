@@ -60,8 +60,8 @@ localhostForwarding=true
 | rabbitmq | 1 | 0.75 | 1024M | 해당 없음 |
 | nginx | 1 | 0.25 | 128M | 해당 없음 |
 | **Compose 합계** | **9** | **7.5** | **9344M** | |
-| **관측 스택** | 6 | **2.1** | **1984M** | `compose.observability.yaml`. 내역은 `observability/README.md` §2 |
-| **앱 + 관측 총합** | **15** | **9.6** | **11328M** | 관측 스택을 함께 띄울 때 |
+| **관측 스택** | 7 | **2.2** | **2112M** | `compose.observability.yaml`. 내역은 `observability/README.md` §2 |
+| **앱 + 관측 총합** | **16** | **9.7** | **11456M** | 관측 스택을 함께 띄울 때 |
 | **WSL 예산** | | **12.0** | **14GB** | 상한 합이 VM 예산을 넘지 않음 |
 
 컨테이너 상한은 예약이 아니라 상한이다. WSL 예산이 총합을 덮는 한 관측 스택은 앱의 CPU와

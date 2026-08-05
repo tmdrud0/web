@@ -74,6 +74,10 @@ class ContestSubmissionQueueGaugeTests {
         first.toCompletableFuture().get(5, TimeUnit.SECONDS);
     }
 
+    /**
+     * Every assertion here expects zero, which an unwired gauge also reports, so the ceiling is
+     * asserted alongside them. Without it this passes with the bind call deleted and says nothing.
+     */
     @Test
     void queueGaugesReturnToZeroOnceEverythingDrains() throws Exception {
         startWriter();
@@ -82,6 +86,9 @@ class ContestSubmissionQueueGaugeTests {
         writer.saveAsync(request("only")).toCompletableFuture().get(5, TimeUnit.SECONDS);
         awaitZero("contest.submission.bulk.active.workers");
 
+        assertThat(gauge("contest.submission.in_flight.limit"))
+                .as("a zero here would mean the gauges are unbound rather than drained")
+                .isEqualTo(MAX_IN_FLIGHT);
         assertThat(gauge("contest.submission.bulk.queue.depth")).isZero();
         assertThat(gauge("contest.submission.in_flight")).isZero();
     }
