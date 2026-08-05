@@ -5,6 +5,7 @@ import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxPropert
 import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxRecoveryService;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
 import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxScheduler;
+import my.oj.web.observability.ContestOutboxDrainMetrics;
 import my.oj.web.user.rank.streak.StreakRankBatchScheduler;
 import my.oj.web.user.rank.streak.StreakRankBatchService;
 import org.junit.jupiter.api.Test;
@@ -120,6 +121,12 @@ class RoleBasedSchedulerActivationTests {
         @Bean
         ContestScoreboardOutboxRepository contestScoreboardOutboxRepository() {
             return mock(ContestScoreboardOutboxRepository.class);
+        }
+
+        /** Real rather than mocked: unbound to any registry it discards its recordings anyway. */
+        @Bean
+        ContestOutboxDrainMetrics contestOutboxDrainMetrics() {
+            return new ContestOutboxDrainMetrics();
         }
 
         @Bean

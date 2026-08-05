@@ -13,7 +13,8 @@ docker compose -f compose.yaml -f compose.observability.yaml up -d --build
 | 접속 | 주소 | 비고 |
 |---|---|---|
 | Grafana | http://localhost:3000 | admin / admin, 익명 조회 허용 |
-| Prometheus | http://localhost:9090 | PromQL 직접 확인용 |
+| Prometheus | http://localhost:9090 | PromQL 직접 확인용, `Status > Rules`에서 규칙 상태 |
+| Alertmanager | http://localhost:9093 | 발화 중인 알림, 그룹핑과 silence |
 
 앱 스택만 띄우려면 `-f compose.observability.yaml`을 빼면 된다. 관측 스택은 앱 스택에
 의존하지만 그 반대는 아니다.
@@ -35,12 +36,13 @@ docker compose -p oj-loadtest -f compose.yaml -f compose.loadtest.yaml -f compos
 | prometheus | 1.00 | 1024M |
 | grafana | 0.50 | 512M |
 | cadvisor | 0.30 | 256M |
+| alertmanager | 0.10 | 128M |
 | mysqld-exporter | 0.10 | 64M |
 | redis-exporter | 0.10 | 64M |
 | nginx-exporter | 0.10 | 64M |
-| **관측 합계** | **2.10** | **1984M** |
+| **관측 합계** | **2.20** | **2112M** |
 | 앱 합계 (`compose.yaml`) | 7.50 | 9344M |
-| **총합** | **9.60** | **11328M** |
+| **총합** | **9.70** | **11456M** |
 
 컨테이너 상한은 예약이 아니라 상한이므로, WSL VM 예산이 총합을 덮으면 관측 스택이 앱의
 CPU/메모리를 빼앗지 않는다. `docs/ENVIRONMENT.md` §2의 기존 예산(8 CPU / 10GB)은 총합보다
@@ -81,6 +83,11 @@ localhostForwarding=true
 | `prometheus` | localhost:9090 (자기 자신) | `/metrics` | 15s |
 
 job은 7개, 스크레이프 대상은 `oj-app`의 5개를 포함해 모두 11개다.
+
+Alertmanager는 이 표에 없다. Prometheus가 알림을 보내는 대상이지 긁어오는 대상이 아니다.
+받는 쪽(receiver)이 설정되지 않은 지금은 실패할 알림 전송 자체가 없으므로 job을 만들지 않았다.
+Prometheus가 Alertmanager를 찾았는지는 이미 긁고 있는 `prometheus` job의
+`prometheus_notifications_alertmanagers_discovered`로 본다.
 
 ### 관리 포트 9000
 
@@ -134,6 +141,16 @@ Actuator는 업무 포트가 아니라 별도 포트에서 듣는다(`applicatio
 
 버킷 범위는 5ms~10s로 제한해 시계열 수를 묶어두었다.
 
+파이프라인 내부 지표(§9)의 Timer 3개도 같은 이유로 버킷을 낸다. 다만 이쪽 버킷 경계는
+프로필이 아니라 meter 자체에 속하는 값이므로 `application.properties`가 아니라
+`ContestSubmissionBulkMetrics` 안에 있다. 프로필 조합에 따라 사라질 수 있는 자리에 두지
+않는다.
+
+**Micrometer Timer는 요청하지 않아도 `_max` 시계열을 함께 낸다.** time-decaying 창의
+인스턴스별 최댓값이므로 §5의 규칙에 걸리는 값이다. `http.server.requests`도 마찬가지다.
+percentile은 항상 `histogram_quantile(..., sum by (le) (rate(..._bucket[...])))`으로 구하고,
+`_max`는 단일 인스턴스를 들여다볼 때만 쓴다. 절대 인스턴스 간에 더하거나 평균내지 않는다.
+
 ## 6. 검증
 
 ```powershell
@@ -157,6 +174,16 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
 4. `histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{role="web"}[5m])))`
    가 값을 반환하는지 본다. 비어 있으면 히스토그램 버킷이 꺼진 것이다.
 5. Grafana의 `OJ` 폴더에 `OJ - Bottleneck Overview` 대시보드가 있는지 본다.
+6. `contest_outbox_backlog_rows`가 **5개 시계열**을 반환하는지 본다. judge 2개(PENDING,
+   PUBLISHING)와 scoreboard 3개(PENDING, PROCESSING, FAILED)다. 이보다 많으면 batch-1 외의
+   역할에서도 폴러가 켜진 것이고, 그러면 `sum()`이 backlog를 인스턴스 수만큼 부풀린다.
+   `count by (node) (contest_outbox_backlog_rows)`가 `batch-1` 하나만 내야 한다.
+7. Prometheus `Status > Rule Health`에서 규칙 그룹 4개가 모두 `OK`인지 본다.
+   `oj:contest_outbox_estimated_drain:seconds`가 비어 있으면 backlog 지표가 올라오지 않은
+   것이다(6번). 값이 없는 것과 0인 것은 다르다 — 빈 outbox는 0/0이라 NaN이고, 시계열 자체는
+   존재한다.
+8. Prometheus `Status > Runtime & Build Information`의 Alertmanagers에 `alertmanager:9093`이
+   보이는지 본다. 비어 있으면 규칙은 평가되지만 발화가 아무 데도 가지 않는다.
 
 ## 7. 알려진 제약
 
@@ -196,13 +223,35 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
   live queue를 분리해서 보려면 이 작업이 선행돼야 한다.
 - **스크레이프 주기와 부하 실행 길이.** 5s 주기에서 10초 hold 실행은 표본이 두어 개뿐이라
   곡선이 되지 않는다. 이 대시보드로 판단하려면 hold를 60초 이상으로 늘려야 한다.
-- **아직 없는 지표.** `ContestSubmissionBulkMetrics`의 in-flight/rejected/completion 계열과
-  두 outbox의 상태별 count·oldest age는 아직 Micrometer에 올라가 있지 않다.
-  `docs/CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §10.1과 §10.5의 대부분이 여기에 해당한다.
-  MySQL에 영속으로 쌓이는 두 outbox는 §7 표에서 유일하게 무한히 자라는 대기 위치이므로
-  다음 작업의 우선순위가 가장 높다.
-- **알림 없음.** §9.2의 `estimated_drain_seconds = backlog_count / recent_sustainable_throughput`
-  는 backlog 지표가 생긴 뒤에 규칙으로 옮긴다. `prometheus.yml`에 `rule_files` 자리를 비워뒀다.
+- **backlog 게이지는 값이 오래됐을 수 있다.** §10의 폴러는 5초마다 질의하고 게이지는 그
+  결과를 읽는다. 스크레이프 경로에서 DB를 건드리지 않기 위한 구조이므로, 게이지는 최대
+  폴링 주기만큼 과거다. 질의가 실패하면 게이지는 **0으로 떨어지지 않고 직전 값을 유지한다.**
+  0은 "backlog가 없다"는 뜻이라 실패 상황에서 정확히 반대로 읽히기 때문이다. 그래서 "backlog가
+  평평하다"와 "보는 것을 멈췄다"는 게이지만으로 구분되지 않는다. 구분해 주는 것은
+  `contest_outbox_backlog_poll_failures_total`이고 `ContestOutboxBacklogUnobserved` 알림이
+  이 값을 본다.
+- **backlog 개수는 상한에서 잘린다.** 질의는 파생 테이블의 `LIMIT`로 스캔을 묶는다
+  (`contest.outbox.metrics.max-counted-rows`, 기본 100000). backlog가 상한을 넘으면 게이지는
+  상한값을 보고하므로 **실제보다 작은 값**이다. 모든 알림 임계값은 상한보다 한참 아래이므로
+  잘린 값이 알림을 가리지는 못한다. 측정값은 §10에 있다.
+- **judge outbox의 head lag는 PENDING만 본다.** `PUBLISHING`에서 멈춘 행은 개수에는 잡히지만
+  나이에는 잡히지 않는다. relay가 lease 만료 후 그 행을 다시 claim하면서 상태를 계속
+  `PUBLISHING`으로 두기 때문이다. scoreboard outbox는 `due_at` 하나로 세 상태를 모두 덮으므로
+  이 구멍이 없다.
+- **아직 없는 지표.** §9·§10으로
+  `docs/CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §10.1의 제출 파이프라인 항목과 §10.3의 outbox
+  항목은 채워졌다. 남은 것은 §10.1의 async in-flight·Tomcat accept queue·중복 응답 수와
+  `ContestSubmissionBatchConsistencyException` 카운트, §10.5의 judge API latency histogram,
+  listener retry/DLQ 이동 수, result writer queue depth, Redis pipeline latency, Lua 오류와
+  `w:*` 필드 총량이다. 이들은 judge 역할과 Redis 경로에 있어 이번 작업 범위 밖이다.
+- **알림 임계값은 실측값이 아니다.** 규칙은 `observability/prometheus/rules/oj-pipeline.yml`에
+  있고 숫자는 전부 출발점이다. 임계값을 정할 근거가 되는 실행 — 곡선이 나올 만큼 긴 hold,
+  위의 "스크레이프 주기와 부하 실행 길이" 항목 — 이 아직 없다. 각 임계값이 무엇의 대리값인지는
+  규칙 파일에 적어두었으니 측정이 생기면 그 자리를 바꾼다.
+- **알림을 받을 곳이 없다.** Alertmanager는 떠 있지만 receiver가 비어 있다. Slack이나
+  webhook 주소는 배포에 속하는 값이라 리포에 두면 "보내는 것처럼 보이는데 아무 데도 안 가는"
+  설정이 된다. 지금 얻는 것은 그룹핑·중복 제거·inhibition·silence와 http://localhost:9093의
+  목록까지다. 실제 발송은 receiver를 붙이는 시점의 작업이다.
 
 ## 8. 기동 직후 관측된 값
 
@@ -231,3 +280,140 @@ throttle된 주기 비율은 대시보드의 `Throttled period ratio (app tier)`
 throttling은 정상이다. 다만 **부하 실행 중에도 이 비율이 유지된다면 그 실행의 지연 수치는
 애플리케이션 병목이 아니라 자원 상한을 측정한 것**이다. 다음 부하 측정에서 가장 먼저
 확인해야 할 값이다.
+
+## 9. 제출 파이프라인 지표
+
+`ContestSubmissionBulkMetrics`는 이제 두 곳에 기록한다. `snapshot()`은 perf 엔드포인트가
+읽는 기존 경로 그대로고, `bindTo()`가 Prometheus용 meter를 등록한다. 두 독자의 요구가
+다르기 때문에 형태도 다르다.
+
+| | perf 스냅샷 | Prometheus |
+|---|---|---|
+| 읽는 주기 | 실행 1회당 1번 | 5초마다 계속 |
+| 범위 | JVM 하나 | web-1 + web-2 |
+| 형태 | 평균, 프로세스별 max | Timer 히스토그램, last-value 게이지 |
+| `reset()` | 실행 사이에 초기화 | **건드리지 않는다** |
+
+`reset()`이 meter를 건드리지 않는 이유는 카운터가 0으로 떨어지면 Prometheus가 프로세스
+재시작으로 읽고 `rate()`를 끊기 때문이다. f94de98의 carry-forward와 같은 이유다.
+
+| meter | 종류 | 노출 이름 |
+|---|---|---|
+| `contest.submission.bulk.chunk` | Timer + 버킷 | `contest_submission_bulk_chunk_seconds_*` |
+| `contest.submission.bulk.submissions` | Counter (`outcome`) | `contest_submission_bulk_submissions_total` |
+| `contest.submission.rejected` | Counter | `contest_submission_rejected_total` |
+| `contest.submission.in_flight` | Gauge | `contest_submission_in_flight` |
+| `contest.submission.in_flight.limit` | Gauge | `contest_submission_in_flight_limit` |
+| `contest.submission.bulk.queue.depth` | Gauge | `contest_submission_bulk_queue_depth` |
+| `contest.submission.completion.queue.delay` | Timer + 버킷 | `contest_submission_completion_queue_delay_seconds_*` |
+| `contest.submission.completion.task` | Timer + 버킷 | `contest_submission_completion_task_seconds_*` |
+| `contest.submission.completion.queue.depth` | Gauge | `contest_submission_completion_queue_depth` |
+| `contest.submission.completion.failures` | Counter | `contest_submission_completion_failures_total` |
+| `contest.submission.completion.caller_runs` | Counter | `contest_submission_completion_caller_runs_total` |
+
+스냅샷에 있던 `maxPendingBefore`·`maxChunkElapsedMillis`·`maxCompletionQueueDepth` 같은
+프로세스별 max는 하나도 옮기지 않았다. 인스턴스 간 합산이 불가능하다. 최댓값이 필요하면
+게이지에 `max_over_time()`을 씌운다. 질의 시점에 창을 고르므로 프로세스별 누적 max보다
+정확하다.
+
+`bulk.queue.depth` 게이지는 chunk가 끝날 때가 아니라 **제출이 큐에 들어갈 때마다** 갱신된다.
+chunk 완료 시점에만 기록하면, 워커가 아무것도 끝내지 못하는 동안 큐가 자라는 — 정확히 보고
+싶은 — 상황에서 게이지가 낮은 값에 얼어붙는다.
+
+## 10. outbox backlog 지표
+
+`docs/CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §7 표에서 상한 없이 자라는 대기 위치는 두
+outbox뿐이다. 나머지는 semaphore, 고정 크기 executor 큐, broker가 각각 묶고 있다. 그래서
+용량을 넘긴 실행은 결국 여기에 앉는다.
+
+| meter | 종류 | 노출 이름 | 게시 주체 |
+|---|---|---|---|
+| `contest.outbox.backlog` | Gauge (`outbox`, `status`) | `contest_outbox_backlog_rows` | batch-1 |
+| `contest.outbox.head.lag` | Gauge (`outbox`) | `contest_outbox_head_lag_seconds` | batch-1 |
+| `contest.outbox.backlog.poll.failures` | Counter | `contest_outbox_backlog_poll_failures_total` | batch-1 |
+| `contest.outbox.drained` | Counter (`outbox`) | `contest_outbox_drained_total` | relay / worker |
+| `contest.outbox.retries` | Counter (`outbox`) | `contest_outbox_retries_total` | relay / worker |
+
+### 왜 batch-1 한 곳에서만 게시하는가
+
+테이블의 backlog는 그 테이블의 성질이지 읽는 프로세스의 성질이 아니다. 5개 인스턴스가 모두
+폴링하면 같은 질의를 5번 하고 같은 시계열을 5개 만든다. 그리고 다른 모든 애플리케이션
+지표에서 옳은 연산인 `sum()`이 여기서는 backlog를 5배로 보고한다. batch-1이 두 drain을 모두
+소유하므로 읽는 것도 batch-1이 한다. `contest.outbox.metrics.enabled=false`가 web-role과
+judge-role에 있다.
+
+### 왜 스크레이프 경로에서 질의하지 않는가
+
+스크레이프 주기는 5s, 타임아웃은 4s다. 스크레이프가 이를 넘기면 그 인스턴스의 **모든** 지표가
+사라진다. backlog가 커진 순간이 곧 질의가 느려지는 순간이므로, 스크레이프 경로에 DB 왕복을
+두면 가장 보고 싶을 때 계기판 전체가 꺼진다. 폴러가 스케줄러에서 돌고 게이지는 남겨진 값만
+읽는다.
+
+### 왜 질의에 상한을 두는가
+
+두 outbox 모두 terminal 행(`PUBLISHED`, `COMPLETED`)의 purge 정책이 없다(§9.4). 그래서
+전체를 세는 질의는 backlog가 아니라 테이블 크기에 비례한다. 질의는 non-terminal 상태만
+보고, 파생 테이블 `LIMIT`로 스캔 자체를 묶는다.
+
+MySQL 8.0에서 실측한 계획과 시간이다. 두 테이블 각각 40만 행이고, `EXPLAIN ANALYZE`로 쟀다.
+
+| 질의 | 계획 | backlog 2만 | backlog 40만 |
+|---|---|---:|---:|
+| judge 개수 (상한 100000) | `idx_contest_judge_outbox_claim` covering range scan | 15.2 ms | — |
+| judge head lag | 같은 인덱스, 1행 | 0.08 ms | — |
+| scoreboard 개수 (상한 100000) | `idx_cs_outbox_status_created` covering range scan | 13.3 ms | 69.2 ms |
+| scoreboard head lag | `idx_cs_outbox_due` covering range scan, 1행 | 0.01 ms | 0.02 ms |
+| (비교) 상한 없는 같은 개수 질의 | 같은 인덱스, 전량 | — | **1189 ms** |
+| (비교) `GROUP BY status` 전체 | covering index scan 40만 항목 | 62.7 ms | — |
+
+네 질의 모두 covering index다. 행 조회가 없다. 상한은 실제로 적용된다 — 계획에
+`Limit: 100000 row(s)`가 남아 있고 읽은 항목 수가 정확히 상한에서 멈춘다. 파생 테이블의
+`LIMIT`가 바깥 질의로 병합돼 사라지는 경우가 있어 통합 테스트로 이 동작을 고정해 두었다.
+
+40만 backlog에서 상한이 1189 ms를 69 ms로 바꾼다. 그리고 상한 없는 쪽은 backlog와 함께
+계속 자란다. 상한에 닿은 게이지는 실제보다 작은 값이지만, 그 시점은 이미 모든 임계값을 한참
+넘긴 상태다.
+
+head lag는 뺄셈을 MySQL 안에서 한다(`TIMESTAMPDIFF(..., CURRENT_TIMESTAMP(6))`). JVM 시계와
+DB 시계를 섞지 않기 위해서다. scoreboard 쪽은 worker가 claim할 때 쓰는 바로 그 `due_at`
+컬럼을 읽으므로, worker가 다음에 실제로 보게 될 지연을 잰다. 아직 due하지 않은 행(backoff
+중인 FAILED, lease 안에 있는 PROCESSING)은 음수로 나오고 0으로 자른다.
+
+## 11. 알림
+
+규칙은 `observability/prometheus/rules/oj-pipeline.yml`에 있고 Prometheus가 기동 시 문법을
+검사한다. 잘못된 규칙 파일은 그 안의 알림만 조용히 꺼지는 게 아니라 Prometheus를 멈춘다.
+
+| 알림 | 조건 | for | 등급 |
+|---|---|---:|---|
+| `ContestOutboxDrainTimeTooLong` | 예상 drain 시간 > 120s | 2m | warning |
+| `ContestOutboxHeadOfLineStalled` | head lag > 60s | 2m | warning |
+| `ContestOutboxBacklogUnobserved` | backlog 질의 실패 발생 | 5m | warning |
+| `ContestSubmissionShedding` | 503 shed rate > 0 | 2m | warning |
+| `ContestSubmissionCompletionSaturated` | CallerRuns rate > 0 | 5m | warning |
+| `OjAppInstanceDown` | `up{job="oj-app"} == 0` | 1m | critical |
+| `OjAppInstanceRestarted` | 10분 내 `process_start_time_seconds` 변화 | — | critical |
+
+`estimated_drain_seconds = backlog_count / recent_sustainable_throughput`(§9.2)는 recording
+rule 3개로 들어갔다. 대시보드 패널과 알림이 같은 규칙을 읽으므로 정의가 하나다.
+
+drain rate가 0이면 결과는 `+Inf`다. 나누기를 방어하지 않은 것은 의도다. 움직이지 않는
+backlog에는 유한한 drain 시간이 없고, 그 상태가 가장 알림이 필요한 상태다. 방어하면 그래프에
+구멍이 생긴다. 빈 outbox는 0/0이라 `NaN`이고 모든 비교에서 false이므로 놀고 있는 스택은
+조용하다.
+
+head lag를 따로 두는 이유는 drain rate가 볼 수 없는 절반이 있기 때문이다. 뒤쪽 backlog가
+정상적으로 빠지는 동안 맨 앞 행 하나가 막혀 있으면 예상 drain 시간은 건강하게 나온다.
+
+**CPU throttling 알림은 일부러 만들지 않았다.** §8이 부하 없이도 모든 인스턴스에서 61~78%를
+기록했으므로, 의미가 있을 만큼 낮은 임계값은 항상 발화한다. throttling은 실행을 해석할 때
+대시보드에서 읽는 값이지 호출을 받을 값이 아니다.
+
+`OjAppInstanceDown`은 다른 어디에도 신호가 없는 실패를 위해 있다. 관리 포트 없이 뜬 역할은
+커넥터를 하나도 바인딩하지 않고, 예외 없이 기동하고, 프로세스 존재만 보는 헬스체크를 계속
+통과한다(§3). 스크레이프 대상이 down이 되는 것이 유일한 신호다. `OjAppInstanceRestarted`는
+§7의 `cgroup_memory_oom_kills`가 닿지 못하는 절반 — JVM 자신이 OOM으로 죽는 경우 — 을 잡는다.
+
+Alertmanager의 inhibition은 critical이 warning을 누르도록 해 두었다. 인스턴스가 죽었거나 방금
+재시작했다면 그 인스턴스가 만든 숫자는 전부 무효다. backlog 게이지는 batch-1에서만 나오므로
+batch-1이 내려가면 outbox warning들은 독립된 발견이 아니라 critical의 결과다.

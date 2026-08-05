@@ -50,6 +50,7 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
         this.workerCount = properties.effectiveWorkerCount();
         this.maxInFlight = properties.effectiveMaxInFlight();
         this.inFlightPermits = new Semaphore(maxInFlight);
+        metrics.recordInFlightLimit(maxInFlight);
         this.executor = Executors.newFixedThreadPool(this.workerCount, r -> {
             Thread thread = new Thread(r, "contest-submission-bulk");
             thread.setDaemon(true);
@@ -72,9 +73,11 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
                 metrics.recordRejectedSubmission();
                 return CompletableFuture.failedFuture(new ContestSubmissionOverloadedException());
             }
-            metrics.recordInFlight(currentInFlight());
             queue.add(new PendingSubmission(request, future));
-            pendingCount.incrementAndGet();
+            // Reported after the enqueue so the queue depth gauge rises as submissions arrive.
+            // Reporting it only when a chunk finishes would leave the gauge frozen at a low value
+            // in exactly the case worth seeing: a queue growing while no worker completes.
+            metrics.recordInFlight(currentInFlight(), pendingCount.incrementAndGet());
         }
         triggerFlushIfNecessary();
         return future;
@@ -305,7 +308,7 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
 
     private void releaseChunk(List<PendingSubmission> chunk) {
         inFlightPermits.release(chunk.size());
-        metrics.recordInFlight(currentInFlight());
+        metrics.recordInFlight(currentInFlight(), pendingCount.get());
     }
 
     private void executeDrain(Runnable drain) {
@@ -324,7 +327,7 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
             inFlightPermits.release();
             pending.future().completeExceptionally(new ContestSubmissionOverloadedException());
         }
-        metrics.recordInFlight(currentInFlight());
+        metrics.recordInFlight(currentInFlight(), pendingCount.get());
     }
 
     private int currentInFlight() {

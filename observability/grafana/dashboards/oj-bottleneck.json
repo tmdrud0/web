@@ -355,18 +355,169 @@
       ]
     },
     {
+      "id": 250,
+      "type": "row",
+      "title": "Submission pipeline internals (web role)",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Admission occupancy vs ceiling",
+      "description": "Submissions admitted but not yet committed, against the configured max-in-flight ceiling summed over both web instances. The gap is the headroom before requests are shed with 503. Both are last-value gauges rather than per-instance maxima, which do not aggregate: wrap the expression in max_over_time() to read a peak.",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "ceiling" },
+            "properties": [{ "id": "custom.fillOpacity", "value": 0 }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(contest_submission_in_flight)",
+          "legendFormat": "in flight"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(contest_submission_in_flight_limit)",
+          "legendFormat": "ceiling"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Chunk persist latency (web-1 + web-2)",
+      "description": "Time to commit one chunk of submissions and their judge outbox rows, from histogram buckets so the percentile is true over both instances combined. This is the DB-write stage on its own; the HTTP latency panel above it also carries queueing, completion dispatch and the response.",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 0, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(contest_submission_bulk_chunk_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(contest_submission_bulk_chunk_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(contest_submission_bulk_chunk_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "In-JVM queue depth",
+      "description": "The two non-durable queues of the pipeline history section 7 table. Neither survives a JVM exit, which is why the admission ceiling bounds them rather than any persistence. The completion queue is capped at contest.submission.completion.queue-capacity; reaching it hands the task back to the calling bulk worker, which is the caller-runs series next door.",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(contest_submission_bulk_queue_depth)",
+          "legendFormat": "awaiting a bulk worker"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(contest_submission_completion_queue_depth)",
+          "legendFormat": "awaiting completion"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Load shed and back-pressure",
+      "description": "Three different failures that a single error rate would blur together. Shed submissions are the admission ceiling working as designed and are answered with 503. Caller-runs means the completion executor is full and is stalling a bulk DB worker. Failed submissions are chunks that did not persist, and unlike the other two nothing about them is by design.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(contest_submission_rejected_total[$__rate_interval]))",
+          "legendFormat": "shed at the ceiling (503)"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(contest_submission_completion_caller_runs_total[$__rate_interval]))",
+          "legendFormat": "completion caller-runs"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(contest_submission_bulk_submissions_total{outcome=\"failure\"}[$__rate_interval]))",
+          "legendFormat": "failed to persist"
+        }
+      ]
+    },
+    {
       "id": 300,
       "type": "row",
       "title": "JVM",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
       "panels": []
     },
     {
       "id": 7,
       "type": "timeseries",
       "title": "Heap used",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 27 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -392,7 +543,7 @@
       "id": 8,
       "type": "timeseries",
       "title": "GC pause time per second",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 27 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -418,7 +569,7 @@
       "id": 9,
       "type": "timeseries",
       "title": "Live threads",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 27 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -445,7 +596,7 @@
       "type": "row",
       "title": "MySQL and Hikari",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
       "panels": []
     },
     {
@@ -453,7 +604,7 @@
       "type": "timeseries",
       "title": "Hikari threads awaiting a connection",
       "description": "Sustained non-zero means the pool, not the database, is the constraint. Pool sizes across all five roles must stay under MySQL max_connections=500 (pipeline history 9.5).",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 45 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -479,7 +630,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Hikari active connections",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 45 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -505,7 +656,7 @@
       "id": 12,
       "type": "timeseries",
       "title": "MySQL threads running / connected",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 45 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -533,11 +684,139 @@
       ]
     },
     {
+      "id": 450,
+      "type": "row",
+      "title": "Outbox backlog (batch role)",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 53 },
+      "panels": []
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Rows waiting in each outbox",
+      "description": "The two positions in the pipeline history section 7 table that hold load in MySQL with no ceiling. Every other queue in that table is bounded - by the admission semaphore, by a fixed executor queue, or by the broker - so a run that overruns capacity settles here. PUBLISHED and COMPLETED rows are deliberately not counted: they are not backlog, and counting them would tie the query cost to table size, which has no purge policy yet (pipeline history 9.4). Read alongside drain rate, never as an absolute. Published by batch-1 alone, since a table's backlog is not a per-process quantity.",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 20, "showPoints": "never", "stacking": { "mode": "normal" } }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outbox, status) (contest_outbox_backlog_rows)",
+          "legendFormat": "{{outbox}} {{status}}"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Head-of-line lag",
+      "description": "How long the row at the head of each outbox has been claimable without being claimed, measured on the MySQL clock against the same column the worker claims on. This is the half a drain-rate estimate cannot see: one row stuck at the front while the rest of the backlog drains normally leaves the estimate healthy and moves this instead. Zero also means an empty outbox, so read it next to the row counts.",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "contest_outbox_head_lag_seconds",
+          "legendFormat": "{{outbox}}"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Drain and retry rate",
+      "description": "Rows per second reaching a terminal state, against rows put back for another attempt. Only applied updates are counted: a claim whose lease had already expired changed no row and left the event in the backlog. A retry rate rising against a flat drain rate is a stuck pipeline rather than a slow one, and the two are indistinguishable from the backlog count alone.",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 0, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outbox) (rate(contest_outbox_drained_total[$__rate_interval]))",
+          "legendFormat": "{{outbox}} drained"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (outbox) (rate(contest_outbox_retries_total[$__rate_interval]))",
+          "legendFormat": "{{outbox}} retried"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Estimated drain time",
+      "description": "backlog / recent drain rate, the figure pipeline history 9.2 asks for: a queue depth on its own says nothing about whether a contest can wait for it. From the recording rule in observability/prometheus/rules/oj-pipeline.yml, which is also what the drain-time alert fires on. No line at all means the backlog is empty. A line pinned at the top means the backlog is not moving - the rule leaves that as +Inf on purpose rather than papering over a division by zero.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 120 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "oj:contest_outbox_estimated_drain:seconds",
+          "legendFormat": "{{outbox}}"
+        }
+      ]
+    },
+    {
       "id": 500,
       "type": "row",
       "title": "RabbitMQ",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 62 },
       "panels": []
     },
     {
@@ -545,7 +824,7 @@
       "type": "timeseries",
       "title": "Messages ready (judge backlog)",
       "description": "Aggregated across queues. Per-queue breakdown needs the /metrics/detailed endpoint. Read this together with drain rate, not as an absolute count (pipeline history 10.4).",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 45 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 63 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -576,7 +855,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Publish / deliver / ack rate",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 45 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 63 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {

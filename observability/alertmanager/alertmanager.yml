@@ -1,0 +1,35 @@
+# No notification integration is configured, and that is the intended state for this stack.
+# A Slack or webhook receiver belongs to a deployment, not to a repository, and putting a
+# placeholder one here would only produce a config that silently delivers nowhere while
+# appearing to deliver somewhere. What Alertmanager provides without one is still the part
+# Prometheus alone cannot: grouping, deduplication across evaluations, inhibition and silences,
+# all visible at http://localhost:9093.
+#
+# Prometheus reports whether it can reach this container at all through
+# prometheus_notifications_alertmanagers_discovered, which the prometheus job already scrapes.
+# Once a real receiver exists, add an alertmanager scrape job and alert on
+# alertmanager_notifications_failed_total - until then there are no notifications to fail.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: oj-default
+  # Both outboxes can go off together for one shared cause - MySQL, or batch-1 - so grouping by
+  # outbox keeps the two as one incident rather than two pages.
+  group_by: [alertname, outbox]
+  group_wait: 30s
+  group_interval: 5m
+  # Long enough that a backlog being worked on does not re-page every few minutes.
+  repeat_interval: 3h
+
+receivers:
+  - name: oj-default
+
+inhibit_rules:
+  # An instance that is down or has just restarted invalidates every number it produced. The
+  # backlog gauges come from batch-1 alone, so batch-1 going down turns the outbox warnings into
+  # consequences of the critical alert rather than independent findings. No equality constraint:
+  # with this few alerts, any critical is enough context to read the warnings by.
+  - source_matchers: [severity="critical"]
+    target_matchers: [severity="warning"]

@@ -10,11 +10,12 @@
 #   prometheus       1.00 CPU / 1024M
 #   grafana          0.50 CPU /  512M
 #   cadvisor         0.30 CPU /  256M
+#   alertmanager     0.10 CPU /  128M
 #   mysqld-exporter  0.10 CPU /   64M
 #   redis-exporter   0.10 CPU /   64M
 #   nginx-exporter   0.10 CPU /   64M
 #   -----------------------------------
-#   total            2.10 CPU / 1984M
+#   total            2.20 CPU / 2112M
 #
 # The WSL 2 budget must cover both. See docs/ENVIRONMENT.md section 2.
 
@@ -24,6 +25,10 @@ services:
     container_name: oj-prometheus
     volumes:
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Mounted as a directory so prometheus.yml can glob it and a new rule file needs no
+      # compose change. Rule syntax is checked at startup: a bad file stops Prometheus rather
+      # than silently disabling the alerts in it.
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -72,6 +77,32 @@ services:
         limits:
           cpus: "0.5"
           memory: 512M
+
+  # Grouping, deduplication, inhibition and silences for the rules in
+  # observability/prometheus/rules. Prometheus evaluates and fires; it has no notion of any of
+  # those on its own, so without this an alert is a row in a status page that repeats every
+  # evaluation interval. No receiver is configured - see the config file for why.
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    container_name: oj-alertmanager
+    volumes:
+      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "9093:9093"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9093/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 128M
 
   # Container CPU/memory for MySQL, Redis, RabbitMQ and nginx - the containers with no
   # JVM of their own to report from. It cannot name them: Docker Desktop's containerd
@@ -153,3 +184,4 @@ services:
 volumes:
   prometheus-data:
   grafana-data:
+  alertmanager-data:

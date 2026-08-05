@@ -8,7 +8,13 @@ global:
   external_labels:
     stack: oj
 
-# Alert rules land here once backlog drain-time metrics exist (pipeline history, 9.2).
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
 
 scrape_configs:
   # The five application JVMs. Actuator listens on 9000 on every role, set globally in

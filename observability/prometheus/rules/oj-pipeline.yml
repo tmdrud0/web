@@ -1,0 +1,137 @@
+# Alert rules for the submission pipeline.
+#
+# Thresholds here are starting points, not measured values. The run that would set them - a
+# sustained hold long enough to produce a curve rather than two samples, observability/README.md
+# section 7 - has not happened yet. Each threshold below says what it is a proxy for, so the
+# number can be replaced once there is a measurement to replace it with.
+#
+# There is deliberately no CPU throttling alert. README section 8 recorded 61-78% of CFS periods
+# throttled on every instance at idle, so any threshold low enough to be meaningful would fire
+# permanently. Throttling is read off the dashboard when interpreting a run, not paged on.
+
+groups:
+  - name: oj-outbox-drain
+    rules:
+      # A backlog count says how much is waiting; it does not say whether a contest can wait for
+      # it. Pipeline history 9.2 asks for the drain estimate instead, and this is the recording
+      # rule behind both the alert below and the dashboard panel.
+      - record: oj:contest_outbox_backlog:rows
+        expr: sum by (outbox) (contest_outbox_backlog_rows)
+
+      - record: oj:contest_outbox_drained:rate5m
+        expr: sum by (outbox) (rate(contest_outbox_drained_total[5m]))
+
+      # Division by a zero drain rate is left as +Inf on purpose. A backlog that is not moving has
+      # no finite drain time, and that is the state most worth alerting on; guarding the division
+      # would turn it into a gap in the graph. An empty outbox gives 0/0 = NaN, which compares
+      # false against every threshold, so an idle stack stays quiet.
+      - record: oj:contest_outbox_estimated_drain:seconds
+        expr: oj:contest_outbox_backlog:rows / oj:contest_outbox_drained:rate5m
+
+  - name: oj-outbox-alerts
+    rules:
+      # 120s is a scoreboard staleness budget, not a system property: this is how long a
+      # participant would be looking at a scoreboard that does not yet include a judged
+      # submission. Replace it with whatever the contest actually tolerates.
+      - alert: ContestOutboxDrainTimeTooLong
+        expr: oj:contest_outbox_estimated_drain:seconds > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.outbox }} outbox needs {{ $value | humanizeDuration }} to drain"
+          description: >-
+            Backlog divided by the drain rate of the last five minutes. Sustained for two minutes,
+            so a burst that the workers absorb does not reach here. An infinite value means the
+            backlog is not draining at all. Both outboxes are persistent in MySQL and neither has
+            a purge policy, so this does not self-correct by dropping work.
+
+      # The half the drain estimate cannot see. One row stuck at the head while the rest of the
+      # backlog drains normally leaves the estimate healthy, so this reads the age of the head of
+      # the queue directly.
+      - alert: ContestOutboxHeadOfLineStalled
+        expr: contest_outbox_head_lag_seconds > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Head of the {{ $labels.outbox }} outbox has waited {{ $value | humanizeDuration }}"
+          description: >-
+            The oldest claimable row has been claimable this long without being picked up. The
+            judge relay polls every 100ms and the scoreboard worker every 200ms on batch-1, so a
+            minute here is four hundred missed polls rather than a slow one.
+
+      # Without this, a poller that stopped querying looks exactly like a backlog that cleared:
+      # the gauges hold their last value rather than falling to zero, precisely so that they do
+      # not lie in the other direction.
+      - alert: ContestOutboxBacklogUnobserved
+        expr: rate(contest_outbox_backlog_poll_failures_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox backlog queries are failing on {{ $labels.node }}"
+          description: >-
+            Every other alert in this group is reading gauges that are no longer being refreshed.
+            Treat their values as stale rather than as evidence.
+
+  - name: oj-submission-alerts
+    rules:
+      # Shedding is the admission ceiling working as designed, so a blip is not a finding. Two
+      # minutes of it is: the ceiling exists to protect the JVM from unbounded in-flight requests,
+      # and reaching it continuously means demand is above what this deployment can accept.
+      - alert: ContestSubmissionShedding
+        expr: sum(rate(contest_submission_rejected_total[1m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Submissions have been shed at the admission ceiling for two minutes"
+          description: >-
+            Answered with 503 before any database write, so nothing is lost - these submissions
+            were never accepted. Separate from the 429 rate limit, which is per user and means
+            something different. Read against contest_submission_in_flight and its limit.
+
+      # CallerRuns is a designed backstop, not a failure, but it runs the completion on the bulk
+      # DB worker's own thread - so while it happens the stage that persists submissions is
+      # blocked doing something else.
+      - alert: ContestSubmissionCompletionSaturated
+        expr: sum(rate(contest_submission_completion_caller_runs_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Completion executor is pushing work back onto the bulk DB workers"
+          description: >-
+            The completion queue has been full for five minutes. Load tests peaked at depth 2 with
+            no caller-runs at all, so this is well outside the measured envelope.
+
+  - name: oj-instance-alerts
+    rules:
+      # The failure this exists for is silent everywhere else. A role that comes up without a
+      # management port binds no connector at all, starts without an exception, and keeps passing
+      # its process-liveness healthcheck: the scrape target going down is the only signal.
+      - alert: OjAppInstanceDown
+        expr: up{job="oj-app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.node }} is not answering /actuator/prometheus"
+          description: >-
+            Either the process is gone or it is running without a management connector. A green
+            container healthcheck does not distinguish the two - it only checks that the process
+            exists.
+
+      # cgroup_memory_oom_kills cannot see a kill of the JVM itself: the container ends with it,
+      # the increment falls after the last scrape, and the replacement starts a fresh cgroup at
+      # zero. ENVIRONMENT.md 8.1 was exactly that case. A restart is what catches that half.
+      - alert: OjAppInstanceRestarted
+        expr: changes(process_start_time_seconds{job="oj-app"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.node }} restarted in the last ten minutes"
+          description: >-
+            Any measurement spanning this window is invalid. If the cause was the kernel OOM
+            killer, this is the only alert that will show it.
