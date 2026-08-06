@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("smoke", "target", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed")]
+    [ValidateSet("smoke", "target", "step", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed")]
     [string]$Scenario = "smoke",
     [int]$UserCount = 10000,
     [int]$ProblemCount = 5,
@@ -8,6 +8,11 @@ param(
     [int]$DrainTimeoutSeconds = 300,
     [int]$P95Millis = 10000,
     [string]$GatlingMaxHeap = "2g",
+    [double]$StepStartRps = 200,
+    [double]$StepRps = 200,
+    [double]$StepMaxRps = 1400,
+    [int]$StepRampSeconds = 10,
+    [int]$StepHoldSeconds = 30,
     [switch]$KeepStack,
     [switch]$RemoveData
 )
@@ -21,6 +26,8 @@ $baseUrl = "http://127.0.0.1:18080"
 $dbName = "oj_loadtest"
 $seedPrefix = "loadtest"
 $expectedSubmissionCount = 0L
+$metricsRoot = Join-Path $repoRoot ("var\loadtest-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+$bulkStatsCsv = Join-Path $metricsRoot "bulk-stats.csv"
 
 function Invoke-SetupRequest {
     param(
@@ -182,6 +189,63 @@ function Assert-NoOomKilled {
     }
 }
 
+function Get-WebContainerAddress {
+    param([Parameter(Mandatory = $true)][string]$Service)
+
+    Push-Location $repoRoot
+    try {
+        $containerId = (& docker compose "-p" $projectName @composeFiles ps -q $Service | Select-Object -Last 1)
+        if ($LASTEXITCODE -ne 0 -or -not $containerId) {
+            throw "Could not find the container for service $Service."
+        }
+        $address = & docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $containerId
+        if ($LASTEXITCODE -ne 0 -or -not $address) {
+            throw "Could not read the container address for service $Service."
+        }
+        return ($address | Select-Object -Last 1).Trim()
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+# nginx resolves the names in its upstream block once, when it loads its config, and there is no
+# resolver directive to refresh them. Compose recreating a web container hands it a new IP while
+# nginx keeps proxying to the old one, and proxy_next_upstream quietly retries onto the surviving
+# node - so every request succeeds while half the cluster sits idle. Restarting nginx after the
+# stack is healthy is what forces a fresh resolution.
+function Reset-LoadBalancer {
+    Invoke-LoadCompose -Arguments @("restart", "nginx")
+    Wait-Healthy
+}
+
+# Client-side success rate cannot see a missing upstream, so the split has to be proven before the
+# load starts rather than inferred from the run afterwards.
+function Assert-WebDistribution {
+    param([int]$Probes = 20)
+
+    $expected = @((Get-WebContainerAddress "web-1"), (Get-WebContainerAddress "web-2")) | Sort-Object
+    $served = New-Object System.Collections.Generic.HashSet[string]
+
+    for ($probe = 1; $probe -le $Probes; $probe++) {
+        $response = Invoke-WebRequest -Uri "$baseUrl/perf/contest/submission-bulk-stats" -UseBasicParsing -TimeoutSec 15
+        $upstream = $response.Headers['X-Upstream-Addr']
+        if (-not $upstream) {
+            throw "nginx did not return X-Upstream-Addr; cannot verify the two-web split."
+        }
+        if ($upstream -match ',') {
+            throw "nginx retried an upstream during preflight ($upstream). It is still proxying to an address no web node holds."
+        }
+        [void]$served.Add(($upstream -split ':')[0])
+    }
+
+    $observed = @($served) | Sort-Object
+    if (Compare-Object $expected $observed) {
+        throw "nginx did not spread preflight traffic across both web nodes. expected=$($expected -join ', ') observed=$($observed -join ', ')"
+    }
+    Write-Host "Preflight: nginx is balancing across $($observed -join ', ')."
+}
+
 function Reset-WebMetrics {
     foreach ($webPort in 18081, 18082) {
         Invoke-SetupRequest -Method Post -Uri "http://127.0.0.1:$webPort/perf/contest/submission-bulk-stats/reset" | Out-Null
@@ -259,6 +323,135 @@ function Show-WebMetrics {
     }
 }
 
+# Gatling reports what the client saw. It cannot say which container ran out of CPU or where work
+# piled up, so a background sampler records the server side on the same timeline as each run.
+function Start-LoadSampler {
+    param([Parameter(Mandatory = $true)][string]$Phase)
+
+    New-Item -ItemType Directory -Force -Path $metricsRoot | Out-Null
+    $stopFile = Join-Path $metricsRoot "sampler.stop"
+    if (Test-Path $stopFile) {
+        Remove-Item $stopFile -Force
+    }
+
+    $samplerScript = Join-Path $PSScriptRoot "sample-loadtest.ps1"
+    $job = Start-Job -FilePath $samplerScript -ArgumentList @(
+        $repoRoot, $projectName, $dbName, $metricsRoot, $stopFile, $Phase
+    )
+    return [pscustomobject]@{ Job = $job; StopFile = $stopFile }
+}
+
+function Stop-LoadSampler {
+    param($Sampler)
+
+    if (-not $Sampler) {
+        return
+    }
+    New-Item -ItemType File -Path $Sampler.StopFile -Force | Out-Null
+    Wait-Job -Job $Sampler.Job -Timeout 30 | Out-Null
+    Receive-Job -Job $Sampler.Job -ErrorAction SilentlyContinue | Out-Null
+    Remove-Job -Job $Sampler.Job -Force -ErrorAction SilentlyContinue
+    Remove-Item $Sampler.StopFile -Force -ErrorAction SilentlyContinue
+}
+
+# The bulk metrics are cumulative counters, so a snapshot per phase is what makes chunk size,
+# admission pressure and completion-queue depth attributable to one scenario.
+function Save-WebMetricsSnapshot {
+    param([Parameter(Mandatory = $true)][string]$Phase)
+
+    New-Item -ItemType Directory -Force -Path $metricsRoot | Out-Null
+    if (-not (Test-Path $bulkStatsCsv)) {
+        Add-Content -Path $bulkStatsCsv -Encoding utf8 -Value ("phase,webPort,submissions,chunks,avgChunkSize," +
+            "avgChunkMillis,maxChunkMillis,maxChunkSize,maxPendingAfter,maxActiveWorkers,rejected,failedChunks," +
+            "maxInFlight,completionCallerRuns,maxCompletionQueueDepth,maxCompletionQueueDelayMillis")
+    }
+
+    foreach ($webPort in 18081, 18082) {
+        $metrics = Invoke-SetupRequest -Method Get -Uri "http://127.0.0.1:$webPort/perf/contest/submission-bulk-stats"
+        $avgChunkSize = 0
+        if ([int64]$metrics.chunkCount -gt 0) {
+            $avgChunkSize = [math]::Round([double]$metrics.totalSubmissionCount / [double]$metrics.chunkCount, 2)
+        }
+        Add-Content -Path $bulkStatsCsv -Encoding utf8 -Value ("$Phase,$webPort," +
+            "$($metrics.totalSubmissionCount),$($metrics.chunkCount),$avgChunkSize," +
+            "$($metrics.averageChunkElapsedMillis),$($metrics.maxChunkElapsedMillis),$($metrics.maxChunkSize)," +
+            "$($metrics.maxPendingAfter),$($metrics.maxActiveWorkers),$($metrics.rejectedSubmissionCount)," +
+            "$($metrics.failedChunkCount),$($metrics.maxInFlight),$($metrics.completionCallerRunsCount)," +
+            "$($metrics.maxCompletionQueueDepth),$($metrics.maxCompletionQueueDelayMillis)")
+    }
+}
+
+function Show-MetricsSummary {
+    $containerCsv = Join-Path $metricsRoot "containers.csv"
+    $pipelineCsv = Join-Path $metricsRoot "pipeline.csv"
+
+    Write-Host ""
+    Write-Host "=== Sampled metrics: $metricsRoot ==="
+
+    if (Test-Path $containerCsv) {
+        Write-Host "-- peak container CPU and memory per phase --"
+        Import-Csv $containerCsv |
+            Group-Object phase, container |
+            ForEach-Object {
+                $peakCpu = ($_.Group | Measure-Object -Property cpuPercent -Maximum).Maximum
+                $peakMem = ($_.Group | Measure-Object -Property memUsedMb -Maximum).Maximum
+                $limit = ($_.Group | Select-Object -Last 1).memLimitMb
+                [pscustomobject]@{
+                    Phase = $_.Group[0].phase
+                    Container = $_.Group[0].container
+                    PeakCpuPercent = [math]::Round([double]$peakCpu, 1)
+                    PeakMemMb = [math]::Round([double]$peakMem, 1)
+                    MemLimitMb = $limit
+                }
+            } |
+            Sort-Object @{ Expression = "Phase" }, @{ Expression = "PeakCpuPercent"; Descending = $true } |
+            Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+    }
+
+    if (Test-Path $pipelineCsv) {
+        Write-Host "-- peak backlog and lag per phase --"
+        Import-Csv $pipelineCsv |
+            Group-Object phase |
+            ForEach-Object {
+                [pscustomobject]@{
+                    Phase = $_.Name
+                    PeakJudgeOutbox = ($_.Group | Measure-Object -Property judgeOutboxPending -Maximum).Maximum
+                    PeakScoreboardPending = ($_.Group | Measure-Object -Property scoreboardPending -Maximum).Maximum
+                    PeakScoreboardFailed = ($_.Group | Measure-Object -Property scoreboardFailed -Maximum).Maximum
+                    PeakLagMs = ($_.Group | Measure-Object -Property oldestPendingLagMs -Maximum).Maximum
+                    PeakRabbitReady = ($_.Group | Measure-Object -Property rabbitReady -Maximum).Maximum
+                    PeakRabbitUnacked = ($_.Group | Measure-Object -Property rabbitUnacked -Maximum).Maximum
+                    PeakMysqlThreads = ($_.Group | Measure-Object -Property mysqlThreadsConnected -Maximum).Maximum
+                }
+            } |
+            Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+
+        # Client RPS counts accepted requests. This is the rate rows actually landed in MySQL,
+        # which is what separates "the load generator asked for more" from "the server wrote more".
+        Write-Host "-- peak observed insert rate (rows/s between samples) --"
+        Import-Csv $pipelineCsv |
+            Group-Object phase |
+            ForEach-Object {
+                $rows = @($_.Group | Sort-Object timestamp)
+                $peak = 0d
+                for ($index = 1; $index -lt $rows.Count; $index++) {
+                    $seconds = ([datetime]$rows[$index].timestamp - [datetime]$rows[$index - 1].timestamp).TotalSeconds
+                    if ($seconds -le 0) { continue }
+                    $delta = [double]$rows[$index].submissionRows - [double]$rows[$index - 1].submissionRows
+                    $rate = $delta / $seconds
+                    if ($rate -gt $peak) { $peak = $rate }
+                }
+                [pscustomobject]@{ Phase = $_.Name; PeakInsertRowsPerSecond = [math]::Round($peak, 1) }
+            } |
+            Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+    }
+
+    if (Test-Path $bulkStatsCsv) {
+        Write-Host "-- submission bulk metrics per phase --"
+        Import-Csv $bulkStatsCsv | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+    }
+}
+
 function New-Seed {
     $request = @{
         prefix = $seedPrefix
@@ -272,7 +465,14 @@ function New-Seed {
 }
 
 function Invoke-GatlingScenario {
-    param([Parameter(Mandatory = $true)]$Seed, [Parameter(Mandatory = $true)][string]$SelectedScenario)
+    param(
+        [Parameter(Mandatory = $true)]$Seed,
+        [Parameter(Mandatory = $true)][string]$SelectedScenario,
+        # Exploration scenarios are meant to be pushed past the point where they fail. Their
+        # assertion result is data, not a verdict, and tearing the stack down would discard the
+        # samples that say where the limit was.
+        [switch]$AllowAssertionFailure
+    )
 
     $shared = @(
         "-Dperf.baseUrl=$baseUrl",
@@ -305,6 +505,19 @@ function Invoke-GatlingScenario {
             $minRequests = 135000L
             $script:expectedSubmissionCount = $minRequests
             $scenarioArgs = @("-Dperf.targetRps=1000", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=120") + $seedArgs
+        }
+        "step" {
+            # A staircase finds the rate the stack sustains cleanly. A fixed-RPS pass/fail run only
+            # says whether one chosen rate worked.
+            $simulationClass = "my.oj.perf.ContestSubmissionStepLoadSimulation"
+            $minRequests = 1L
+            $scenarioArgs = @(
+                "-Dperf.startRps=$StepStartRps",
+                "-Dperf.stepRps=$StepRps",
+                "-Dperf.maxRps=$StepMaxRps",
+                "-Dperf.rampSeconds=$StepRampSeconds",
+                "-Dperf.stepHoldSeconds=$StepHoldSeconds"
+            ) + $seedArgs
         }
         "scoreboard-200" {
             $simulationClass = "my.oj.perf.ContestScoreboardReadSimulation"
@@ -355,9 +568,21 @@ function Invoke-GatlingScenario {
         "-rd", "oj-loadtest $SelectedScenario"
     )
 
-    & $javaExe @javaArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "Gatling assertions failed for $SelectedScenario."
+    $sampler = Start-LoadSampler -Phase $SelectedScenario
+    try {
+        & $javaExe @javaArgs
+        $gatlingExitCode = $LASTEXITCODE
+    }
+    finally {
+        Stop-LoadSampler -Sampler $sampler
+    }
+    Save-WebMetricsSnapshot -Phase $SelectedScenario
+
+    if ($gatlingExitCode -ne 0) {
+        if (-not $AllowAssertionFailure) {
+            throw "Gatling assertions failed for $SelectedScenario."
+        }
+        Write-Host "Gatling assertions failed for $SelectedScenario; continuing because this is an exploration scenario."
     }
 }
 
@@ -378,6 +603,8 @@ try {
     $started = $true
     Invoke-LoadCompose -Arguments @("up", "-d", "--build")
     Wait-Healthy
+    Reset-LoadBalancer
+    Assert-WebDistribution
     Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
 
     Reset-LoadRedis
@@ -398,6 +625,9 @@ try {
         Assert-PipelineMaterialized -ContestId $seed.contestId
         Invoke-GatlingScenario -Seed $seed -SelectedScenario "scoreboard-300"
     }
+    elseif ($Scenario -eq "step") {
+        Invoke-GatlingScenario -Seed $seed -SelectedScenario "step" -AllowAssertionFailure
+    }
     elseif ($Scenario -in @("scoreboard-200", "scoreboard-300", "scoreboard-2000")) {
         Write-Host "Populating the Redis scoreboard through the full submission pipeline first."
         Invoke-GatlingScenario -Seed $seed -SelectedScenario "submit-139"
@@ -417,6 +647,10 @@ try {
     Assert-NoOomKilled
 }
 finally {
+    # Runs before teardown so a failed run still reports where the pressure was.
+    if (Test-Path $metricsRoot) {
+        Show-MetricsSummary
+    }
     if ($started -and -not $KeepStack) {
         if ($RemoveData) {
             Invoke-LoadCompose -Arguments @("down", "-v")

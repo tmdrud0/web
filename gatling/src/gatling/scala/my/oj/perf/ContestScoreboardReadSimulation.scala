@@ -24,10 +24,15 @@ class ContestScoreboardReadSimulation extends Simulation {
   require(maxStartRank >= minStartRank, "perf.startRank.max must be greater than or equal to perf.startRank.min")
   require(pageSize > 0, "perf.pageSize must be greater than 0")
 
+  // Without a shared pool every virtual user opens its own connection, so a few hundred RPS
+  // exhausts the Windows ephemeral port range (16,384 ports, 120s TIME_WAIT) and the run fails
+  // with BindException long before the server is loaded. nginx keeps 256 upstream connections
+  // alive for 10,000 requests each, so sharing is also what the real read path looks like.
   private val httpProtocol = http
     .baseUrl(baseUrl)
     .acceptHeader("application/json")
     .userAgentHeader("Gatling")
+    .shareConnections
 
   private val feeder = Iterator.continually {
     Map("startRank" -> Random.between(minStartRank, maxStartRank + 1))
