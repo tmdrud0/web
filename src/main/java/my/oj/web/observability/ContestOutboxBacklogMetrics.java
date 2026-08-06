@@ -92,19 +92,31 @@ public class ContestOutboxBacklogMetrics implements MeterBinder {
             """;
 
     /**
-     * {@code due_at} is the single column the worker claims on (V15), and it is NULL exactly for
-     * COMPLETED rows, so {@code idx_cs_outbox_due (due_at, id)} hands over the head of the queue
-     * in one index entry. Reading the same column the claim query orders by means this measures
-     * the delay the worker will actually see next.
+     * PENDING only, matching the judge query, because the three active statuses are three
+     * different signals. A FAILED row is legitimately old while its exponential backoff runs, and
+     * a PROCESSING row is legitimately old while its lease runs; neither means work is piling up.
+     * Ranging over all three would put "throughput is short" and "one row has been retrying for
+     * an hour" into one number. The FAILED count carries the second on its own.
      *
-     * <p>Negative for a row whose retry backoff has not elapsed and for a PROCESSING row inside
-     * its lease. Both mean nothing is overdue, and the caller clamps them to zero.
+     * <p>PENDING needs no "and it is due" clause: {@code due_at} is stamped at insert, so a
+     * PENDING row is claimable from the moment it exists.
+     *
+     * <p>Claiming sets status and {@code claimed_at} together and both completion paths clear
+     * them, so PENDING implies a NULL {@code claimed_at}. Within that range
+     * {@code idx_cs_outbox_claim (status, claimed_at, created_at, id)} is ordered by
+     * {@code created_at}, making the first index entry the oldest row - one index entry, then one
+     * row lookup for {@code due_at}.
+     *
+     * <p>The value comes from {@code due_at} rather than the {@code created_at} the ordering uses,
+     * because {@code created_at} is written by the JVM while {@code due_at} is stamped by
+     * {@code CURRENT_TIMESTAMP(6)}. Subtracting a JVM timestamp from MySQL's clock would fold the
+     * skew between them into every reading as a constant bias.
      */
     private static final String SCOREBOARD_HEAD_LAG_SQL = """
             SELECT TIMESTAMPDIFF(MICROSECOND, due_at, CURRENT_TIMESTAMP(6))
             FROM contest_submission_outbox
-            WHERE due_at IS NOT NULL
-            ORDER BY due_at, id
+            WHERE status = 'PENDING'
+            ORDER BY claimed_at, created_at, id
             LIMIT 1
             """;
 
@@ -146,9 +158,11 @@ public class ContestOutboxBacklogMetrics implements MeterBinder {
                         "contest.outbox.head.lag", micros, value -> value.get() / 1_000_000.0)
                 .tag("outbox", outbox)
                 .baseUnit("seconds")
-                .description("How long the row at the head of this outbox has been claimable "
-                        + "without being claimed. Unlike a drain-rate estimate this still moves "
-                        + "when one row is stuck behind a backlog that is otherwise draining")
+                .description("How long the oldest PENDING row has been waiting. PENDING only: a "
+                        + "row in retry backoff or inside a processing lease is old for a reason "
+                        + "that is not a shortage of throughput, and the FAILED and PUBLISHING "
+                        + "counts carry those. Unlike a drain-rate estimate this still moves when "
+                        + "one row is stuck behind a backlog that is otherwise draining")
                 .register(registry));
         this.pollFailures = pollFailureCounter(registry);
     }
@@ -188,7 +202,9 @@ public class ContestOutboxBacklogMetrics implements MeterBinder {
             // written on every poll. Leaving one untouched would pin it at its last value.
             STATUSES.get(outbox).forEach(status ->
                     backlogRows.get(new BacklogKey(outbox, status)).set(byStatus.getOrDefault(status, 0L)));
-            // Empty means an empty outbox, which is a lag of zero rather than an unknown one.
+            // Empty means no PENDING row, which is a lag of zero rather than an unknown one. The
+            // floor is for clock movement between the insert and the read, not for backoff: both
+            // queries are PENDING-only, and a PENDING row is due from the moment it is written.
             Long lagMicros = headLag.isEmpty() ? null : headLag.get(0);
             headLagMicros.get(outbox).set(lagMicros == null ? 0L : Math.max(0L, lagMicros));
         } catch (RuntimeException e) {

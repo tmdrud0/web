@@ -147,18 +147,40 @@ class ContestOutboxBacklogMetricsMySqlIntegrationTests {
     }
 
     /**
-     * A FAILED row waiting out its retry backoff is not overdue, and neither is a PROCESSING row
-     * inside its lease. Both have a due_at ahead of now, which the query returns as a negative.
+     * The split the head-lag gauge exists to keep: a row in exponential backoff is legitimately
+     * old, and reporting that age as backlog would say "throughput is short" about a row that is
+     * waiting on purpose. Its FAILED count is the signal for it instead.
+     *
+     * <p>Asserted with the backoff already elapsed, which is the case an "overdue by due_at"
+     * query would have picked up. A future due_at proves nothing here - it would read zero under
+     * either definition.
      */
     @Test
-    void reportsNoLagWhileTheOnlyRowIsStillWaitingForItsRetry() {
-        insertScoreboardOutbox("FAILED", 3_600);
+    void leavesARetryingRowOutOfTheBacklogAge() {
+        insertScoreboardOutbox("FAILED", -3_600);
+        insertScoreboardOutbox("PROCESSING", -3_600);
 
         ContestOutboxBacklogMetrics metrics = metrics(1_000);
         metrics.poll();
 
         assertThat(backlog("scoreboard", "FAILED")).isGreaterThanOrEqualTo(1.0);
-        assertThat(headLag("scoreboard")).isZero();
+        assertThat(backlog("scoreboard", "PROCESSING")).isGreaterThanOrEqualTo(1.0);
+        assertThat(headLag("scoreboard"))
+                .as("an hour-old FAILED row is a stuck row, not a deep queue")
+                .isZero();
+    }
+
+    /** The same row set, plus one PENDING row, which is the one the age is meant to see. */
+    @Test
+    void reportsTheOldestPendingRowPastTheRetryingOnes() {
+        insertScoreboardOutbox("FAILED", -3_600);
+        insertScoreboardOutbox("PROCESSING", -3_600);
+        insertScoreboardOutbox("PENDING", -45);
+
+        ContestOutboxBacklogMetrics metrics = metrics(1_000);
+        metrics.poll();
+
+        assertThat(headLag("scoreboard")).isBetween(45.0, 3_000.0);
     }
 
     private ContestOutboxBacklogMetrics metrics(int maxCountedRows) {

@@ -251,16 +251,25 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
   (`contest.outbox.metrics.max-counted-rows`, 기본 100000). backlog가 상한을 넘으면 게이지는
   상한값을 보고하므로 **실제보다 작은 값**이다. 모든 알림 임계값은 상한보다 한참 아래이므로
   잘린 값이 알림을 가리지는 못한다. 측정값은 이 문서 §10에 있다.
-- **judge outbox의 head lag는 PENDING만 본다.** `PUBLISHING`에서 멈춘 행은 개수에는 잡히지만
-  나이에는 잡히지 않는다. relay가 lease 만료 후 그 행을 다시 claim하면서 상태를 계속
-  `PUBLISHING`으로 두기 때문이다. scoreboard outbox는 `due_at` 하나로 세 상태를 모두 덮으므로
-  이 구멍이 없다.
+- **head lag는 두 outbox 모두 PENDING만 본다.** 의도한 설계다(§10). `PUBLISHING`에서 멈춘
+  행, backoff 중인 `FAILED` 행, lease 안의 `PROCESSING` 행은 **개수에는 잡히지만 나이에는
+  잡히지 않는다.** 이 상태들의 나이는 "처리량 부족"이 아니라 "재시도 중"을 뜻하므로 같은 값에
+  섞으면 두 신호가 구분되지 않는다. 나이가 0인데 `FAILED`나 `PUBLISHING` count가 올라가 있으면
+  막힌 행이 있는 것이다. 두 신호는 §11에서 서로 다른 알림이 된다.
+- **batch-1이 멈추면 backlog 신호도 멈춘다.** 게이지를 앱 안에 두고 소유 역할을 하나로 고정한
+  구조(§10의 (a))가 치르는 대가다. drain이 멈춘 바로 그 순간에 관측도 멈춘다. Prometheus는
+  마지막 값을 5분 유지한 뒤 시계열을 버리므로, 이 경우 알림은 `ContestOutboxDrainTimeTooLong`이
+  아니라 `OjAppInstanceDown`(node=batch-1)으로 온다. **batch-1의 down을 outbox 알림보다 먼저
+  읽어야 한다** — backlog 게이지가 평평한 것이 근거가 되지 못한다.
 - **아직 없는 지표.** 이 문서 §9·§10으로
   `docs/CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §10.1의 제출 파이프라인 항목과 §10.3의 outbox
-  항목은 채워졌다. 남은 것은 같은 문서 §10.1의 async in-flight·Tomcat accept queue·중복 응답 수와
+  항목("각 outbox의 상태별 count와 oldest age")은 채워졌다. 두 outbox 모두 활성 상태별 count와
+  PENDING oldest age가 Prometheus에서 조회되고, 부하로 쌓았다 빼는 곡선까지 실측했다(§10).
+  남은 것은 같은 문서 §10.1의 async in-flight·Tomcat accept queue·중복 응답 수와
   `ContestSubmissionBatchConsistencyException` 카운트, §10.5의 judge API latency histogram,
   listener retry/DLQ 이동 수, result writer queue depth, Redis pipeline latency, Lua 오류와
   `w:*` 필드 총량이다. 이들은 judge 역할과 Redis 경로에 있어 이번 작업 범위 밖이다.
+  §10.4의 RabbitMQ 큐별 지표는 별도 제약 항목으로 위에 있다.
 - **알림 임계값은 실측값이 아니다.** 규칙은 `observability/prometheus/rules/oj-pipeline.yml`에
   있고 숫자는 전부 출발점이다. 임계값을 정할 근거가 되는 실행 — 곡선이 나올 만큼 긴 hold,
   위의 "스크레이프 주기와 부하 실행 길이" 항목 — 이 아직 없다. 각 임계값이 무엇의 대리값인지는
@@ -421,8 +430,56 @@ outbox뿐이다. 나머지는 semaphore, 고정 크기 executor 큐, broker가 �
 | `contest.outbox.backlog` | Gauge (`outbox`, `status`) | `contest_outbox_backlog_rows` | batch-1 |
 | `contest.outbox.head.lag` | Gauge (`outbox`) | `contest_outbox_head_lag_seconds` | batch-1 |
 | `contest.outbox.backlog.poll.failures` | Counter | `contest_outbox_backlog_poll_failures_total` | batch-1 |
-| `contest.outbox.drained` | Counter (`outbox`) | `contest_outbox_drained_total` | relay / worker |
-| `contest.outbox.retries` | Counter (`outbox`) | `contest_outbox_retries_total` | relay / worker |
+| `contest.outbox.drained` | Counter (`outbox`) | `contest_outbox_drained_total` | 5개 역할 전부 등록, batch-1만 증가 |
+| `contest.outbox.retries` | Counter (`outbox`) | `contest_outbox_retries_total` | 5개 역할 전부 등록, batch-1만 증가 |
+
+drained/retries 두 카운터는 §9.4의 제출 파이프라인 지표처럼 다섯 역할 전부에서 등록된다.
+`ContestOutboxDrainMetrics`가 조건 없는 `@Component`여야 relay와 scheduler가 주입받을 수 있기
+때문이다. 실측으로 web-1·web-2·judge-1에도 시계열이 있는 것을 확인했다.
+
+**그런데 여기에는 `{role=...}` 필터를 붙이지 않았다.** §9.4와 다른 판단이고 이유가 있다.
+증가시키는 코드(relay, scheduler)는 batch-1에만 존재하므로 나머지 네 인스턴스의 값은 영원히
+정확히 0이다. 0인 시계열을 더해도 합은 변하지 않으므로 `sum()`이 정확하다. §9.4에서 필터가
+필요했던 것은 상한 게이지가 **0이 아닌 상수**를 다섯 번 보고해서 분모가 2.5배가 됐기
+때문이다.
+
+즉 판단 기준은 "몇 개 인스턴스가 등록하는가"가 아니라 **"등록만 하는 인스턴스가 0을 보고하는가
+아닌가"**다. 0이면 합산이 정확하고, 상수면 배수가 된다. `contest_outbox_backlog_rows`와
+`head_lag`는 batch-1에서만 등록되므로(위 표) 애초에 이 문제가 없다.
+
+### 앱 게이지인가 별도 exporter인가
+
+이 지표는 스택의 다른 모든 지표와 모양이 다르다. 나머지는 전부 인스턴스별 상태(이 JVM의 heap,
+이 컨테이너의 cgroup)인데 outbox backlog는 **전역 공유 DB 상태**다. 그래서 두 가지를 놓고
+비교했다.
+
+| | (a) 앱 게이지 + batch 역할 고정 | (b) sql_exporter 계열 별도 컨테이너 |
+|---|---|---|
+| 중복 시계열 | 소유 역할을 지정해서 막는다 | 구조적으로 1회 실행 |
+| status enum 결합 | 컴파일 타임에 묶인다 | SQL이 앱 밖에 살아 결합이 끊긴다 |
+| 스크레이프 경로 | 폴러를 따로 두면 DB 질의가 안 들어간다 | 구조적으로 안 들어간다 |
+| 예산 | 0 | 컨테이너 1개 추가 |
+| 소유 프로세스 정지 | **backlog 신호를 잃는다** | 신호가 유지된다 |
+
+**(a)를 골랐다.** 결정적인 근거는 두 가지다.
+
+첫째, (b)의 최대 장점인 "스크레이프 경로에 DB 질의가 안 들어간다"는 (a)에서도 얻을 수 있다.
+폴러를 스케줄러에 두고 게이지는 남겨진 값만 읽으면 된다(아래 항목). 이 구조를 택하는 순간
+(b)의 우위는 "소유 프로세스가 죽어도 신호가 유지된다" 하나로 줄어든다.
+
+둘째, status 문자열은 `ContestScoreboardOutboxStatus` enum과 claim/complete SQL에 이미
+박혀 있다. exporter로 빼면 같은 문자열이 리포의 두 곳에 살면서 컴파일러가 둘의 일치를 검사하지
+않는다. 상태 하나가 추가되거나 이름이 바뀌면 지표가 조용히 그 상태를 세지 않게 된다 — 이
+리포가 f94de98에서 이미 겪은 침묵 실패와 같은 모양이다.
+
+예산은 결정적이지 않았다. Alertmanager를 넣고도 관측 합계가 2.2 CPU / 2112M이라 12 CPU /
+14GB 안에 여유가 있다.
+
+**대신 (a)의 약점은 그대로 남는다.** batch-1이 죽으면 backlog 게이지가 멈춘다 — drain이
+멈춘 바로 그 순간이다. Prometheus는 마지막 값을 5분간 유지한 뒤 시계열을 버리므로, 알림은
+`ContestOutboxDrainTimeTooLong`이 아니라 `OjAppInstanceDown`(batch-1)으로 온다. §7에 제약으로
+적어두었다. 이 약점이 실제로 문제가 되면 그때 (b)로 옮기는 것이 맞고, 그 경우 위 표의 두 번째
+행(enum 결합)을 어떻게 지킬지가 그 작업의 핵심이 된다.
 
 ### 왜 batch-1 한 곳에서만 게시하는가
 
@@ -431,6 +488,9 @@ outbox뿐이다. 나머지는 semaphore, 고정 크기 executor 큐, broker가 �
 지표에서 옳은 연산인 `sum()`이 여기서는 backlog를 5배로 보고한다. batch-1이 두 drain을 모두
 소유하므로 읽는 것도 batch-1이 한다. `contest.outbox.metrics.enabled=false`가 web-role과
 judge-role에 있다.
+
+실측으로 `count(contest_outbox_backlog_rows)`가 5개(judge 2개 + scoreboard 3개),
+`count by (node) (...)`가 `batch-1` 하나만 반환하는 것을 확인했다.
 
 ### 왜 스크레이프 경로에서 질의하지 않는가
 
@@ -465,10 +525,74 @@ MySQL 8.0에서 실측한 계획과 시간이다. 두 테이블 각각 40만 행
 계속 자란다. 상한에 닿은 게이지는 실제보다 작은 값이지만, 그 시점은 이미 모든 임계값을 한참
 넘긴 상태다.
 
-head lag는 뺄셈을 MySQL 안에서 한다(`TIMESTAMPDIFF(..., CURRENT_TIMESTAMP(6))`). JVM 시계와
-DB 시계를 섞지 않기 위해서다. scoreboard 쪽은 worker가 claim할 때 쓰는 바로 그 `due_at`
-컬럼을 읽으므로, worker가 다음에 실제로 보게 될 지연을 잰다. 아직 due하지 않은 행(backoff
-중인 FAILED, lease 안에 있는 PROCESSING)은 음수로 나오고 0으로 자른다.
+### head lag가 PENDING만 보는 이유
+
+**활성 상태 3개는 서로 다른 신호다.** backoff 중인 FAILED 행은 정당하게 오래됐고, lease 안에
+있는 PROCESSING 행도 정당하게 오래됐다. 둘 다 "처리량이 부족하다"는 뜻이 아니다. 세 상태를
+한 값으로 뭉개면 "처리량이 모자란다"와 "뭔가 한 시간째 재시도 중이다"가 구분되지 않는다.
+
+그래서 두 outbox 모두 head lag는 **PENDING 행의 나이**만 잰다. stuck 신호는 FAILED count와
+PUBLISHING count가 따로 나른다. `ContestOutboxBacklogMetricsMySqlIntegrationTests`가 한
+시간 지난 FAILED·PROCESSING 행을 넣고 head lag가 0인 것을, 거기에 PENDING 행 하나를 더하면
+그 나이가 나오는 것을 고정한다.
+
+PENDING에 "그리고 due가 지났다"는 조건은 필요 없다. `due_at`은 insert 시점에 찍히므로 PENDING
+행은 생긴 순간부터 claim 가능하다.
+
+### head lag의 시계와 인덱스
+
+뺄셈은 MySQL 안에서 한다(`TIMESTAMPDIFF(..., CURRENT_TIMESTAMP(6))`). JVM 시계와 DB 시계를
+섞으면 스큐가 상수 편향으로 들어오고 음수가 시계 문제인지 지표 버그인지 구분되지 않는다.
+scoreboard 쪽 값이 `created_at`이 아니라 `due_at`인 이유도 이것이다 — `created_at`은 JVM이
+써 넣지만 `due_at`은 `CURRENT_TIMESTAMP(6)`로 찍힌다.
+
+두 질의 모두 `status='PENDING'`으로 좁힌 뒤 인덱스 순서의 첫 행 하나만 읽는다. PENDING이면
+`claimed_at`이 NULL이라는 불변식(claim이 둘을 함께 쓰고 완료 경로가 둘을 함께 지운다) 덕분에
+인덱스 범위 안의 첫 항목이 곧 가장 오래된 행이다. 40만 행 fixture에서 잰 값이다.
+
+| 질의 | 계획 | 시간 |
+|---|---|---:|
+| scoreboard head lag (PENDING only) | `idx_cs_outbox_claim` index lookup, 1행 | 0.18 ms |
+| judge head lag (PENDING only) | `idx_contest_judge_outbox_claim` index lookup, 1행 | 0.03 ms |
+| (기각) `MIN(created_at) WHERE status='PENDING'` | 같은 인덱스, **PENDING 19000행 전부** | 10.3 ms |
+| (기각) `due_at` 인덱스 + status 필터 | due_at 순서로 훑으며 비-PENDING을 버림 | 0.04 ms |
+
+`MIN(created_at)` 형태는 PENDING 행을 전부 읽는다 — backlog가 깊을수록 비싸지므로 **지표가
+필요한 바로 그 순간에 비싸진다.** `ORDER BY ... LIMIT 1`은 항상 1행이다.
+`contest_judge_outbox`의 인덱스에는 `created_at`이 없지만, `LIMIT 1` 덕분에 행 조회가 한 번뿐이라
+인덱스에 컬럼을 추가할 필요가 없었다.
+
+마지막 기각안은 이 fixture에서 0.04 ms로 싸 보이지만 계획이 `Filter: status='PENDING'`을
+인덱스 스캔 **뒤에** 둔다. due_at 순서 앞쪽에 비-PENDING 행이 길게 늘어서면 그만큼 훑는다.
+싸 보이는 것이 데이터 배치에 달려 있는 계획이라 쓰지 않았다.
+
+### 실측: backlog가 쌓였다가 빠지는 곡선
+
+격리 부하 스택(`oj-loadtest`)에 nginx를 통해 제출 2500건을 넣고 2초 간격으로 게이지를 읽었다.
+이 하드웨어에서는 relay가 5000행/s, scoreboard worker가 2500행/s를 빼므로 제출 부하만으로는
+backlog가 쌓이지 않는다. 그래서 **scoreboard worker만** `batch-size=1`,
+`poll-interval=3000ms`(약 0.33행/s)로 굶겼다. 행·insert·drain은 전부 실제 코드 경로이고
+drain 속도만 제한한 것이다.
+
+| 시각 | judge PENDING | scoreboard PENDING | judge lag | scoreboard lag |
+|---|---:|---:|---:|---:|
+| 17:56:51 | 0 | 0 | 0.0s | 0.0s |
+| 17:56:56 | 67 | 331 | 1.5s | 2.9s |
+| 17:57:11 | 5 | 1088 | 0.1s | 17.9s |
+| 17:57:40 | 0 | 2485 | 0.0s | 47.7s |
+| 17:58:09 | 0 | 2478 | 0.0s | **72.6s** |
+| 17:58:13 | 0 | 0 | 0.0s | 0.0s |
+
+읽을 것이 세 가지다.
+
+1. **judge outbox는 따라잡는다.** 같은 부하에서 PENDING이 67까지 튀었다가 곧 0으로 돌아오고
+   lag가 1.5초를 넘지 않는다. 굶긴 쪽과 정상인 쪽이 나란히 보인다.
+2. **17:57:40 → 17:58:09 구간이 count와 age를 같이 봐야 하는 이유다.** count는 2485에서
+   2478로 사실상 평평한데(-0.3%) age는 47.7초에서 72.6초로 계속 오른다. count만 보면 "아무
+   일도 없다", age를 같이 보면 "맨 앞 행이 늙고 있다"가 된다. 대시보드가 두 패널을 나란히
+   두는 근거가 이 구간이다.
+3. **17:58:09 → 17:58:13.** worker를 정상 설정으로 되돌리자 2478행이 한 샘플 안에 빠졌다.
+   500행/200ms면 약 1초 분량이므로 계산과 맞는다.
 
 ## 11. 알림
 
