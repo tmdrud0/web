@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("smoke", "target", "step", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed", "mixed-real")]
+    [ValidateSet("smoke", "target", "step", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed", "mixed-target", "mixed-real")]
     [string]$Scenario = "smoke",
     [int]$UserCount = 10000,
     [int]$ProblemCount = 5,
@@ -276,8 +276,23 @@ function Reset-WebMetrics {
     }
 }
 
+# FLUSHDB resets the Redis sequence counter to zero, so every redis_seq already stored in the
+# database becomes a value the next run will hand out again. That is exactly the signal section 5
+# of the pipeline history defines as a Redis rollback, and the recovery worker acts on it: it
+# requeues COMPLETED rows whose sequence now looks duplicated, they are applied a second time, and
+# their processed_at is rewritten long after the run. Measured on the first completing run - 946
+# sequence values shared between the previous contest and the current one, 924 rows at attempts=2,
+# and a scoreboard-applied tail of p99 31s and max 178s against 4.5s for everything that ran once.
+# The requeue loop was still firing five minutes after the load stopped.
+#
+# Redis and these two tables are one piece of state. Clearing half of it manufactures the failure
+# the recovery path exists to repair. The drain above guarantees every row is terminal before this
+# runs, so nothing in flight is discarded.
 function Reset-LoadRedis {
     Invoke-LoadCompose -Arguments @("exec", "-T", "redis", "redis-cli", "FLUSHDB") | Out-Null
+    Invoke-LoadCompose -Arguments @(
+        "exec", "-T", "mysql", "mysql", "-uroot", "-p1234", "-D", $dbName, "-Nse",
+        "DELETE FROM contest_submission_outbox; DELETE FROM contest_judge_outbox;") | Out-Null
 }
 
 function Get-ScoreboardSummary {
@@ -701,7 +716,7 @@ function Show-MetricsSummary {
         $crossCheckPassed = Test-ScoreboardStalenessAgainstHeadLag `
             -ScoreboardDistribution $staleness.Scoreboard `
             -SubmissionPhases $submissionPhases
-        if ($ScenarioName -in @("mixed", "mixed-real") -and -not $crossCheckPassed) {
+        if ($ScenarioName -in @("mixed", "mixed-target", "mixed-real") -and -not $crossCheckPassed) {
             $script:stalenessCrossCheckFailed = $true
         }
     }
@@ -789,6 +804,37 @@ function Invoke-GatlingScenario {
             $minRequests = 270000L
             $scenarioArgs = @("-Dperf.targetRps=2000", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=120", "-Dperf.contestId=$($Seed.contestId)", "-Dperf.startRank.min=1", "-Dperf.startRank.max=100000", "-Dperf.pageSize=100")
         }
+        # mixed at the rates each README scenario is documented to pass on its own, run together.
+        # mixed itself combines two loads the scenario table calls "not a pass criterion" -
+        # submit-1000 and scoreboard-2000 - so it is an overload observation and cannot produce a
+        # latency figure that means anything about the pipeline. Measured on the fixed budget: a
+        # web instance reaches its 1.0 CPU ceiling seven seconds into the ramp, around 470 reads
+        # per second, and both web instances plus judge-1 were OOM-killed once the submit peak
+        # arrived on top of that. 139 -> 200 submits against 300 reads leaves headroom, so a
+        # staleness distribution taken here describes the pipeline rather than the CPU limit.
+        #
+        # Counts follow the injection schedule: submits are (1+avg)/2*ramp + avg*avgHold +
+        # (avg+peak)/2*peakRamp + peak*peakHold = 35,865, reads are (1+rps)/2*ramp + rps*(avgHold
+        # + peakRamp + peakHold) = 67,515. The same arithmetic reproduces mixed's documented
+        # 95,865 and 450,015. Thirty requests of scheduling margin, as mixed uses.
+        "mixed-target" {
+            $simulationClass = "my.oj.perf.OjGoalLoadSimulation"
+            $minRequests = 103350L
+            $script:expectedSubmissionCount = 35835L
+            $scenarioArgs = @(
+                "-Dperf.rampSeconds=30",
+                "-Dperf.avgHoldSeconds=120",
+                "-Dperf.peakRampSeconds=30",
+                "-Dperf.peakHoldSeconds=60",
+                "-Dperf.submitAvgRps=139",
+                "-Dperf.submitPeakRps=200",
+                "-Dperf.readRps=300",
+                "-Dperf.startRank.min=1",
+                "-Dperf.startRank.max=100000",
+                "-Dperf.pageSize=100"
+            ) + $seedArgs
+        }
+
         "mixed" {
             $simulationClass = "my.oj.perf.OjGoalLoadSimulation"
             # Default schedule: 95,865 submissions + 450,015 reads. A 30-request scheduling
@@ -940,13 +986,13 @@ try {
         Invoke-GatlingScenario -Seed $seed -SelectedScenario $Scenario
     }
 
-    if ($Scenario -in @("submit-139", "submit-200", "submit-1000", "mixed", "mixed-real", "step")) {
+    if ($Scenario -in @("submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "mixed-real", "step")) {
         Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase $Scenario
     }
     else {
         Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
     }
-    if ($Scenario -in @("target", "submit-139", "submit-200", "submit-1000", "mixed", "mixed-real")) {
+    if ($Scenario -in @("target", "submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "mixed-real")) {
         Assert-PipelineMaterialized -ContestId $seed.contestId
         $pipelineValidated = $true
     }

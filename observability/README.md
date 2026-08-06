@@ -419,6 +419,33 @@ Admission 패널은 1600 대 4000, 여유 60%로 읽힌다. 유휴 상태에서�
 `contest_outbox_*`에는 `{role="web"}`을 붙이면 안 된다. batch-1이 유일한 게시자이므로
 아무것도 선택되지 않는다. 두 방향 모두 `PipelineMetricNamesTests`가 고정한다.
 
+### 9.5 staleness 꼬리를 읽기 전에 재시도부터 확인한다
+
+`redis_seq`는 Redis의 sequence 카운터가 발급하고 DB outbox에 저장된다. 그래서 **Redis만 비우고
+DB outbox 행을 남기면** 다음 실행이 같은 번호를 다시 발급하고, 그것이
+`docs/CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §5.2가 정의한 **Redis 롤백 신호와 구별되지 않는다.**
+복구 워커는 정상 동작한다 — 없는 장애를 만들어 준 쪽이 잘못이다.
+
+이때 나타나는 모양은 다음과 같다. 실측이다.
+
+| | 오염된 실행 | 정상 실행 |
+|---|---:|---:|
+| 겹친 `redis_seq` 값 | 946 | 0 |
+| `attempts > 1` 행 | 924 | **0** |
+| `scoreboard applied` p99 | 31.4s | **4.9s** |
+| `scoreboard applied` max | 178s | **13.3s** |
+
+`attempts = 1`인 행만 보면 오염된 실행에서도 최대 4.5초였다. **꼬리 전체가 재시도였다.**
+
+부수 증상이 두 가지 더 있다. `Wait-PipelineDrain`이 0을 보고 끝난 뒤 복구 워커가 `COMPLETED`
+행을 다시 큐에 넣으므로 **`processed_at`이 드레인 완료 후에 갱신되고**, 샘플러는 이미 멈춘
+뒤라 head-lag 교차 검증이 서로 다른 시간 구간을 비교해 `MISMATCH`를 낸다. 실측 실행에서
+샘플링은 07:46:18에 끝났는데 처리는 07:49:23까지 이어졌다. 그리고 이 되돌림은 수렴하지 않아
+**부하가 끝난 지 5분이 지나도 requeue 로그가 계속 찍혔다.**
+
+`gatling/run-loadtest.ps1`의 `Reset-LoadRedis`가 `FLUSHDB`와 함께 두 outbox 테이블을 비우는
+이유가 이것이다. Redis와 그 두 테이블은 한 덩어리 상태이고, 절반만 비우면 안 된다.
+
 ## 10. outbox backlog 지표
 
 `docs/CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §7 표에서 상한 없이 자라는 대기 위치는 두
@@ -636,11 +663,20 @@ V16부터 관련 시각을 `DATETIME(6)`으로 저장한다. V16 이전 행은 �
 조용한 scoreboard 조건과 비교한다. 실행별 원시 마이크로초 값은
 `var/loadtest-*/end-to-end-staleness.csv`에 남는다.
 
+첫 실측값이다. `mixed-target`(제출 139→200 RPS, 조회 300 RPS, 사용자 10,000명), web CPU가
+상한의 35~38%에 머문 조건이므로 자원 상한이 아니라 파이프라인을 잰 값이다.
+
 ```text
 -- end-to-end staleness --
-result queryable    p50 0.42s  p95 1.8s  p99 3.1s  max 4.7s   n=2500
-scoreboard applied  p50 0.61s  p95 2.4s  p99 4s    max 6.2s   n=2500
+result queryable    p50 0.352s  p95 3.498s  p99 4.347s  max 9.744s    n=35865
+scoreboard applied  p50 0.607s  p95 4.046s  p99 4.921s  max 13.270s   n=35865
 ```
+
+두 분포의 차이가 scoreboard outbox 단계의 비용이다. p50에서 0.26초, p99에서 0.57초로 작고,
+지연의 대부분은 judge 경로에 있다.
+
+**같은 실행에서 재시도(`attempts > 1`)는 0건이었다.** 이 값이 0이 아니면 아래 §9.5의 오염을
+먼저 의심한다. 재시도가 섞인 실행에서는 같은 조건인데도 p99가 31초, max가 178초까지 벌어졌다.
 
 하네스는 scoreboard p99와 같은 제출+drain 구간에서 샘플링한
 `contest_outbox_head_lag_seconds{outbox="scoreboard"}` 최댓값의 비율도 계산한다. 두 양수 값의
