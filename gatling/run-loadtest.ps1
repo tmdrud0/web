@@ -1,11 +1,12 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("smoke", "target", "step", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed")]
+    [ValidateSet("smoke", "target", "step", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed", "mixed-real")]
     [string]$Scenario = "smoke",
     [int]$UserCount = 10000,
     [int]$ProblemCount = 5,
     [int]$DurationMinutes = 240,
     [int]$DrainTimeoutSeconds = 300,
+    [int]$HealthTimeoutSeconds = 300,
     [int]$P95Millis = 10000,
     [string]$GatlingMaxHeap = "2g",
     [double]$StepStartRps = 200,
@@ -28,6 +29,9 @@ $seedPrefix = "loadtest"
 $expectedSubmissionCount = 0L
 $metricsRoot = Join-Path $repoRoot ("var\loadtest-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 $bulkStatsCsv = Join-Path $metricsRoot "bulk-stats.csv"
+$stalenessCsv = Join-Path $metricsRoot "end-to-end-staleness.csv"
+$httpSummaryCsv = Join-Path $metricsRoot "http-summary.csv"
+$script:stalenessCrossCheckFailed = $false
 
 function Invoke-SetupRequest {
     param(
@@ -101,8 +105,14 @@ function Assert-NormalStackStopped {
     }
 }
 
+# The five application JVMs take about 170s to open their ports on the fixed 7.5-CPU budget,
+# and `up -d --build` recreates them on every run, so this is the cold-start path every time
+# rather than only on the first. The old 180s deadline was also stricter than the healthcheck it
+# polls - compose allows interval 10s x retries 20 = 200s - so the script could fail a stack that
+# Docker was still willing to wait for, and did. Measured 06:53:38 start to 06:56:28 first
+# passing check, five instances within a second of each other.
 function Wait-Healthy {
-    param([int]$TimeoutSeconds = 180)
+    param([int]$TimeoutSeconds = $HealthTimeoutSeconds)
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
@@ -123,6 +133,20 @@ function Invoke-LoadSqlScalar {
 
     $value = Invoke-LoadCompose -Arguments @("exec", "-T", "mysql", "mysql", "-uroot", "-p1234", "-D", $dbName, "-Nse", $Sql)
     return [int64]($value | Select-Object -Last 1)
+}
+
+# Keep the scalar helper's contract intact. Distribution queries return one tab-separated row
+# with several values, so their caller must opt into this sibling explicitly.
+function Invoke-LoadSqlRow {
+    param([Parameter(Mandatory = $true)][string]$Sql)
+
+    $statement = ($Sql -replace "\r?\n", " ").Trim()
+    $rows = @(Invoke-LoadCompose -Arguments @("exec", "-T", "mysql", "mysql", "-uroot", "-p1234", "-D", $dbName, "-Nse", $statement))
+    $row = $rows | Select-Object -Last 1
+    if ([string]::IsNullOrWhiteSpace($row)) {
+        throw "SQL returned no row."
+    }
+    return $row -split "`t"
 }
 
 function Get-RabbitBacklog {
@@ -293,6 +317,141 @@ function Assert-PipelineMaterialized {
     Write-Host "Pipeline materialized: submissions=$submissionCount, results=$resultCount, scoreboardParticipants=$($scoreboard.totalParticipants)"
 }
 
+function Get-EndToEndLatencyDistribution {
+    param(
+        [Parameter(Mandatory = $true)][long]$ContestId,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("created_at", "processed_at")]
+        [string]$EndColumn,
+        [switch]$RequireResult
+    )
+
+    $resultJoin = if ($RequireResult) {
+        "JOIN contest_submission_result csr ON csr.submission_id = cs.id"
+    }
+    else {
+        ""
+    }
+    $sql = @"
+WITH latencies AS (
+    SELECT TIMESTAMPDIFF(MICROSECOND, cs.submitted_time, o.$EndColumn) AS latency_us
+    FROM contest_submission cs
+    JOIN contest_submission_outbox o ON o.contest_submission_id = cs.id
+    $resultJoin
+    WHERE cs.contest_id = $ContestId
+      AND o.$EndColumn IS NOT NULL
+), ranked AS (
+    SELECT latency_us,
+           ROW_NUMBER() OVER (ORDER BY latency_us) AS rn,
+           COUNT(*) OVER () AS sample_count
+    FROM latencies
+)
+SELECT COALESCE(MAX(CASE WHEN rn = CEIL(sample_count * 0.50) THEN latency_us END), 0),
+       COALESCE(MAX(CASE WHEN rn = CEIL(sample_count * 0.95) THEN latency_us END), 0),
+       COALESCE(MAX(CASE WHEN rn = CEIL(sample_count * 0.99) THEN latency_us END), 0),
+       COALESCE(MAX(latency_us), 0),
+       COALESCE(MAX(sample_count), 0)
+FROM ranked
+"@
+    $values = @(Invoke-LoadSqlRow -Sql $sql)
+    if ($values.Count -ne 5) {
+        throw "Expected five latency distribution fields but received $($values.Count): $($values -join ', ')"
+    }
+
+    return [pscustomobject]@{
+        P50Micros = [int64]$values[0]
+        P95Micros = [int64]$values[1]
+        P99Micros = [int64]$values[2]
+        MaxMicros = [int64]$values[3]
+        SampleCount = [int64]$values[4]
+    }
+}
+
+function Format-LatencySeconds {
+    param([Parameter(Mandatory = $true)][long]$Microseconds)
+
+    $seconds = [double]$Microseconds / 1000000d
+    return $seconds.ToString("0.######", [Globalization.CultureInfo]::InvariantCulture) + "s"
+}
+
+function Show-EndToEndStaleness {
+    param(
+        [Parameter(Mandatory = $true)][long]$ContestId,
+        [Parameter(Mandatory = $true)][string]$ScenarioName
+    )
+
+    # created_at is stamped after the result batch INSERT and the result/outbox rows commit in the
+    # same transaction. processed_at is stamped only after the Redis apply succeeds.
+    $result = Get-EndToEndLatencyDistribution -ContestId $ContestId -EndColumn "created_at" -RequireResult
+    $scoreboard = Get-EndToEndLatencyDistribution -ContestId $ContestId -EndColumn "processed_at"
+    if ($result.SampleCount -le 0 -or $scoreboard.SampleCount -le 0) {
+        throw "End-to-end staleness has no samples: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount)"
+    }
+    if ($result.SampleCount -ne $scoreboard.SampleCount) {
+        throw "End-to-end sample count mismatch: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount)"
+    }
+
+    Write-Host "-- end-to-end staleness --"
+    Write-Host ("result queryable    p50 {0}  p95 {1}  p99 {2}  max {3}   n={4}" -f
+        (Format-LatencySeconds $result.P50Micros),
+        (Format-LatencySeconds $result.P95Micros),
+        (Format-LatencySeconds $result.P99Micros),
+        (Format-LatencySeconds $result.MaxMicros),
+        $result.SampleCount)
+    Write-Host ("scoreboard applied  p50 {0}  p95 {1}  p99 {2}  max {3}   n={4}" -f
+        (Format-LatencySeconds $scoreboard.P50Micros),
+        (Format-LatencySeconds $scoreboard.P95Micros),
+        (Format-LatencySeconds $scoreboard.P99Micros),
+        (Format-LatencySeconds $scoreboard.MaxMicros),
+        $scoreboard.SampleCount)
+
+    @(
+        "scenario,metric,p50Micros,p95Micros,p99Micros,maxMicros,sampleCount",
+        "$ScenarioName,result-queryable,$($result.P50Micros),$($result.P95Micros),$($result.P99Micros),$($result.MaxMicros),$($result.SampleCount)",
+        "$ScenarioName,scoreboard-applied,$($scoreboard.P50Micros),$($scoreboard.P95Micros),$($scoreboard.P99Micros),$($scoreboard.MaxMicros),$($scoreboard.SampleCount)"
+    ) | Set-Content -Path $stalenessCsv -Encoding utf8
+
+    return [pscustomobject]@{ Result = $result; Scoreboard = $scoreboard }
+}
+
+function Test-ScoreboardStalenessAgainstHeadLag {
+    param(
+        [Parameter(Mandatory = $true)]$ScoreboardDistribution,
+        [Parameter(Mandatory = $true)][string[]]$SubmissionPhases
+    )
+
+    $pipelineCsv = Join-Path $metricsRoot "pipeline.csv"
+    if (-not (Test-Path $pipelineCsv)) {
+        Write-Host "head-lag cross-check  UNAVAILABLE (pipeline samples are missing)"
+        return $false
+    }
+
+    $samples = @(Import-Csv $pipelineCsv | Where-Object { $_.phase -in $SubmissionPhases })
+    if ($samples.Count -eq 0) {
+        Write-Host "head-lag cross-check  UNAVAILABLE (no samples for $($SubmissionPhases -join ', '))"
+        return $false
+    }
+
+    $peakLagMillis = ($samples | ForEach-Object { [double]$_.oldestPendingLagMs } |
+        Measure-Object -Maximum).Maximum
+    $scoreboardP99Millis = [double]$ScoreboardDistribution.P99Micros / 1000d
+    if ($peakLagMillis -le 0d -or $scoreboardP99Millis -le 0d) {
+        Write-Host ("head-lag cross-check  UNAVAILABLE (scoreboard p99={0}ms, sampled peak={1}ms)" -f
+            [math]::Round($scoreboardP99Millis, 3), [math]::Round($peakLagMillis, 3))
+        return $false
+    }
+
+    $ratio = [math]::Max($scoreboardP99Millis, $peakLagMillis) /
+        [math]::Min($scoreboardP99Millis, $peakLagMillis)
+    $status = if ($ratio -lt 10d) { "PASS" } else { "MISMATCH" }
+    Write-Host ("head-lag cross-check  {0}  scoreboard p99={1}ms  sampled peak={2}ms  ratio={3}x" -f
+        $status,
+        [math]::Round($scoreboardP99Millis, 3),
+        [math]::Round($peakLagMillis, 3),
+        [math]::Round($ratio, 2))
+    return $status -eq "PASS"
+}
+
 function Show-WebMetrics {
     param([Parameter(Mandatory = $true)][long]$ContestId)
 
@@ -354,6 +513,23 @@ function Stop-LoadSampler {
     Remove-Item $Sampler.StopFile -Force -ErrorAction SilentlyContinue
 }
 
+function Wait-PipelineDrainWithSampling {
+    param(
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string]$Phase
+    )
+
+    # The end-to-end query includes rows completed after injection stops. Keep sampling under the
+    # same phase name during drain so the head-lag maximum covers that identical interval.
+    $sampler = Start-LoadSampler -Phase $Phase
+    try {
+        Wait-PipelineDrain -TimeoutSeconds $TimeoutSeconds
+    }
+    finally {
+        Stop-LoadSampler -Sampler $sampler
+    }
+}
+
 # The bulk metrics are cumulative counters, so a snapshot per phase is what makes chunk size,
 # admission pressure and completion-queue depth attributable to one scenario.
 function Save-WebMetricsSnapshot {
@@ -381,7 +557,48 @@ function Save-WebMetricsSnapshot {
     }
 }
 
+function Save-GatlingHttpSummary {
+    param(
+        [Parameter(Mandatory = $true)][string]$Phase,
+        [Parameter(Mandatory = $true)][string]$ResultsFolder,
+        [Parameter(Mandatory = $true)][datetime]$RunStartedAt
+    )
+
+    $report = Get-ChildItem -Path $ResultsFolder -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $RunStartedAt.AddSeconds(-2) } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if (-not $report) {
+        Write-Host "Gatling HTTP summary unavailable: no report directory was created for $Phase."
+        return
+    }
+
+    $globalStatsPath = Join-Path $report.FullName "js\global_stats.json"
+    if (-not (Test-Path $globalStatsPath)) {
+        Write-Host "Gatling HTTP summary unavailable: $globalStatsPath is missing."
+        return
+    }
+
+    $stats = Get-Content -Path $globalStatsPath -Raw | ConvertFrom-Json
+    $total = [int64]$stats.numberOfRequests.total
+    $ok = [int64]$stats.numberOfRequests.ok
+    $ko = [int64]$stats.numberOfRequests.ko
+    $successPercent = if ($total -gt 0) { [math]::Round(100d * $ok / $total, 4) } else { 0d }
+    $p95Millis = [int64]$stats.percentiles3.total
+
+    if (-not (Test-Path $httpSummaryCsv)) {
+        Add-Content -Path $httpSummaryCsv -Encoding utf8 -Value "phase,totalRequests,successfulRequests,failedRequests,successPercent,p95Millis,reportDirectory"
+    }
+    Add-Content -Path $httpSummaryCsv -Encoding utf8 -Value `
+        "$Phase,$total,$ok,$ko,$successPercent,$p95Millis,$($report.Name)"
+}
+
 function Show-MetricsSummary {
+    param(
+        [long]$ContestId = 0,
+        [string]$ScenarioName = ""
+    )
+
     $containerCsv = Join-Path $metricsRoot "containers.csv"
     $pipelineCsv = Join-Path $metricsRoot "pipeline.csv"
 
@@ -389,17 +606,29 @@ function Show-MetricsSummary {
     Write-Host "=== Sampled metrics: $metricsRoot ==="
 
     if (Test-Path $containerCsv) {
-        Write-Host "-- peak container CPU and memory per phase --"
+        Write-Host "-- peak container CPU, throttling, and memory per phase --"
         Import-Csv $containerCsv |
             Group-Object phase, container |
             ForEach-Object {
                 $peakCpu = ($_.Group | Measure-Object -Property cpuPercent -Maximum).Maximum
                 $peakMem = ($_.Group | Measure-Object -Property memUsedMb -Maximum).Maximum
                 $limit = ($_.Group | Select-Object -Last 1).memLimitMb
+                $throttleRows = @($_.Group |
+                    Where-Object { $_.cpuPeriods -match '^[0-9]+$' -and $_.cpuThrottledPeriods -match '^[0-9]+$' } |
+                    Sort-Object timestamp)
+                $throttledRatio = $null
+                if ($throttleRows.Count -ge 2) {
+                    $periodDelta = [double]$throttleRows[-1].cpuPeriods - [double]$throttleRows[0].cpuPeriods
+                    $throttledDelta = [double]$throttleRows[-1].cpuThrottledPeriods - [double]$throttleRows[0].cpuThrottledPeriods
+                    if ($periodDelta -gt 0d) {
+                        $throttledRatio = [math]::Round(100d * $throttledDelta / $periodDelta, 2)
+                    }
+                }
                 [pscustomobject]@{
                     Phase = $_.Group[0].phase
                     Container = $_.Group[0].container
                     PeakCpuPercent = [math]::Round([double]$peakCpu, 1)
+                    ThrottledRatioPercent = $throttledRatio
                     PeakMemMb = [math]::Round([double]$peakMem, 1)
                     MemLimitMb = $limit
                 }
@@ -413,12 +642,17 @@ function Show-MetricsSummary {
         Import-Csv $pipelineCsv |
             Group-Object phase |
             ForEach-Object {
+                $peakScoreboardOutbox = ($_.Group | ForEach-Object {
+                    [int64]$_.scoreboardPending + [int64]$_.scoreboardProcessing + [int64]$_.scoreboardFailed
+                } | Measure-Object -Maximum).Maximum
                 [pscustomobject]@{
                     Phase = $_.Name
                     PeakJudgeOutbox = ($_.Group | Measure-Object -Property judgeOutboxPending -Maximum).Maximum
+                    PeakJudgeHeadLagMs = ($_.Group | Measure-Object -Property judgeHeadLagMs -Maximum).Maximum
+                    PeakScoreboardOutbox = $peakScoreboardOutbox
                     PeakScoreboardPending = ($_.Group | Measure-Object -Property scoreboardPending -Maximum).Maximum
                     PeakScoreboardFailed = ($_.Group | Measure-Object -Property scoreboardFailed -Maximum).Maximum
-                    PeakLagMs = ($_.Group | Measure-Object -Property oldestPendingLagMs -Maximum).Maximum
+                    PeakScoreboardHeadLagMs = ($_.Group | Measure-Object -Property oldestPendingLagMs -Maximum).Maximum
                     PeakRabbitReady = ($_.Group | Measure-Object -Property rabbitReady -Maximum).Maximum
                     PeakRabbitUnacked = ($_.Group | Measure-Object -Property rabbitUnacked -Maximum).Maximum
                     PeakMysqlThreads = ($_.Group | Measure-Object -Property mysqlThreadsConnected -Maximum).Maximum
@@ -449,6 +683,27 @@ function Show-MetricsSummary {
     if (Test-Path $bulkStatsCsv) {
         Write-Host "-- submission bulk metrics per phase --"
         Import-Csv $bulkStatsCsv | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+    }
+
+    if (Test-Path $httpSummaryCsv) {
+        Write-Host "-- Gatling HTTP summary per phase --"
+        Import-Csv $httpSummaryCsv | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+    }
+
+    if ($ContestId -gt 0) {
+        $staleness = Show-EndToEndStaleness -ContestId $ContestId -ScenarioName $ScenarioName
+        $submissionPhases = switch ($ScenarioName) {
+            "smoke" { @("submit-139") }
+            "target" { @("submit-200") }
+            { $_ -in @("scoreboard-200", "scoreboard-300", "scoreboard-2000") } { @("submit-139") }
+            default { @($ScenarioName) }
+        }
+        $crossCheckPassed = Test-ScoreboardStalenessAgainstHeadLag `
+            -ScoreboardDistribution $staleness.Scoreboard `
+            -SubmissionPhases $submissionPhases
+        if ($ScenarioName -in @("mixed", "mixed-real") -and -not $crossCheckPassed) {
+            $script:stalenessCrossCheckFailed = $true
+        }
     }
 }
 
@@ -536,8 +791,47 @@ function Invoke-GatlingScenario {
         }
         "mixed" {
             $simulationClass = "my.oj.perf.OjGoalLoadSimulation"
-            $minRequests = 1L
-            $scenarioArgs = $seedArgs
+            # Default schedule: 95,865 submissions + 450,015 reads. A 30-request scheduling
+            # margin still proves that both populations really ran instead of accepting one hit.
+            $minRequests = 545850L
+            $script:expectedSubmissionCount = 95835L
+            $scenarioArgs = @(
+                "-Dperf.rampSeconds=30",
+                "-Dperf.avgHoldSeconds=120",
+                "-Dperf.peakRampSeconds=30",
+                "-Dperf.peakHoldSeconds=60",
+                "-Dperf.submitAvgRps=139",
+                "-Dperf.submitPeakRps=1000",
+                "-Dperf.readRps=2000",
+                "-Dperf.startRank.min=1",
+                "-Dperf.startRank.max=100000",
+                "-Dperf.pageSize=100"
+            ) + $seedArgs
+        }
+        "mixed-real" {
+            $simulationClass = "my.oj.perf.OjRealPathGoalLoadSimulation"
+            # The closed submission model targets the same 95,865 logical submissions as mixed.
+            # Session setup and initial jitter happen on the measured web path, so allow roughly
+            # four percent scheduling margin while still requiring the full 450,015-read shape.
+            # Each accepted submission contributes its POST and checked redirect to Gatling's
+            # request total; the 3,100 peak sessions also each load login, authenticate, and load
+            # the submission form once.
+            $minRequests = 640000L
+            $script:expectedSubmissionCount = 92000L
+            $scenarioArgs = @(
+                "-Dperf.rampSeconds=30",
+                "-Dperf.avgHoldSeconds=120",
+                "-Dperf.peakRampSeconds=30",
+                "-Dperf.peakHoldSeconds=60",
+                "-Dperf.submitAvgRps=139",
+                "-Dperf.submitPeakRps=1000",
+                "-Dperf.readRps=2000",
+                "-Dperf.submitIntervalMillis=3100",
+                "-Dperf.initialJitterMillis=3000",
+                "-Dperf.userPrefix=$seedPrefix",
+                "-Dperf.userIndex.start=1",
+                "-Dperf.userIndex.end=$UserCount"
+            ) + $seedArgs
         }
         default { throw "Unsupported Gatling scenario: $SelectedScenario" }
     }
@@ -568,6 +862,7 @@ function Invoke-GatlingScenario {
         "-rd", "oj-loadtest $SelectedScenario"
     )
 
+    $runStartedAt = Get-Date
     $sampler = Start-LoadSampler -Phase $SelectedScenario
     try {
         & $javaExe @javaArgs
@@ -576,6 +871,7 @@ function Invoke-GatlingScenario {
     finally {
         Stop-LoadSampler -Sampler $sampler
     }
+    Save-GatlingHttpSummary -Phase $SelectedScenario -ResultsFolder $resultsFolder -RunStartedAt $runStartedAt
     Save-WebMetricsSnapshot -Phase $SelectedScenario
 
     if ($gatlingExitCode -ne 0) {
@@ -588,6 +884,8 @@ function Invoke-GatlingScenario {
 
 Assert-NormalStackStopped
 $started = $false
+$seed = $null
+$pipelineValidated = $false
 try {
     Invoke-LoadCompose -Arguments @("config") | Out-Null
     Push-Location $repoRoot
@@ -615,14 +913,16 @@ try {
 
     if ($Scenario -eq "smoke") {
         Invoke-GatlingScenario -Seed $seed -SelectedScenario "submit-139"
-        Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
+        Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase "submit-139"
         Assert-PipelineMaterialized -ContestId $seed.contestId
+        $pipelineValidated = $true
         Invoke-GatlingScenario -Seed $seed -SelectedScenario "scoreboard-200"
     }
     elseif ($Scenario -eq "target") {
         Invoke-GatlingScenario -Seed $seed -SelectedScenario "submit-200"
-        Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
+        Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase "submit-200"
         Assert-PipelineMaterialized -ContestId $seed.contestId
+        $pipelineValidated = $true
         Invoke-GatlingScenario -Seed $seed -SelectedScenario "scoreboard-300"
     }
     elseif ($Scenario -eq "step") {
@@ -631,32 +931,49 @@ try {
     elseif ($Scenario -in @("scoreboard-200", "scoreboard-300", "scoreboard-2000")) {
         Write-Host "Populating the Redis scoreboard through the full submission pipeline first."
         Invoke-GatlingScenario -Seed $seed -SelectedScenario "submit-139"
-        Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
+        Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase "submit-139"
         Assert-PipelineMaterialized -ContestId $seed.contestId
+        $pipelineValidated = $true
         Invoke-GatlingScenario -Seed $seed -SelectedScenario $Scenario
     }
     else {
         Invoke-GatlingScenario -Seed $seed -SelectedScenario $Scenario
     }
 
-    Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
-    if ($Scenario -in @("target", "submit-139", "submit-200", "submit-1000", "mixed")) {
+    if ($Scenario -in @("submit-139", "submit-200", "submit-1000", "mixed", "mixed-real", "step")) {
+        Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase $Scenario
+    }
+    else {
+        Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
+    }
+    if ($Scenario -in @("target", "submit-139", "submit-200", "submit-1000", "mixed", "mixed-real")) {
         Assert-PipelineMaterialized -ContestId $seed.contestId
+        $pipelineValidated = $true
     }
     Show-WebMetrics -ContestId $seed.contestId
     Assert-NoOomKilled
 }
 finally {
-    # Runs before teardown so a failed run still reports where the pressure was.
-    if (Test-Path $metricsRoot) {
-        Show-MetricsSummary
-    }
-    if ($started -and -not $KeepStack) {
-        if ($RemoveData) {
-            Invoke-LoadCompose -Arguments @("down", "-v")
-        }
-        else {
-            Invoke-LoadCompose -Arguments @("down")
+    try {
+        # Runs before teardown so a failed run still reports where the pressure was. End-to-end
+        # SQL needs the materialization invariant, so only query it after that check passed.
+        if (Test-Path $metricsRoot) {
+            $summaryContestId = if ($pipelineValidated) { [long]$seed.contestId } else { 0L }
+            Show-MetricsSummary -ContestId $summaryContestId -ScenarioName $Scenario
         }
     }
+    finally {
+        if ($started -and -not $KeepStack) {
+            if ($RemoveData) {
+                Invoke-LoadCompose -Arguments @("down", "-v")
+            }
+            else {
+                Invoke-LoadCompose -Arguments @("down")
+            }
+        }
+    }
+}
+
+if ($script:stalenessCrossCheckFailed) {
+    throw "$Scenario end-to-end scoreboard p99 did not match the sampled scoreboard head-lag maximum within one order of magnitude."
 }

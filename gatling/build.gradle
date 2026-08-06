@@ -84,3 +84,9 @@ registerSimulationTask(
     'Runs only OjGoalLoadSimulation.'
 )
 
+registerSimulationTask(
+    'ojRealPathGoalLoadRun',
+    '**/OjRealPathGoalLoadSimulation.scala',
+    'Runs only OjRealPathGoalLoadSimulation.'
+)
+

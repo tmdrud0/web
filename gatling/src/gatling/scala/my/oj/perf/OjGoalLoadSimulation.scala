@@ -39,11 +39,17 @@ class OjGoalLoadSimulation extends Simulation {
 
   private val readHoldSeconds = avgHoldSeconds + peakRampSeconds + peakHoldSeconds
 
+  // Without a shared pool every virtual user opens its own connection, so the 2000 RPS read
+  // stream exhausts the Windows ephemeral port range (16,384 ports, 120s TIME_WAIT) within
+  // seconds. Measured without it: BindException on 100% of requests, climbing past 55,000 while
+  // the server sat idle - a client-side limit reported as a server result. This was the last
+  // simulation still missing the setting that 1625d55 applied to the others.
   private val httpProtocol = http
     .baseUrl(baseUrl)
     .acceptHeader("application/json")
     .contentTypeHeader("application/json")
     .userAgentHeader("Gatling")
+    .shareConnections
 
   private val submitFeeder = Iterator.continually {
     val userId = Random.between(userIdStart, userIdEnd + 1)

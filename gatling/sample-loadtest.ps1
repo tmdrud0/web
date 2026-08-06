@@ -25,16 +25,17 @@ $composeArgs = @("-p", $ProjectName, "-f", "compose.yaml", "-f", "compose.loadte
 $containerCsv = Join-Path $OutputDirectory "containers.csv"
 $pipelineCsv = Join-Path $OutputDirectory "pipeline.csv"
 
-# One statement keeps the whole pipeline snapshot on a single MySQL round trip. due_at is the
-# indexed "claimable at" column, so the largest positive age over non-COMPLETED rows is how long
-# the oldest undrained scoreboard event has been waiting.
+# One statement keeps the whole pipeline snapshot on a single MySQL round trip. The lag subquery
+# deliberately matches contest_outbox_head_lag_seconds for both outboxes: PENDING only, ordered
+# through each claim index, with MySQL's clock on both sides of the subtraction.
 $pipelineSql = @(
     "SELECT"
     "(SELECT COUNT(*) FROM contest_judge_outbox WHERE status <> 'PUBLISHED'),"
+    "(SELECT COALESCE((SELECT TIMESTAMPDIFF(MICROSECOND, created_at, CURRENT_TIMESTAMP(6)) DIV 1000 FROM contest_judge_outbox WHERE status = 'PENDING' ORDER BY claimed_at, id LIMIT 1), 0)),"
     "(SELECT COUNT(*) FROM contest_submission_outbox WHERE status = 'PENDING'),"
     "(SELECT COUNT(*) FROM contest_submission_outbox WHERE status = 'PROCESSING'),"
     "(SELECT COUNT(*) FROM contest_submission_outbox WHERE status = 'FAILED'),"
-    "(SELECT COALESCE(MAX(TIMESTAMPDIFF(MICROSECOND, due_at, CURRENT_TIMESTAMP(6))), 0) DIV 1000 FROM contest_submission_outbox WHERE status <> 'COMPLETED' AND due_at IS NOT NULL),"
+    "(SELECT COALESCE((SELECT TIMESTAMPDIFF(MICROSECOND, due_at, CURRENT_TIMESTAMP(6)) DIV 1000 FROM contest_submission_outbox WHERE status = 'PENDING' ORDER BY claimed_at, created_at, id LIMIT 1), 0)),"
     "(SELECT COUNT(*) FROM contest_submission),"
     "(SELECT COUNT(*) FROM contest_submission_result),"
     "(SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Threads_connected'),"
@@ -71,6 +72,37 @@ function ConvertTo-Megabytes {
     return $null
 }
 
+function Get-CpuThrottleCounters {
+    param([string]$ContainerName)
+
+    if ($ContainerName -notmatch '-web-[12](?:-[0-9]+)?$') {
+        return $null
+    }
+
+    $stats = @(& docker exec $ContainerName cat /sys/fs/cgroup/cpu.stat 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $stats.Count -eq 0) {
+        $stats = @(& docker exec $ContainerName cat /sys/fs/cgroup/cpu/cpu.stat 2>$null)
+    }
+    if ($LASTEXITCODE -ne 0 -or $stats.Count -eq 0) {
+        return $null
+    }
+
+    $periods = $null
+    $throttled = $null
+    foreach ($stat in $stats) {
+        if ($stat -match '^nr_periods\s+(?<value>[0-9]+)$') {
+            $periods = [int64]$Matches.value
+        }
+        elseif ($stat -match '^nr_throttled\s+(?<value>[0-9]+)$') {
+            $throttled = [int64]$Matches.value
+        }
+    }
+    if ($null -eq $periods -or $null -eq $throttled) {
+        return $null
+    }
+    return [pscustomobject]@{ Periods = $periods; Throttled = $throttled }
+}
+
 function Sample-Containers {
     param([string]$Timestamp)
 
@@ -89,8 +121,11 @@ function Sample-Containers {
         $memParts = $parts[2] -split '/'
         $memUsed = if ($memParts.Count -ge 1) { ConvertTo-Megabytes $memParts[0] } else { $null }
         $memLimit = if ($memParts.Count -ge 2) { ConvertTo-Megabytes $memParts[1] } else { $null }
+        $throttle = Get-CpuThrottleCounters -ContainerName $name
+        $cpuPeriods = if ($null -ne $throttle) { $throttle.Periods } else { $null }
+        $cpuThrottledPeriods = if ($null -ne $throttle) { $throttle.Throttled } else { $null }
 
-        Write-CsvLine -Path $containerCsv -Line "$Timestamp,$Phase,$name,$cpu,$memUsed,$memLimit"
+        Write-CsvLine -Path $containerCsv -Line "$Timestamp,$Phase,$name,$cpu,$memUsed,$memLimit,$cpuPeriods,$cpuThrottledPeriods"
     }
 }
 
@@ -102,7 +137,7 @@ function Sample-Pipeline {
         $row = & docker compose @composeArgs exec -T mysql mysql -uroot -p1234 -D $DbName -Nse $pipelineSql 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $row) { return }
         $values = ($row | Select-Object -Last 1) -split "`t"
-        if ($values.Count -lt 9) { return }
+        if ($values.Count -lt 10) { return }
 
         $rabbitReady = 0L
         $rabbitUnacked = 0L
@@ -129,10 +164,10 @@ function Sample-Pipeline {
 }
 
 if (-not (Test-Path $containerCsv)) {
-    Write-CsvLine -Path $containerCsv -Line "timestamp,phase,container,cpuPercent,memUsedMb,memLimitMb"
+    Write-CsvLine -Path $containerCsv -Line "timestamp,phase,container,cpuPercent,memUsedMb,memLimitMb,cpuPeriods,cpuThrottledPeriods"
 }
 if (-not (Test-Path $pipelineCsv)) {
-    Write-CsvLine -Path $pipelineCsv -Line ("timestamp,phase,judgeOutboxPending,scoreboardPending,scoreboardProcessing," +
+    Write-CsvLine -Path $pipelineCsv -Line ("timestamp,phase,judgeOutboxPending,judgeHeadLagMs,scoreboardPending,scoreboardProcessing," +
         "scoreboardFailed,oldestPendingLagMs,submissionRows,resultRows,mysqlThreadsConnected,mysqlThreadsRunning," +
         "rabbitReady,rabbitUnacked")
 }

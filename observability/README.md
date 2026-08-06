@@ -594,6 +594,60 @@ drain 속도만 제한한 것이다.
 3. **17:58:09 → 17:58:13.** worker를 정상 설정으로 되돌리자 2478행이 한 샘플 안에 빠졌다.
    500행/200ms면 약 1초 분량이므로 계산과 맞는다.
 
+### 제출 단위 end-to-end staleness
+
+`gatling/run-loadtest.ps1`은 drain과 정합성 검사가 끝난 뒤, 같은 제출의 시작과 종점을 직접
+빼서 다음 두 분포를 출력한다. 분위수는 MySQL 8의 `ROW_NUMBER()`를 사용한 nearest-rank
+p50/p95/p99이며 `max`와 표본 수 `n`을 항상 함께 낸다. 단계별 분위수를 더한 값이 아니다.
+
+| 출력 이름 | 시작 | 종점 | SQL 의미 |
+|---|---|---|---|
+| `result queryable` | `contest_submission.submitted_time` | `contest_submission_outbox.created_at` | `TIMESTAMPDIFF(MICROSECOND, submitted_time, created_at)` |
+| `scoreboard applied` | `contest_submission.submitted_time` | `contest_submission_outbox.processed_at` | `TIMESTAMPDIFF(MICROSECOND, submitted_time, processed_at)` |
+
+시작은 **(가) 요청 처리 중 `SubmissionService`가 `LocalDateTime.now()`로 찍은 서버 시각**이다.
+200 응답 시각이 아니므로 admission semaphore 대기, bulk queue 대기, 제출 DB transaction과
+completion executor를 포함한다. 따라서 이 문서와 리포트에서 end-to-end staleness는
+"제출 처리를 시작한 뒤 결과/scoreboard가 보일 때까지"를 뜻한다. HTTP 200 이후만을 뜻하는
+값으로 읽으면 안 된다.
+
+200 반환 시각은 제출 행에 저장하지 않는다. `http_server_requests`는 요청 앞단 분포를 별도로
+보여 주므로 두 분포를 나란히 비교할 수는 있지만, 서로 다른 표본의 p99를 빼서 "200 이후
+p99"를 만들지는 않는다. 그 값도 어떤 실제 제출의 p99가 아니기 때문이다. (나)가 제출별로
+필요해지면 응답 완료 시각 또는 상관 가능한 요청 식별자를 별도로 저장해야 한다.
+
+`result queryable`의 종점으로 `provisional_judged_at`을 쓰지 않는다. 그 값은 judge가 result
+writer queue에 넣기 전에 찍혀 queue 대기와 결과 DB 쓰기를 누락한다. 대신 결과 batch INSERT
+직후 생성되는 scoreboard outbox의 `created_at`을 쓴다. 결과 행과 outbox 행은 같은 transaction
+에서 커밋되므로 현재 스키마에서 조회 가능 시점에 가장 가까운 저장 시각이다. 다만 MySQL의
+실제 MVCC commit timestamp는 아니어서, outbox INSERT와 commit에 걸린 아주 짧은 구간은
+포함하지 않는다는 한계가 있다.
+
+`scoreboard applied`의 `processed_at`은 Redis Lua/pipeline 적용이 성공한 뒤
+`CURRENT_TIMESTAMP(6)`로 기록된다. 따라서 두 번째 분포는 judge와 result writer를 거쳐 Redis
+반영까지의 전체 경로를 포함한다. 두 쿼리 모두 같은 contest의 materialized 행만 읽고,
+`submissions == results == outbox == completed` 검사가 먼저 표본 완전성을 보장한다.
+
+V16부터 관련 시각을 `DATETIME(6)`으로 저장한다. V16 이전 행은 컬럼 형식만 바뀌고 기존 값의
+소수부는 `.000000`으로 남으므로, **마이그레이션 이전 행이 섞인 분포는 신뢰할 수 없다.** 부하
+하네스는 매 실행 새 contest를 seed하므로 실행끼리 표본이 섞이지 않는다.
+
+대표값은 조회와 제출이 동시에 Redis를 쓰는 `mixed`에서 잰다. `smoke`에도 같은 SQL을 적용해
+조용한 scoreboard 조건과 비교한다. 실행별 원시 마이크로초 값은
+`var/loadtest-*/end-to-end-staleness.csv`에 남는다.
+
+```text
+-- end-to-end staleness --
+result queryable    p50 0.42s  p95 1.8s  p99 3.1s  max 4.7s   n=2500
+scoreboard applied  p50 0.61s  p95 2.4s  p99 4s    max 6.2s   n=2500
+```
+
+하네스는 scoreboard p99와 같은 제출+drain 구간에서 샘플링한
+`contest_outbox_head_lag_seconds{outbox="scoreboard"}` 최댓값의 비율도 계산한다. 두 양수 값의
+비율이 10배 미만이면 `PASS`, 아니면 `MISMATCH`다. `mixed`에서 샘플이 없거나 `MISMATCH`이면
+실행을 실패시킨다. 이는 두 값이 같은 통계라는 뜻이 아니라, end-to-end SQL이 scoreboard
+backlog와 무관한 시각을 잘못 빼는 오류를 잡는 자릿수 교차 검증이다.
+
 ## 11. 알림
 
 규칙은 `observability/prometheus/rules/oj-pipeline.yml`에 있고 Prometheus가 기동 시 문법을
