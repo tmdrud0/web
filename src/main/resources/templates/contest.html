@@ -77,8 +77,8 @@
     </div>
 
     <div class="panel" th:if="${activeTab} == 'scoreboard'">
-        <h3 th:text="${scoreboardFinalized} ? (${scoreboardAroundMe} ? 'Final Scoreboard – Around Me' : 'Final Scoreboard')
-                : (${scoreboardAroundMe} ? 'Scoreboard – Around Me' : 'Live Scoreboard')}">Live Scoreboard</h3>
+        <h3 th:text="${scoreboardFinalized ? (scoreboardAroundMe ? 'Final Scoreboard – Around Me' : 'Final Scoreboard')
+                : (scoreboardAroundMe ? 'Scoreboard – Around Me' : 'Live Scoreboard')}">Live Scoreboard</h3>
         <div class="scoreboard-meta" th:if="${scoreboardTotalParticipants} > 0">
             <span th:text="'Total participants: ' + ${scoreboardTotalParticipants}">Total participants</span>
             <span th:if="${hasScoreboard}" th:text="' | Showing ranks ' + ${scoreboardStartRank} + ' – ' + (${scoreboardStartRank} + ${#lists.size(scoreboardRows)} - 1)">Range</span>
