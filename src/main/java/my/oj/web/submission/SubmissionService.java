@@ -6,6 +6,7 @@ import my.oj.web.contest.submission.support.ContestSubmissionProblemCache;
 import my.oj.web.contest.submission.support.ContestSubmissionRateLimitExceededException;
 import my.oj.web.contest.submission.support.ContestSubmissionRateLimiter;
 import my.oj.web.problem.Problem;
+import my.oj.web.problem.ProblemNotFoundException;
 import my.oj.web.submission.dto.SubmissionReceipt;
 import my.oj.web.submission.dto.SubmitSubmissionCommand;
 import my.oj.web.submission.event.SubmissionSubmittedEvent;
@@ -32,7 +33,7 @@ public class SubmissionService {
     public SubmissionReceipt submit(SubmitSubmissionCommand cmd) {
         User user = userRepository.getReferenceById(cmd.userId());
         Problem problem = problemCache.findById(cmd.problemId())
-                .orElseThrow(() -> new IllegalStateException("Problem not found: " + cmd.problemId()));
+                .orElseThrow(() -> new ProblemNotFoundException(cmd.problemId()));
         LocalDateTime submittedTime = LocalDateTime.now();
         boolean contestSubmission = storeSelector.onContest(problem, submittedTime);
         Contest contest = contestSubmission ? problem.getContest() : null;
@@ -62,7 +63,7 @@ public class SubmissionService {
     public CompletionStage<SubmissionReceipt> submitAsync(SubmitSubmissionCommand cmd) {
         User user = userRepository.getReferenceById(cmd.userId());
         Problem problem = problemCache.findById(cmd.problemId())
-                .orElseThrow(() -> new IllegalStateException("Problem not found: " + cmd.problemId()));
+                .orElseThrow(() -> new ProblemNotFoundException(cmd.problemId()));
         LocalDateTime submittedTime = LocalDateTime.now();
         boolean contestSubmission = storeSelector.onContest(problem, submittedTime);
         Contest contest = contestSubmission ? problem.getContest() : null;

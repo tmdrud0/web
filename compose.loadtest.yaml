@@ -24,12 +24,17 @@ services:
     container_name: oj-loadtest-rabbitmq
     ports: !reset []
 
+  # CONTEST_RATE_LIMIT_* passes through from the shell for the same reason JUDGE_* does: whether
+  # the per-user cooldown is in the measurement depends on the load model, not on the stack. Only
+  # the web nodes accept submissions, so only they need it.
   web-1:
     container_name: oj-loadtest-web-1
     environment:
       SPRING_PROFILES_ACTIVE: multi-web,perf,loadtest
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 1
+      CONTEST_RATE_LIMIT_STORE: ${CONTEST_RATE_LIMIT_STORE:-none}
+      CONTEST_RATE_LIMIT_COOLDOWN_MILLIS: ${CONTEST_RATE_LIMIT_COOLDOWN_MILLIS:-2000}
     # Direct ports are setup/diagnostic-only. Gatling must use nginx:18080.
     ports: !override
       - "18081:8080"
@@ -40,6 +45,8 @@ services:
       SPRING_PROFILES_ACTIVE: multi-web,perf,loadtest
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 2
+      CONTEST_RATE_LIMIT_STORE: ${CONTEST_RATE_LIMIT_STORE:-none}
+      CONTEST_RATE_LIMIT_COOLDOWN_MILLIS: ${CONTEST_RATE_LIMIT_COOLDOWN_MILLIS:-2000}
     ports: !override
       - "18082:8080"
 

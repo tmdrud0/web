@@ -6,6 +6,7 @@ import my.oj.web.contest.finalization.ContestFinalScore;
 import my.oj.web.contest.finalization.ContestFinalScoreService;
 import my.oj.web.contest.finalization.ContestFinalScoreStatus;
 import my.oj.web.contest.scoreboard.ContestScoreboardEntry;
+import my.oj.web.contest.scoreboard.ContestScoreboardRanking;
 import my.oj.web.contest.scoreboard.ContestScoreboardService;
 import my.oj.web.contest.scoreboard.ContestScoreboardSlice;
 import my.oj.web.user.User;
@@ -193,20 +194,12 @@ class ContestScoreboardPageAssembler {
             return List.of();
         }
 
+        long[] ranks = ContestScoreboardRanking.competitionRanks(slice);
         List<ContestScoreboardRow> rows = new ArrayList<>(slice.entries().size());
-        long displayRank = slice.startRank() - 1;
-        int previousSolved = Integer.MIN_VALUE;
-        long previousPenalty = Long.MIN_VALUE;
         for (int i = 0; i < slice.entries().size(); i++) {
             ContestScoreboardEntry entry = slice.entries().get(i);
-            long absoluteRank = slice.startRank() + i;
-            if (entry.solvedCount() != previousSolved || entry.penalty() != previousPenalty) {
-                displayRank = absoluteRank;
-                previousSolved = entry.solvedCount();
-                previousPenalty = entry.penalty();
-            }
             rows.add(new ContestScoreboardRow(
-                    Math.toIntExact(displayRank),
+                    Math.toIntExact(ranks[i]),
                     entry.userId(),
                     userNames.getOrDefault(entry.userId(), "User #" + entry.userId()),
                     entry.solvedCount(),

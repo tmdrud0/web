@@ -1,5 +1,6 @@
 package my.oj.perf
 
+import io.gatling.commons.validation._
 import io.gatling.core.Predef._
 import io.gatling.http.Predef._
 
@@ -21,6 +22,12 @@ import scala.util.Random
  * log in once per submission and measure the login. Concurrent users each authenticate once and
  * then submit on a fixed pace, so `submitAvgRps` is delivered by `ceil(rps * interval)` users
  * rather than by an injection rate. Reads stay open and anonymous, which is what the endpoint is.
+ *
+ * That population is also the contest. Reads page through the scoreboard the submissions build,
+ * so `ceil(peakRps * interval)` is both the number of sessions and the number of participants,
+ * and `perf.startRank.max` is derived from it rather than given - the first version of this
+ * simulation set the two independently, drew ranks from 1..100,000 against 620 participants, and
+ * spent the run reading past the end of an almost empty scoreboard.
  */
 class OjGoalLoadSimulation extends Simulation {
 
@@ -35,8 +42,6 @@ class OjGoalLoadSimulation extends Simulation {
   private val userIndexEnd   = propInt("perf.userIndex.end", 10000)
   private val problemIdStart = propLong("perf.problemId.start", 1L)
   private val problemIdEnd   = propLong("perf.problemId.end", 5L)
-  private val minStartRank   = propLong("perf.startRank.min", 1L)
-  private val maxStartRank   = propLong("perf.startRank.max", 100000L)
   private val pageSize       = propInt("perf.pageSize", 100)
 
   private val rampSeconds     = propInt("perf.rampSeconds", 30)
@@ -49,16 +54,34 @@ class OjGoalLoadSimulation extends Simulation {
   private val readRps       = propDouble("perf.readRps", 300d)
 
   // How long a user waits between submissions. With the closed model this is what converts a
-  // target rate into a population, so it also sets how many sessions exist: at 3.1s, 200 RPS needs
-  // 620 concurrent users rather than 200 arrivals a second.
+  // target rate into a population - ceil(rps * interval) users, not rps arrivals a second - so it
+  // decides two things at once: the pace and the size of the contest. The rate is what the caller
+  // asked for either way; the interval is what says whether that rate comes from a few users
+  // submitting constantly or from a field of them submitting occasionally, and the scoreboard
+  // these reads page through is the second number. Choosing it is choosing the contest.
   private val submitIntervalMs = propLong("perf.submitIntervalMillis", 3100L)
-  private val initialJitterMs  = propLong("perf.initialJitterMillis", 3000L)
+  // One interval, and derived rather than given so it stays one. Spreading a user's first
+  // submission uniformly across a whole interval makes the expected number of submissions from a
+  // session exactly its lifetime divided by the interval - which is the rate schedule the
+  // scenario's expected counts are computed from. Any shorter and the population fires an extra
+  // burst as it arrives; any longer and it starts behind the schedule and never catches up.
+  private val initialJitterMs  = propLong("perf.initialJitterMillis", submitIntervalMs)
 
   private val availableUsers = userIndexEnd - userIndexStart + 1
   private val avgConcurrentUsers = math.max(1, math.ceil(submitAvgRps * submitIntervalMs / 1000d).toInt)
   private val peakConcurrentUsers = math.max(1, math.ceil(submitPeakRps * submitIntervalMs / 1000d).toInt)
   private val readHoldSeconds = avgHoldSeconds + peakRampSeconds + peakHoldSeconds
   private val totalDuration = (rampSeconds + readHoldSeconds).seconds
+
+  // The contest this reads is the contest these submissions build, so the population the closed
+  // model creates is exactly the range of ranks that has rows in it. Deriving the range from that
+  // population rather than accepting it as a number keeps the two from drifting apart, which is
+  // how the previous run measured nothing: 620 participants against startRank drawn from
+  // 1..100,000 put 99.4% of reads past the end of the scoreboard, where the reader answers with a
+  // single ZCARD and returns early. A page that has rows costs 102 Redis commands. Web CPU of
+  // 33-41% was therefore a ZCARD benchmark, roughly a hundredth of the request it claimed to be.
+  private val minStartRank = propLong("perf.startRank.min", 1L)
+  private val maxStartRank = propLong("perf.startRank.max", peakConcurrentUsers.toLong)
 
   require(userIndexEnd >= userIndexStart, "perf.userIndex.end must be greater than or equal to perf.userIndex.start")
   require(problemIdEnd >= problemIdStart, "perf.problemId.end must be greater than or equal to perf.problemId.start")
@@ -94,7 +117,7 @@ class OjGoalLoadSimulation extends Simulation {
     .body(StringBody("""{"userName":"#{userName}","pass":"#{password}"}"""))
     .asJson
     .check(status.is(200))
-    .check(jsonPath("$.id").saveAs("userId"))
+    .check(jsonPath("$.id").exists)
 
   private val randomSubmissionData = exec { session =>
     val problemId = Random.between(problemIdStart, problemIdEnd + 1)
@@ -104,7 +127,9 @@ class OjGoalLoadSimulation extends Simulation {
 
   // Sessions start together after the ramp, so without this they would submit in lockstep and
   // deliver the target rate as one spike per interval instead of a steady stream.
-  private val initialJitter = pause(_ => Random.between(0L, initialJitterMs + 1L).millis)
+  private val initialJitter = pause(_ =>
+    (if (initialJitterMs > 0L) Random.between(0L, initialJitterMs) else 0L).millis
+  )
 
   // 202 is the accept; 503 is the admission limiter refusing work it cannot queue, which is
   // backpressure rather than a fault and is counted separately by the harness.
@@ -115,15 +140,29 @@ class OjGoalLoadSimulation extends Simulation {
     .check(status.is(202))
     .check(jsonPath("$.submissionId").exists)
 
-  // Checking an entry proves the page carried rows. The endpoint this replaces reported a count,
-  // so a response with no rows in it would have passed.
+  // How many rows this page must carry, computed from the two numbers the server itself used:
+  // the startRank we asked for and the participant count it reports. The reader reads ZCARD and
+  // clamps its range to it, so this is the exact row count rather than a lower bound, and it is
+  // right while the scoreboard is still filling - early in the ramp the expectation is zero and
+  // an empty page passes.
+  private def expectedRows(startRank: Long, totalParticipants: Long): Int =
+    math.max(0L, math.min(pageSize.toLong, totalParticipants - startRank + 1L)).toInt
+
+  // Counting the rows is the check. The previous one asked for entries[0] and marked it optional,
+  // so it passed on any 200 including the empty pages this run was almost entirely making - a
+  // check that cannot fail, guarding against the one thing the endpoint it replaced got wrong.
   private val readRequest = http("api-contest-scoreboard-read")
     .get(s"/api/contests/$contestId/scoreboard")
     .queryParam("startRank", "#{startRank}")
     .queryParam("size", pageSize)
     .check(status.is(200))
-    .check(jsonPath("$.totalParticipants").exists)
-    .check(jsonPath("$.entries[0].userId").optional)
+    .check(jsonPath("$.totalParticipants").ofType[Long].saveAs("totalParticipants"))
+    .check(jsonPath("$.entries[*].userId").count.is { session =>
+      for {
+        total <- session("totalParticipants").validate[Long]
+        start <- session("startRank").validate[Long]
+      } yield expectedRows(start, total)
+    })
 
   private val readFeeder = Iterator.continually {
     Map("startRank" -> Random.between(minStartRank, maxStartRank + 1))

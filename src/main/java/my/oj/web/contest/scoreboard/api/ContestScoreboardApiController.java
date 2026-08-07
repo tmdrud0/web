@@ -1,10 +1,10 @@
 package my.oj.web.contest.scoreboard.api;
 
+import my.oj.web.api.JsonApiController;
 import my.oj.web.contest.scoreboard.ContestScoreboardService;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
 
 /**
  * The scoreboard as its own resource.
@@ -20,8 +20,14 @@ import org.springframework.web.bind.annotation.RestController;
  * nothing else. There is deliberately no existence check on the contest - that would put back a
  * query to learn what an empty slice already says, and an unknown contest is not an error worth a
  * round trip on the hot read path.
+ *
+ * <p>Entries carry user ids and not user names. The page resolves names from MySQL for the
+ * hundred rows it renders; keeping that off this path is what makes "Redis and nothing else"
+ * true, and it is the reason this endpoint is not yet a drop-in replacement for the scoreboard
+ * tab. Stated rather than implied, because the query count only falls to zero for as long as
+ * nobody adds names back.
  */
-@RestController
+@JsonApiController
 class ContestScoreboardApiController {
 
     /**

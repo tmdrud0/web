@@ -33,6 +33,16 @@ $stalenessCsv = Join-Path $metricsRoot "end-to-end-staleness.csv"
 $httpSummaryCsv = Join-Path $metricsRoot "http-summary.csv"
 $script:stalenessCrossCheckFailed = $false
 
+# The per-user cooldown costs a Redis round trip on every submission in production, so a run with
+# it off measures a system cheaper than the deployed one by exactly that. Only the closed-model
+# scenarios can carry it. They pace each user well past the cooldown on purpose, so the round trip
+# is paid and no request is refused; the open-model /perf scenarios draw a user at random per
+# request, and at their rates nearly one submission in five would land inside another's cooldown
+# and be refused by a limiter that their own load model tripped. mixed-real* are included because
+# that pairing is only comparable if both sides pay the same round trip.
+$closedModelScenarios = @("mixed", "mixed-target", "mixed-real", "mixed-real-target")
+$env:CONTEST_RATE_LIMIT_STORE = if ($Scenario -in $closedModelScenarios) { "redis" } else { "none" }
+
 function Invoke-SetupRequest {
     param(
         [Parameter(Mandatory = $true)][string]$Method,
@@ -813,10 +823,22 @@ function Invoke-GatlingScenario {
         # arrived on top of that. 139 -> 200 submits against 300 reads leaves headroom, so a
         # staleness distribution taken here describes the pipeline rather than the CPU limit.
         #
-        # Counts follow the injection schedule: submits are (1+avg)/2*ramp + avg*avgHold +
-        # (avg+peak)/2*peakRamp + peak*peakHold = 35,865, reads are (1+rps)/2*ramp + rps*(avgHold
-        # + peakRamp + peakHold) = 67,515. The same arithmetic reproduces mixed's documented
-        # 95,865 and 450,015. Thirty requests of scheduling margin, as mixed uses.
+        # Counts still follow the rate schedule, because a closed model delivers the rate it was
+        # sized for: submits are (1+avg)/2*ramp + avg*avgHold + (avg+peak)/2*peakRamp +
+        # peak*peakHold = 35,865 and reads are (1+rps)/2*ramp + rps*(avgHold + peakRamp +
+        # peakHold) = 67,515. What the closed model changes is where those submissions come from -
+        # ceil(rps * interval) users pacing, rather than that many arrivals a second - and the
+        # simulation spreads each user's first submission over one interval so the schedule holds
+        # through the ramp instead of firing the whole population at once. Four percent of margin,
+        # as the other closed scenarios use, because the population's phase is randomised.
+        #
+        # The interval is 25s rather than 3.1s because it sets the size of the contest as well as
+        # the pace: the same 200 submissions a second come from ceil(200 * 25) = 5,000
+        # participants instead of 620, and the reads page through that scoreboard. 620 was not a
+        # contest a scoreboard endpoint is worth measuring against, and 25s between submissions is
+        # a cadence a contestant plausibly has where 3.1s is not. 5,000 is half the seeded pool at
+        # the default -UserCount, so the run keeps headroom over the simulation's requirement that
+        # every concurrent user have a seeded account of its own.
         "mixed-target" {
             $simulationClass = "my.oj.perf.OjGoalLoadSimulation"
             $minRequests = 99835L
@@ -829,23 +851,35 @@ function Invoke-GatlingScenario {
                 "-Dperf.submitAvgRps=139",
                 "-Dperf.submitPeakRps=200",
                 "-Dperf.readRps=300",
-                "-Dperf.submitIntervalMillis=3100",
-                "-Dperf.initialJitterMillis=3000",
+                "-Dperf.submitIntervalMillis=25000",
                 "-Dperf.userPrefix=$seedPrefix",
                 "-Dperf.userIndex.start=1",
                 "-Dperf.userIndex.end=$UserCount",
-                "-Dperf.startRank.min=1",
-                "-Dperf.startRank.max=100000",
                 "-Dperf.pageSize=100"
             ) + $seedArgs
         }
 
+        # Schedule: 95,865 submissions + 450,015 reads, from ceil(1000 * 3.1) = 3,100 concurrent
+        # users at peak. The interval stays at 3.1s here, unlike mixed-target: this scenario's
+        # peak is 1,000 a second, so a longer interval would need more seeded users than the
+        # default -UserCount has, and 3,100 participants is already a scoreboard worth reading.
+        #
+        # It takes the same user-pool arguments as mixed-target rather than relying on the
+        # simulation defaults. Those defaults - "loadtest", 1..10000, 3.1s - happened to equal
+        # this script's seed prefix and its default -UserCount, so the scenario ran only by
+        # coincidence: at -UserCount 2000 it would have logged in as users 2001..10000, which were
+        # never seeded, and taken 401s until exitHereIfFailed drained the injector. Passed
+        # explicitly, the simulation instead refuses to start when the pool cannot cover the
+        # concurrency it needs.
+        #
+        # Four percent of margin on both figures, the convention the other closed scenarios use.
+        # The 30-request margin this carried is arithmetic from the open model, where every
+        # submission was a scheduled arrival; a closed population's phase is randomised, so a
+        # margin that tight cannot be met.
         "mixed" {
             $simulationClass = "my.oj.perf.OjGoalLoadSimulation"
-            # Default schedule: 95,865 submissions + 450,015 reads. A 30-request scheduling
-            # margin still proves that both populations really ran instead of accepting one hit.
-            $minRequests = 545850L
-            $script:expectedSubmissionCount = 95835L
+            $minRequests = 524000L
+            $script:expectedSubmissionCount = 92000L
             $scenarioArgs = @(
                 "-Dperf.rampSeconds=30",
                 "-Dperf.avgHoldSeconds=120",
@@ -854,8 +888,10 @@ function Invoke-GatlingScenario {
                 "-Dperf.submitAvgRps=139",
                 "-Dperf.submitPeakRps=1000",
                 "-Dperf.readRps=2000",
-                "-Dperf.startRank.min=1",
-                "-Dperf.startRank.max=100000",
+                "-Dperf.submitIntervalMillis=3100",
+                "-Dperf.userPrefix=$seedPrefix",
+                "-Dperf.userIndex.start=1",
+                "-Dperf.userIndex.end=$UserCount",
                 "-Dperf.pageSize=100"
             ) + $seedArgs
         }
