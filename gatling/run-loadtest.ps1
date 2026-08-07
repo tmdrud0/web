@@ -819,8 +819,8 @@ function Invoke-GatlingScenario {
         # 95,865 and 450,015. Thirty requests of scheduling margin, as mixed uses.
         "mixed-target" {
             $simulationClass = "my.oj.perf.OjGoalLoadSimulation"
-            $minRequests = 103350L
-            $script:expectedSubmissionCount = 35835L
+            $minRequests = 99835L
+            $script:expectedSubmissionCount = 34425L
             $scenarioArgs = @(
                 "-Dperf.rampSeconds=30",
                 "-Dperf.avgHoldSeconds=120",
@@ -829,6 +829,11 @@ function Invoke-GatlingScenario {
                 "-Dperf.submitAvgRps=139",
                 "-Dperf.submitPeakRps=200",
                 "-Dperf.readRps=300",
+                "-Dperf.submitIntervalMillis=3100",
+                "-Dperf.initialJitterMillis=3000",
+                "-Dperf.userPrefix=$seedPrefix",
+                "-Dperf.userIndex.start=1",
+                "-Dperf.userIndex.end=$UserCount",
                 "-Dperf.startRank.min=1",
                 "-Dperf.startRank.max=100000",
                 "-Dperf.pageSize=100"
