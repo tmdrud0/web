@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("smoke", "target", "step", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed", "mixed-target", "mixed-real")]
+    [ValidateSet("smoke", "target", "step", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed", "mixed-target", "mixed-real", "mixed-real-target")]
     [string]$Scenario = "smoke",
     [int]$UserCount = 10000,
     [int]$ProblemCount = 5,
@@ -716,7 +716,7 @@ function Show-MetricsSummary {
         $crossCheckPassed = Test-ScoreboardStalenessAgainstHeadLag `
             -ScoreboardDistribution $staleness.Scoreboard `
             -SubmissionPhases $submissionPhases
-        if ($ScenarioName -in @("mixed", "mixed-target", "mixed-real") -and -not $crossCheckPassed) {
+        if ($ScenarioName -in @("mixed", "mixed-target", "mixed-real", "mixed-real-target") -and -not $crossCheckPassed) {
             $script:stalenessCrossCheckFailed = $true
         }
     }
@@ -854,6 +854,38 @@ function Invoke-GatlingScenario {
                 "-Dperf.pageSize=100"
             ) + $seedArgs
         }
+        # The real-path counterpart of mixed-target, and the only pairing that can be compared:
+        # mixed and mixed-real both run rates that OOM-kill the stack, and the real path is the
+        # heavier of the two per request - a login session, two extra MySQL queries per read and
+        # Thymeleaf rendering - so it fails wherever the perf path already did.
+        #
+        # Submits use a closed model here, concurrent users pacing at submitIntervalMillis, so the
+        # count comes from users rather than an injection rate: ceil(139*3.1)=431 average and
+        # ceil(200*3.1)=620 peak, each submitting every 3.1s, which lands at 35,860 submissions
+        # against mixed-target's 35,865. That correspondence is what makes the two comparable.
+        # Requests are two per submission (POST plus its checked redirect) plus three per peak
+        # session for login-page, login and form, plus the same 67,515 reads. Four percent margin,
+        # as mixed-real uses, because session setup competes with the measured path.
+        "mixed-real-target" {
+            $simulationClass = "my.oj.perf.OjRealPathGoalLoadSimulation"
+            $minRequests = 135451L
+            $script:expectedSubmissionCount = 34425L
+            $scenarioArgs = @(
+                "-Dperf.rampSeconds=30",
+                "-Dperf.avgHoldSeconds=120",
+                "-Dperf.peakRampSeconds=30",
+                "-Dperf.peakHoldSeconds=60",
+                "-Dperf.submitAvgRps=139",
+                "-Dperf.submitPeakRps=200",
+                "-Dperf.readRps=300",
+                "-Dperf.submitIntervalMillis=3100",
+                "-Dperf.initialJitterMillis=3000",
+                "-Dperf.userPrefix=$seedPrefix",
+                "-Dperf.userIndex.start=1",
+                "-Dperf.userIndex.end=$UserCount"
+            ) + $seedArgs
+        }
+
         "mixed-real" {
             $simulationClass = "my.oj.perf.OjRealPathGoalLoadSimulation"
             # The closed submission model targets the same 95,865 logical submissions as mixed.
@@ -986,13 +1018,13 @@ try {
         Invoke-GatlingScenario -Seed $seed -SelectedScenario $Scenario
     }
 
-    if ($Scenario -in @("submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "mixed-real", "step")) {
+    if ($Scenario -in @("submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "mixed-real", "mixed-real-target", "step")) {
         Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase $Scenario
     }
     else {
         Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
     }
-    if ($Scenario -in @("target", "submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "mixed-real")) {
+    if ($Scenario -in @("target", "submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "mixed-real", "mixed-real-target")) {
         Assert-PipelineMaterialized -ContestId $seed.contestId
         $pipelineValidated = $true
     }

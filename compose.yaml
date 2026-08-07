@@ -1,3 +1,19 @@
+# Every JVM here carried -XX:MaxRAMPercentage=60 and none of them obeyed it. UseContainerSupport
+# is on and /sys/fs/cgroup/memory.max reads the right limit, but under Docker Desktop on WSL2 the
+# JVM still sizes from host memory: MaxRAM came back as 19.53 GiB and judge-2, in a 768M
+# container, reported an 11.73 GiB maximum heap through its own actuator. The percentage was
+# applied to the host figure, so it never constrained anything - lowering it to 45 would only have
+# moved an 11.73 GiB ceiling to 8.79 GiB. Every OOM kill measured on this branch, both web
+# instances under mixed and judge-1 three times, is that: a JVM that feels no pressure, defers
+# collection, grows, and is killed by the kernel at a limit it does not know exists.
+#
+# MaxRAM states the limit the JVM failed to detect, which also corrects the ergonomics that read
+# it. Heap is then explicit rather than a percentage, because the overhead outside it does not
+# scale with the container: judge-2 measured 158M non-heap and about 132M more in thread stacks,
+# GC structures and direct buffers, and that ~290M is roughly the same in a 768M container as in a
+# 1280M one. A single percentage that suits web starves judge - 60% of 768M plus 290M is 98% of
+# the limit. Each ceiling below leaves the measured overhead plus roughly a fifth of the container
+# free. Re-measure under load before trusting them; they come from idle readings.
 x-spring-build: &spring-build
   context: .
   args:
@@ -144,7 +160,7 @@ services:
       <<: *spring-environment
       CONTEST_SUBMISSION_WORKER_ID: 1
       OJ_ROLE: web
-      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
+      JAVA_TOOL_OPTIONS: -XX:MaxRAM=1280m -Xmx700m
     ports:
       - "8081:8080"
     healthcheck: *web-healthcheck
@@ -163,7 +179,7 @@ services:
       <<: *spring-environment
       CONTEST_SUBMISSION_WORKER_ID: 2
       OJ_ROLE: web
-      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
+      JAVA_TOOL_OPTIONS: -XX:MaxRAM=1280m -Xmx700m
     ports:
       - "8082:8080"
     healthcheck: *web-healthcheck
@@ -182,7 +198,7 @@ services:
       <<: [*spring-environment, *rabbitmq-environment]
       CONTEST_SUBMISSION_WORKER_ID: 100
       OJ_ROLE: batch
-      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
+      JAVA_TOOL_OPTIONS: -XX:MaxRAM=1024m -Xmx520m
     healthcheck: *worker-healthcheck
     deploy:
       resources:
@@ -199,7 +215,7 @@ services:
       <<: [*spring-environment, *rabbitmq-environment]
       CONTEST_SUBMISSION_WORKER_ID: 200
       OJ_ROLE: judge
-      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
+      JAVA_TOOL_OPTIONS: -XX:MaxRAM=768m -Xmx320m
     healthcheck: *worker-healthcheck
     deploy:
       resources:
@@ -216,7 +232,7 @@ services:
       <<: [*spring-environment, *rabbitmq-environment]
       CONTEST_SUBMISSION_WORKER_ID: 201
       OJ_ROLE: judge
-      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60
+      JAVA_TOOL_OPTIONS: -XX:MaxRAM=768m -Xmx320m
     healthcheck: *worker-healthcheck
     deploy:
       resources:

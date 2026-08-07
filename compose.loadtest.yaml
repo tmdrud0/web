@@ -50,12 +50,19 @@ services:
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 100
 
+  # JUDGE_* passes through from the shell so a run can give the judge a latency profile without
+  # editing a file. Off by default, which keeps every earlier measurement comparable. See
+  # application-loadtest.properties.
   judge-1:
     container_name: oj-loadtest-judge-1
     environment:
       SPRING_PROFILES_ACTIVE: multi-judge,loadtest
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 200
+      JUDGE_LATENCY_ENABLED: ${JUDGE_LATENCY_ENABLED:-false}
+      JUDGE_SLOW_RATIO: ${JUDGE_SLOW_RATIO:-0.01}
+      JUDGE_SLOW_MILLIS: ${JUDGE_SLOW_MILLIS:-2000}
+      JUDGE_BASE_MILLIS: ${JUDGE_BASE_MILLIS:-10}
 
   judge-2:
     container_name: oj-loadtest-judge-2
@@ -63,6 +70,10 @@ services:
       SPRING_PROFILES_ACTIVE: multi-judge,loadtest
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 201
+      JUDGE_LATENCY_ENABLED: ${JUDGE_LATENCY_ENABLED:-false}
+      JUDGE_SLOW_RATIO: ${JUDGE_SLOW_RATIO:-0.01}
+      JUDGE_SLOW_MILLIS: ${JUDGE_SLOW_MILLIS:-2000}
+      JUDGE_BASE_MILLIS: ${JUDGE_BASE_MILLIS:-10}
 
 volumes:
   mysql-data:
