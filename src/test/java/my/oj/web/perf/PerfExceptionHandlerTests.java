@@ -28,7 +28,7 @@ class PerfExceptionHandlerTests {
     @Test
     void handleOverloaded_returnsServiceUnavailableWithRetryAfter() {
         HttpServletRequest request = mock(HttpServletRequest.class);
-        given(request.getRequestURI()).willReturn("/perf/contest/submit");
+        given(request.getRequestURI()).willReturn("/perf/contest/seed");
 
         var response = new PerfExceptionHandler().handleOverloaded(
                 new ContestSubmissionOverloadedException(),
@@ -38,7 +38,7 @@ class PerfExceptionHandlerTests {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
         assertThat(response.getHeaders().getFirst("Retry-After")).isEqualTo("1");
         assertThat(response.getBody()).containsEntry("error", "ContestSubmissionOverloadedException")
-                .containsEntry("path", "/perf/contest/submit");
+                .containsEntry("path", "/perf/contest/seed");
     }
 
     @Test

@@ -2,13 +2,13 @@ package my.oj.web.user.api;
 
 import jakarta.servlet.http.HttpSession;
 import jakarta.validation.Valid;
-import my.oj.web.api.JsonApiController;
 import my.oj.web.user.UserService;
 import my.oj.web.user.dto.UserDto;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Map;
 
@@ -24,7 +24,7 @@ import java.util.Map;
  * authentication is paid once per user rather than once per submission, which is what the page
  * flow already did; what it removes is the login page GET and the form GET around it.
  */
-@JsonApiController
+@RestController
 class LoginApiController {
 
     private final UserService userService;

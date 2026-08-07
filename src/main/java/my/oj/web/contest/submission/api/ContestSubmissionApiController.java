@@ -1,7 +1,6 @@
 package my.oj.web.contest.submission.api;
 
 import jakarta.validation.Valid;
-import my.oj.web.api.JsonApiController;
 import my.oj.web.auth.CurrentUser;
 import my.oj.web.submission.SubmissionService;
 import my.oj.web.submission.dto.SubmitSubmissionCommand;
@@ -11,6 +10,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.util.concurrent.CompletionStage;
 
@@ -26,7 +26,7 @@ import java.util.concurrent.CompletionStage;
  * took a {@code userId} field, which made it convenient to drive under load and meant the
  * authentication cost was never in any measurement.
  */
-@JsonApiController
+@RestController
 class ContestSubmissionApiController {
 
     private final SubmissionService submissionService;

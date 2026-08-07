@@ -1,14 +1,11 @@
 package my.oj.perf
 
-import io.gatling.commons.validation._
 import io.gatling.core.Predef._
-import io.gatling.http.Predef._
 
 import scala.concurrent.duration._
-import scala.util.Random
 
 /**
- * Submissions and scoreboard reads against the JSON API, which is now the only path there is.
+ * Submissions and scoreboard reads together, at the rates the OJ targets.
  *
  * This simulation used to drive `/perf/contest/submit` and `/perf/contest/scoreboard`. Those
  * endpoints took a userId in the body instead of authenticating, and the read returned the size of
@@ -68,8 +65,8 @@ class OjGoalLoadSimulation extends Simulation {
   private val initialJitterMs  = propLong("perf.initialJitterMillis", submitIntervalMs)
 
   private val availableUsers = userIndexEnd - userIndexStart + 1
-  private val avgConcurrentUsers = math.max(1, math.ceil(submitAvgRps * submitIntervalMs / 1000d).toInt)
-  private val peakConcurrentUsers = math.max(1, math.ceil(submitPeakRps * submitIntervalMs / 1000d).toInt)
+  private val avgConcurrentUsers = ApiLoad.concurrentUsers(submitAvgRps, submitIntervalMs)
+  private val peakConcurrentUsers = ApiLoad.concurrentUsers(submitPeakRps, submitIntervalMs)
   private val readHoldSeconds = avgHoldSeconds + peakRampSeconds + peakHoldSeconds
   private val totalDuration = (rampSeconds + readHoldSeconds).seconds
 
@@ -93,95 +90,24 @@ class OjGoalLoadSimulation extends Simulation {
     s"peak needs $peakConcurrentUsers seeded users but only $availableUsers are available - " +
       "raise -UserCount or lower perf.submitPeakRps")
 
-  // Without a shared pool every virtual user opens its own connection and the read stream exhausts
-  // the Windows ephemeral port range (16,384 ports, 120s TIME_WAIT) within seconds. Measured
-  // without it: BindException on 100% of requests while the server sat idle.
-  private val httpProtocol = http
-    .baseUrl(baseUrl)
-    .acceptHeader("application/json")
-    .contentTypeHeader("application/json")
-    .userAgentHeader("Gatling")
-    .shareConnections
-
-  // Queued rather than random: two sessions sharing a user would share its dedup and rate-limit
-  // state, so the load would not be the load it claims to be.
-  private val loginFeeder = (userIndexStart to userIndexEnd).map { userIndex =>
-    Map(
-      "userName" -> s"${userPrefix}_user_$userIndex",
-      "password" -> "pass"
-    )
-  }.queue
-
-  private val login = http("api-login-once")
-    .post("/api/login")
-    .body(StringBody("""{"userName":"#{userName}","pass":"#{password}"}"""))
-    .asJson
-    .check(status.is(200))
-    .check(jsonPath("$.id").exists)
-
-  private val randomSubmissionData = exec { session =>
-    val problemId = Random.between(problemIdStart, problemIdEnd + 1)
-    val code = s"// oj-${session("userName").as[String]}-${java.util.UUID.randomUUID()}%0Aint main(){return 0;}"
-    session.set("problemId", problemId).set("code", code)
-  }
-
-  // Sessions start together after the ramp, so without this they would submit in lockstep and
-  // deliver the target rate as one spike per interval instead of a steady stream.
-  private val initialJitter = pause(_ =>
-    (if (initialJitterMs > 0L) Random.between(0L, initialJitterMs) else 0L).millis
-  )
-
-  // 202 is the accept; 503 is the admission limiter refusing work it cannot queue, which is
-  // backpressure rather than a fault and is counted separately by the harness.
-  private val submit = http("api-contest-submit")
-    .post("/api/problems/#{problemId}/submissions")
-    .body(StringBody("""{"code":"#{code}"}"""))
-    .asJson
-    .check(status.is(202))
-    .check(jsonPath("$.submissionId").exists)
-
-  // How many rows this page must carry, computed from the two numbers the server itself used:
-  // the startRank we asked for and the participant count it reports. The reader reads ZCARD and
-  // clamps its range to it, so this is the exact row count rather than a lower bound, and it is
-  // right while the scoreboard is still filling - early in the ramp the expectation is zero and
-  // an empty page passes.
-  private def expectedRows(startRank: Long, totalParticipants: Long): Int =
-    math.max(0L, math.min(pageSize.toLong, totalParticipants - startRank + 1L)).toInt
-
-  // Counting the rows is the check. The previous one asked for entries[0] and marked it optional,
-  // so it passed on any 200 including the empty pages this run was almost entirely making - a
-  // check that cannot fail, guarding against the one thing the endpoint it replaced got wrong.
-  private val readRequest = http("api-contest-scoreboard-read")
-    .get(s"/api/contests/$contestId/scoreboard")
-    .queryParam("startRank", "#{startRank}")
-    .queryParam("size", pageSize)
-    .check(status.is(200))
-    .check(jsonPath("$.totalParticipants").ofType[Long].saveAs("totalParticipants"))
-    .check(jsonPath("$.entries[*].userId").count.is { session =>
-      for {
-        total <- session("totalParticipants").validate[Long]
-        start <- session("startRank").validate[Long]
-      } yield expectedRows(start, total)
-    })
-
-  private val readFeeder = Iterator.continually {
-    Map("startRank" -> Random.between(minStartRank, maxStartRank + 1))
-  }
+  private val httpProtocol = ApiLoad.jsonProtocol(baseUrl)
 
   private val submitScenario = scenario("Contest submissions (OJ target)")
-    .feed(loginFeeder)
-    .exec(login)
+    .feed(ApiLoad.loginFeeder(userPrefix, userIndexStart, userIndexEnd))
+    .exec(ApiLoad.login)
     .exitHereIfFailed
-    .exec(initialJitter)
+    // Sessions start together after the ramp, so without this they would submit in lockstep and
+    // deliver the target rate as one spike per interval instead of a steady stream.
+    .exec(ApiLoad.initialJitter(initialJitterMs))
     .forever {
       pace(submitIntervalMs.millis)
-        .exec(randomSubmissionData)
-        .exec(submit)
+        .exec(ApiLoad.randomSubmissionData(problemIdStart, problemIdEnd, "oj"))
+        .exec(ApiLoad.submit)
     }
 
   private val readScenario = scenario("Contest scoreboard reads (OJ target)")
-    .feed(readFeeder)
-    .exec(readRequest)
+    .feed(ApiLoad.startRankFeeder(minStartRank, maxStartRank))
+    .exec(ApiLoad.scoreboardRead("api-contest-scoreboard-read", contestId, pageSize))
 
   setUp(
     submitScenario.inject(

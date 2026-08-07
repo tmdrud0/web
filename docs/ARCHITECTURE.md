@@ -6,7 +6,7 @@
 
 | 역할 | 인스턴스 | Spring profile | 주 책임 |
 |---|---|---|---|
-| Web | `web-1`, `web-2` | `multi-web` | HTTP 요청, 제출 검증, 제출/outbox 저장 |
+| Web | `web-1`, `web-2` | `multi-web` | JSON API 요청, 제출 검증, 제출/outbox 저장 |
 | Batch | `batch-1` | `multi-batch` | judge outbox 발행, scoreboard 반영·복구, rank batch |
 | Judge | `judge-1`, `judge-2` | `multi-judge` | RabbitMQ 소비, 채점, 결과/outbox 저장 |
 | Data | MySQL, Redis, RabbitMQ | 해당 없음 | 원본 데이터, 파생 상태, 메시지 전달 |
@@ -16,7 +16,7 @@
 
 ```mermaid
 flowchart LR
-    Client["브라우저 / Gatling"] --> Nginx
+    Client["API 클라이언트 / Gatling"] --> Nginx
     Nginx --> Web["Web ×2"]
     Web --> Submission["contest_submission"]
     Web --> JudgeOutbox["contest_judge_outbox"]
@@ -36,19 +36,21 @@ flowchart LR
 | 경로 | 책임 | 먼저 볼 파일 |
 |---|---|---|
 | `auth` | 현재 사용자 주입과 미인증 처리 | `CurrentUserArgumentResolver` |
-| `problem` | 문제 조회와 대회 문제 연결 | `ProblemController`, `ProblemRepository` |
-| `submission` | 일반/대회 제출 진입점과 결과 화면 | `SubmissionController`, `SubmissionService` |
-| `contest` | 대회 목록·상세와 대회 상태 | `ContestController`, `ContestService` |
+| `problem` | 문제 조회와 대회 문제 연결 | `problem/api/ProblemApiController`, `ProblemRepository` |
+| `submission` | 제출 조회와 제출 유스케이스 | `submission/api/SubmissionApiController`, `SubmissionService` |
+| `contest` | 대회 목록·상세와 대회 상태 | `contest/api/ContestApiController`, `ContestService` |
 | `contest/submission/core` | 대회 제출 모델·유스케이스와 저장 포트 | `ContestSubmissionService`, `ContestSubmissionWriter` |
 | `contest/submission/queue` | core 저장 포트의 immediate/batch 구현과 영속화 | `ContestSubmissionBulkWriter`, `ContestSubmissionBulkProcessor` |
 | `contest/submission/messaging` | judge DB outbox와 RabbitMQ 발행/소비 | `ContestJudgeOutboxRelay`, `ContestJudgeRabbitListener` |
 | `contest/submission/judge` | 채점 실행과 결과 batch 저장 | `ContestSubmissionJudgeProcessor`, `ContestSubmissionJudgeResultBatchWriter` |
 | `contest/submission/support` | ID, 중복 방지, rate limit 지원 | `ContestSubmissionIdGenerator` 구현체 |
 | `contest/scoreboard` | live scoreboard 조회와 Redis 저장 | `ContestScoreboardService`, `ContestScoreboardReader`, `ContestScoreboardApplier` |
+| `contest/scoreboard/api` | scoreboard 읽기 경로. hot(Redis 전용)과 cold(최종·aroundMe) 분리 | `ContestScoreboardApiController`, `ContestScoreboardViewApiController` |
+| `api` | API 전역 오류 응답과 페이지 응답 봉투 | `JsonApiExceptionHandler`, `PageResponse` |
 | `contest/scoreboard/outbox` | scoreboard 반영·재시도·복구 | `ContestScoreboardOutboxProcessor`, `ContestScoreboardOutboxRecoveryService` |
 | `contest/finalization` | 대회 종료, 최종 점수, rejudge | `ContestFinalizationService` |
 | `user/rank` | solved/streak/longest rank | 각 하위 `*RankService` |
-| `perf` | `perf` profile 전용 seed·부하 측정 endpoint | `ContestPerfController`, `RankPerfController` |
+| `perf` | `perf` profile 전용 seed·계측 endpoint(측정용 제출/조회는 제거됨) | `ContestPerfController`, `RankPerfController` |
 
 `src/test/java`는 main package 경로를 그대로 따른다. MySQL/Redis 의존 테스트와 부하 테스트는 일반 단위 테스트보다 실행 조건이 많으므로 테스트 클래스의 profile·tag를 먼저 확인한다.
 
@@ -56,7 +58,7 @@ flowchart LR
 
 ### 대회 제출
 
-1. `SubmissionController.submit`
+1. `ContestSubmissionApiController.submit`
 2. `SubmissionService.submitAsync`
 3. `ContestSubmissionService`
 4. `ContestSubmissionBulkWriter` → `ContestSubmissionBulkProcessor`
@@ -67,10 +69,14 @@ flowchart LR
 
 ### 대회 상세과 scoreboard
 
-1. `ContestController.contestDetail`
-2. `ContestScoreboardPageAssembler`
-3. 진행 중이면 `ContestScoreboardService`
-4. 종료 후 확정됐으면 `ContestFinalScoreService`
+대회 상세·문제 목록·scoreboard는 각각 별개의 리소스다. 하나의 탭 페이지가 세 가지를 모두
+불러오던 시절에는 scoreboard 한 번 읽는 데 MySQL 3회가 앞섰다.
+
+1. `ContestApiController.contest` → `ContestService.getDetail` (MySQL 1회, `finalized` 포함)
+2. `ContestApiController.problems` → `ContestService.getProblems`
+3. `ContestScoreboardApiController` → `ContestScoreboardService` (Redis만)
+4. 최종 순위·aroundMe는 `ContestScoreboardViewApiController` → `ContestScoreboardViewAssembler`
+   → 종료 후 확정됐으면 `ContestFinalScoreService`
 
 ### 대회 종료와 rejudge
 
@@ -80,10 +86,11 @@ flowchart LR
 
 ## 4. 코드 배치 원칙
 
-- Controller는 요청 매핑과 template model 전달만 담당한다.
+- Controller는 요청 매핑과 응답 DTO 변환만 담당한다. 뷰 렌더링은 없다.
 - Service는 하나의 유스케이스와 트랜잭션 경계를 소유한다.
 - Repository/JDBC persistence는 데이터 접근만 담당한다.
 - RabbitMQ·Redis 같은 외부 시스템 코드는 해당 기능의 infrastructure 역할로 한정한다.
+- 뜨거운 읽기 경로에 조회를 되돌리지 않는다. `GET /api/contests/{id}/scoreboard`가 Redis만 읽는 것은 설계이고, 이름·최종 순위처럼 MySQL이 필요한 것은 별도 cold endpoint에 둔다.
 - profile 조건과 운영 설정 key는 역할 계약이므로 리팩터링 중 임의로 바꾸지 않는다.
 - 동시성 실행기와 queue의 종료 정책 변경은 단순 구조 이동과 분리해 검증한다.
 - scoreboard 반영은 적용 순서와 중복 횟수에 무관해야 한다. Redis live/rebuild는 같은 Lua applier를 공유하고, 메모리 구현도 같은 규칙을 지켜야 한다. 배경은 `CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §4.10.1이다.

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("smoke", "target", "step", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed", "mixed-target", "mixed-real", "mixed-real-target")]
+    [ValidateSet("smoke", "target", "step", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed", "mixed-target")]
     [string]$Scenario = "smoke",
     [int]$UserCount = 10000,
     [int]$ProblemCount = 5,
@@ -34,14 +34,20 @@ $httpSummaryCsv = Join-Path $metricsRoot "http-summary.csv"
 $script:stalenessCrossCheckFailed = $false
 
 # The per-user cooldown costs a Redis round trip on every submission in production, so a run with
-# it off measures a system cheaper than the deployed one by exactly that. Only the closed-model
-# scenarios can carry it. They pace each user well past the cooldown on purpose, so the round trip
-# is paid and no request is refused; the open-model /perf scenarios draw a user at random per
-# request, and at their rates nearly one submission in five would land inside another's cooldown
-# and be refused by a limiter that their own load model tripped. mixed-real* are included because
-# that pairing is only comparable if both sides pay the same round trip.
-$closedModelScenarios = @("mixed", "mixed-target", "mixed-real", "mixed-real-target")
-$env:CONTEST_RATE_LIMIT_STORE = if ($Scenario -in $closedModelScenarios) { "redis" } else { "none" }
+# it off measures a system cheaper than the deployed one by exactly that. It used to be on only
+# for the closed-model scenarios, because the open-model ones drew a user at random per request
+# and would have spent the run being refused by a limiter their own load model tripped. Every
+# submission scenario is closed now - the API authenticates, so there is no other way to drive it -
+# and every one of them paces each user deliberately, so it is simply on.
+#
+# That pace has to clear the cooldown, or the run manufactures 429s the product would never have
+# produced. Both come from this one number so they cannot drift apart, and a rate that would need
+# users to submit faster than the product allows fails at simulation start rather than quietly
+# measuring refusals.
+$rateLimitCooldownMillis = 2000
+$minSubmitIntervalMillis = $rateLimitCooldownMillis + 1000
+$env:CONTEST_RATE_LIMIT_STORE = "redis"
+$env:CONTEST_RATE_LIMIT_COOLDOWN_MILLIS = "$rateLimitCooldownMillis"
 
 function Invoke-SetupRequest {
     param(
@@ -305,10 +311,29 @@ function Reset-LoadRedis {
         "DELETE FROM contest_submission_outbox; DELETE FROM contest_judge_outbox;") | Out-Null
 }
 
+# Reads the product's own scoreboard endpoint rather than a /perf mirror of it. The mirror
+# returned the size of the page instead of the page and took no authentication, so the harness was
+# checking a different query than the one it then went on to load.
 function Get-ScoreboardSummary {
     param([Parameter(Mandatory = $true)][long]$ContestId)
 
-    return Invoke-SetupRequest -Method Get -Uri "$baseUrl/perf/contest/scoreboard?contestId=$ContestId&startRank=1&size=1"
+    return Invoke-SetupRequest -Method Get -Uri "$baseUrl/api/contests/$ContestId/scoreboard?startRank=1&size=1"
+}
+
+# How many participants the population phase actually produced, so the read phase can draw ranks
+# from the scoreboard that exists rather than from a constant. The read simulation refuses to start
+# without this, which is what stops a hardcoded range coming back: paging past the last participant
+# costs one Redis command instead of 102, and a run that mostly does that reports a rate it never
+# served.
+function Get-ScoreboardParticipants {
+    param([Parameter(Mandatory = $true)][long]$ContestId)
+
+    $participants = [int64](Get-ScoreboardSummary -ContestId $ContestId).totalParticipants
+    if ($participants -le 0) {
+        throw "Scoreboard has no participants; the read phase would measure empty pages."
+    }
+    Write-Host "Scoreboard reads will draw startRank from 1..$participants."
+    return $participants
 }
 
 function Assert-PipelineMaterialized {
@@ -726,7 +751,7 @@ function Show-MetricsSummary {
         $crossCheckPassed = Test-ScoreboardStalenessAgainstHeadLag `
             -ScoreboardDistribution $staleness.Scoreboard `
             -SubmissionPhases $submissionPhases
-        if ($ScenarioName -in @("mixed", "mixed-target", "mixed-real", "mixed-real-target") -and -not $crossCheckPassed) {
+        if ($ScenarioName -in @("mixed", "mixed-target") -and -not $crossCheckPassed) {
             $script:stalenessCrossCheckFailed = $true
         }
     }
@@ -744,10 +769,83 @@ function New-Seed {
     return Invoke-SetupRequest -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" -Body $request
 }
 
+# A closed model has no arrival rate. It has a population and a pace, and the rate falls out as
+# users/interval, so the interval is not free: it decides how many participants the contest ends
+# up with, how many logins the run pays, and how large a scoreboard the read scenarios page
+# through. Half the seeded pool, which is where -UserCount 10000 against a 200/s peak already put
+# mixed-target at 5,000 users. Derived rather than written per scenario so that -UserCount scales
+# the field instead of breaking the run, and so no scenario can ask for more sessions than there
+# are seeded accounts.
+function Get-SubmitIntervalMillis {
+    param([Parameter(Mandatory = $true)][double]$PeakRps)
+
+    $millis = [long]([math]::Floor(0.5 * $UserCount / $PeakRps) * 1000)
+    if ($millis -lt $minSubmitIntervalMillis) { $millis = [long]$minSubmitIntervalMillis }
+    return $millis
+}
+
+# The population that delivers a rate at that pace, which is also the participant count and the
+# number of logins: one per session, and sessions never rotate.
+function Get-ConcurrentUsers {
+    param(
+        [Parameter(Mandatory = $true)][double]$Rps,
+        [Parameter(Mandatory = $true)][long]$IntervalMillis
+    )
+
+    return [long][math]::Ceiling($Rps * $IntervalMillis / 1000.0)
+}
+
+# Area under an injection schedule. A ramp is a trapezoid between two rates, a hold is a
+# rectangle, and a closed model delivers the rate it was sized for - so the same arithmetic counts
+# its submissions as counted the open model's arrivals.
+function Get-RampCount {
+    param(
+        [Parameter(Mandatory = $true)][double]$FromRps,
+        [Parameter(Mandatory = $true)][double]$ToRps,
+        [Parameter(Mandatory = $true)][int]$Seconds
+    )
+
+    return [long][math]::Floor((($FromRps + $ToRps) / 2.0) * $Seconds)
+}
+
+function Get-HoldCount {
+    param(
+        [Parameter(Mandatory = $true)][double]$Rps,
+        [Parameter(Mandatory = $true)][int]$Seconds
+    )
+
+    return [long][math]::Floor($Rps * $Seconds)
+}
+
+# The common ramp-then-hold shape: up from one arrival a second to the target, then flat.
+function Get-ScheduledCount {
+    param(
+        [Parameter(Mandatory = $true)][double]$Rps,
+        [Parameter(Mandatory = $true)][int]$RampSeconds,
+        [Parameter(Mandatory = $true)][int]$HoldSeconds
+    )
+
+    return (Get-RampCount -FromRps 1 -ToRps $Rps -Seconds $RampSeconds) +
+           (Get-HoldCount -Rps $Rps -Seconds $HoldSeconds)
+}
+
+# Four percent, the convention every closed scenario uses. A closed population's phase is
+# randomised over one interval, so the tight scheduling margin the open model could hold is not
+# reachable here.
+function Get-AssertionFloor {
+    param([Parameter(Mandatory = $true)][long]$Expected)
+
+    return [long][math]::Floor($Expected * 0.96)
+}
+
 function Invoke-GatlingScenario {
     param(
         [Parameter(Mandatory = $true)]$Seed,
         [Parameter(Mandatory = $true)][string]$SelectedScenario,
+        # Measured from the scoreboard after the population phase drained, not assumed. Reads that
+        # land past the last participant cost one Redis command instead of 102, so a range wider
+        # than the contest turns a read benchmark into a ZCARD benchmark.
+        [long]$ScoreboardParticipants = 0,
         # Exploration scenarios are meant to be pushed past the point where they fail. Their
         # assertion result is data, not a verdict, and tearing the stack down would discard the
         # samples that say where the limit was.
@@ -759,60 +857,100 @@ function Invoke-GatlingScenario {
         "-Dperf.assert.minSuccessPercent=99",
         "-Dperf.assert.p95Millis=$P95Millis"
     )
+    # The submission simulations authenticate now, so they address users by seeded name rather than
+    # by the id range the perf endpoint took in its body.
     $seedArgs = @(
         "-Dperf.contestId=$($Seed.contestId)",
-        "-Dperf.userId.start=$($Seed.firstUserId)",
-        "-Dperf.userId.end=$($Seed.lastUserId)",
         "-Dperf.problemId.start=$($Seed.firstProblemId)",
         "-Dperf.problemId.end=$($Seed.lastProblemId)"
+    )
+    $userArgs = @(
+        "-Dperf.userPrefix=$seedPrefix",
+        "-Dperf.userIndex.start=1",
+        "-Dperf.userIndex.end=$UserCount"
     )
 
     switch ($SelectedScenario) {
         "submit-139" {
             $simulationClass = "my.oj.perf.ContestSubmissionSimulation"
-            $minRequests = 27105L
-            $script:expectedSubmissionCount = $minRequests
-            $scenarioArgs = @("-Dperf.targetRps=139", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=180") + $seedArgs
+            # Submissions follow the rate schedule; the logins do not. Every session authenticates
+            # once, so the run also pays one login per concurrent user, and leaving those out of
+            # minRequests would let a run that never logged anybody in still clear the bar.
+            $submitInterval = Get-SubmitIntervalMillis -PeakRps 139
+            $submissions = Get-ScheduledCount -Rps 139 -RampSeconds 30 -HoldSeconds 180
+            $logins = Get-ConcurrentUsers -Rps 139 -IntervalMillis $submitInterval
+            $minRequests = Get-AssertionFloor -Expected ($submissions + $logins)
+            $script:expectedSubmissionCount = Get-AssertionFloor -Expected $submissions
+            $scenarioArgs = @(
+                "-Dperf.targetRps=139",
+                "-Dperf.rampSeconds=30",
+                "-Dperf.holdSeconds=180",
+                "-Dperf.submitIntervalMillis=$submitInterval"
+            ) + $userArgs + $seedArgs
         }
         "submit-200" {
             $simulationClass = "my.oj.perf.ContestSubmissionSimulation"
-            $minRequests = 27000L
-            $script:expectedSubmissionCount = $minRequests
-            $scenarioArgs = @("-Dperf.targetRps=200", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=120") + $seedArgs
+            $submitInterval = Get-SubmitIntervalMillis -PeakRps 200
+            $submissions = Get-ScheduledCount -Rps 200 -RampSeconds 30 -HoldSeconds 120
+            $logins = Get-ConcurrentUsers -Rps 200 -IntervalMillis $submitInterval
+            $minRequests = Get-AssertionFloor -Expected ($submissions + $logins)
+            $script:expectedSubmissionCount = Get-AssertionFloor -Expected $submissions
+            $scenarioArgs = @(
+                "-Dperf.targetRps=200",
+                "-Dperf.rampSeconds=30",
+                "-Dperf.holdSeconds=120",
+                "-Dperf.submitIntervalMillis=$submitInterval"
+            ) + $userArgs + $seedArgs
         }
         "submit-1000" {
             $simulationClass = "my.oj.perf.ContestSubmissionSimulation"
-            $minRequests = 135000L
-            $script:expectedSubmissionCount = $minRequests
-            $scenarioArgs = @("-Dperf.targetRps=1000", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=120") + $seedArgs
+            $submitInterval = Get-SubmitIntervalMillis -PeakRps 1000
+            $submissions = Get-ScheduledCount -Rps 1000 -RampSeconds 30 -HoldSeconds 120
+            $logins = Get-ConcurrentUsers -Rps 1000 -IntervalMillis $submitInterval
+            $minRequests = Get-AssertionFloor -Expected ($submissions + $logins)
+            $script:expectedSubmissionCount = Get-AssertionFloor -Expected $submissions
+            $scenarioArgs = @(
+                "-Dperf.targetRps=1000",
+                "-Dperf.rampSeconds=30",
+                "-Dperf.holdSeconds=120",
+                "-Dperf.submitIntervalMillis=$submitInterval"
+            ) + $userArgs + $seedArgs
         }
         "step" {
-            # A staircase finds the rate the stack sustains cleanly. A fixed-RPS pass/fail run only
+            # A staircase finds where the stack stops keeping up. A fixed-rate pass/fail run only
             # says whether one chosen rate worked.
+            #
+            # The steps are populations now, because the load is closed: a closed model cannot
+            # overload a server the way an open one does - its users wait for their last response
+            # instead of piling arrivals on top - so saturation reads as throughput falling short
+            # of the step's target rather than as errors. minRequests stays at 1 because this run
+            # is meant to be pushed until it fails and the samples are the point.
             $simulationClass = "my.oj.perf.ContestSubmissionStepLoadSimulation"
             $minRequests = 1L
+            $submitInterval = Get-SubmitIntervalMillis -PeakRps $StepMaxRps
             $scenarioArgs = @(
                 "-Dperf.startRps=$StepStartRps",
                 "-Dperf.stepRps=$StepRps",
                 "-Dperf.maxRps=$StepMaxRps",
                 "-Dperf.rampSeconds=$StepRampSeconds",
-                "-Dperf.stepHoldSeconds=$StepHoldSeconds"
-            ) + $seedArgs
+                "-Dperf.stepHoldSeconds=$StepHoldSeconds",
+                "-Dperf.submitIntervalMillis=$submitInterval"
+            ) + $userArgs + $seedArgs
         }
         "scoreboard-200" {
             $simulationClass = "my.oj.perf.ContestScoreboardReadSimulation"
-            $minRequests = 15000L
-            $scenarioArgs = @("-Dperf.targetRps=200", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=60", "-Dperf.contestId=$($Seed.contestId)", "-Dperf.startRank.min=1", "-Dperf.startRank.max=100000", "-Dperf.pageSize=100")
+            $minRequests = Get-AssertionFloor -Expected (Get-ScheduledCount -Rps 200 -RampSeconds 30 -HoldSeconds 60)
+            $scenarioArgs = @("-Dperf.targetRps=200", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=60", "-Dperf.contestId=$($Seed.contestId)", "-Dperf.startRank.min=1", "-Dperf.startRank.max=$ScoreboardParticipants", "-Dperf.pageSize=100")
         }
         "scoreboard-300" {
             $simulationClass = "my.oj.perf.ContestScoreboardReadSimulation"
-            $minRequests = 40500L
-            $scenarioArgs = @("-Dperf.targetRps=300", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=120", "-Dperf.contestId=$($Seed.contestId)", "-Dperf.startRank.min=1", "-Dperf.startRank.max=100000", "-Dperf.pageSize=100")
+            $minRequests = Get-AssertionFloor -Expected (Get-ScheduledCount -Rps 300 -RampSeconds 30 -HoldSeconds 120)
+            $scenarioArgs = @("-Dperf.targetRps=300", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=120", "-Dperf.contestId=$($Seed.contestId)", "-Dperf.startRank.min=1", "-Dperf.startRank.max=$ScoreboardParticipants", "-Dperf.pageSize=100")
         }
         "scoreboard-2000" {
             $simulationClass = "my.oj.perf.ContestScoreboardReadSimulation"
-            $minRequests = 270000L
-            $scenarioArgs = @("-Dperf.targetRps=2000", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=120", "-Dperf.contestId=$($Seed.contestId)", "-Dperf.startRank.min=1", "-Dperf.startRank.max=100000", "-Dperf.pageSize=100")
+            $minRequests = Get-AssertionFloor -Expected (Get-ScheduledCount -Rps 2000 -RampSeconds 30 -HoldSeconds 120)
+            $scenarioArgs = @("-Dperf.targetRps=2000", "-Dperf.rampSeconds=30", "-Dperf.holdSeconds=120", "-Dperf.contestId=$($Seed.contestId)", "-Dperf.startRank.min=1", "-Dperf.startRank.max=$ScoreboardParticipants", "-Dperf.pageSize=100")
         }
         # mixed at the rates each README scenario is documented to pass on its own, run together.
         # mixed itself combines two loads the scenario table calls "not a pass criterion" -
@@ -829,20 +967,22 @@ function Invoke-GatlingScenario {
         # peakHold) = 67,515. What the closed model changes is where those submissions come from -
         # ceil(rps * interval) users pacing, rather than that many arrivals a second - and the
         # simulation spreads each user's first submission over one interval so the schedule holds
-        # through the ramp instead of firing the whole population at once. Four percent of margin,
-        # as the other closed scenarios use, because the population's phase is randomised.
+        # through the ramp instead of firing the whole population at once.
         #
-        # The interval is 25s rather than 3.1s because it sets the size of the contest as well as
-        # the pace: the same 200 submissions a second come from ceil(200 * 25) = 5,000
-        # participants instead of 620, and the reads page through that scoreboard. 620 was not a
-        # contest a scoreboard endpoint is worth measuring against, and 25s between submissions is
-        # a cadence a contestant plausibly has where 3.1s is not. 5,000 is half the seeded pool at
-        # the default -UserCount, so the run keeps headroom over the simulation's requirement that
-        # every concurrent user have a seeded account of its own.
+        # The peak population also logs in once each, and those logins are requests. Leaving them
+        # out is how minRequests came to sit at 99,835 against a run that now issues 108,380: a
+        # floor 8% below the truth stops proving that the run ran.
         "mixed-target" {
             $simulationClass = "my.oj.perf.OjGoalLoadSimulation"
-            $minRequests = 99835L
-            $script:expectedSubmissionCount = 34425L
+            $submitInterval = Get-SubmitIntervalMillis -PeakRps 200
+            $submissions = (Get-RampCount -FromRps 1 -ToRps 139 -Seconds 30) +
+                           (Get-HoldCount -Rps 139 -Seconds 120) +
+                           (Get-RampCount -FromRps 139 -ToRps 200 -Seconds 30) +
+                           (Get-HoldCount -Rps 200 -Seconds 60)
+            $reads = Get-ScheduledCount -Rps 300 -RampSeconds 30 -HoldSeconds 210
+            $logins = Get-ConcurrentUsers -Rps 200 -IntervalMillis $submitInterval
+            $minRequests = Get-AssertionFloor -Expected ($submissions + $reads + $logins)
+            $script:expectedSubmissionCount = Get-AssertionFloor -Expected $submissions
             $scenarioArgs = @(
                 "-Dperf.rampSeconds=30",
                 "-Dperf.avgHoldSeconds=120",
@@ -851,35 +991,24 @@ function Invoke-GatlingScenario {
                 "-Dperf.submitAvgRps=139",
                 "-Dperf.submitPeakRps=200",
                 "-Dperf.readRps=300",
-                "-Dperf.submitIntervalMillis=25000",
-                "-Dperf.userPrefix=$seedPrefix",
-                "-Dperf.userIndex.start=1",
-                "-Dperf.userIndex.end=$UserCount",
+                "-Dperf.submitIntervalMillis=$submitInterval",
                 "-Dperf.pageSize=100"
-            ) + $seedArgs
+            ) + $userArgs + $seedArgs
         }
 
-        # Schedule: 95,865 submissions + 450,015 reads, from ceil(1000 * 3.1) = 3,100 concurrent
-        # users at peak. The interval stays at 3.1s here, unlike mixed-target: this scenario's
-        # peak is 1,000 a second, so a longer interval would need more seeded users than the
-        # default -UserCount has, and 3,100 participants is already a scoreboard worth reading.
-        #
-        # It takes the same user-pool arguments as mixed-target rather than relying on the
-        # simulation defaults. Those defaults - "loadtest", 1..10000, 3.1s - happened to equal
-        # this script's seed prefix and its default -UserCount, so the scenario ran only by
-        # coincidence: at -UserCount 2000 it would have logged in as users 2001..10000, which were
-        # never seeded, and taken 401s until exitHereIfFailed drained the injector. Passed
-        # explicitly, the simulation instead refuses to start when the pool cannot cover the
-        # concurrency it needs.
-        #
-        # Four percent of margin on both figures, the convention the other closed scenarios use.
-        # The 30-request margin this carried is arithmetic from the open model, where every
-        # submission was a scheduled arrival; a closed population's phase is randomised, so a
-        # margin that tight cannot be met.
+        # The same shape at rates the scenario table calls "not a pass criterion" on their own.
+        # Its counts come from the same three formulas; only the rates differ.
         "mixed" {
             $simulationClass = "my.oj.perf.OjGoalLoadSimulation"
-            $minRequests = 524000L
-            $script:expectedSubmissionCount = 92000L
+            $submitInterval = Get-SubmitIntervalMillis -PeakRps 1000
+            $submissions = (Get-RampCount -FromRps 1 -ToRps 139 -Seconds 30) +
+                           (Get-HoldCount -Rps 139 -Seconds 120) +
+                           (Get-RampCount -FromRps 139 -ToRps 1000 -Seconds 30) +
+                           (Get-HoldCount -Rps 1000 -Seconds 60)
+            $reads = Get-ScheduledCount -Rps 2000 -RampSeconds 30 -HoldSeconds 210
+            $logins = Get-ConcurrentUsers -Rps 1000 -IntervalMillis $submitInterval
+            $minRequests = Get-AssertionFloor -Expected ($submissions + $reads + $logins)
+            $script:expectedSubmissionCount = Get-AssertionFloor -Expected $submissions
             $scenarioArgs = @(
                 "-Dperf.rampSeconds=30",
                 "-Dperf.avgHoldSeconds=120",
@@ -888,69 +1017,9 @@ function Invoke-GatlingScenario {
                 "-Dperf.submitAvgRps=139",
                 "-Dperf.submitPeakRps=1000",
                 "-Dperf.readRps=2000",
-                "-Dperf.submitIntervalMillis=3100",
-                "-Dperf.userPrefix=$seedPrefix",
-                "-Dperf.userIndex.start=1",
-                "-Dperf.userIndex.end=$UserCount",
+                "-Dperf.submitIntervalMillis=$submitInterval",
                 "-Dperf.pageSize=100"
-            ) + $seedArgs
-        }
-        # The real-path counterpart of mixed-target, and the only pairing that can be compared:
-        # mixed and mixed-real both run rates that OOM-kill the stack, and the real path is the
-        # heavier of the two per request - a login session, two extra MySQL queries per read and
-        # Thymeleaf rendering - so it fails wherever the perf path already did.
-        #
-        # Submits use a closed model here, concurrent users pacing at submitIntervalMillis, so the
-        # count comes from users rather than an injection rate: ceil(139*3.1)=431 average and
-        # ceil(200*3.1)=620 peak, each submitting every 3.1s, which lands at 35,860 submissions
-        # against mixed-target's 35,865. That correspondence is what makes the two comparable.
-        # Requests are two per submission (POST plus its checked redirect) plus three per peak
-        # session for login-page, login and form, plus the same 67,515 reads. Four percent margin,
-        # as mixed-real uses, because session setup competes with the measured path.
-        "mixed-real-target" {
-            $simulationClass = "my.oj.perf.OjRealPathGoalLoadSimulation"
-            $minRequests = 135451L
-            $script:expectedSubmissionCount = 34425L
-            $scenarioArgs = @(
-                "-Dperf.rampSeconds=30",
-                "-Dperf.avgHoldSeconds=120",
-                "-Dperf.peakRampSeconds=30",
-                "-Dperf.peakHoldSeconds=60",
-                "-Dperf.submitAvgRps=139",
-                "-Dperf.submitPeakRps=200",
-                "-Dperf.readRps=300",
-                "-Dperf.submitIntervalMillis=3100",
-                "-Dperf.initialJitterMillis=3000",
-                "-Dperf.userPrefix=$seedPrefix",
-                "-Dperf.userIndex.start=1",
-                "-Dperf.userIndex.end=$UserCount"
-            ) + $seedArgs
-        }
-
-        "mixed-real" {
-            $simulationClass = "my.oj.perf.OjRealPathGoalLoadSimulation"
-            # The closed submission model targets the same 95,865 logical submissions as mixed.
-            # Session setup and initial jitter happen on the measured web path, so allow roughly
-            # four percent scheduling margin while still requiring the full 450,015-read shape.
-            # Each accepted submission contributes its POST and checked redirect to Gatling's
-            # request total; the 3,100 peak sessions also each load login, authenticate, and load
-            # the submission form once.
-            $minRequests = 640000L
-            $script:expectedSubmissionCount = 92000L
-            $scenarioArgs = @(
-                "-Dperf.rampSeconds=30",
-                "-Dperf.avgHoldSeconds=120",
-                "-Dperf.peakRampSeconds=30",
-                "-Dperf.peakHoldSeconds=60",
-                "-Dperf.submitAvgRps=139",
-                "-Dperf.submitPeakRps=1000",
-                "-Dperf.readRps=2000",
-                "-Dperf.submitIntervalMillis=3100",
-                "-Dperf.initialJitterMillis=3000",
-                "-Dperf.userPrefix=$seedPrefix",
-                "-Dperf.userIndex.start=1",
-                "-Dperf.userIndex.end=$UserCount"
-            ) + $seedArgs
+            ) + $userArgs + $seedArgs
         }
         default { throw "Unsupported Gatling scenario: $SelectedScenario" }
     }
@@ -1035,14 +1104,16 @@ try {
         Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase "submit-139"
         Assert-PipelineMaterialized -ContestId $seed.contestId
         $pipelineValidated = $true
-        Invoke-GatlingScenario -Seed $seed -SelectedScenario "scoreboard-200"
+        Invoke-GatlingScenario -Seed $seed -SelectedScenario "scoreboard-200" `
+            -ScoreboardParticipants (Get-ScoreboardParticipants -ContestId $seed.contestId)
     }
     elseif ($Scenario -eq "target") {
         Invoke-GatlingScenario -Seed $seed -SelectedScenario "submit-200"
         Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase "submit-200"
         Assert-PipelineMaterialized -ContestId $seed.contestId
         $pipelineValidated = $true
-        Invoke-GatlingScenario -Seed $seed -SelectedScenario "scoreboard-300"
+        Invoke-GatlingScenario -Seed $seed -SelectedScenario "scoreboard-300" `
+            -ScoreboardParticipants (Get-ScoreboardParticipants -ContestId $seed.contestId)
     }
     elseif ($Scenario -eq "step") {
         Invoke-GatlingScenario -Seed $seed -SelectedScenario "step" -AllowAssertionFailure
@@ -1053,19 +1124,20 @@ try {
         Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase "submit-139"
         Assert-PipelineMaterialized -ContestId $seed.contestId
         $pipelineValidated = $true
-        Invoke-GatlingScenario -Seed $seed -SelectedScenario $Scenario
+        Invoke-GatlingScenario -Seed $seed -SelectedScenario $Scenario `
+            -ScoreboardParticipants (Get-ScoreboardParticipants -ContestId $seed.contestId)
     }
     else {
         Invoke-GatlingScenario -Seed $seed -SelectedScenario $Scenario
     }
 
-    if ($Scenario -in @("submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "mixed-real", "mixed-real-target", "step")) {
+    if ($Scenario -in @("submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "step")) {
         Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase $Scenario
     }
     else {
         Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
     }
-    if ($Scenario -in @("target", "submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "mixed-real", "mixed-real-target")) {
+    if ($Scenario -in @("target", "submit-139", "submit-200", "submit-1000", "mixed", "mixed-target")) {
         Assert-PipelineMaterialized -ContestId $seed.contestId
         $pipelineValidated = $true
     }

@@ -19,10 +19,10 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * Run with the perf profile, which is how the load-test stack runs it, because that is where this
- * endpoint's errors went wrong: it was not covered by the API advice, so a malformed body reached
- * {@code PerfExceptionHandler}'s catch-all and came back 500. Outside that profile the same
- * request got a bodyless 400. Both were the advice not knowing about the package, which is what
- * the {@code @JsonApiController} marker replaces.
+ * endpoint's errors went wrong: the API advice was scoped to a list of packages that did not
+ * include this one, so a malformed body reached {@code PerfExceptionHandler}'s catch-all and came
+ * back 500. Outside that profile the same request got a bodyless 400. The advice is unscoped now
+ * that there are no rendered pages for it to avoid, so there is no list left to forget.
  */
 @WebMvcTest(LoginApiController.class)
 @ActiveProfiles({"test", "perf"})

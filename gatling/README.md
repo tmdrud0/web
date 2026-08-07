@@ -18,36 +18,56 @@ nginx가 `web-1`과 `web-2`로 나눈 합산 값이다.
 
 ## 시나리오
 
+모든 시나리오는 제품의 API(`POST /api/login`, `POST /api/problems/{id}/submissions`,
+`GET /api/contests/{id}/scoreboard`)를 사용한다. `/perf`에 있던 제출·조회 엔드포인트는 없어졌다.
+그 둘은 body에 userId를 받아 인증을 건너뛰었고 조회는 행이 아니라 행 수를 돌려줬으므로,
+거기서 나온 수치는 아무도 쓰지 않는 시스템을 설명했다. `/perf`에 남은 것은 seed와 bulk-stats,
+즉 제품이 노출할 이유가 없는 시험 도구뿐이다.
+
 | 이름 | 제출 합산 RPS | scoreboard 합산 RPS | 용도 |
 |---|---:|---:|---|
 | `smoke` | 139 | 200 | 짧은 회귀 확인 |
 | `target` | 200 | 300 | 현재 고정 자원에서 통과해야 하는 기준선 |
 | `submit-1000` | 1000 | - | 통과 기준이 아닌 과부하/장애 관찰 |
 | `scoreboard-2000` | 선행 제출 139 | 2000 | 통과 기준이 아닌 로컬 네트워크 한계 관찰 |
-| `mixed` | 139 평상시 → 1000 피크 | 2000 | `/perf` JSON 경로로 파이프라인과 Redis 깊은 페이지네이션을 함께 압박 |
-| `mixed-real` | 139 평상시 → 1000 피크 | 2000 | 로그인 세션을 재사용하는 실제 제출과 Thymeleaf contest 페이지가 겹치는 사용자 경로 측정 |
+| `mixed-target` | 139 평상시 → 200 피크 | 300 | 제출과 조회가 겹칠 때의 기준선, staleness 분포의 근거 |
+| `mixed` | 139 평상시 → 1000 피크 | 2000 | 통과 기준이 아닌 과부하 관찰 |
 
 `target`은 제출 부하가 끝난 뒤 judge와 scoreboard 파이프라인이 완전히 drain될 때까지 기다리고,
 DB 제출·결과·outbox 완료 건수가 같은지, DB 고유 참가자 수와 Redis scoreboard 참가자 수가
 같은지 확인한 후 조회 부하를 실행한다. 따라서 비어 있거나 일부만 채워진 scoreboard를 조회해
 빠르게 통과하는 오탐이 없다.
 
-`mixed`와 `mixed-real`은 제출 ramp/hold/peak와 조회 2000 RPS의 시간 모양이 같다. 차이는 HTTP
-경로다. `mixed`는 로그인 없는 `/perf/contest/submit` JSON 제출과 `startRank=1..100000`인
-`/perf/contest/scoreboard` JSON 조회를 사용하므로 비동기 파이프라인 처리량과 Redis 깊은
-페이지네이션을 비교·회귀할 때 쓴다. `mixed-real`은 사용자마다 한 번 로그인하고 세션을
-재사용해 제출 폼과 redirect까지 따르며, 조회는 익명 `GET /contests/{id}?tab=scoreboard`로
-controller·assembler·Thymeleaf 렌더링을 모두 지난다. 실제 웹 계층 CPU 경합이 end-to-end
-staleness에 미치는 영향을 잴 때는 `mixed-real`을 쓰고, 두 실행의 차이를 정량화할 때는 같은
-seed 크기로 둘을 연속 실행한다. 실제 페이지는 기본 상위권 cursor 조회이므로 `mixed-real`이
-`mixed`의 깊은 페이지네이션 커버리지를 대체하지 않는다.
+### 제출은 닫힌 모델, 조회는 열린 모델
 
-`mixed-real`은 Windows ephemeral port 고갈을 서버 장애로 오인하지 않도록 Gatling의 공유
-connection pool을 사용한다. HTML check는 `Live Scoreboard` 제목과 실제 table 또는 empty-state
-본문을 함께 요구하므로, 빈 페이지나 다른 200 응답은 성공으로 집계되지 않는다.
+API가 세션 인증을 하므로 제출을 열린 모델로 두면 가상 사용자마다 로그인이 한 번씩 붙어
+로그인을 재게 된다. 그래서 제출은 **동시 사용자 `ceil(rps × interval)`명이 각각 한 번
+로그인한 뒤 `interval` 간격으로 제출**한다. 조회는 익명이라 열린 모델 그대로다.
+
+닫힌 모델에서 간격은 자유 변수가 아니다. 같은 RPS를 몇 명이 만드는지를 정하고, 그 인원이 곧
+**대회 참가자 수이자 로그인 횟수이자 조회가 훑는 scoreboard의 크기**다. `run-loadtest.ps1`은
+`interval = floor(0.5 × UserCount / peakRps)`로 seed한 사용자 풀의 절반을 쓰도록 유도하며,
+per-user 쿨다운(2초)보다 짧아지지 않게 하한을 둔다. 쿨다운보다 빠른 pace를 요구하는 조합은
+시뮬레이션 시작 단계에서 실패한다 — 제품이 허용하지 않는 속도를 부하가 만들어낼 수는 없다.
+
+`step`은 RPS 계단이 아니라 **인원 계단**이다. 닫힌 모델은 서버가 느려지면 사용자가 응답을
+기다리므로 열린 모델처럼 요청을 쌓아 과부하를 만들 수 없다. 포화는 오류가 아니라 "인원을
+늘려도 처리량이 목표를 따라가지 못하는 지점"으로 나타나고, 그것이 계단이 찾는 값이다.
+
+### 조회 범위는 실측한 참가자 수에서 나온다
+
+`startRank`는 1..참가자 수에서 뽑는다. 범위 밖 조회는 리더가 ZCARD 한 번만 하고 조기 반환하므로
+Redis 명령 1회, 정상 페이지는 102회다. 예전에는 이 상한이 100,000으로 박혀 있고 실제 참가자는
+약 9,720명이었으므로 대부분의 조회가 아무것도 재지 않았다. 이제 하네스가 선행 제출이 drain된 뒤
+scoreboard에서 참가자 수를 읽어 넘기고, 읽기 시뮬레이션은 그 값 없이는 시작을 거부한다.
+
+조회 체크는 응답이 스스로 보고한 `totalParticipants`와 요청한 `startRank`로
+`min(pageSize, total - startRank + 1)`행을 요구한다. 리더가 ZCARD를 한 번만 호출해 범위 클램프와
+응답 총계 양쪽에 쓰므로 이 값은 근사가 아니라 정확값이고, scoreboard가 채워지는 중에도 맞다.
 
 각 Gatling 실행의 기본 assertion은 시나리오별 최소 요청 수, 성공률 99% 이상, p95 10초 이하다.
-HTTP 500도 실패로 판정한다. assertion 실패는 프로세스 종료 코드 실패로 전달된다.
+최소 요청 수에는 로그인도 포함된다(동시 사용자 1명당 1회). HTTP 500도 실패로 판정한다.
+assertion 실패는 프로세스 종료 코드 실패로 전달된다.
 
 ## 반복 실행
 
@@ -57,9 +77,9 @@ docker compose down
 .\gatling\run-loadtest.ps1 -Scenario smoke -KeepStack
 .\gatling\run-loadtest.ps1 -Scenario target -RemoveData
 
-# 같은 user/problem seed 크기로 perf 경로와 실제 경로를 비교한다.
+# 제출과 조회가 겹치는 기준선. 과부하 관찰은 mixed.
+.\gatling\run-loadtest.ps1 -Scenario mixed-target -UserCount 10000 -ProblemCount 5
 .\gatling\run-loadtest.ps1 -Scenario mixed -UserCount 10000 -ProblemCount 5
-.\gatling\run-loadtest.ps1 -Scenario mixed-real -UserCount 10000 -ProblemCount 5
 
 docker compose up -d --build
 ```
@@ -82,6 +102,11 @@ docker compose up -d --build
 
 ## 2026-07-23 고정 예산 실측
 
+> 아래 수치는 `/perf` 경로를 열린 모델로 몰던 시절의 것이다. 제출에는 로그인도 per-user
+> 쿨다운도 없었고, 조회는 참가자 약 9,720명에 대해 `startRank`를 1..100,000에서 뽑아 대부분
+> 빈 페이지를 쟀다. 제출 건수와 후단 검증은 그대로 유효하지만 **조회 쪽 수치와 CPU는 현재
+> 경로의 기준선이 아니다.** API 전환 이후 부하 실행은 아직 없다.
+
 | 단계 | 결과 | 성공률 | p95 | 후단 검증 |
 |---|---:|---:|---:|---|
 | 제출 139 RPS | 27,120건 | 100% | 154ms | 결과/outbox 27,120건, Redis 9,379명 |
@@ -95,8 +120,8 @@ docker compose up -d --build
 과부하 탐색에서 제출 1000 RPS는 요청 적체 뒤 web×2가 OOM 종료됐고, scoreboard 2000 RPS는
 Windows→Docker 포트 포워딩에서 연결 거부가 발생했다. 두 값은 현재 통과 기준이 아니다.
 제출 폭주가 프로세스를 죽이지 않도록 각 웹 노드의 admission은 256건으로 제한된다.
-부하용 `/perf` API는 포화 시 HTTP 503과 `Retry-After`를 반환하고, 브라우저 제출 화면은
-기존 UX를 유지해 오류 flash message가 있는 302 redirect를 반환한다.
+제출 API는 포화 시 HTTP 503과 `Retry-After`를 반환하고, per-user 쿨다운에 걸린 제출은
+429와 `Retry-After`를 반환한다. 둘 다 장애가 아니라 backpressure이므로 하네스는 따로 센다.
 
 ## 결과와 정리
 

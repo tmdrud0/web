@@ -309,9 +309,17 @@ throttling은 정상이다. 다만 **부하 실행 중에도 이 비율이 유�
 
 ## 9. 제출 파이프라인 지표
 
-`ContestSubmissionBulkMetrics`는 이제 두 곳에 기록한다. `snapshot()`은 perf 엔드포인트가
-읽는 기존 경로 그대로고, `bindTo()`가 Prometheus용 meter를 등록한다. 두 독자의 요구가
-다르기 때문에 형태도 다르다.
+> **측정 맥락이 바뀌었다.** 이 절의 staleness 수치는 여전히 제출 경로 기준이라 유효하지만,
+> 그때의 제출은 `POST /perf/contest/submit`이었다. 그 엔드포인트는 body의 userId를 그대로 믿어
+> 세션 조회가 없었고 per-user 쿨다운도 꺼져 있었다. 지금 제출은
+> `POST /api/problems/{id}/submissions`이고 세션 인증과 쿨다운 Redis 왕복이 측정 안에 있다.
+> 파이프라인 뒤쪽(bulk writer → outbox → judge → scoreboard)은 같은 코드이므로 분포의 모양은
+> 비교 가능하지만, **절대값을 그대로 인용하지 말고 API 전환 이후 실행에서 다시 재라.**
+> 이 커밋 시점 기준으로 그 실행은 아직 없다.
+
+`ContestSubmissionBulkMetrics`는 이제 두 곳에 기록한다. `snapshot()`은 `/perf`의 bulk-stats
+엔드포인트가 읽는 기존 경로 그대로고, `bindTo()`가 Prometheus용 meter를 등록한다. 두 독자의
+요구가 다르기 때문에 형태도 다르다.
 
 | | perf 스냅샷 | Prometheus |
 |---|---|---|
