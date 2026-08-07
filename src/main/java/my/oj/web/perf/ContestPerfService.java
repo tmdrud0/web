@@ -5,20 +5,12 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.concurrent.CompletionStage;
 
 import lombok.RequiredArgsConstructor;
-import my.oj.web.contest.scoreboard.ContestScoreboardService;
 import my.oj.web.contest.submission.queue.ContestSubmissionBulkMetrics;
 import my.oj.web.perf.dto.ContestSeedRequest;
 import my.oj.web.perf.dto.ContestSeedResult;
-import my.oj.web.perf.dto.ContestScoreboardPerfResult;
 import my.oj.web.perf.dto.ContestSubmissionBulkStatsResult;
-import my.oj.web.perf.dto.ContestSubmissionPerfResult;
-import my.oj.web.perf.dto.ContestSubmissionRequest;
-import my.oj.web.submission.dto.SubmissionReceipt;
-import my.oj.web.submission.dto.SubmitSubmissionCommand;
-import my.oj.web.submission.SubmissionService;
 import org.springframework.context.annotation.Profile;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -35,8 +27,6 @@ public class ContestPerfService {
     private static final int BATCH_SIZE = 1_000;
 
     private final JdbcTemplate jdbcTemplate;
-    private final SubmissionService submissionService;
-    private final ContestScoreboardService contestScoreboardService;
     private final ContestSubmissionBulkMetrics contestSubmissionBulkMetrics;
 
     @Transactional
@@ -64,50 +54,6 @@ public class ContestPerfService {
         );
     }
 
-    public ContestSubmissionPerfResult submitContestSolution(ContestSubmissionRequest request) {
-        if (request == null || request.userId() == null || request.problemId() == null) {
-            throw new IllegalArgumentException("userId and problemId are required");
-        }
-
-        String code = request.code() == null || request.code().isBlank()
-                ? java.util.UUID.randomUUID().toString()
-                : request.code();
-
-        long start = System.nanoTime();
-        SubmissionReceipt receipt = submissionService.submit(
-                new SubmitSubmissionCommand(request.userId(), request.problemId(), code)
-        );
-        long elapsedNanos = System.nanoTime() - start;
-        double elapsedMillis = elapsedNanos / 1_000_000.0;
-
-        return new ContestSubmissionPerfResult(
-                receipt.submissionId(),
-                receipt.origin(),
-                receipt.duplicate(),
-                elapsedMillis
-        );
-    }
-
-    public CompletionStage<ContestSubmissionPerfResult> submitContestSolutionAsync(ContestSubmissionRequest request) {
-        if (request == null || request.userId() == null || request.problemId() == null) {
-            throw new IllegalArgumentException("userId and problemId are required");
-        }
-
-        String code = request.code() == null || request.code().isBlank()
-                ? java.util.UUID.randomUUID().toString()
-                : request.code();
-
-        long start = System.nanoTime();
-        return submissionService.submitAsync(
-                new SubmitSubmissionCommand(request.userId(), request.problemId(), code)
-        ).thenApply(receipt -> new ContestSubmissionPerfResult(
-                receipt.submissionId(),
-                receipt.origin(),
-                receipt.duplicate(),
-                (System.nanoTime() - start) / 1_000_000.0
-        ));
-    }
-
     @Transactional
     public ContestSeedResult seedPractice(ContestSeedRequest request) {
         LocalDateTime now = LocalDateTime.now();
@@ -120,25 +66,6 @@ public class ContestPerfService {
                 request.shouldReset()
         );
         return seedContest(practiceRequest);
-    }
-
-    @Transactional(readOnly = true)
-    public ContestScoreboardPerfResult readScoreboard(long contestId, long startRank, int size) {
-        long effectiveStartRank = Math.max(1L, startRank);
-        int effectiveSize = Math.max(1, size);
-
-        long started = System.nanoTime();
-        var slice = contestScoreboardService.slice(contestId, effectiveStartRank, effectiveSize);
-        long ended = System.nanoTime();
-
-        return new ContestScoreboardPerfResult(
-                contestId,
-                slice.startRank(),
-                effectiveSize,
-                slice.entries().size(),
-                slice.totalParticipants(),
-                (ended - started) / 1_000_000.0
-        );
     }
 
     public ContestSubmissionBulkStatsResult getBulkStats() {

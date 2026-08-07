@@ -3,20 +3,23 @@ package my.oj.web.perf;
 import lombok.RequiredArgsConstructor;
 import my.oj.web.perf.dto.ContestSeedRequest;
 import my.oj.web.perf.dto.ContestSeedResult;
-import my.oj.web.perf.dto.ContestScoreboardPerfResult;
 import my.oj.web.perf.dto.ContestSubmissionBulkStatsResult;
-import my.oj.web.perf.dto.ContestSubmissionPerfResult;
-import my.oj.web.perf.dto.ContestSubmissionRequest;
 import org.springframework.context.annotation.Profile;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.util.concurrent.CompletionStage;
-
+/**
+ * Test infrastructure: build a contest to load, and read the writer's own counters.
+ *
+ * <p>What used to be here as well was a way to submit and a way to read the scoreboard, taking a
+ * user id in the body instead of authenticating. Those were shortcuts around the product, and
+ * every figure measured through them described a system nobody uses. The load generator drives
+ * {@code /api/...} now, so the only thing left on this path is the setup the product has no
+ * reason to expose and the metrics the product does not serve.
+ */
 @RestController
 @RequestMapping("/perf")
 @Profile("perf")
@@ -31,27 +34,10 @@ public class ContestPerfController {
         return contestPerfService.seedContest(effective);
     }
 
-    @PostMapping("/contest/submit")
-    public CompletionStage<ContestSubmissionPerfResult> submit(@RequestBody ContestSubmissionRequest request) {
-        return contestPerfService.submitContestSolutionAsync(request);
-    }
-
     @PostMapping("/submission/seed")
     public ContestSeedResult seedPractice(@RequestBody(required = false) ContestSeedRequest request) {
         ContestSeedRequest effective = request == null ? new ContestSeedRequest(null, null, null, null, null, null) : request;
         return contestPerfService.seedPractice(effective);
-    }
-
-    @PostMapping("/submission/submit")
-    public ContestSubmissionPerfResult submitPractice(@RequestBody ContestSubmissionRequest request) {
-        return contestPerfService.submitContestSolution(request);
-    }
-
-    @GetMapping("/contest/scoreboard")
-    public ContestScoreboardPerfResult readScoreboard(@RequestParam long contestId,
-                                                      @RequestParam(defaultValue = "1") long startRank,
-                                                      @RequestParam(defaultValue = "100") int size) {
-        return contestPerfService.readScoreboard(contestId, startRank, size);
     }
 
     @GetMapping("/contest/submission-bulk-stats")

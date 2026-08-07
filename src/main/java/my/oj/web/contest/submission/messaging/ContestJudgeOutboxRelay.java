@@ -1,6 +1,7 @@
 package my.oj.web.contest.submission.messaging;
 
 import lombok.extern.slf4j.Slf4j;
+import my.oj.web.observability.ContestOutboxDrainMetrics;
 import org.springframework.amqp.core.MessageDeliveryMode;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -22,15 +23,18 @@ class ContestJudgeOutboxRelay {
     static final int SCHEMA_VERSION = 1;
     private final ContestJudgeOutboxStore outboxStore;
     private final RabbitTemplate rabbitTemplate;
+    private final ContestOutboxDrainMetrics drainMetrics;
     private final int batchSize;
     private final Duration claimLease;
     private final Duration confirmTimeout;
 
     ContestJudgeOutboxRelay(ContestJudgeOutboxStore outboxStore,
                             @Qualifier("contestJudgeRabbitTemplate") RabbitTemplate rabbitTemplate,
-                            ContestJudgeOutboxRelayProperties properties) {
+                            ContestJudgeOutboxRelayProperties properties,
+                            ContestOutboxDrainMetrics drainMetrics) {
         this.outboxStore = outboxStore;
         this.rabbitTemplate = rabbitTemplate;
+        this.drainMetrics = drainMetrics;
         this.batchSize = properties.effectiveBatchSize();
         this.claimLease = properties.claimTimeout();
         this.confirmTimeout = properties.confirmTimeout();
@@ -61,6 +65,9 @@ class ContestJudgeOutboxRelay {
         }
 
         ContestJudgeOutboxStore.BatchCompletionResult result = outboxStore.completeAll(published, failures);
+        // The applied counts, not the requested ones: a stale completion changed no row, so the
+        // event is still someone else's to drain and must not be counted as drained here.
+        drainMetrics.recordJudgeRelay(result.publishedApplied(), result.failedApplied());
         if (result.staleCount() > 0) {
             log.debug("Ignored {} stale contest judge outbox completion results", result.staleCount());
         }

@@ -6,5 +6,5 @@ import java.util.List;
 
 public interface ContestSubmissionBatchPersistence {
 
-    void insertAll(List<ContestSubmission> submissions);
+    ContestSubmissionBatchInsertResult insertAll(List<ContestSubmission> submissions);
 }

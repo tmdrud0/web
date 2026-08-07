@@ -1,0 +1,187 @@
+# Observability overlay. Use together with compose.yaml so the stack joins the same
+# network and can scrape app containers by service name:
+#
+#   docker compose -f compose.yaml -f compose.observability.yaml up -d
+#
+# The app services in compose.yaml keep their limits unchanged (7.5 CPU / 9344M).
+# Everything here is charged to a separate budget so measurement baselines taken with
+# and without monitoring stay comparable. See docs/ENVIRONMENT.md section 3.
+#
+#   prometheus       1.00 CPU / 1024M
+#   grafana          0.50 CPU /  512M
+#   cadvisor         0.30 CPU /  256M
+#   alertmanager     0.10 CPU /  128M
+#   mysqld-exporter  0.10 CPU /   64M
+#   redis-exporter   0.10 CPU /   64M
+#   nginx-exporter   0.10 CPU /   64M
+#   -----------------------------------
+#   total            2.20 CPU / 2112M
+#
+# The WSL 2 budget must cover both. See docs/ENVIRONMENT.md section 2.
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: oj-prometheus
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Mounted as a directory so prometheus.yml can glob it and a new rule file needs no
+      # compose change. Rule syntax is checked at startup: a bad file stops Prometheus rather
+      # than silently disabling the alerts in it.
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=5GB
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: oj-grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  # Grouping, deduplication, inhibition and silences for the rules in
+  # observability/prometheus/rules. Prometheus evaluates and fires; it has no notion of any of
+  # those on its own, so without this an alert is a row in a status page that repeats every
+  # evaluation interval. No receiver is configured - see the config file for why.
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    container_name: oj-alertmanager
+    volumes:
+      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "9093:9093"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9093/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 128M
+
+  # Container CPU/memory for MySQL, Redis, RabbitMQ and nginx - the containers with no
+  # JVM of their own to report from. It cannot name them: Docker Desktop's containerd
+  # image store defeats cAdvisor's container registration, so its series arrive keyed by
+  # id="/docker/<hash>" with no name label. The five application instances therefore do
+  # not come from here at all; CgroupResourceMetrics reads cgroup v2 from inside each JVM
+  # and answers "did web-1 hit its 1.0 CPU ceiling" with the same role/node labels as
+  # every other application metric. See observability/README.md section 7.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: oj-cadvisor
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /sys:/sys:ro
+      - /dev/disk/:/dev/disk:ro
+    command:
+      - --housekeeping_interval=5s
+      - --store_container_labels=false
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 256M
+
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.16.0
+    container_name: oj-mysqld-exporter
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: 1234
+    command:
+      - --mysqld.address=mysql:3306
+      - --mysqld.username=root
+      - --collect.info_schema.innodb_metrics
+      - --collect.info_schema.processlist
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64M
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.67.0
+    container_name: oj-redis-exporter
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64M
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.4.0
+    container_name: oj-nginx-exporter
+    depends_on:
+      - nginx
+    command:
+      - --nginx.scrape-uri=http://nginx:8090/stub_status
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64M
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:

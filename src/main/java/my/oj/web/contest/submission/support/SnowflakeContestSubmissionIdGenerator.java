@@ -14,6 +14,25 @@ public class SnowflakeContestSubmissionIdGenerator implements ContestSubmissionI
     private static final long WORKER_ID_SHIFT = SEQUENCE_BITS;
     private static final long TIMESTAMP_SHIFT = SEQUENCE_BITS + WORKER_ID_BITS;
 
+    /**
+     * How far the clock may run backwards before a submission fails instead of waiting.
+     *
+     * <p>Measured on this stack: a load run recorded {@code last=1786062625753,
+     * current=1786062625751} and failed seven users' submissions with a 500. Two milliseconds is a
+     * correction, not a reset - containers on WSL2 resynchronise the guest clock against the host
+     * routinely and produce exactly this - and refusing the request is a worse answer than holding
+     * it for as long as the correction lasts.
+     *
+     * <p>100ms is fifty times the observed correction, so a real correction is nowhere near the
+     * bound, and it is a tenth of the shortest delay this system already asks a client to accept
+     * (the one-second Retry-After the admission limiter sends), so a submission that waits is
+     * inside noise on a path whose p95 budget is measured in seconds.
+     *
+     * <p>Past it the generator still fails. A jump that large is not a correction to the clock the
+     * previous ids were minted from, and reissuing those ids is worse than refusing the request.
+     */
+    private static final long MAX_BACKWARD_DRIFT_MILLIS = 100L;
+
     private final long epochMillis;
     private final long workerId;
 
@@ -36,10 +55,18 @@ public class SnowflakeContestSubmissionIdGenerator implements ContestSubmissionI
         long currentTimestamp = currentTimeMillis();
 
         if (currentTimestamp < lastTimestamp) {
-            throw new IllegalStateException(
-                    "Clock moved backwards for Snowflake ID generation: last="
-                            + lastTimestamp + ", current=" + currentTimestamp
-            );
+            long driftMillis = lastTimestamp - currentTimestamp;
+            if (driftMillis > MAX_BACKWARD_DRIFT_MILLIS) {
+                throw new IllegalStateException(
+                        "Clock moved backwards for Snowflake ID generation: last="
+                                + lastTimestamp + ", current=" + currentTimestamp
+                                + " (" + driftMillis + "ms, tolerance " + MAX_BACKWARD_DRIFT_MILLIS + "ms)"
+                );
+            }
+            // Wait for the clock to reach the millisecond ids were last minted from, which the
+            // sequence below then shares as it does for any other repeated millisecond. The wait
+            // is bounded by the tolerance because anything longer threw above.
+            currentTimestamp = waitUntil(lastTimestamp);
         }
 
         if (currentTimestamp == lastTimestamp) {
@@ -63,8 +90,13 @@ public class SnowflakeContestSubmissionIdGenerator implements ContestSubmissionI
     }
 
     private long waitUntilNextMillis(long timestamp) {
+        return waitUntil(timestamp + 1);
+    }
+
+    private long waitUntil(long targetMillis) {
         long current = currentTimeMillis();
-        while (current <= timestamp) {
+        while (current < targetMillis) {
+            Thread.onSpinWait();
             current = currentTimeMillis();
         }
         return current;

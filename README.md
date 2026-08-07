@@ -1,6 +1,6 @@
 # OJ 프로젝트
 
-Spring Boot와 Thymeleaf로 만든 온라인 저지다. 대회 제출은 웹 서버에서 저장한 뒤 RabbitMQ를 통해 judge 서버로 전달하고, 결과는 Redis scoreboard에 반영한다.
+Spring Boot로 만든 온라인 저지 API 서버다. 대회 제출은 웹 서버에서 저장한 뒤 RabbitMQ를 통해 judge 서버로 전달하고, 결과는 Redis scoreboard에 반영한다.
 
 ## 먼저 읽을 문서
 

@@ -7,6 +7,7 @@ import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
+import my.oj.web.contest.submission.support.ContestSubmissionProblemCache;
 import my.oj.web.submission.SubmissionResult;
 import my.oj.web.submission.accepted.AcceptedSubmission;
 import org.slf4j.Logger;
@@ -32,6 +33,7 @@ public class ContestFinalizationService {
     private final ContestRejudgeService rejudgeService;
     private final ContestSubmissionResultRepository resultRepository;
     private final ContestSubmissionService contestSubmissionService;
+    private final ContestSubmissionProblemCache problemCache;
     private final ContestFinalizationBatchRepository batchRepository;
     private final TransactionTemplate writeTxTemplate;
 
@@ -41,6 +43,7 @@ public class ContestFinalizationService {
                                       ContestRejudgeService rejudgeService,
                                       ContestSubmissionResultRepository resultRepository,
                                       ContestSubmissionService contestSubmissionService,
+                                      ContestSubmissionProblemCache problemCache,
                                       ContestFinalizationBatchRepository batchRepository,
                                       PlatformTransactionManager transactionManager) {
         this.finalScoreService = finalScoreService;
@@ -49,6 +52,7 @@ public class ContestFinalizationService {
         this.rejudgeService = rejudgeService;
         this.resultRepository = resultRepository;
         this.contestSubmissionService = contestSubmissionService;
+        this.problemCache = problemCache;
         this.batchRepository = batchRepository;
         this.writeTxTemplate = new TransactionTemplate(transactionManager);
     }
@@ -77,6 +81,7 @@ public class ContestFinalizationService {
 
         contest.markFinalized(LocalDateTime.now());
         contestRepository.save(contest);
+        problemCache.evictContest(contestId);
     }
 
     void applyContestResultsToNormal(Contest contest, List<ContestSubmissionResult> results) {

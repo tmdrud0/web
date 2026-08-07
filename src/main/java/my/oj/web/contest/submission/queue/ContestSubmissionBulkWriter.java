@@ -9,7 +9,9 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -53,6 +55,11 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
             thread.setDaemon(true);
             return thread;
         });
+        // The gauges read these at scrape time. Nothing is pushed: a value captured when a chunk
+        // finished would stop moving in the case worth watching, a queue filling while every
+        // worker is stuck.
+        metrics.bindSubmissionQueue(
+                pendingCount::get, activeWorkers::get, this::currentInFlight, workerCount, maxInFlight);
     }
 
     @Override
@@ -172,6 +179,10 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
     }
 
     private void processChunk(List<PendingSubmission> chunk) {
+        processChunk(chunk, true);
+    }
+
+    private void processChunk(List<PendingSubmission> chunk, boolean isolateInconsistentSubmissions) {
         int pendingBefore = pendingCount.get();
         long startedAt = System.nanoTime();
         boolean permitsReleased = false;
@@ -193,13 +204,98 @@ public class ContestSubmissionBulkWriter implements ContestSubmissionWriter {
             });
         } catch (RuntimeException ex) {
             long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
-            metrics.recordFailure(chunk.size(), elapsedMillis, pendingBefore, pendingCount.get(), activeWorkers.get());
-            if (!permitsReleased) {
-                releaseChunk(chunk);
+            if (!permitsReleased
+                    && isolateInconsistentSubmissions
+                    && ex instanceof ContestSubmissionBatchConsistencyException consistencyFailure) {
+                ChunkPartition partition = partitionInconsistent(chunk, consistencyFailure);
+                if (!partition.offenders().isEmpty() && !partition.remainder().isEmpty()) {
+                    failSubmissions(
+                            partition.offenders(),
+                            consistencyFailure,
+                            elapsedMillis,
+                            pendingBefore
+                    );
+                    // The rollback undid every insert, and reserved ids are assigned per request, so
+                    // replaying the survivors is safe. Isolation is off for the retry to bound the
+                    // work at two attempts per chunk.
+                    processChunk(partition.remainder(), false);
+                    return;
+                }
             }
+            if (!permitsReleased) {
+                failSubmissions(chunk, ex, elapsedMillis, pendingBefore);
+                return;
+            }
+            metrics.recordFailure(chunk.size(), elapsedMillis, pendingBefore, pendingCount.get(), activeWorkers.get());
             dispatchOrComplete(
                     chunk.size(),
                     () -> chunk.forEach(pending -> pending.future().completeExceptionally(ex))
+            );
+        }
+    }
+
+    private void failSubmissions(List<PendingSubmission> submissions,
+                                 RuntimeException failure,
+                                 long elapsedMillis,
+                                 int pendingBefore) {
+        metrics.recordFailure(
+                submissions.size(),
+                elapsedMillis,
+                pendingBefore,
+                pendingCount.get(),
+                activeWorkers.get()
+        );
+        releaseChunk(submissions);
+        dispatchOrComplete(
+                submissions.size(),
+                () -> submissions.forEach(pending -> pending.future().completeExceptionally(failure))
+        );
+    }
+
+    /**
+     * Splits a chunk into the submissions the batch could not account for and the ones that only
+     * failed because they shared a transaction with them.
+     */
+    private static ChunkPartition partitionInconsistent(List<PendingSubmission> chunk,
+                                                        ContestSubmissionBatchConsistencyException failure) {
+        Set<Long> offendingIds = new HashSet<>(failure.offendingSubmissionIds());
+        if (offendingIds.isEmpty()) {
+            return new ChunkPartition(List.of(), chunk);
+        }
+
+        // The processor collapses in-batch duplicates before inserting, so a request that shares a
+        // dedup key with an offender never reaches the insert and never appears in the reported ids.
+        // The key includes the user id, so it would fail for the same reason on the retry.
+        Set<DedupKey> offendingKeys = new HashSet<>();
+        for (PendingSubmission pending : chunk) {
+            Long reservedId = pending.request().reservedSubmissionId();
+            if (reservedId != null && offendingIds.contains(reservedId)) {
+                offendingKeys.add(DedupKey.from(pending.request()));
+            }
+        }
+
+        List<PendingSubmission> offenders = new ArrayList<>();
+        List<PendingSubmission> remainder = new ArrayList<>();
+        for (PendingSubmission pending : chunk) {
+            if (offendingKeys.contains(DedupKey.from(pending.request()))) {
+                offenders.add(pending);
+            } else {
+                remainder.add(pending);
+            }
+        }
+        return new ChunkPartition(offenders, remainder);
+    }
+
+    private record ChunkPartition(List<PendingSubmission> offenders, List<PendingSubmission> remainder) {
+    }
+
+    private record DedupKey(long contestId, long problemId, long userId, String codeHash) {
+        private static DedupKey from(ContestSubmissionWriteRequest request) {
+            return new DedupKey(
+                    request.contestId(),
+                    request.problemId(),
+                    request.userId(),
+                    request.codeHash()
             );
         }
     }

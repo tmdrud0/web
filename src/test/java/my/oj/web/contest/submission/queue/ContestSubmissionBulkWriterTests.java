@@ -19,6 +19,8 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 class ContestSubmissionBulkWriterTests {
 
@@ -165,6 +167,128 @@ class ContestSubmissionBulkWriterTests {
     }
 
     @Test
+    void saveAsync_failsOnlyInconsistentSubmissionsAndRetriesTheRest() throws Exception {
+        ContestSubmissionBulkProcessor processor = mock(ContestSubmissionBulkProcessor.class);
+        ContestSubmissionBulkMetrics metrics = new ContestSubmissionBulkMetrics();
+        ContestSubmissionService.ContestSubmissionCreateResult second = result(202L);
+        ContestSubmissionService.ContestSubmissionCreateResult third = result(203L);
+        AtomicReference<List<ContestSubmissionWriteRequest>> retried = new AtomicReference<>();
+        given(processor.process(anyList()))
+                .willThrow(new ContestSubmissionBatchConsistencyException("omitted", List.of(201L)))
+                .willAnswer(invocation -> {
+                    retried.set(invocation.getArgument(0));
+                    return List.of(second, third);
+                });
+
+        writer = new ContestSubmissionBulkWriter(
+                processor,
+                metrics,
+                immediateDispatcher(),
+                new ContestSubmissionBulkProperties(3, 1, 10)
+        );
+
+        var offending = writer.saveAsync(request(201L));
+        var survivorA = writer.saveAsync(request(202L));
+        var survivorB = writer.saveAsync(request(203L));
+
+        assertThatThrownBy(() -> offending.toCompletableFuture().get(2, TimeUnit.SECONDS))
+                .hasCauseInstanceOf(ContestSubmissionBatchConsistencyException.class);
+        assertThat(survivorA.toCompletableFuture().get(2, TimeUnit.SECONDS)).isSameAs(second);
+        assertThat(survivorB.toCompletableFuture().get(2, TimeUnit.SECONDS)).isSameAs(third);
+        assertThat(retried.get())
+                .extracting(ContestSubmissionWriteRequest::reservedSubmissionId)
+                .containsExactly(202L, 203L);
+        assertThat(metrics.snapshot().currentInFlight()).isZero();
+    }
+
+    @Test
+    void saveAsync_failsInBatchDuplicatesOfAnInconsistentSubmission() throws Exception {
+        ContestSubmissionBulkProcessor processor = mock(ContestSubmissionBulkProcessor.class);
+        ContestSubmissionBulkMetrics metrics = new ContestSubmissionBulkMetrics();
+        ContestSubmissionService.ContestSubmissionCreateResult survivor = result(303L);
+        AtomicReference<List<ContestSubmissionWriteRequest>> retried = new AtomicReference<>();
+        // Only the primary of the collapsed pair is reported; its duplicate carries the same user
+        // and code, so replaying it would fail again.
+        given(processor.process(anyList()))
+                .willThrow(new ContestSubmissionBatchConsistencyException("omitted", List.of(301L)))
+                .willAnswer(invocation -> {
+                    retried.set(invocation.getArgument(0));
+                    return List.of(survivor);
+                });
+
+        writer = new ContestSubmissionBulkWriter(
+                processor,
+                metrics,
+                immediateDispatcher(),
+                new ContestSubmissionBulkProperties(3, 1, 10)
+        );
+
+        var offending = writer.saveAsync(request(301L, "shared-hash"));
+        var collapsedDuplicate = writer.saveAsync(request(302L, "shared-hash"));
+        var unrelated = writer.saveAsync(request(303L, "other-hash"));
+
+        assertThatThrownBy(() -> offending.toCompletableFuture().get(2, TimeUnit.SECONDS))
+                .hasCauseInstanceOf(ContestSubmissionBatchConsistencyException.class);
+        assertThatThrownBy(() -> collapsedDuplicate.toCompletableFuture().get(2, TimeUnit.SECONDS))
+                .hasCauseInstanceOf(ContestSubmissionBatchConsistencyException.class);
+        assertThat(unrelated.toCompletableFuture().get(2, TimeUnit.SECONDS)).isSameAs(survivor);
+        assertThat(retried.get())
+                .extracting(ContestSubmissionWriteRequest::reservedSubmissionId)
+                .containsExactly(303L);
+        assertThat(metrics.snapshot().currentInFlight()).isZero();
+    }
+
+    @Test
+    void saveAsync_failsWholeChunkWhenConsistencyFailureNamesNoSubmissions() throws Exception {
+        ContestSubmissionBulkProcessor processor = mock(ContestSubmissionBulkProcessor.class);
+        ContestSubmissionBulkMetrics metrics = new ContestSubmissionBulkMetrics();
+        given(processor.process(anyList()))
+                .willThrow(new ContestSubmissionBatchConsistencyException("duplicate reserved id in batch"));
+
+        writer = new ContestSubmissionBulkWriter(
+                processor,
+                metrics,
+                immediateDispatcher(),
+                new ContestSubmissionBulkProperties(2, 1, 10)
+        );
+
+        var first = writer.saveAsync(request(401L));
+        var second = writer.saveAsync(request(402L));
+
+        assertThatThrownBy(() -> first.toCompletableFuture().get(2, TimeUnit.SECONDS))
+                .hasCauseInstanceOf(ContestSubmissionBatchConsistencyException.class);
+        assertThatThrownBy(() -> second.toCompletableFuture().get(2, TimeUnit.SECONDS))
+                .hasCauseInstanceOf(ContestSubmissionBatchConsistencyException.class);
+        verify(processor, times(1)).process(anyList());
+        assertThat(metrics.snapshot().currentInFlight()).isZero();
+    }
+
+    @Test
+    void saveAsync_failsWholeChunkWhenEveryRowIsInconsistent() throws Exception {
+        ContestSubmissionBulkProcessor processor = mock(ContestSubmissionBulkProcessor.class);
+        ContestSubmissionBulkMetrics metrics = new ContestSubmissionBulkMetrics();
+        given(processor.process(anyList()))
+                .willThrow(new ContestSubmissionBatchConsistencyException("omitted", List.of(501L, 502L)));
+
+        writer = new ContestSubmissionBulkWriter(
+                processor,
+                metrics,
+                immediateDispatcher(),
+                new ContestSubmissionBulkProperties(2, 1, 10)
+        );
+
+        var first = writer.saveAsync(request(501L));
+        var second = writer.saveAsync(request(502L));
+
+        assertThatThrownBy(() -> first.toCompletableFuture().get(2, TimeUnit.SECONDS))
+                .hasCauseInstanceOf(ContestSubmissionBatchConsistencyException.class);
+        assertThatThrownBy(() -> second.toCompletableFuture().get(2, TimeUnit.SECONDS))
+                .hasCauseInstanceOf(ContestSubmissionBatchConsistencyException.class);
+        verify(processor, times(1)).process(anyList());
+        assertThat(metrics.snapshot().currentInFlight()).isZero();
+    }
+
+    @Test
     void shutdown_failsQueuedSubmissionsWithoutLeakingAdmission() throws Exception {
         ContestSubmissionBulkMetrics metrics = new ContestSubmissionBulkMetrics();
         writer = new ContestSubmissionBulkWriter(
@@ -192,12 +316,16 @@ class ContestSubmissionBulkWriterTests {
     }
 
     private static ContestSubmissionWriteRequest request(long submissionId) {
+        return request(submissionId, "hash-" + submissionId);
+    }
+
+    private static ContestSubmissionWriteRequest request(long submissionId, String codeHash) {
         return new ContestSubmissionWriteRequest(
                 1L,
                 2L,
                 3L,
                 "code",
-                "hash-" + submissionId,
+                codeHash,
                 LocalDateTime.now(),
                 submissionId
         );

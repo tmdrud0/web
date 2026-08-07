@@ -4,6 +4,7 @@ import my.oj.web.contest.submission.judge.ContestSubmissionJudgeProcessor;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultBatchWriter;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultWriterProperties;
 import my.oj.web.contest.submission.judge.JdbcContestSubmissionJudgeResultBatchPersistence;
+import my.oj.web.observability.ContestOutboxDrainMetrics;
 import org.junit.jupiter.api.Test;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.boot.SpringApplication;
@@ -81,6 +82,12 @@ class ContestJudgeRoleProfileActivationTests {
         @Bean
         ContestJudgeOutboxStore contestJudgeOutboxStore() {
             return mock(ContestJudgeOutboxStore.class);
+        }
+
+        /** Real rather than mocked: unbound to any registry it discards its recordings anyway. */
+        @Bean
+        ContestOutboxDrainMetrics contestOutboxDrainMetrics() {
+            return new ContestOutboxDrainMetrics();
         }
 
         @Bean("contestJudgeRabbitTemplate")

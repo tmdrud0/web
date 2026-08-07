@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 - `src/main/java`: Spring Boot code organized by feature (`contest`, `problem`, `submission`, `user`, `user/rank` with `solvedBucket`).
-- `src/main/resources/templates`: Thymeleaf pages; `static`: assets.
+- `src/main/resources/static`: assets. There is no view layer; every endpoint returns JSON.
 - `src/test/java`: JUnit tests (see `WebApplicationTests`).
 - Build files: `build.gradle`, `settings.gradle`, Gradle wrapper `gradlew` / `gradlew.bat`.
 
@@ -14,7 +14,7 @@
 
 ## Coding Style & Naming Conventions
 - Java 17, 4-space indentation, standard Spring naming.
-- Suffixes: `Controller`, `Service`, `Repository`, `Dto`. Entities use singular nouns.
+- Suffixes: `ApiController`, `Service`, `Repository`, `Dto`. Entities use singular nouns.
 - Prefer DTOs and interface projections over raw `Object[]`; keep SQL aliases matching projection getters.
 - Repositories: data access only. Services: business logic with `@Transactional` boundaries.
 
@@ -34,6 +34,6 @@
 - Production: set `spring.jpa.hibernate.ddl-auto=validate` and reduce Hibernate SQL logging.
 
 ## Architecture Notes
-- Spring MVC + Thymeleaf; feature-based packages.
+- Spring MVC JSON API, feature-based packages. Controllers live in `<feature>/api` and every route is under `/api`.
 - Ranking uses bucket table `solved_count_bucket`; rebuild via `RankService.rebuildSolvedBuckets()` when distribution changes.
 

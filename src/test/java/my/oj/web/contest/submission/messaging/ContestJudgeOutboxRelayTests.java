@@ -1,5 +1,7 @@
 package my.oj.web.contest.submission.messaging;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import my.oj.web.observability.ContestOutboxDrainMetrics;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.amqp.core.Message;
@@ -12,6 +14,7 @@ import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import java.util.List;
 import java.time.Duration;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
@@ -25,6 +28,8 @@ class ContestJudgeOutboxRelayTests {
 
     private final ContestJudgeOutboxStore outboxStore = mock(ContestJudgeOutboxStore.class);
     private final RabbitTemplate rabbitTemplate = mock(RabbitTemplate.class);
+    private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    private final ContestOutboxDrainMetrics drainMetrics = new ContestOutboxDrainMetrics();
     private final ContestJudgeOutboxRelay relay = new ContestJudgeOutboxRelay(
             outboxStore,
             rabbitTemplate,
@@ -32,15 +37,38 @@ class ContestJudgeOutboxRelayTests {
                     50,
                     Duration.ofSeconds(30),
                     Duration.ofSeconds(10)
-            )
+            ),
+            drainMetrics
     );
     private final ContestJudgeOutboxStore.ClaimedEvent event =
             new ContestJudgeOutboxStore.ClaimedEvent(7L, 42L, "claim-token");
 
     @BeforeEach
     void setUp() {
+        drainMetrics.bindTo(registry);
         when(outboxStore.completeAll(anyList(), anyList()))
                 .thenReturn(new ContestJudgeOutboxStore.BatchCompletionResult(0, 0, 0, 0));
+    }
+
+    /**
+     * A completion the store rejected as stale changed no row, so the event is still someone
+     * else's to publish. Counting the requested updates instead would let the drain rate outrun
+     * the work and understate the estimated drain time built on it.
+     */
+    @Test
+    void countsAppliedUpdatesRatherThanRequestedOnes() {
+        when(outboxStore.claim(any(Integer.class), any())).thenReturn(List.of());
+        when(outboxStore.completeAll(anyList(), anyList()))
+                .thenReturn(new ContestJudgeOutboxStore.BatchCompletionResult(9, 7, 4, 2));
+
+        relay.relay();
+
+        assertThat(counter("contest.outbox.drained")).isEqualTo(7.0);
+        assertThat(counter("contest.outbox.retries")).isEqualTo(2.0);
+    }
+
+    private double counter(String name) {
+        return registry.get(name).tag("outbox", ContestOutboxDrainMetrics.JUDGE_OUTBOX).counter().count();
     }
 
     @Test

@@ -1,3 +1,5 @@
+import org.gradle.api.tasks.PathSensitivity
+
 plugins {
 	id 'java'
 	id 'org.springframework.boot' version '3.4.3'
@@ -24,15 +26,15 @@ repositories {
 }
 
 dependencies {
-	implementation 'org.springframework.boot:spring-boot-starter-thymeleaf'
 	implementation 'org.springframework.boot:spring-boot-starter-web'
 	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
 	implementation 'org.springframework.boot:spring-boot-starter-data-redis'
 	implementation 'org.springframework.boot:spring-boot-starter-amqp'
+	implementation 'org.springframework.boot:spring-boot-starter-actuator'
+	implementation 'io.micrometer:micrometer-registry-prometheus'
 	implementation 'org.springframework.session:spring-session-data-redis'
 	implementation 'org.flywaydb:flyway-core'
 	implementation 'org.flywaydb:flyway-mysql'
-	implementation 'org.thymeleaf.extras:thymeleaf-extras-java8time:3.0.4.RELEASE'
 	compileOnly 'org.projectlombok:lombok'
 	runtimeOnly 'com.mysql:mysql-connector-j'
 	annotationProcessor 'org.projectlombok:lombok'
@@ -77,4 +79,13 @@ tasks.named('test') {
     }
     // Run tests with MySQL-backed 'test' profile by default
     systemProperty "spring.profiles.active", System.getProperty("spring.profiles.active", "test")
+
+    // PipelineMetricNamesTests reads these two files at runtime to check that every contest_*
+    // series they query is one the application exports. Neither is on the test classpath, so
+    // without declaring them Gradle sees no input change when a panel or a rule is edited and
+    // leaves the previous PASS in place - which is the one case the test exists to catch.
+    inputs.files(
+            "observability/grafana/dashboards/oj-bottleneck.json",
+            "observability/prometheus/rules/oj-pipeline.yml"
+    ).withPropertyName("pipelineMetricSources").withPathSensitivity(PathSensitivity.RELATIVE)
 }

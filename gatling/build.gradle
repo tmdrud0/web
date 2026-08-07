@@ -67,18 +67,6 @@ registerSimulationTask(
 )
 
 registerSimulationTask(
-    'realContestSubmissionRun',
-    '**/RealContestSubmissionSimulation.scala',
-    'Runs only RealContestSubmissionSimulation.'
-)
-
-registerSimulationTask(
-    'realContestSubmissionSessionReuseRun',
-    '**/RealContestSubmissionSessionReuseSimulation.scala',
-    'Runs only RealContestSubmissionSessionReuseSimulation.'
-)
-
-registerSimulationTask(
     'ojGoalLoadRun',
     '**/OjGoalLoadSimulation.scala',
     'Runs only OjGoalLoadSimulation.'

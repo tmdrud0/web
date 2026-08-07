@@ -44,7 +44,7 @@ Invoke-RestMethod http://localhost:8080/perf/contest/submission-bulk-stats
 Treat the highest clean step as the max sustainable RPS when all of these hold:
 
 - success rate stays at or above `99%`
-- there are no `500` errors from `/perf/contest/submit`
+- there are no `500` errors from `POST /api/problems/{id}/submissions` (`503` and `429` are backpressure, not faults)
 - there are no `HikariPool` timeout or `Too many connections` errors
 - latency is still within the threshold you care about, usually `p95`
 

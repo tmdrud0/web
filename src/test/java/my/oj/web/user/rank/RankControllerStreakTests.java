@@ -18,8 +18,16 @@ import java.time.LocalDateTime;
 import java.util.UUID;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+/**
+ * The streak orderings, read as JSON.
+ *
+ * <p>These asserted on a view name and on model attributes named per ordering, which is how a
+ * template picked one of three results out of the model. There is one {@code page} now and
+ * {@code sortBy} says which ordering produced it.
+ */
 @SpringBootTest
 @ActiveProfiles("test")
 @AutoConfigureMockMvc
@@ -60,23 +68,23 @@ class RankControllerStreakTests {
     }
 
     @Test
-    void get_streak_rank_page_renders() throws Exception {
+    void get_streak_rank_page_returns_json() throws Exception {
         var dto = UserDto.from(loggedIn);
-        mockMvc.perform(get("/rank").param("sortBy", "streak").sessionAttr("user", dto))
+        mockMvc.perform(get("/api/rank").param("sortBy", "streak").sessionAttr("user", dto))
                 .andExpect(status().isOk())
-                .andExpect(view().name("rank"))
-                .andExpect(model().attributeExists("streakPageResult"))
-                .andExpect(model().attribute("sortBy", "streak"));
+                .andExpect(jsonPath("$.sortBy").value("streak"))
+                .andExpect(jsonPath("$.aroundMe").value(false))
+                .andExpect(jsonPath("$.page").exists());
     }
 
     @Test
-    void get_streak_around_me_renders() throws Exception {
+    void get_streak_around_me_returns_json() throws Exception {
         var dto = UserDto.from(loggedIn);
-        mockMvc.perform(get("/rank").param("sortBy", "streak").param("aroundMe", "true").sessionAttr("user", dto))
+        mockMvc.perform(get("/api/rank").param("sortBy", "streak").param("aroundMe", "true").sessionAttr("user", dto))
                 .andExpect(status().isOk())
-                .andExpect(view().name("rank"))
-                .andExpect(model().attributeExists("streakPageResult"))
-                .andExpect(model().attribute("aroundMe", true));
+                .andExpect(jsonPath("$.sortBy").value("streak"))
+                .andExpect(jsonPath("$.aroundMe").value(true))
+                .andExpect(jsonPath("$.page").exists());
     }
 
     private static void setStreak(User user, LocalDateTime last, int current, int longest) throws Exception {

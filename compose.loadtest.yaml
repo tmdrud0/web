@@ -24,12 +24,17 @@ services:
     container_name: oj-loadtest-rabbitmq
     ports: !reset []
 
+  # CONTEST_RATE_LIMIT_* passes through from the shell for the same reason JUDGE_* does: the
+  # harness sets the cooldown from the same number it derives every scenario's pace from. Only
+  # the web nodes accept submissions, so only they need it.
   web-1:
     container_name: oj-loadtest-web-1
     environment:
       SPRING_PROFILES_ACTIVE: multi-web,perf,loadtest
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 1
+      CONTEST_RATE_LIMIT_STORE: ${CONTEST_RATE_LIMIT_STORE:-redis}
+      CONTEST_RATE_LIMIT_COOLDOWN_MILLIS: ${CONTEST_RATE_LIMIT_COOLDOWN_MILLIS:-2000}
     # Direct ports are setup/diagnostic-only. Gatling must use nginx:18080.
     ports: !override
       - "18081:8080"
@@ -40,6 +45,8 @@ services:
       SPRING_PROFILES_ACTIVE: multi-web,perf,loadtest
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 2
+      CONTEST_RATE_LIMIT_STORE: ${CONTEST_RATE_LIMIT_STORE:-redis}
+      CONTEST_RATE_LIMIT_COOLDOWN_MILLIS: ${CONTEST_RATE_LIMIT_COOLDOWN_MILLIS:-2000}
     ports: !override
       - "18082:8080"
 
@@ -50,12 +57,20 @@ services:
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 100
 
+  # JUDGE_* passes through from the shell so a run can give the judge a latency profile without
+  # editing a file. Off by default, which keeps every earlier measurement comparable. See
+  # application-loadtest.properties.
   judge-1:
     container_name: oj-loadtest-judge-1
     environment:
       SPRING_PROFILES_ACTIVE: multi-judge,loadtest
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 200
+      JUDGE_LATENCY_ENABLED: ${JUDGE_LATENCY_ENABLED:-false}
+      JUDGE_SLOW_RATIO: ${JUDGE_SLOW_RATIO:-0.01}
+      JUDGE_SLOW_MILLIS: ${JUDGE_SLOW_MILLIS:-2000}
+      JUDGE_BASE_MILLIS: ${JUDGE_BASE_MILLIS:-10}
+      CONTEST_JUDGE_CONCURRENCY: ${CONTEST_JUDGE_CONCURRENCY:-16}
 
   judge-2:
     container_name: oj-loadtest-judge-2
@@ -63,6 +78,11 @@ services:
       SPRING_PROFILES_ACTIVE: multi-judge,loadtest
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 201
+      JUDGE_LATENCY_ENABLED: ${JUDGE_LATENCY_ENABLED:-false}
+      JUDGE_SLOW_RATIO: ${JUDGE_SLOW_RATIO:-0.01}
+      JUDGE_SLOW_MILLIS: ${JUDGE_SLOW_MILLIS:-2000}
+      JUDGE_BASE_MILLIS: ${JUDGE_BASE_MILLIS:-10}
+      CONTEST_JUDGE_CONCURRENCY: ${CONTEST_JUDGE_CONCURRENCY:-16}
 
 volumes:
   mysql-data:

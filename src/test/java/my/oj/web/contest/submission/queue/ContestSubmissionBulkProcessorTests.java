@@ -16,10 +16,13 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.LocalDateTime;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -78,6 +81,15 @@ class ContestSubmissionBulkProcessorTests {
         given(entityManager.getReference(Contest.class, 10L)).willReturn(contest);
         given(entityManager.getReference(Problem.class, 20L)).willReturn(problem);
         given(entityManager.getReference(User.class, 30L)).willReturn(user);
+        given(batchPersistence.insertAll(any())).willAnswer(invocation -> {
+            List<my.oj.web.contest.submission.core.ContestSubmission> submissions = invocation.getArgument(0);
+            Map<Long, ContestSubmissionBatchInsertResult.Resolution> resolutions = new LinkedHashMap<>();
+            submissions.forEach(submission -> resolutions.put(
+                    submission.getId(),
+                    ContestSubmissionBatchInsertResult.Resolution.inserted(submission.getId())
+            ));
+            return new ContestSubmissionBatchInsertResult(resolutions);
+        });
 
         var results = processor.process(List.of(first, duplicate));
 
@@ -96,6 +108,35 @@ class ContestSubmissionBulkProcessorTests {
         verify(entityManager).clear();
         verify(judgeOutboxWriter).enqueueAll(List.of(100L));
         verifyNoMoreInteractions(entityManager);
+    }
+
+    @Test
+    void processReturnsExistingIdAndSkipsOutboxForDatabaseDuplicate() {
+        ContestSubmissionWriteRequest request = new ContestSubmissionWriteRequest(
+                10L,
+                20L,
+                30L,
+                "print(1)",
+                "hash",
+                LocalDateTime.now(),
+                100L
+        );
+
+        given(entityManager.getReference(Contest.class, 10L)).willReturn(contest);
+        given(entityManager.getReference(Problem.class, 20L)).willReturn(problem);
+        given(entityManager.getReference(User.class, 30L)).willReturn(user);
+        given(batchPersistence.insertAll(any())).willReturn(new ContestSubmissionBatchInsertResult(Map.of(
+                100L,
+                ContestSubmissionBatchInsertResult.Resolution.duplicate(77L)
+        )));
+
+        var results = processor.process(List.of(request));
+
+        assertThat(results).hasSize(1);
+        assertThat(results.get(0).duplicate()).isTrue();
+        assertThat(results.get(0).submission().getId()).isEqualTo(77L);
+        verify(judgeOutboxWriter).enqueueAll(List.of());
+        verify(entityManager).clear();
     }
 
     @Test
