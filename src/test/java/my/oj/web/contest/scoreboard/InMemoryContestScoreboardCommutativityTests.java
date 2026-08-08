@@ -161,7 +161,7 @@ class InMemoryContestScoreboardCommutativityTests {
                 new InMemoryContestScoreboardApplier(scoreboard);
 
         private void apply(long eventId, Event event) {
-            applier.apply(eventId, new ContestScoreboardUpdate(
+            applier.apply(ContestScoreboardApplier.ApplyRequest.rebuild(eventId, new ContestScoreboardUpdate(
                     event.contestSubmissionId(),
                     CONTEST_ID,
                     event.problemId(),
@@ -170,7 +170,7 @@ class InMemoryContestScoreboardCommutativityTests {
                     CONTEST_START.plusMinutes(event.submittedMinute()),
                     event.result(),
                     null
-            ));
+            )));
         }
 
         private List<ContestScoreboardEntry> ranking() {

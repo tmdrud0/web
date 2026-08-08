@@ -12,6 +12,9 @@ import java.util.Optional;
 
 public interface ContestSubmissionResultRepository extends JpaRepository<ContestSubmissionResult, Long> {
 
+    @Query("select distinct csr.contestId from ContestSubmissionResult csr order by csr.contestId")
+    List<Long> findDistinctContestIds();
+
     @Query("""
             select csr.id as submissionId,
                    csr.contestId as contestId,

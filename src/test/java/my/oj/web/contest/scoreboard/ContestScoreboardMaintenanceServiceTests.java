@@ -1,31 +1,24 @@
 package my.oj.web.contest.scoreboard;
 
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
-import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.verify;
 
 @ExtendWith(MockitoExtension.class)
 class ContestScoreboardMaintenanceServiceTests {
 
     @Mock
     private ContestScoreboardApplier scoreboardApplier;
-    @Mock
-    private ContestScoreboardOutboxService outboxService;
-
     @Test
-    void clearLiveContestState_resetsProjectionBeforeDeletingPendingUpdates() {
+    void clearLiveContestState_resetsProjection() {
         ContestScoreboardMaintenanceService maintenanceService =
-                new ContestScoreboardMaintenanceService(scoreboardApplier, outboxService);
+                new ContestScoreboardMaintenanceService(scoreboardApplier);
 
         maintenanceService.clearLiveContestState(42L);
 
-        InOrder order = inOrder(scoreboardApplier, outboxService);
-        order.verify(scoreboardApplier).reset(42L);
-        order.verify(outboxService).deleteByContestId(42L);
+        verify(scoreboardApplier).reset(42L);
     }
 }

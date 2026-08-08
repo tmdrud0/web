@@ -42,8 +42,9 @@ scrape_configs:
 
   # Keep the cheap aggregate endpoint above for node-wide health. Queue comparisons need object
   # labels, but the all-object endpoint also emits every connection/channel combination. The
-  # detailed endpoint lets this repository request only queue-owned families, then retain only
-  # the six series used by the dashboard and load harness. The sample limit makes cardinality a
+  # detailed endpoint lets this repository request only queue-owned families. AMQP 0.9.1 stream
+  # consumers do not publish broker-managed offset lag; batch-1 derives that from a short
+  # x-stream-offset=last probe and the Redis checkpoint instead. The sample limit makes cardinality a
   # hard failure (up=0) instead of allowing a topology mistake to grow the TSDB silently.
   - job_name: rabbitmq-per-queue
     metrics_path: /metrics/detailed

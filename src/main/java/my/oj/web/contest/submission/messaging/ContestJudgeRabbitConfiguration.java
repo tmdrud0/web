@@ -25,7 +25,8 @@ import org.springframework.context.annotation.Configuration;
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnExpression("'${contest.submission.judge.rabbit.publisher.enabled:false}' == 'true' || "
         + "'${contest.submission.judge.rabbit.listener.enabled:false}' == 'true' || "
-        + "'${contest.submission.judge.result-stream.publisher.enabled:false}' == 'true'")
+        + "'${contest.submission.judge.result-stream.publisher.enabled:false}' == 'true' || "
+        + "'${contest.scoreboard.stream.consumer.enabled:false}' == 'true'")
 class ContestJudgeRabbitConfiguration {
 
     @Bean

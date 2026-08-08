@@ -1,6 +1,6 @@
 # 대회 제출 파이프라인 설계 및 개선 기록
 
-> 최종 갱신: 2026-08-08
+> 최종 갱신: 2026-08-09
 > 작업 브랜치: `codex/contest-judge-stream-publish`
 > 문서 목적: 과거의 설계 판단부터 현재 구현, 성능 측정, 미해결 문제까지 한 문서에서 다시 파악하고 LLM에 인수인계하기 위한 기록
 
@@ -17,6 +17,7 @@
 7. 제출, relay, 채점 결과, scoreboard 반영을 각각 batch화
 8. 전체 1000 TPS 부하와 JFR 진단으로 현재 병목을 다시 확인
 9. scoreboard outbox를 유지한 채 judge 결과를 RabbitMQ Stream에 confirm 병행 발행하는 A단계 추가
+10. scoreboard 구동과 복구 checkpoint를 RabbitMQ Stream offset + Redis Lua로 전환하는 B단계 적용
 
 현재 선택한 구조는 다음과 같다.
 
@@ -27,11 +28,13 @@ HTTP 제출
   -> Batch relay
   -> RabbitMQ quorum queue
   -> Judge listener
-  -> MySQL: contest_submission_result + contest_submission_outbox (동일 트랜잭션)
+  -> MySQL: contest_submission_result
   -> RabbitMQ Stream: contest.judge.result.stream (publisher confirm)
   -> Judge queue ACK
-  -> Scoreboard batch worker
-  -> Redis scoreboard
+  -> Scoreboard stream consumer(prefetch + consumer batch)
+  -> Redis Lua: scoreboard + stream offset + DB-completion repair marker
+  -> MySQL JDBC batch: scoreboard_applied_at
+  -> Stream delivery ACK
 ```
 
 핵심 판단은 다음과 같다.
@@ -39,9 +42,9 @@ HTTP 제출
 - 제출 원본과 중복 제약의 최종 권위는 MySQL이다.
 - RabbitMQ는 원본 저장소가 아니라 채점 작업을 분배하는 durable work queue다.
 - DB와 RabbitMQ 사이에 2PC를 사용하지 않고 outbox와 멱등성으로 at-least-once를 만든다.
-- RabbitMQ consumer ACK는 채점 결과와 scoreboard outbox의 DB commit, result stream publisher confirm이 모두 끝난 뒤에만 발생한다.
+- RabbitMQ judge consumer ACK는 채점 결과 DB commit과 result stream publisher confirm이 모두 끝난 뒤에만 발생한다.
 - 채점 서버의 긴 꼬리 지연은 `prefetch=1`과 다수 consumer로 서로 격리한다.
-- Redis scoreboard는 파생 상태이며 DB outbox로 재구성할 수 있어야 한다.
+- Redis scoreboard는 파생 상태이며 MySQL 결과에서 contest 단위로 재구성할 수 있어야 한다.
 - 채점 완료 순서는 제출 순서와 다르므로 scoreboard 반영은 순서와 중복에 무관해야 한다. 라이브 값과 rebuild 값이 같은 데이터에서 일치하는 것이 기준이다.
 - 2026-07-31 리팩터링에서 제출 경로의 동기 Redis dedup 호출과 user/problem 반복 조회를 제거했다.
 - 제출 admission은 `max-in-flight` semaphore로 제한하며, 현재 공통 설정은
@@ -292,11 +295,11 @@ Docker Compose 기준 역할은 다음과 같다.
 | 역할 | Spring profile | 책임 |
 |---|---|---|
 | Web 1, 2 | `multi-web` | HTTP, 검증, 중복 확인, 제출 batch 저장 |
-| Batch | `multi-batch` | judge outbox relay, scoreboard outbox 반영/복구 |
-| Judge 1, 2 | `multi-judge` | Rabbit 소비, 채점, 결과/outbox batch 저장 |
-| MySQL | MySQL 8.0 | 원본, unique 제약, 두 종류 outbox |
+| Batch | `multi-batch` | judge outbox relay, scoreboard stream 소비/복구 |
+| Judge 1, 2 | `multi-judge` | Rabbit 소비, 채점, 결과 batch 저장, result stream confirm 발행 |
+| MySQL | MySQL 8.0 | 원본, unique 제약, judge outbox, 적용 시각 |
 | Redis | Redis 7 | session, rate limit, scoreboard |
-| RabbitMQ | RabbitMQ 4.1 | 채점 work queue와 DLQ |
+| RabbitMQ | RabbitMQ 4.1 | 채점 work queue/DLQ와 scoreboard result stream |
 
 관련 설정:
 
@@ -340,12 +343,13 @@ flowchart LR
     API --> RW["Result batch writer"]
     RW --> T2["MySQL transaction"]
     T2 --> CR["contest_submission_result"]
-    T2 --> SO["contest_submission_outbox"]
     T2 --> SP["Result stream publisher"]
     SP --> SMQ["RabbitMQ result stream confirm"]
     SMQ --> ACK["Judge work queue ACK"]
-    SO --> SB["Scoreboard batch worker"]
-    SB --> RS["Redis Lua and pipeline"]
+    SMQ --> SB["Scoreboard stream consumer"]
+    SB --> RS["Redis Lua: scoreboard + offset"]
+    SB --> AT["JDBC batch: scoreboard_applied_at"]
+    AT --> SACK["Stream delivery ACK"]
 ```
 
 ### 4.3 HTTP 제출과 DB 저장
@@ -564,7 +568,106 @@ retention은 `max-age=7D`, `max-length-bytes=10 GiB`로 시작한다.
 
 이 순서는 DB와 Rabbit 사이의 2PC를 추가하지 않으면서도 `DB commit 후 publish 전` 장애를 원래 judge work queue 재전달로 복구한다. publish를 commit 앞에 두거나 confirm을 기다리지 않고 listener를 반환하면 이 복구 연결이 끊기므로 허용하지 않는다.
 
-### 4.10 scoreboard outbox와 Redis pipeline
+### 4.9.2 B단계: scoreboard consumer와 checkpoint를 Stream으로 전환
+
+B단계에서는 `contest_submission_outbox` write/worker/recovery를 제거하고 batch-1이
+`contest.judge.result.stream`을 직접 소비한다. 테이블 자체는 롤백 호환을 위해 아직 schema에
+남지만 현재 코드에는 INSERT, claim, recovery 경로가 없다. `contest_judge_outbox`는 제출 DB
+commit과 judge queue publish 사이의 복구 경로이므로 그대로 유지한다.
+
+단조 증가 키의 소유권을 뒤집은 것이 핵심이다.
+
+```text
+이전: Redis INCR(redis_seq) -> DB outbox에 checkpoint
+현재: RabbitMQ offset       -> Redis Lua에 checkpoint
+```
+
+이전에는 Redis RDB rollback과 DB checkpoint rollback이 서로 달라질 수 있어서 lost-tail scan,
+duplicate `redis_seq` group requeue, pagination이 필요했다. 현재는 Lua가 아래 세 가지를 한 번에
+실행한다.
+
+1. commutative scoreboard 갱신
+2. `contest:scoreboard:stream:offset` 저장
+3. `contest:scoreboard:stream:db-pending`에 submission ID 기록
+
+따라서 Redis가 snapshot으로 돌아가면 scoreboard와 적용 offset도 같은 시점으로 돌아간다.
+consumer lifecycle은 메모리에 본 마지막 offset보다 Redis offset이 작아진 것을 감지해 container를
+중지하고 `x-stream-offset=storedOffset+1`로 다시 구독한다. 첫 적용 전에는 offset이 없으므로
+`first`를 사용한다.
+
+기존 key 계약 중 전역 sequence counter와 `contestSubmissionId -> redis_seq` hash는 제거했다.
+둘은 DB checkpoint를 만들기 위한 장치였고 broker offset 아래서는 중복된 권위가 된다. 반면
+contest별 processed-submission set은 남겼다. §4.10.1의 commutative 문제 상태가 정확성을
+보장하므로 processed set은 더 이상 정합성 방어선이 아니며, 같은 제출의 중복 stream entry에서
+불필요한 hash 재계산을 줄이고 A→B 전환을 부드럽게 하는 최적화다. contest rebuild는 이 set을
+지우고 DB 결과로 다시 채운다.
+
+Redis 적용과 `scoreboard_applied_at`은 서로 다른 저장소이므로 그 컬럼을 checkpoint로 사용하지
+않는다. 대신 Lua가 `db-pending` set을 offset과 함께 기록하고, consumer가 Redis batch를 모두
+적용한 뒤 submission ID 전체를 한 번의 JDBC batch update로 완료한 다음 set에서 제거한다.
+Redis 적용 뒤 MySQL 쓰기 전에 프로세스가 죽으면 재전달 또는 다음 기동의 `repairPending()`이
+같은 batch update를 반복한다. SQL은 `COALESCE(scoreboard_applied_at, CURRENT_TIMESTAMP(6))`라서
+최초 완료 시각을 보존한다.
+
+AMQP 0.9.1 stream 소비 설정:
+
+- queue: `contest.judge.result.stream`
+- 명시적 prefetch: 500(항상 consumer batch size 이상으로 정규화)
+- consumer batch size: 500
+- consumer/role: batch-1의 1 consumer
+- ACK: Lua 적용과 JDBC batch 완료 뒤 listener 정상 반환 시 AUTO ACK
+
+AMQP 0.9.1 stream consumer에는 QoS/prefetch와 ACK가 필요하다. 또한 stream의
+single-active-consumer 조정은 AMQP 0.9.1에서 제공되지 않고 native stream protocol 기능이므로,
+5552 plugin을 열지 않는 현재 설계에서는 scoreboard consumer role을 한 인스턴스로 제한한다.
+Lua는 offset이 연속적이지 않으면 실패하므로 잘못된 다중 소비가 조용히 offset을 건너뛰지는
+않는다.
+
+poison 처리는 **건너뛰지 않는 것**으로 정의했다. Redis pipeline은 앞 명령이 실패해도 뒤
+`EVAL`을 실행할 수 있어 checkpoint가 poison 뒤로 점프할 수 있으므로 live batch는 offset 순서로
+fail-fast 실행한다. Redis outage가 주 실패 양상이라 batch requeue + 고정 backoff로 복구한다.
+schema 불일치나 잘못된 Redis key type처럼 결정적인 poison도 DLQ로 빼고 다음 offset을 진행하지
+않는다. stream은 work queue의 FAILED/backoff/DLX 모델이 아니므로 데이터를 고친 뒤 같은 offset을
+재시도하거나 아래 rebuild 경로를 사용한다.
+
+RabbitMQ는 요청한 숫자 offset이 retention 밖이면 첫 보존 offset으로 맞춰 전달한다. consumer는
+`firstDeliveredOffset > storedOffset + 1`을 gap으로 보고 자동 진행을 거부한다. MySQL의 모든 contest
+결과를 `ContestScoreboardRebuildService`로 재구성한 뒤 첫 보존 event 하나에만
+`allowOffsetGap=true`를 주어 Redis Lua 안에서 새 offset과 상태를 함께 확정한다. operator가 특정
+contest만 복구할 때는 내부 management endpoint
+`POST /actuator/contestscoreboard?contestId={id}`를 사용한다. endpoint rebuild와 live consumer는
+같은 process lock을 사용한다.
+
+구현 중립 지표의 원천도 다음처럼 바뀌었다.
+
+| 지표 | B단계 원천 |
+|---|---|
+| `contest_scoreboard_pending_events` | AMQP 0.9.1 `last` tail probe offset - Redis Lua 적용 offset |
+| `contest_scoreboard_oldest_ready_seconds` | 현재 처리/retry 중인 head batch의 `judgedAt` 나이 |
+| `contest_scoreboard_applied_total` | Lua + JDBC batch를 모두 완료한 새 offset 수 |
+
+RabbitMQ 4.1.8에서 AMQP 0.9.1 consumer를 직접 확인했을 때
+`stream_consumer_metrics` family는 HELP/TYPE만 있고 consumer sample은 없었다. broker 제공 offset
+tracking은 native Stream plugin 전용이므로 5552를 열지 않는 이 단계에서 그 지표를 사용할 수 없다.
+대신 batch-1이 5초마다 별도 AMQP 0.9.1 consumer를 `x-stream-offset=last`로 붙여 마지막 저장
+chunk를 drain하고, 가장 큰 전달 header offset을 최신 offset으로 관측한다. `last`가 메시지 한 건이
+아니라 마지막 chunk부터 시작하므로 prefetch 4,096과 manual ACK를 사용하며 50ms quiet period 뒤
+probe를 취소한다. pending은 이 관측값과 Lua checkpoint의 차이여서 최대 한 probe 주기만큼 늦게
+보일 수 있다. probe 실패는 마지막 값을 0으로 덮지 않고
+`contest_scoreboard_stream_tail_probe_failures_total`로 별도 노출한다. RabbitMQ
+`/metrics/detailed`의 queue family에는 stream queue의 consumer/ready/delivery sample이 계속 포함된다.
+probe가 붙은 50ms와 scrape가 겹치면 consumer count가 순간 2일 수 있지만 steady-state는 1이다.
+
+2026-08-09 `submit-100` 재실행에서는 submission/result/result-stream 증가분/
+`scoreboard_applied_at`이 모두 19,386으로 일치했고 최종 unapplied는 0이었다. unacked delivery를
+가진 별도 AMQP consumer connection을 abort한 통합 테스트에서도 기존 result 1행은 유지되고 stream entry만 1건 늘었으며
+judge 호출은 0회였다. Redis를 비운 통합 시나리오는 offset 0부터 세 이벤트를 재소비해 live와
+rebuild scoreboard를 다시 일치시켰다.
+
+scoreboard 전용 `contest_outbox_*` 상태와 retry 시계열은 제거했다. judge outbox의 backlog, head lag,
+drain/retry 시계열은 계속 남는다.
+
+### 4.10 과거 scoreboard outbox와 Redis pipeline(A단계까지)
 
 주요 코드:
 
@@ -731,7 +834,7 @@ Redis/MySQL이 필요하므로 실행 조건은 `docs/ENVIRONMENT.md` §8을 따
 
 따라서 `max(outbox.id)` 하나만 Redis checkpoint로 저장하면 중간 누락을 정확히 판단할 수 없다.
 
-### 5.2 현재 `redis_seq` 방식
+### 5.2 과거 `redis_seq` 방식(B단계 이전)
 
 Redis Lua script는 다음을 함께 처리한다.
 
@@ -764,7 +867,24 @@ Redis가 과거 RDB snapshot으로 일관되게 rollback되면 다음 신호가 
 
 이전 구현의 pagination 문제도 수정했다. 이미 복구한 duplicate sequence가 첫 페이지를 계속 채우지 않도록 성공 replay 시 DB에 새로운/기존 Redis 결과를 다시 저장하고, duplicate group 전체를 함께 requeue한다.
 
-### 5.3 복구 전제와 한계
+### 5.3 현재 Stream offset 방식
+
+현재 복구 checkpoint는 DB가 아니라 Redis Lua 안의
+`contest:scoreboard:stream:offset`이다. Redis scoreboard와 동일한 snapshot/rollback 경계를
+공유하므로 별도의 lost-tail·duplicate sequence 탐지와 pagination이 없다.
+
+```text
+정상: stored offset N -> request N+1 -> Lua(state + offset N+1) -> JDBC applied_at -> ACK
+Redis rollback: state + offset가 K로 함께 복귀 -> consumer restart -> K+1부터 replay
+retention gap: 첫 delivery > K+1 -> 전체 DB rebuild -> 첫 보존 offset을 Lua에서 연결
+```
+
+processed set은 중복 작업을 줄이는 장치일 뿐 checkpoint가 아니다. 이 set만 유실돼도 동일
+submission의 problem contribution을 다시 계산할 뿐 §4.10.1의 최종 결과는 변하지 않는다.
+반대로 stream offset만 임의로 삭제하는 운영 조작은 의도적인 전체 replay이므로 scoreboard key와
+함께 다뤄야 한다.
+
+### 5.4 복구 전제와 한계
 
 이 방식은 Redis snapshot이 관련 key들을 대체로 같은 시점으로 되돌린다는 전제에 가장 잘 맞는다.
 
@@ -931,7 +1051,7 @@ DB bulk 지표:
 | Judge 대기 | Rabbit live queue의 ready messages | quorum queue 영속 | judge보다 유입이 빠르면 broker disk 사용 증가 |
 | Judge 처리 중 | 최대 약 64 unacked messages | Rabbit 관리 | `concurrency=64`, `prefetch=1` |
 | 결과 DB 대기 | result writer `ArrayBlockingQueue(512)` | 없음 | `put()`이 producer/listener를 block |
-| Scoreboard 대기 | `contest_submission_outbox` PENDING/FAILED rows | MySQL 영속 | Redis보다 결과 유입이 빠르면 row와 lag 증가 |
+| Scoreboard 대기 | result stream tail offset - Redis 적용 offset | Rabbit stream retention | Redis보다 결과 유입이 빠르면 pending offset 증가 |
 | 최종 실패 | Rabbit dead-letter queue | quorum queue 영속 | 운영자가 재처리/폐기하지 않으면 계속 증가 |
 
 과거 1000 TPS 실행에서 관찰된 위치:
@@ -954,7 +1074,7 @@ DB bulk 지표:
 - HTTP 성공을 받았다면 제출 원본은 DB에 commit돼 있다.
 - 제출 row와 judge outbox row는 같은 transaction에 저장된다.
 - relay는 Rabbit publisher ACK와 mandatory return을 확인한 뒤에만 `PUBLISHED`로 기록한다.
-- Rabbit listener는 result와 scoreboard outbox DB commit 후에만 정상 반환하고 ACK된다.
+- Rabbit judge listener는 result DB commit과 result stream publisher confirm 후에만 정상 반환하고 ACK된다.
 - publish 또는 consume 중복은 DB PK/unique와 `INSERT IGNORE`로 흡수한다.
 - cross-node 동일 제출 race는 batch 전체 rollback 없이 기존 submission ID의 정상 중복 응답으로 변환한다.
 - `INSERT IGNORE`가 FK 위반 등 중복 이외의 이유로 행을 누락하면 정합성 예외로 실패한다.
@@ -965,10 +1085,10 @@ DB bulk 지표:
 - scoreboard 반영은 적용 순서와 중복 횟수에 무관하다. 같은 제출·결과 집합이면 항상 같은
   solved/penalty가 된다 (§4.10.1).
 - 같은 데이터에 대해 라이브 scoreboard와 rebuild 결과가 일치한다.
-- scoreboard outbox worker를 여러 인스턴스에서 동시에 실행해도 결과가 단일 worker와 같다
-  (§4.10.2).
-- scoreboard outbox claim은 lease token으로 stale completion을 막는다.
-- scoreboard 실패는 exponential backoff 후 재시도된다.
+- scoreboard와 stream offset은 같은 Redis Lua 실행에서 원자적으로 갱신된다.
+- Redis snapshot rollback은 scoreboard와 offset을 함께 되돌리고 consumer가 그 offset부터 재소비한다.
+- `scoreboard_applied_at`은 JDBC batch로 기록하며 Redis pending set이 Redis 적용 뒤 DB 완료 전 crash를 복구한다.
+- scoreboard 적용 실패는 해당 batch를 ACK하지 않고 같은 offset부터 재시도한다.
 
 ### 8.2 보장하지 않는 것
 
@@ -1031,7 +1151,7 @@ estimated_drain_seconds = backlog_count / recent_sustainable_throughput
 - result stream의 7일/10 GiB retention 중 실제 트래픽에서 어느 제한이 먼저 도달하는지와 segment 단위 삭제 지연을 측정하고 disk free alert를 연결해야 한다.
 - consumer timeout은 정상 최대 judge 시간보다 크게 설정하되 무한정 두지 않는다.
 - DLQ 재처리 도구와 보관 정책이 필요하다.
-- `PUBLISHED` outbox와 `COMPLETED` scoreboard outbox의 archive/purge 정책이 필요하다.
+- `PUBLISHED` judge outbox의 archive/purge 정책이 필요하다. scoreboard outbox는 더 이상 쓰지 않는다.
 
 ### 9.5 DB와 ID 운영
 
@@ -1043,20 +1163,16 @@ estimated_drain_seconds = backlog_count / recent_sustainable_throughput
 
 ### 9.6 scoreboard 확장
 
-named lock을 제거했으므로 scoreboard batch worker는 여러 인스턴스에서 동시에 실행할 수 있다
-(§4.10.2). 순서 보존을 위한 contest 단위 lock이나 partitioning은 더 이상 필요하지 않다.
-남은 과제는 다음이다.
+AMQP 0.9.1 stream에는 native stream protocol의 single-active-consumer 조정이 없으므로 현재
+scoreboard consumer는 batch-1 한 인스턴스에서만 실행한다. 향후 수평 확장은 5552 protocol 도입,
+외부 lease, 또는 contest partitioning 중 하나를 먼저 설계해야 한다. 남은 과제는 다음이다.
 
-1. batch/pipeline 크기와 Redis latency 확인. worker를 늘리기 전에 단일 worker가 어디서
-   막히는지 먼저 본다.
-2. claim 쿼리는 `due_at, id` 인덱스를 사용한다. backlog가 커질 때도 `EXPLAIN`으로
-   `idx_cs_outbox_due` range scan과 LIMIT 조기 종료가 유지되는지 확인한다.
-3. 대회 종료 후 problem hash의 `w:*` 필드 정리 시점. 새 schema에서 이 필드가 제출 수만큼
+1. consumer batch 크기와 순차 Lua 적용 latency 확인. consumer를 늘리기 전에 단일 consumer가
+   어디서 막히는지 먼저 본다.
+2. 대회 종료 후 problem hash의 `w:*` 필드 정리 시점. 새 schema에서 이 필드가 제출 수만큼
    쌓이므로 `reset`/archive 정책이 메모리 상한과 직접 연결된다 (§4.10.1 측정값).
-4. 명시적 contest rebuild 도구 추가. 지금은 `ContestScoreboardRebuildService`를 호출하는
-   운영 진입점이 없다. schema 변경 배포와 선택적 key 손상 복구 양쪽에 필요하다.
-5. worker를 2개 이상 상시 운영할 경우의 Redis 연결 수와 pipeline 크기 재확인. Lua script는
-   pipeline마다 dedicated connection을 쓴다.
+3. 내부 Actuator rebuild endpoint에 운영 인증/감사 로그를 붙이고 실제 배포 runbook에 연결한다.
+4. retention gap 전체 rebuild의 시간·메모리 비용을 대규모 contest 데이터로 측정한다.
 
 ## 10. 운영 지표와 알림
 
@@ -1087,7 +1203,7 @@ named lock을 제거했으므로 scoreboard batch worker는 여러 인스턴스�
 - transaction commit latency와 fsync 관련 지표
 - batch 크기와 batch transaction 시간
 - lock wait, deadlock, rollback
-- 각 outbox의 상태별 count와 oldest age
+- judge outbox 상태별 count와 oldest age
 
 ### 10.4 RabbitMQ
 
@@ -1096,6 +1212,7 @@ named lock을 제거했으므로 scoreboard batch worker는 여러 인스턴스�
 - publish, deliver, ack, redeliver rate
 - publisher confirm latency, NACK, mandatory return
 - consumer 수와 consumer utilization
+- result stream queue consumer/delivery와 retained bytes
 - queue bytes와 disk 사용량
 - memory/disk alarm
 - DLQ count와 oldest age
@@ -1107,11 +1224,11 @@ named lock을 제거했으므로 scoreboard batch worker는 여러 인스턴스�
 - judge API latency histogram, timeout, 오류율
 - listener retry 및 DLQ 이동 수
 - result writer queue depth, batch size, batch commit latency
-- scoreboard outbox PENDING/PROCESSING/FAILED/COMPLETED
-- scoreboard oldest lag
-- Redis pipeline batch 크기와 latency
-- Lua 오류, fallback 횟수
-- duplicate `redis_seq`, lost-tail requeue 수
+- `contest_scoreboard_pending_events` AMQP tail offset - Redis 적용 offset
+- tail probe 실패 수
+- scoreboard oldest ready age와 applied rate
+- Redis Lua batch 처리 latency
+- Lua 오류, stream batch retry, retention gap, Redis rollback restart 수
 - 최종 scoreboard와 DB 결과 정합성 검사 결과
 - problem hash의 `w:*` 필드 총량과 Redis `used_memory` (§4.10.1에서 제출 수에 비례해 늘어난다)
 

@@ -17,7 +17,7 @@ public record ContestJudgeResultStreamMessage(
         SubmissionResult result
 ) {
 
-    static final int CURRENT_SCHEMA_VERSION = 1;
+    public static final int CURRENT_SCHEMA_VERSION = 1;
 
     static ContestJudgeResultStreamMessage from(ContestSubmissionJudgeResultCommand command) {
         return new ContestJudgeResultStreamMessage(

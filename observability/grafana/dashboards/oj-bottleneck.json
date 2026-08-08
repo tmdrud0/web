@@ -759,7 +759,7 @@
       "id": 23,
       "type": "timeseries",
       "title": "Scoreboard pending events",
-      "description": "Judged results not yet applied to the scoreboard. This is the implementation-neutral comparison axis: the current implementation derives it from all non-terminal scoreboard outbox states, while a stream implementation will publish consumer lag under the same name. Read alongside apply rate, never as an absolute.",
+      "description": "Judged results not yet reflected in Redis. batch-1 derives this as the AMQP 0.9.1 tail offset minus the offset atomically stored by the scoreboard Lua script; the tail is probed every five seconds. Read alongside apply rate, never as an absolute.",
       "gridPos": { "h": 8, "w": 6, "x": 0, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
@@ -786,7 +786,7 @@
       "id": 24,
       "type": "timeseries",
       "title": "Oldest ready scoreboard event",
-      "description": "How long the oldest event ready for scoreboard application has waited. This is the half a drain-rate estimate cannot see: one event stuck at the front while the rest drains normally leaves the estimate healthy and moves this instead. Retry backoff and active processing leases are excluded, so inspect the implementation diagnostics below for those states.",
+      "description": "How long the currently delivered head batch has waited since judging. This is the half a drain-rate estimate cannot see: poison or a Redis outage leaves the batch unacknowledged and this value keeps growing until the retry succeeds.",
       "gridPos": { "h": 8, "w": 6, "x": 6, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
@@ -812,8 +812,8 @@
     {
       "id": 25,
       "type": "timeseries",
-      "title": "Scoreboard apply and retry rate",
-      "description": "Events per second applied to the scoreboard, against the current outbox implementation's retries. The apply series is implementation-neutral and counts only successful state changes; the retry series remains an implementation diagnostic.",
+      "title": "Scoreboard apply rate",
+      "description": "Events per second completed by the scoreboard stream consumer. The counter advances only after Redis offset application and the JDBC scoreboard_applied_at batch both succeed.",
       "gridPos": { "h": 8, "w": 6, "x": 12, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
@@ -833,11 +833,6 @@
           "refId": "A",
           "expr": "sum(rate(contest_scoreboard_applied_total[$__rate_interval]))",
           "legendFormat": "applied"
-        },
-        {
-          "refId": "B",
-          "expr": "sum(rate(contest_outbox_retries_total{outbox=\"scoreboard\"}[$__rate_interval]))",
-          "legendFormat": "outbox retried"
         }
       ]
     },
@@ -878,8 +873,8 @@
     {
       "id": 27,
       "type": "timeseries",
-      "title": "Outbox status diagnostics",
-      "description": "Implementation-specific state counts retained for diagnosis. They explain why pending work is not moving: PENDING is ready, PROCESSING owns a lease, FAILED is in retry backoff, and PUBLISHING is awaiting broker confirmation. A future stream implementation may replace this panel without changing the neutral scoreboard panels above.",
+      "title": "Judge outbox status diagnostics",
+      "description": "Implementation-specific state counts for the remaining judge outbox. PENDING is ready for relay and PUBLISHING is awaiting broker confirmation. Scoreboard backlog is the stream lag in the neutral panel above.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 70 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
@@ -906,7 +901,7 @@
       "id": 28,
       "type": "timeseries",
       "title": "Outbox PENDING head lag diagnostics",
-      "description": "Implementation-specific PENDING-row age for both outboxes. The scoreboard series is the source of the current implementation-neutral oldest-ready gauge; judge remains a separate relay diagnostic.",
+      "description": "Implementation-specific age of the remaining judge outbox's oldest PENDING row. Scoreboard head age now comes from the stream consumer and is shown in the neutral panel above.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 70 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {

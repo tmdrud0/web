@@ -102,7 +102,7 @@ Snowflake worker ID는 `web-1=1`, `web-2=2`, `batch-1=100`, `judge-1=200`, `judg
 | `contest.submission.async` | 제출 비동기 실행기 크기와 대기열 |
 | `contest.submission.bulk` | 제출 bulk 크기와 worker 수 |
 | `contest.submission.completion` | 제출 완료 통지 실행기와 대기열 |
-| `contest.outbox` | scoreboard outbox batch·복구·claim 시간 |
+| `contest.scoreboard.stream.consumer` | scoreboard stream batch·prefetch·retry·offset/tail 관측 주기 |
 | `contest.submission.judge.rabbit.publisher` | judge outbox relay batch·claim·confirm 시간 |
 | `contest.submission.judge.result-writer` | judge 결과 batch·worker·대기열·최대 대기시간 |
 
@@ -195,8 +195,9 @@ docker inspect --format '{{.Name}} OOMKilled={{.State.OOMKilled}}' $containers
 1. Nginx를 통해 대회 문제 제출을 한 건 보낸다.
 2. MySQL `contest_submission`과 `contest_judge_outbox`에 같은 제출 ID가 생긴다.
 3. RabbitMQ live queue가 drain되고 `contest_submission_result`가 생성된다.
-4. `contest_submission_outbox.status`가 `COMPLETED`가 된다.
-5. Redis `contest:scoreboard:<contestId>:ranking`에 해당 user가 존재한다.
+4. Redis `contest:scoreboard:stream:offset`이 result stream offset까지 전진한다.
+5. `contest_submission_result.scoreboard_applied_at`이 JDBC batch로 기록된다.
+6. Redis `contest:scoreboard:<contestId>:ranking`에 해당 user가 존재한다.
 
 실제 스모크에 사용한 contest/user/problem/submission ID와 측정 커밋 해시는 측정 기록에 남기되, 이 기준선 문서에는 특정 데이터 ID를 고정하지 않는다.
 

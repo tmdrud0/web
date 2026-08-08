@@ -12,8 +12,7 @@ import java.util.Locale;
 import java.util.UUID;
 
 /**
- * Seeds one contest's submissions and scoreboard outbox rows, for tests that drain the outbox
- * into Redis and then read the scoreboard back.
+ * Seeds one contest's stored judgement results for live-versus-rebuild scoreboard tests.
  */
 public final class ContestScoreboardTestData {
 
@@ -22,7 +21,7 @@ public final class ContestScoreboardTestData {
 
     /**
      * One submission and the judgement it eventually got. {@code judgedMinute} is what drives
-     * the outbox order, so a late judgement on an early submission reproduces the case the live
+     * stream order, so a late judgement on an early submission reproduces the case the live
      * scoreboard and a rebuild used to disagree on.
      */
     public record Attempt(long submissionId,
@@ -74,8 +73,7 @@ public final class ContestScoreboardTestData {
     }
 
     /**
-     * Writes each attempt as a submission plus a PENDING outbox row, using the judgement time as
-     * {@code created_at} so the outbox drains in judging order.
+     * Writes each attempt as a submission and optionally its stored judgement result.
      *
      * @param withResultRows also write {@code contest_submission_result}, which a rebuild reads
      */
@@ -86,7 +84,6 @@ public final class ContestScoreboardTestData {
                                       boolean withResultRows) {
         List<Object[]> submissions = new ArrayList<>(attempts.size());
         List<Object[]> results = new ArrayList<>(attempts.size());
-        List<Object[]> outboxes = new ArrayList<>(attempts.size());
         for (Attempt attempt : attempts) {
             LocalDateTime submittedAt = contestStart.plusMinutes(attempt.submittedMinute());
             LocalDateTime judgedAt = contestStart.plusMinutes(attempt.judgedMinute());
@@ -97,10 +94,6 @@ public final class ContestScoreboardTestData {
             results.add(new Object[]{
                     attempt.submissionId(), contestId, attempt.result().name(), judgedAt,
                     attempt.result().name(), judgedAt
-            });
-            outboxes.add(new Object[]{
-                    attempt.submissionId(), contestId, attempt.problemId(), attempt.userId(),
-                    contestStart, submittedAt, judgedAt, attempt.result().name(), judgedAt, judgedAt
             });
         }
         jdbcTemplate.batchUpdate("""
@@ -116,12 +109,6 @@ public final class ContestScoreboardTestData {
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     """, results);
         }
-        jdbcTemplate.batchUpdate("""
-                INSERT INTO contest_submission_outbox (
-                    contest_submission_id, contest_id, problem_id, user_id,
-                    contest_start, submitted_time, judged_at, result, status, created_at, due_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
-                """, outboxes);
     }
 
     public static void deleteContest(JdbcTemplate jdbcTemplate, long contestId) {
@@ -130,7 +117,6 @@ public final class ContestScoreboardTestData {
                 Long.class,
                 contestId
         );
-        jdbcTemplate.update("DELETE FROM contest_submission_outbox WHERE contest_id = ?", contestId);
         jdbcTemplate.update("DELETE FROM contest_submission_result WHERE contest_id = ?", contestId);
         jdbcTemplate.update("DELETE FROM contest_submission WHERE contest_id = ?", contestId);
         jdbcTemplate.update("DELETE FROM problem WHERE contest_id = ?", contestId);
@@ -138,24 +124,6 @@ public final class ContestScoreboardTestData {
         for (Long userId : userIds) {
             jdbcTemplate.update("DELETE FROM `user` WHERE id = ?", userId);
         }
-    }
-
-    /** Outbox rows this contest still has to apply. */
-    public static long unappliedEvents(JdbcTemplate jdbcTemplate, long contestId) {
-        Long count = jdbcTemplate.queryForObject("""
-                SELECT COUNT(*) FROM contest_submission_outbox
-                WHERE contest_id = ? AND status <> 'COMPLETED'
-                """, Long.class, contestId);
-        return count == null ? 0L : count;
-    }
-
-    public static long seededEvents(JdbcTemplate jdbcTemplate, long contestId) {
-        Long count = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM contest_submission_outbox WHERE contest_id = ?",
-                Long.class,
-                contestId
-        );
-        return count == null ? 0L : count;
     }
 
     /** The set the scoreboard marks each applied event in. */

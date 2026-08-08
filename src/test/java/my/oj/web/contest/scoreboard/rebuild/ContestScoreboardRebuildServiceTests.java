@@ -8,6 +8,7 @@ import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
+import my.oj.web.contest.scoreboard.stream.JdbcContestScoreboardAppliedAtWriter;
 import my.oj.web.problem.Problem;
 import my.oj.web.submission.SubmissionResult;
 import my.oj.web.user.Streak;
@@ -53,6 +54,8 @@ class ContestScoreboardRebuildServiceTests {
     private ContestSubmissionResultRepository resultRepository;
     @Mock
     private ContestSubmissionService contestSubmissionService;
+    @Mock
+    private JdbcContestScoreboardAppliedAtWriter appliedAtWriter;
 
     private ContestScoreboardRebuildService rebuildService;
 
@@ -68,7 +71,8 @@ class ContestScoreboardRebuildServiceTests {
                 scoreboardApplier,
                 resultRepository,
                 contestSubmissionService,
-                new ContestSubmissionBatchExecutor(new NoOpTransactionManager())
+                new ContestSubmissionBatchExecutor(new NoOpTransactionManager()),
+                appliedAtWriter
         );
 
         contest = new Contest("Contest");
@@ -118,6 +122,8 @@ class ContestScoreboardRebuildServiceTests {
                                 3L, CONTEST_ID, problem.getId(), user.getId(),
                                 submission3.getSubmittedTime(), SubmissionResult.WRONG_ANSWER)
                 );
+        assertThat(captor.getValue()).allMatch(request -> request.streamOffset() == null);
+        verify(appliedAtWriter).markApplied(List.of(5L, 3L));
     }
 
     /**
@@ -148,7 +154,7 @@ class ContestScoreboardRebuildServiceTests {
             List<ContestScoreboardApplier.ApplyRequest> requests = invocation.getArgument(0);
             return requests.stream()
                     .map(request -> ContestScoreboardApplier.ApplyResult.failure(
-                            request.eventId(), "wrong Redis key type"))
+                            request.correlationId(), "wrong Redis key type"))
                     .toList();
         });
 
@@ -166,6 +172,7 @@ class ContestScoreboardRebuildServiceTests {
 
         verify(scoreboardApplier).reset(CONTEST_ID);
         verify(scoreboardApplier, never()).applyAll(anyList());
+        verify(appliedAtWriter, never()).markApplied(anyList());
     }
 
     private void stubBatches(Map<Long, ContestSubmissionResult> resultMap) {
@@ -200,7 +207,7 @@ class ContestScoreboardRebuildServiceTests {
     private static List<ContestScoreboardApplier.ApplyResult> succeed(
             List<ContestScoreboardApplier.ApplyRequest> requests) {
         return requests.stream()
-                .map(request -> ContestScoreboardApplier.ApplyResult.success(request.eventId(), request.eventId()))
+                .map(request -> ContestScoreboardApplier.ApplyResult.success(request.correlationId(), null))
                 .toList();
     }
 
