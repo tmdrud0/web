@@ -5,7 +5,7 @@
 # work piled up. These samples do: container CPU/memory, the two outbox backlogs, the Rabbit
 # queue depth, and the persisted submission count, all on one timeline.
 #
-# Samples land in two CSVs because they have different shapes and cadences. Every row carries the
+# Samples land in three CSVs because they have different shapes and cadences. Every row carries the
 # phase name, so one output directory can hold several scenarios back to back.
 [CmdletBinding()]
 param(
@@ -24,6 +24,8 @@ $ErrorActionPreference = "Continue"
 $composeArgs = @("-p", $ProjectName, "-f", "compose.yaml", "-f", "compose.loadtest.yaml")
 $containerCsv = Join-Path $OutputDirectory "containers.csv"
 $pipelineCsv = Join-Path $OutputDirectory "pipeline.csv"
+$jvmCsv = Join-Path $OutputDirectory "jvm-metrics.csv"
+$prometheusUrl = "http://127.0.0.1:9090"
 
 # One statement keeps the whole pipeline snapshot on a single MySQL round trip. The lag subquery
 # deliberately matches contest_outbox_head_lag_seconds for both outboxes: PENDING only, ordered
@@ -75,7 +77,7 @@ function ConvertTo-Megabytes {
 function Get-CpuThrottleCounters {
     param([string]$ContainerName)
 
-    if ($ContainerName -notmatch '-web-[12](?:-[0-9]+)?$') {
+    if ($ContainerName -notmatch '-(?:web-[12]|batch-1|judge-[12])$') {
         return $null
     }
 
@@ -101,6 +103,74 @@ function Get-CpuThrottleCounters {
         return $null
     }
     return [pscustomobject]@{ Periods = $periods; Throttled = $throttled }
+}
+
+function Get-PrometheusValuesByNode {
+    param([Parameter(Mandatory = $true)][string]$Query)
+
+    try {
+        $encodedQuery = [uri]::EscapeDataString($Query)
+        $response = Invoke-RestMethod -Uri "$prometheusUrl/api/v1/query?query=$encodedQuery" -TimeoutSec 4
+        if ($response.status -ne "success") {
+            return $null
+        }
+
+        $values = @{}
+        foreach ($sample in @($response.data.result)) {
+            $node = [string]$sample.metric.node
+            if (-not [string]::IsNullOrWhiteSpace($node) -and $sample.value.Count -ge 2) {
+                $values[$node] = [double]::Parse(
+                    [string]$sample.value[1],
+                    [Globalization.CultureInfo]::InvariantCulture)
+            }
+        }
+        return $values
+    }
+    catch {
+        # The observability overlay is optional for other harness users. Missing one scrape must
+        # not take the load run down; the final summary makes incomplete JVM evidence visible.
+        return $null
+    }
+}
+
+function Format-InvariantNumber {
+    param($Value)
+
+    if ($null -eq $Value) { return "" }
+    return ([double]$Value).ToString("R", [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Sample-JvmMetrics {
+    param([string]$Timestamp)
+
+    # The 30-second rate window contains six app scrapes. It is long enough not to turn one
+    # scheduler period into a spike, and short enough that the 180-second hold dominates it.
+    $throttle = Get-PrometheusValuesByNode -Query (
+        'sum by (node) (rate(cgroup_cpu_throttled_periods_total{job="oj-app"}[30s])) / ' +
+        'sum by (node) (rate(cgroup_cpu_periods_total{job="oj-app"}[30s]))')
+    $processStart = Get-PrometheusValuesByNode -Query `
+        'max by (node) (process_start_time_seconds{job="oj-app"})'
+    $gcTime = Get-PrometheusValuesByNode -Query `
+        'sum by (node) (jvm_gc_pause_seconds_sum{job="oj-app"})'
+    $heapUsed = Get-PrometheusValuesByNode -Query `
+        'sum by (node) (jvm_memory_used_bytes{job="oj-app",area="heap"})'
+
+    if ($null -eq $processStart -or $processStart.Count -eq 0) { return }
+    foreach ($node in @($processStart.Keys | Sort-Object)) {
+        $throttleValue = if ($null -ne $throttle -and $throttle.ContainsKey($node)) { $throttle[$node] } else { $null }
+        $gcValue = if ($null -ne $gcTime -and $gcTime.ContainsKey($node)) { $gcTime[$node] } else { $null }
+        $heapValue = if ($null -ne $heapUsed -and $heapUsed.ContainsKey($node)) { $heapUsed[$node] } else { $null }
+        $line = @(
+            $Timestamp,
+            $Phase,
+            $node,
+            (Format-InvariantNumber $throttleValue),
+            (Format-InvariantNumber $processStart[$node]),
+            (Format-InvariantNumber $gcValue),
+            (Format-InvariantNumber $heapValue)
+        ) -join ','
+        Write-CsvLine -Path $jvmCsv -Line $line
+    }
 }
 
 function Sample-Containers {
@@ -171,8 +241,12 @@ if (-not (Test-Path $pipelineCsv)) {
         "scoreboardFailed,oldestPendingLagMs,submissionRows,resultRows,mysqlThreadsConnected,mysqlThreadsRunning," +
         "rabbitReady,rabbitUnacked")
 }
+if (-not (Test-Path $jvmCsv)) {
+    Write-CsvLine -Path $jvmCsv -Line "timestamp,phase,node,throttleRatio,processStartTimeSeconds,gcPauseSeconds,heapUsedBytes"
+}
 
 $lastPipelineSample = [DateTime]::MinValue
+$lastJvmSample = [DateTime]::MinValue
 while (-not (Test-Path $StopFile)) {
     $now = Get-Date
     $timestamp = $now.ToString("yyyy-MM-ddTHH:mm:ss.fff")
@@ -181,6 +255,10 @@ while (-not (Test-Path $StopFile)) {
     if (($now - $lastPipelineSample).TotalSeconds -ge $PipelineIntervalSeconds) {
         Sample-Pipeline -Timestamp $timestamp
         $lastPipelineSample = $now
+    }
+    if (($now - $lastJvmSample).TotalSeconds -ge $PipelineIntervalSeconds) {
+        Sample-JvmMetrics -Timestamp $timestamp
+        $lastJvmSample = $now
     }
 
     Start-Sleep -Seconds $ContainerIntervalSeconds

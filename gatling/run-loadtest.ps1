@@ -31,7 +31,14 @@ $metricsRoot = Join-Path $repoRoot ("var\loadtest-" + (Get-Date -Format "yyyyMMd
 $bulkStatsCsv = Join-Path $metricsRoot "bulk-stats.csv"
 $stalenessCsv = Join-Path $metricsRoot "end-to-end-staleness.csv"
 $httpSummaryCsv = Join-Path $metricsRoot "http-summary.csv"
+$stateResetCsv = Join-Path $metricsRoot "state-reset.csv"
+$jvmSummaryCsv = Join-Path $metricsRoot "jvm-summary.csv"
+$runDiagnosticsCsv = Join-Path $metricsRoot "run-diagnostics.csv"
 $script:stalenessCrossCheckFailed = $false
+$script:resetRedisKeys = $null
+$script:resetSubmissionOutboxRows = $null
+$script:resetJudgeOutboxRows = $null
+$script:resetTimestamp = $null
 
 # The per-user cooldown costs a Redis round trip on every submission in production, so a run with
 # it off measures a system cheaper than the deployed one by exactly that. It used to be on only
@@ -173,6 +180,13 @@ function Invoke-LoadSqlRow {
         throw "SQL returned no row."
     }
     return $row -split "`t"
+}
+
+function Invoke-LoadRedisScalar {
+    param([Parameter(Mandatory = $true)][string]$Command)
+
+    $value = Invoke-LoadCompose -Arguments @("exec", "-T", "redis", "redis-cli", "--raw", $Command)
+    return [int64]($value | Select-Object -Last 1)
 }
 
 function Get-RabbitBacklog {
@@ -319,6 +333,24 @@ function Reset-LoadRedis {
     Invoke-LoadCompose -Arguments @(
         "exec", "-T", "mysql", "mysql", "-uroot", "-p1234", "-D", $dbName, "-Nse",
         "DELETE FROM contest_submission_outbox; DELETE FROM contest_judge_outbox;") | Out-Null
+
+    $script:resetTimestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffK")
+    $script:resetRedisKeys = Invoke-LoadRedisScalar -Command "DBSIZE"
+    $script:resetSubmissionOutboxRows = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_outbox"
+    $script:resetJudgeOutboxRows = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_judge_outbox"
+
+    New-Item -ItemType Directory -Force -Path $metricsRoot | Out-Null
+    @(
+        "timestamp,redisKeys,submissionOutboxRows,judgeOutboxRows",
+        "$($script:resetTimestamp),$($script:resetRedisKeys),$($script:resetSubmissionOutboxRows),$($script:resetJudgeOutboxRows)"
+    ) | Set-Content -Path $stateResetCsv -Encoding utf8
+
+    if ($script:resetRedisKeys -ne 0 -or
+        $script:resetSubmissionOutboxRows -ne 0 -or
+        $script:resetJudgeOutboxRows -ne 0) {
+        throw "Load state reset was incomplete: Redis=$($script:resetRedisKeys), submission outbox=$($script:resetSubmissionOutboxRows), judge outbox=$($script:resetJudgeOutboxRows)."
+    }
+    Write-Host "Load state reset verified (Redis=0, submission outbox=0, judge outbox=0)."
 }
 
 # Reads the product's own scoreboard endpoint rather than a /perf mirror of it. The mirror
@@ -653,6 +685,79 @@ function Save-GatlingHttpSummary {
         "$Phase,$total,$ok,$ko,$successPercent,$p95Millis,$($report.Name)"
 }
 
+function Get-NearestRankValue {
+    param(
+        [Parameter(Mandatory = $true)][double[]]$Values,
+        [Parameter(Mandatory = $true)][double]$Percentile
+    )
+
+    if ($Values.Count -eq 0) { return $null }
+    $ordered = @($Values | Sort-Object)
+    $index = [math]::Max(0, [math]::Ceiling($ordered.Count * $Percentile) - 1)
+    return [double]$ordered[$index]
+}
+
+function Save-JvmMetricsSummary {
+    param([Parameter(Mandatory = $true)][string]$Phase)
+
+    $jvmCsv = Join-Path $metricsRoot "jvm-metrics.csv"
+    if (-not (Test-Path $jvmCsv)) { return @() }
+
+    $summaries = @(
+        Import-Csv $jvmCsv |
+            Group-Object node |
+            ForEach-Object {
+                $rows = @($_.Group | Sort-Object timestamp)
+                $throttleValues = [double[]]@($rows |
+                    Where-Object { $_.throttleRatio -match '^[0-9]' } |
+                    ForEach-Object { [double]$_.throttleRatio })
+                $heapValues = [double[]]@($rows |
+                    Where-Object { $_.heapUsedBytes -match '^[0-9]' } |
+                    ForEach-Object { [double]$_.heapUsedBytes })
+                $restartChanges = 0
+                $gcDelta = 0d
+                for ($index = 1; $index -lt $rows.Count; $index++) {
+                    if ($rows[$index].processStartTimeSeconds -ne $rows[$index - 1].processStartTimeSeconds) {
+                        $restartChanges++
+                    }
+                    if ($rows[$index].gcPauseSeconds -match '^[0-9]' -and
+                        $rows[$index - 1].gcPauseSeconds -match '^[0-9]') {
+                        $delta = [double]$rows[$index].gcPauseSeconds - [double]$rows[$index - 1].gcPauseSeconds
+                        if ($delta -ge 0d) {
+                            $gcDelta += $delta
+                        }
+                        else {
+                            # A restart resets the cumulative counter. The run is invalid anyway,
+                            # but retaining the post-restart contribution keeps the diagnostic honest.
+                            $gcDelta += [double]$rows[$index].gcPauseSeconds
+                        }
+                    }
+                }
+
+                $medianThrottle = Get-NearestRankValue -Values $throttleValues -Percentile 0.50
+                $p95Throttle = Get-NearestRankValue -Values $throttleValues -Percentile 0.95
+                $medianHeap = Get-NearestRankValue -Values $heapValues -Percentile 0.50
+                $p95Heap = Get-NearestRankValue -Values $heapValues -Percentile 0.95
+                [pscustomobject]@{
+                    Phase = $Phase
+                    Node = $_.Name
+                    Samples = $rows.Count
+                    ThrottleMedianPercent = if ($null -ne $medianThrottle) { [math]::Round(100d * $medianThrottle, 2) } else { $null }
+                    ThrottleP95Percent = if ($null -ne $p95Throttle) { [math]::Round(100d * $p95Throttle, 2) } else { $null }
+                    RestartChanges = $restartChanges
+                    GcPauseDeltaSeconds = [math]::Round($gcDelta, 6)
+                    HeapMedianMiB = if ($null -ne $medianHeap) { [math]::Round($medianHeap / 1MB, 2) } else { $null }
+                    HeapP95MiB = if ($null -ne $p95Heap) { [math]::Round($p95Heap / 1MB, 2) } else { $null }
+                }
+            }
+    )
+
+    if ($summaries.Count -gt 0) {
+        $summaries | Export-Csv -Path $jvmSummaryCsv -NoTypeInformation -Encoding utf8
+    }
+    return $summaries
+}
+
 function Show-MetricsSummary {
     param(
         [long]$ContestId = 0,
@@ -750,7 +855,22 @@ function Show-MetricsSummary {
         Import-Csv $httpSummaryCsv | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
     }
 
+    $jvmSummaries = @(Save-JvmMetricsSummary -Phase $ScenarioName)
+    if ($jvmSummaries.Count -gt 0) {
+        Write-Host "-- JVM throttling, restarts, GC, and heap per node --"
+        $jvmSummaries | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+    }
+
     if ($ContestId -gt 0) {
+        $retryRows = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_outbox WHERE contest_id = $ContestId AND attempts > 1"
+        $restartChanges = ($jvmSummaries | Measure-Object -Property RestartChanges -Sum).Sum
+        $observedJvmNodes = @($jvmSummaries | Select-Object -ExpandProperty Node -Unique).Count
+        @(
+            "scenario,contestId,resetTimestamp,resetRedisKeys,resetSubmissionOutboxRows,resetJudgeOutboxRows,scoreboardRetryRows,jvmRestartChanges,observedJvmNodes",
+            "$ScenarioName,$ContestId,$($script:resetTimestamp),$($script:resetRedisKeys),$($script:resetSubmissionOutboxRows),$($script:resetJudgeOutboxRows),$retryRows,$restartChanges,$observedJvmNodes"
+        ) | Set-Content -Path $runDiagnosticsCsv -Encoding utf8
+        Write-Host "Run diagnostics: attempts>1=$retryRows, JVM restart changes=$restartChanges, observed JVM nodes=$observedJvmNodes/5"
+
         $staleness = Show-EndToEndStaleness -ContestId $ContestId -ScenarioName $ScenarioName
         $submissionPhases = switch ($ScenarioName) {
             "smoke" { @("submit-139") }

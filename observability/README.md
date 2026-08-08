@@ -692,6 +692,109 @@ scoreboard applied  p50 0.607s  p95 4.046s  p99 4.921s  max 13.270s   n=35865
 실행을 실패시킨다. 이는 두 값이 같은 통계라는 뜻이 아니라, end-to-end SQL이 scoreboard
 backlog와 무관한 시각을 잘못 빼는 오류를 잡는 자릿수 교차 검증이다.
 
+### submit-100 반복 편차와 비교 가능한 실행의 조건
+
+2026-08-08에 애플리케이션 코드 `1c10173`으로 `submit-100`을 5회 반복했다. 모두 기본 설정
+(사용자 10,000명, 문제 5개, 30초 ramp, 180초 hold, 100 RPS), 같은 load-test/observability
+스택과 같은 Compose 상한을 사용했다. 실행 전에 일반 OJ 스택이 꺼져 있는지 확인했고, 매번
+Redis `DBSIZE`와 `contest_submission_outbox`, `contest_judge_outbox`가 모두 0인지 검증했다.
+
+하네스는 실행별로 다음 파일을 추가로 남긴다.
+
+- `state-reset.csv`: Redis와 두 outbox의 초기화 직후 행 수
+- `jvm-metrics.csv`: `PipelineIntervalSeconds`(기본 5초) 간격으로 수집을 시도한 노드별 CFS throttle 비율
+  (`rate(cgroup_cpu_throttled_periods_total[30s]) / rate(cgroup_cpu_periods_total[30s])`),
+  `process_start_time_seconds`, GC pause 누적 시간, heap 사용량
+- `jvm-summary.csv`: throttle 중앙값/p95, `process_start_time_seconds` 변화 수, GC 시간 증분,
+  heap 중앙값/p95
+- `run-diagnostics.csv`: `attempts > 1`인 scoreboard outbox 행 수와 전체 JVM 재시작 수,
+  관측된 JVM 노드 수
+
+| 실행 (`var/loadtest-*`) | result p95 | scoreboard p95 | 최대 노드 throttle 중앙값 / p95 | JVM 재시작 | `attempts > 1` | GC 합계 | 최대 heap p95 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `20260808-124919` | 0.364s | 0.585s | 0% / 4.03% | 0 | 0 | 0.245s | 427MiB |
+| `20260808-125358` | 0.354s | 0.576s | 0% / 3.20% | 0 | 0 | 0.212s | 421MiB |
+| `20260808-125810` | 0.356s | 0.575s | 0% / 2.40% | 0 | 0 | 0.321s | 428MiB |
+| `20260808-130225` | 0.358s | 0.583s | 0% / 3.60% | 0 | 0 | 0.272s | 411MiB |
+| `20260808-130641` | 0.357s | 0.578s | 0.40% / 1.20% | 0 | 0 | 0.215s | 409MiB |
+
+모든 실행은 HTTP 성공률 100%, JVM 5개 노드 관측, 재시작·재시도·OOM 0을 만족했다. 표본 수는
+19,480~19,517이고 각 실행에서 submissions = results = outbox = completed가 성립했다. §8의
+기동 직후 61~78% throttling은 부하 중에 유지되지 않았다. 아래 사분위수는 정렬한 5개 값에서
+위치 `(n - 1) p`를 선형 보간하는 방식으로 계산했다.
+
+예비 실행 `20260808-124359`은 최종 `run-diagnostics.csv`와 staleness CSV가 없어서 위 5회와
+통계에서 제외했다. 부하가 끝났다는 사실만으로 표본 완전성이 증명되지는 않는다는 기준을 그대로
+적용한 것이다.
+
+| 분포 | 실행별 값 | 중앙값 | Q1 | Q3 | IQR | 실측 min~max |
+|---|---|---:|---:|---:|---:|---:|
+| result queryable | p50 | 0.219s | 0.219s | 0.220s | 0.001s | 0.217~0.223s |
+| result queryable | p95 | **0.357s** | 0.356s | 0.358s | **0.003s (0.77%)** | 0.354~0.364s |
+| result queryable | p99 | 0.412s | 0.411s | 0.413s | 0.002s | 0.407~0.424s |
+| result queryable | max | 0.626s | 0.573s | 0.657s | 0.084s | 0.564~0.815s |
+| result queryable | n | 19,493 | 19,492 | 19,502 | 10 | 19,480~19,517 |
+| scoreboard applied | p50 | 0.394s | 0.394s | 0.397s | 0.003s | 0.392~0.398s |
+| scoreboard applied | p95 | **0.578s** | 0.576s | 0.583s | **0.007s (1.27%)** | 0.575~0.585s |
+| scoreboard applied | p99 | 0.648s | 0.641s | 0.656s | 0.016s | 0.639~0.671s |
+| scoreboard applied | max | 0.844s | 0.806s | 0.953s | 0.147s | 0.777~1.102s |
+| scoreboard applied | n | 19,493 | 19,492 | 19,502 | 10 | 19,480~19,517 |
+
+따라서 같은 조건의 p95는 result에서 중앙값의 0.992~1.022배, scoreboard에서
+0.995~1.013배 안에 실측으로 모였다. max는 상대 IQR이 각각 13.4%, 17.5%라 실행 합격 기준이
+아니라 꼬리 진단값으로만 쓴다.
+
+#### 0.56초 대 6.86초는 정상 분산이 아니다
+
+문제가 된 두 실행의 보존된 Prometheus 시계열을 같은 부하 시간창으로 다시 읽었다.
+
+| 신호 | `20260808-114654` (result p95 0.556s) | `20260808-115115` (result p95 6.864s) |
+|---|---:|---:|
+| JVM restart | 0 | **judge-1 1회** |
+| `up{node="judge-1"}` | 계속 1 | **11:52:55~11:53:50 0** |
+| 최대 노드 throttle 중앙값 / p95 | 0.80% / 4.80% | 0.81% / 32.26% (judge-1 재기동 구간) |
+| scoreboard retry counter 증분 | 0 | 0 |
+| GC pause 합계 | 0.192s | 0.211s |
+| 최대 heap p95 | 409MiB | 413MiB |
+| HTTP 성공률 / p95 | 100% / 184ms | 100% / 186ms |
+
+느린 실행에서만 `process_start_time_seconds`가 바뀌었고 judge-1이 약 55초 동안 스크레이프되지
+않았다. throttle 중앙값은 두 실행 모두 1% 미만이라 §8의 자원 상한 상태가 아니며, 느린 실행의
+p95 throttle만 재기동과 함께 순간적으로 올랐다. GC와 heap도 반복 5회의 범위 안이다. 그러므로
+12배 차이는 정상 분산이나 CPU 상한이 아니라 **`20260808-115115` 실행 중 JVM 중단 사고**와
+상관된다. OOM 지표는 0이지만 §7에 적은 이유로 이것만으로 OOM을 배제할 수 없고, 보존된 지표는
+재시작의 원인까지 구분하지 못한다.
+
+`20260808-114654`의 0.556초도 위 5회 result p95 범위(0.354~0.364초)와 아래 산포 기준 밖이다.
+그 실행에서는 지정한 사고 신호가 발견되지 않았으므로 원인을 추정해 살려 쓰지 않는다. 기존
+두 번만으로 만든 비교 자체를 폐기하고, 위 5회를 현재 기준선으로 사용한다.
+
+#### 이후 구현 비교의 명시적 합격 기준
+
+다음 조건을 모두 만족한 실행만 구현 비교에 사용한다.
+
+1. 비교하려는 구현 외에는 같은 호스트/WSL 예산, Compose 파일과 자원 상한, observability
+   overlay, 시나리오 파라미터와 환경 변수를 사용한다. 일반 OJ 스택이나 다른 부하 작업을 함께
+   실행하지 않는다.
+2. 실행마다 `state-reset.csv`의 Redis·두 outbox가 모두 0이어야 한다. 하나라도 0이 아니면
+   즉시 무효다.
+3. Gatling assertion과 materialization 검사를 통과하고 OOMKilled=false여야 한다.
+   `run-diagnostics.csv`는 `attempts > 1 = 0`, JVM restart=0, observed JVM nodes=5여야 한다.
+4. 부하 구간의 앱 노드별 throttle 중앙값이 모두 **10% 이하**여야 한다. 이번 정상값 0~0.4%에
+   충분한 여유를 주면서 §8의 61~78%가 지속되는 자원 상한 실행을 배제하는 경계다. GC와 heap은
+   함께 보고하되, 구현 자체가 바꾸려는 값일 수 있으므로 기준선과 다르다는 이유만으로 버리지
+   않는다.
+5. 구현 후보마다 위 조건을 통과한 실행을 **최소 5회** 확보하고 p50/p95/p99/max/n의 중앙값,
+   Q1, Q3, IQR을 보고한다. 대표값 하나나 가장 좋은 실행을 고르지 않는다.
+6. 각 후보의 result와 scoreboard p95가 모두 `IQR / 중앙값 <= 5%`이고, 모든 개별 p95가
+   `[Q1 - 3 IQR, Q3 + 3 IQR]` 안에 있어야 반복 집합이 안정적이다. 이번 result 허용 구간은
+   0.347~0.367초, scoreboard는 0.554~0.605초이고 5회가 모두 들어왔다.
+
+**이 조건을 만족하지 않는 실행은 구현 비교에 쓰지 않는다.** 재시작·재시도처럼 원인이 있는
+개별 실행만 무효 처리하고 다시 실행한다. 사고 신호 없이 5% 상대 IQR이나 3 IQR 경계를
+넘는다면 편한 실행만 제거하지 않고 환경이 불안정한 것으로 보고 그 후보의 반복 집합 전체를
+다시 측정한다.
+
 ## 11. 알림
 
 규칙은 `observability/prometheus/rules/oj-pipeline.yml`에 있고 Prometheus가 기동 시 문법을
