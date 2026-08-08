@@ -93,12 +93,19 @@ docker compose up -d --build
 5. judge outbox, RabbitMQ, scoreboard outbox drain 확인
 6. 결과 건수와 실제 Redis scoreboard 확인
 7. 노드별 수용·거절·in-flight 지표와 OOM 상태 확인
-8. HTTP 성공률/p95, web peak CPU·CPU throttled ratio, 두 outbox peak backlog/head lag 출력
+8. HTTP 성공률/p95, web peak CPU·CPU throttled ratio, 두 outbox peak backlog/head lag와
+   RabbitMQ live/DLQ별 depth·unacked·consumer·publish/deliver rate 출력
 9. 제출→결과 조회 가능 및 제출→scoreboard 반영 p50/p95/p99/max와 표본 수 출력
 10. `-KeepStack`이 없으면 격리 스택 종료, `-RemoveData`면 격리 볼륨도 제거
 
 독립 Gatling JVM은 Gradle daemon의 GC가 서버 한계로 오인되는 것을 막는다. 요청별 DEBUG
 로그도 끄되 진행 통계와 assertion 결과는 그대로 출력한다.
+
+실행별 `var/loadtest-<timestamp>/`에는 원본 `rabbitmq-metrics.csv`와 집계
+`rabbitmq-summary.csv`가 남는다. 전자는 5초마다 큐별 gauge와 누적 counter를 보존하고, 후자는
+phase별 peak depth, consumer 범위, publish/deliver 평균·최대 rate와 counter reset 수를 계산한다.
+observability overlay가 없으면 두 파일의 데이터는 비며, 하네스는 이를 0으로 간주하지 않고
+`baseline unavailable`로 표시한다.
 
 ## 2026-07-23 고정 예산 실측
 

@@ -40,6 +40,29 @@ scrape_configs:
       - targets: ["rabbitmq:15692"]
         labels: { node: rabbitmq }
 
+  # Keep the cheap aggregate endpoint above for node-wide health. Queue comparisons need object
+  # labels, but the all-object endpoint also emits every connection/channel combination. The
+  # detailed endpoint lets this repository request only queue-owned families, then retain only
+  # the six series used by the dashboard and load harness. The sample limit makes cardinality a
+  # hard failure (up=0) instead of allowing a topology mistake to grow the TSDB silently.
+  - job_name: rabbitmq-per-queue
+    metrics_path: /metrics/detailed
+    sample_limit: 100
+    params:
+      vhost: ["/"]
+      family:
+        - queue_coarse_metrics
+        - queue_consumer_count
+        - queue_delivery_metrics
+        - queue_exchange_metrics
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: rabbitmq_detailed_queue_(messages_ready|messages_unacked|consumers|messages_delivered_ack_total|messages_delivered_total|exchange_messages_published_total)
+        action: keep
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+        labels: { node: rabbitmq }
+
   # Exporters query the systems they observe, so their cost lands inside the app's
   # resource budget rather than the observability budget. Kept at 10s for that reason.
   - job_name: mysql

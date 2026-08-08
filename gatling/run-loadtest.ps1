@@ -33,6 +33,7 @@ $stalenessCsv = Join-Path $metricsRoot "end-to-end-staleness.csv"
 $httpSummaryCsv = Join-Path $metricsRoot "http-summary.csv"
 $stateResetCsv = Join-Path $metricsRoot "state-reset.csv"
 $jvmSummaryCsv = Join-Path $metricsRoot "jvm-summary.csv"
+$rabbitmqSummaryCsv = Join-Path $metricsRoot "rabbitmq-summary.csv"
 $runDiagnosticsCsv = Join-Path $metricsRoot "run-diagnostics.csv"
 $script:stalenessCrossCheckFailed = $false
 $script:resetRedisKeys = $null
@@ -788,6 +789,86 @@ function Save-JvmMetricsSummary {
     return $summaries
 }
 
+function Get-CounterRateSummary {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Rows,
+        [Parameter(Mandatory = $true)][string[]]$Properties
+    )
+
+    $total = 0d
+    $peak = 0d
+    $resets = 0
+    for ($index = 1; $index -lt $Rows.Count; $index++) {
+        $seconds = ([datetime]$Rows[$index].timestamp - [datetime]$Rows[$index - 1].timestamp).TotalSeconds
+        if ($seconds -le 0d) { continue }
+
+        $current = 0d
+        $previous = 0d
+        foreach ($property in $Properties) {
+            $current += [double]$Rows[$index].$property
+            $previous += [double]$Rows[$index - 1].$property
+        }
+        $delta = $current - $previous
+        if ($delta -lt 0d) {
+            # Broker restart resets these counters. Preserve post-restart work in the total while
+            # making the reset explicit; a comparison run with a reset is invalid independently.
+            $resets++
+            $delta = $current
+        }
+        $total += $delta
+        $rate = $delta / $seconds
+        if ($rate -gt $peak) { $peak = $rate }
+    }
+
+    $duration = if ($Rows.Count -ge 2) {
+        ([datetime]$Rows[-1].timestamp - [datetime]$Rows[0].timestamp).TotalSeconds
+    } else {
+        0d
+    }
+    return [pscustomobject]@{
+        Delta = $total
+        AveragePerSecond = if ($duration -gt 0d) { $total / $duration } else { 0d }
+        PeakPerSecond = $peak
+        Resets = $resets
+    }
+}
+
+function Save-RabbitMqMetricsSummary {
+    $rabbitmqCsv = Join-Path $metricsRoot "rabbitmq-metrics.csv"
+    if (-not (Test-Path $rabbitmqCsv)) { return @() }
+
+    $summaries = @(
+        Import-Csv $rabbitmqCsv |
+            Group-Object phase, queue |
+            ForEach-Object {
+                $rows = @($_.Group | Sort-Object timestamp)
+                $published = Get-CounterRateSummary -Rows $rows -Properties @("publishedTotal")
+                $delivered = Get-CounterRateSummary -Rows $rows -Properties @("deliveredAckTotal", "deliveredAutoTotal")
+                [pscustomobject]@{
+                    Phase = $rows[0].phase
+                    Queue = $rows[0].queue
+                    Samples = $rows.Count
+                    PeakReady = [int64](($rows | Measure-Object -Property ready -Maximum).Maximum)
+                    PeakUnacked = [int64](($rows | Measure-Object -Property unacked -Maximum).Maximum)
+                    ConsumerMin = [int64](($rows | Measure-Object -Property consumers -Minimum).Minimum)
+                    ConsumerMax = [int64](($rows | Measure-Object -Property consumers -Maximum).Maximum)
+                    PublishedDelta = [int64]$published.Delta
+                    PublishedAveragePerSecond = [math]::Round($published.AveragePerSecond, 2)
+                    PublishedPeakPerSecond = [math]::Round($published.PeakPerSecond, 2)
+                    DeliveredDelta = [int64]$delivered.Delta
+                    DeliveredAveragePerSecond = [math]::Round($delivered.AveragePerSecond, 2)
+                    DeliveredPeakPerSecond = [math]::Round($delivered.PeakPerSecond, 2)
+                    CounterResets = $published.Resets + $delivered.Resets
+                }
+            }
+    )
+
+    if ($summaries.Count -gt 0) {
+        $summaries | Export-Csv -Path $rabbitmqSummaryCsv -NoTypeInformation -Encoding utf8
+    }
+    return $summaries
+}
+
 function Show-MetricsSummary {
     param(
         [long]$ContestId = 0,
@@ -850,6 +931,9 @@ function Show-MetricsSummary {
                     PeakScoreboardHeadLagMs = ($_.Group | Measure-Object -Property oldestPendingLagMs -Maximum).Maximum
                     PeakRabbitReady = ($_.Group | Measure-Object -Property rabbitReady -Maximum).Maximum
                     PeakRabbitUnacked = ($_.Group | Measure-Object -Property rabbitUnacked -Maximum).Maximum
+                    PeakRabbitLiveReady = ($_.Group | Measure-Object -Property rabbitLiveReady -Maximum).Maximum
+                    PeakRabbitLiveUnacked = ($_.Group | Measure-Object -Property rabbitLiveUnacked -Maximum).Maximum
+                    PeakRabbitDeadReady = ($_.Group | Measure-Object -Property rabbitDeadReady -Maximum).Maximum
                     PeakMysqlThreads = ($_.Group | Measure-Object -Property mysqlThreadsConnected -Maximum).Maximum
                 }
             } |
@@ -873,6 +957,43 @@ function Show-MetricsSummary {
                 [pscustomobject]@{ Phase = $_.Name; PeakInsertRowsPerSecond = [math]::Round($peak, 1) }
             } |
             Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+    }
+
+    $rabbitmqSummaries = @(Save-RabbitMqMetricsSummary)
+    if ($rabbitmqSummaries.Count -gt 0) {
+        Write-Host "-- RabbitMQ per-queue baseline --"
+        $rabbitmqSummaries |
+            Sort-Object Phase, Queue |
+            Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+
+        if (Test-Path $pipelineCsv) {
+            Write-Host "-- judge outbox to live-queue ingress cross-check --"
+            Import-Csv $pipelineCsv |
+                Group-Object phase |
+                ForEach-Object {
+                    $rows = @($_.Group | Sort-Object timestamp)
+                    $phase = $_.Name
+                    $live = $rabbitmqSummaries |
+                        Where-Object { $_.Phase -eq $phase -and $_.Queue -eq "contest.judge.live" } |
+                        Select-Object -First 1
+                    if ($rows.Count -ge 2 -and $null -ne $live) {
+                        $outboxPublishedDelta = [int64]$rows[-1].judgeOutboxPublished - [int64]$rows[0].judgeOutboxPublished
+                        [pscustomobject]@{
+                            Phase = $phase
+                            JudgeOutboxPublishedDelta = $outboxPublishedDelta
+                            RabbitLivePublishedDelta = $live.PublishedDelta
+                            AbsoluteDifference = [math]::Abs($outboxPublishedDelta - [int64]$live.PublishedDelta)
+                            PeakJudgeOutboxPending = ($rows | Measure-Object -Property judgeOutboxPending -Maximum).Maximum
+                            PeakRabbitLiveReady = ($rows | Measure-Object -Property rabbitLiveReady -Maximum).Maximum
+                            PeakRabbitLiveUnacked = ($rows | Measure-Object -Property rabbitLiveUnacked -Maximum).Maximum
+                        }
+                    }
+                } |
+                Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+        }
+    }
+    else {
+        Write-Host "RabbitMQ per-queue baseline unavailable (rabbitmq-per-queue Prometheus target was not sampled)."
     }
 
     if (Test-Path $bulkStatsCsv) {

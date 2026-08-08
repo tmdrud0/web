@@ -72,9 +72,13 @@ localhostForwarding=true
 
 - 각 JVM이 스크레이프 요청마다 지표를 직렬화하는 비용
 - mysqld/redis/nginx exporter가 관측 대상에게 실제로 던지는 질의
+- RabbitMQ가 `/metrics/detailed`의 큐 객체 지표를 직렬화하는 비용
 - Prometheus TSDB 쓰기와 MySQL commit이 공유하는 디스크 I/O
 
 앞의 둘은 스크레이프 주기로 조절한다. exporter 계열을 10s로 둔 이유가 이것이다.
+RabbitMQ detailed scrape는 새 컨테이너가 아니라 기존 Prometheus의 두 번째 target이므로 표의
+관측 상한은 **2.20 CPU / 2112M**, 총합은 **9.70 CPU / 11456M**으로 그대로다. broker 쪽 비용은
+RabbitMQ의 앱 예산 안에서 발생하며 §12의 family·sample 제한으로 묶는다.
 
 ## 3. 스크레이프 대상
 
@@ -82,13 +86,14 @@ localhostForwarding=true
 |---|---|---|---:|
 | `oj-app` | web-1, web-2, batch-1, judge-1, judge-2 (`:9000`) | `/actuator/prometheus` | 5s |
 | `rabbitmq` | rabbitmq:15692 | `/metrics` | 5s |
+| `rabbitmq-per-queue` | rabbitmq:15692, vhost `/` | `/metrics/detailed` | 5s |
 | `mysql` | mysqld-exporter:9104 | `/metrics` | 10s |
 | `redis` | redis-exporter:9121 | `/metrics` | 10s |
 | `nginx` | nginx-exporter:9113 | `/metrics` | 10s |
 | `cadvisor` | cadvisor:8080 | `/metrics` | 10s |
 | `prometheus` | localhost:9090 (자기 자신) | `/metrics` | 15s |
 
-job은 7개, 스크레이프 대상은 `oj-app`의 5개를 포함해 모두 11개다.
+job은 8개, 스크레이프 대상은 `oj-app`의 5개를 포함해 모두 12개다.
 
 Alertmanager는 이 표에 없다. Prometheus가 알림을 보내는 대상이지 긁어오는 대상이 아니다.
 받는 쪽(receiver)이 설정되지 않은 지금은 실패할 알림 전송 자체가 없으므로 job을 만들지 않았다.
@@ -165,10 +170,14 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
 
 모든 컨테이너가 `healthy`인 것을 확인한 뒤:
 
-1. Prometheus `Status > Target health`에서 위 7개 job, 대상 11개가 모두 `UP`인지 본다.
-2. `up{job="oj-app"}` 이 5개 시계열을 반환하는지 본다. 5개가 아니면 해당 역할의 관리 포트가
+1. Prometheus `Status > Target health`에서 위 8개 job, 대상 12개가 모두 `UP`인지 본다.
+2. `up{job="rabbitmq-per-queue"} == 1`이고
+   `count by (queue) (rabbitmq_detailed_queue_messages_ready)`가 `contest.judge.live`와
+   `contest.judge.dead`를 각각 한 번 반환하는지 본다. target이 0이면 §12의 100-sample 상한을
+   넘겼는지도 함께 확인한다.
+3. `up{job="oj-app"}` 이 5개 시계열을 반환하는지 본다. 5개가 아니면 해당 역할의 관리 포트가
    열리지 않은 것이다.
-3. `cgroup_cpu_limit_cores` 가 compose 상한과 일치하는지 본다. 이 값이 어긋나면 컨테이너가
+4. `cgroup_cpu_limit_cores` 가 compose 상한과 일치하는지 본다. 이 값이 어긋나면 컨테이너가
    의도한 자원 상한으로 뜨지 않은 것이므로 그 실행의 측정값은 버린다.
 
    | node | 기대값 |
@@ -177,20 +186,20 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
    | judge-1, judge-2 | 0.75 |
    | batch-1 | 0.5 |
 
-4. `histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{role="web"}[5m])))`
+5. `histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{role="web"}[5m])))`
    가 값을 반환하는지 본다. 비어 있으면 히스토그램 버킷이 꺼진 것이다.
-5. Grafana의 `OJ` 폴더에 `OJ - Bottleneck Overview` 대시보드가 있는지 본다.
-6. `contest_scoreboard_pending_events`가 `batch-1`의 **한 시계열**만 반환하는지 본다. 진단용
+6. Grafana의 `OJ` 폴더에 `OJ - Bottleneck Overview` 대시보드가 있는지 본다.
+7. `contest_scoreboard_pending_events`가 `batch-1`의 **한 시계열**만 반환하는지 본다. 진단용
    `contest_outbox_backlog_rows`는 judge 2개(PENDING, PUBLISHING)와 scoreboard 3개(PENDING,
    PROCESSING, FAILED), 합계 5개이며 `count by (node) (...)`는 `batch-1` 하나만 내야 한다.
    다른 역할에서도 gauge 폴러가 켜지면 `sum()`이 backlog를 인스턴스 수만큼 부풀린다.
-7. Prometheus `Status > Rule Health`에서 규칙 그룹 4개가 모두 `OK`인지 본다.
+8. Prometheus `Status > Rule Health`에서 규칙 그룹 4개가 모두 `OK`인지 본다.
    `oj:contest_scoreboard_estimated_drain:seconds`가 비어 있으면 pending/apply 지표가 올라오지 않은
-   것이다(6번). 값이 없는 것과 0인 것은 다르다 — 빈 outbox는 0/0이라 NaN이고, 시계열 자체는
+   것이다(7번). 값이 없는 것과 0인 것은 다르다 — 빈 outbox는 0/0이라 NaN이고, 시계열 자체는
    존재한다.
-8. Prometheus `Status > Runtime & Build Information`의 Alertmanagers에 `alertmanager:9093`이
+9. Prometheus `Status > Runtime & Build Information`의 Alertmanagers에 `alertmanager:9093`이
    보이는지 본다. 비어 있으면 규칙은 평가되지만 발화가 아무 데도 가지 않는다.
-9. 제출 파이프라인 상한이 실제 상한과 맞는지 본다. 이 지표들은 다섯 역할 전부에서 나오므로
+10. 제출 파이프라인 상한이 실제 상한과 맞는지 본다. 이 지표들은 다섯 역할 전부에서 나오므로
    (§9.4) 역할을 지정하지 않으면 2.5배가 된다.
 
    | 질의 | 기대값 |
@@ -235,9 +244,6 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
   `JVM restarts over the selected range (app tier)` 패널
   (`changes(process_start_time_seconds{job="oj-app"})`)이 그 신호이고, 이 환경에서 JVM OOM을
   실제로 잡는 것은 이쪽이다.
-- **RabbitMQ 큐별 지표.** 기본 `/metrics`는 큐를 합산한 값만 준다. 큐별로 보려면
-  `/metrics/detailed` 또는 `prometheus.return_per_object_metrics` 설정이 필요하다. DLQ와
-  live queue를 분리해서 보려면 이 작업이 선행돼야 한다.
 - **스크레이프 주기와 부하 실행 길이.** 5s 주기에서 10초 hold 실행은 표본이 두어 개뿐이라
   곡선이 되지 않는다. 이 대시보드로 판단하려면 hold를 60초 이상으로 늘려야 한다.
 - **backlog 게이지는 값이 오래됐을 수 있다.** 이 문서 §10의 폴러는 5초마다 질의하고 게이지는 그
@@ -270,7 +276,6 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
   `ContestSubmissionBatchConsistencyException` 카운트, §10.5의 judge API latency histogram,
   listener retry/DLQ 이동 수, result writer queue depth, Redis pipeline latency, Lua 오류와
   `w:*` 필드 총량이다. 이들은 judge 역할과 Redis 경로에 있어 이번 작업 범위 밖이다.
-  §10.4의 RabbitMQ 큐별 지표는 별도 제약 항목으로 위에 있다.
 - **알림 임계값은 실측값이 아니다.** 규칙은 `observability/prometheus/rules/oj-pipeline.yml`에
   있고 숫자는 전부 출발점이다. 임계값을 정할 근거가 되는 실행 — 곡선이 나올 만큼 긴 hold,
   위의 "스크레이프 주기와 부하 실행 길이" 항목 — 이 아직 없다. 각 임계값이 무엇의 대리값인지는
@@ -946,3 +951,70 @@ oldest-ready를 따로 두는 이유는 drain rate가 볼 수 없는 절반이 �
 Alertmanager의 inhibition은 critical이 warning을 누르도록 해 두었다. 인스턴스가 죽었거나 방금
 재시작했다면 그 인스턴스가 만든 숫자는 전부 무효다. backlog 게이지는 batch-1에서만 나오므로
 batch-1이 내려가면 outbox warning들은 독립된 발견이 아니라 critical의 결과다.
+
+## 12. RabbitMQ 큐별 지표와 judge queue baseline
+
+### detailed endpoint와 시계열 상한
+
+기본 `rabbitmq` job은 노드 전체 상태를 보는 저비용 합산 `/metrics`를 그대로 유지한다. 큐를
+구분하는 `rabbitmq-per-queue` job만 `/metrics/detailed`를 추가로 긁는다. 전체 per-object 모드를
+켜지 않은 이유는 연결·채널 수가 늘 때 시계열도 함께 늘기 때문이다. RabbitMQ 4.1은 detailed
+endpoint에서 family를 고를 수 있으므로 다음 네 개만 요청한다
+([공식 Prometheus 지표 목록](https://www.rabbitmq.com/docs/4.1/prometheus)).
+
+| family | 이 리포에서 쓰는 값 |
+|---|---|
+| `queue_coarse_metrics` | ready, unacked |
+| `queue_consumer_count` | consumer 수 |
+| `queue_delivery_metrics` | 큐별 manual/auto-ack deliver counter |
+| `queue_exchange_metrics` | exchange를 거쳐 큐에 들어온 publish counter |
+
+그 응답에서도 dashboard와 부하 하네스가 읽는 6개 metric 이름만 metric relabeling으로 남긴다.
+채널 ID가 붙는 `channel_queue_metrics`와 `channel_queue_exchange_metrics`는 사용하지 않는다.
+현재 32개 consumer channel에서 `channel_queue_metrics`만 직접 요청해도 230 samples였지만, 선택한
+네 family의 원 응답은 26 samples이고 relabel 뒤 RabbitMQ payload는 **9 series**다. 마지막으로
+`sample_limit: 100`을 둔다. 새 queue/stream을 잘못 무제한 노출하면 target 전체가 `up=0`이 되어
+조용한 TSDB 증가가 아니라 명시적인 관측 실패가 된다.
+
+2026-08-08 같은 실행 중 reload 전후 실측은 다음과 같다.
+
+| 항목 | 전 | 후 | 증가 |
+|---|---:|---:|---:|
+| detailed RabbitMQ payload | 0 | 9 | +9 |
+| target 자체 `up`/scrape 상태 series | 0 | 5 | +5 |
+| `rabbitmq-per-queue` job 합계 | 0 | **14** | **+14** |
+| 기존 합산 `rabbitmq` job | 1,677 | 1,683 | +6 |
+| Prometheus head series | 12,177 | 12,197 | +20 |
+
+기존 job 증가 6개 중 4개는 detailed endpoint 호출 뒤 생긴
+`telemetry_scrape_encoded_size_bytes_{count,sum}{registry="detailed"}`(gzip/identity)였고 나머지 2개는
+같은 시간창의 aggregate drift다. 새 job에서 직접 센 값은 14지만 원인을 낙관적으로 빼지 않고
+**관측된 head 증가 전체 20 series(12,177 대비 0.16%)를 이번 변경의 시계열 예산으로 잡는다.**
+새 서비스나 컨테이너 상한은 없으므로 §2 자원 예산 표는 바뀌지 않는다.
+
+### `submit-100` baseline
+
+실행은 `var/loadtest-20260808-142701`이다. 이전 실패 실행이 남긴 격리 load-test DLQ 10건은
+개수를 확인한 뒤 실행 전에 purge했고, 첫 sample에서 live와 DLQ가 모두 ready=0/unacked=0임을
+확인했다. 새 contest 23을 seed했고 `state-reset.csv`의 Redis·두 outbox는 모두 0이었다. 결과는
+submissions = results = scoreboard completed = 19,495, HTTP 성공률 100%, outbox retry 0, JVM restart
+0, OOMKilled=false였다.
+
+`rabbitmq-metrics.csv`의 35개 queue별 sample과 `rabbitmq-summary.csv`의 결과는 다음과 같다.
+
+| queue | ready max | unacked max | consumers min~max | publish 평균 / 5s구간 최대 | deliver 평균 / 5s구간 최대 | counter delta |
+|---|---:|---:|---:|---:|---:|---:|
+| `contest.judge.live` | 0 | 19 | 32~32 | 88.97/s / 165.54/s | 88.97/s / 169.32/s | publish 19,495 / deliver 19,495 |
+| `contest.judge.dead` | 0 | 0 | 0~0 | 0 / 0 | 0 / 0 | publish 0 / deliver 0 |
+
+Prometheus에서 같은 시간창을 30초 rate로 읽으면 live publish와 deliver 최대가 모두 102.84/s였다.
+ready가 0인 것은 누락이 아니라 `submit-100`이 judge drain rate 아래에 있다는 시나리오 계약과
+일치한다. broker에 머문 일은 unacked 최대 23으로 보이고, 32 consumers는 전 구간 유지됐다.
+
+`contest_outbox_backlog_rows{outbox="judge"}`는 같은 Prometheus 시간창에서 0~37, 하네스의 DB
+직접 sample은 0~26이었다. §7의 5초 gauge poll과 scrape 위상 차이 때문에 최대값은 같을 필요가
+없다. 더 중요한 보존 관계는 정확히 맞았다. `pipeline.csv`에서 judge outbox가 PUBLISHED로 바뀐
+증분 19,495건과 RabbitMQ live queue publish counter 증분 19,495건의 차이가 **0**이고, live
+publish/deliver delta도 둘 다 19,495였다. 즉 outbox에 잠깐 쌓인 work가 broker로 이동한 뒤 ready
+backlog를 만들지 않고 즉시 consumer에게 전달됐으며, DLQ 유입이나 유실은 없었다. 대시보드에서
+두 depth가 같은 모양이어야 하는 것이 아니라 이 연속 단계와 보존 관계가 성립해야 한다.

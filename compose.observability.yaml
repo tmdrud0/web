@@ -17,6 +17,10 @@
 #   -----------------------------------
 #   total            2.20 CPU / 2112M
 #
+# The queue-level RabbitMQ target is a second scrape handled by this same Prometheus container;
+# it adds no service and changes none of these limits. Its broker-side serialization cost remains
+# inside RabbitMQ's application-tier budget and is bounded in prometheus.yml.
+#
 # The WSL 2 budget must cover both. See docs/ENVIRONMENT.md section 2.
 
 services:

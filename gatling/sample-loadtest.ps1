@@ -5,7 +5,7 @@
 # work piled up. These samples do: container CPU/memory, the two outbox backlogs, the Rabbit
 # queue depth, and the persisted submission count, all on one timeline.
 #
-# Samples land in three CSVs because they have different shapes and cadences. Every row carries the
+# Samples land in four CSVs because they have different shapes and cadences. Every row carries the
 # phase name, so one output directory can hold several scenarios back to back.
 [CmdletBinding()]
 param(
@@ -25,6 +25,7 @@ $composeArgs = @("-p", $ProjectName, "-f", "compose.yaml", "-f", "compose.loadte
 $containerCsv = Join-Path $OutputDirectory "containers.csv"
 $pipelineCsv = Join-Path $OutputDirectory "pipeline.csv"
 $jvmCsv = Join-Path $OutputDirectory "jvm-metrics.csv"
+$rabbitmqCsv = Join-Path $OutputDirectory "rabbitmq-metrics.csv"
 $prometheusUrl = "http://127.0.0.1:9090"
 
 # One statement keeps the whole pipeline snapshot on a single MySQL round trip. The lag subquery
@@ -35,6 +36,7 @@ $pipelineSql = @(
     "SELECT"
     "(SELECT COUNT(*) FROM contest_judge_outbox WHERE status <> 'PUBLISHED'),"
     "(SELECT COALESCE((SELECT TIMESTAMPDIFF(MICROSECOND, created_at, CURRENT_TIMESTAMP(6)) DIV 1000 FROM contest_judge_outbox WHERE status = 'PENDING' ORDER BY claimed_at, id LIMIT 1), 0)),"
+    "(SELECT COUNT(*) FROM contest_judge_outbox WHERE status = 'PUBLISHED'),"
     "(SELECT COUNT(*) FROM contest_submission_outbox WHERE status = 'PENDING'),"
     "(SELECT COUNT(*) FROM contest_submission_outbox WHERE status = 'PROCESSING'),"
     "(SELECT COUNT(*) FROM contest_submission_outbox WHERE status = 'FAILED'),"
@@ -174,6 +176,74 @@ function Sample-JvmMetrics {
     }
 }
 
+function Sample-RabbitMqMetrics {
+    param([string]$Timestamp)
+
+    try {
+        # One instant query returns all retained queue-level gauges and counters. Keeping raw
+        # counters in the artifact lets the summary calculate rates over exactly the load phase,
+        # without depending on a later Prometheus retention window.
+        $query = '{job="rabbitmq-per-queue",queue=~"contest\\.judge\\.(live|dead)"}'
+        $encodedQuery = [uri]::EscapeDataString($query)
+        $response = Invoke-RestMethod -Uri "$prometheusUrl/api/v1/query?query=$encodedQuery" -TimeoutSec 4
+        if ($response.status -ne "success") { return }
+
+        $fieldsByMetric = @{
+            rabbitmq_detailed_queue_messages_ready = "Ready"
+            rabbitmq_detailed_queue_messages_unacked = "Unacked"
+            rabbitmq_detailed_queue_consumers = "Consumers"
+            rabbitmq_detailed_queue_exchange_messages_published_total = "PublishedTotal"
+            rabbitmq_detailed_queue_messages_delivered_ack_total = "DeliveredAckTotal"
+            rabbitmq_detailed_queue_messages_delivered_total = "DeliveredAutoTotal"
+        }
+        $queues = @{
+            "contest.judge.live" = @{
+                Ready = 0d; Unacked = 0d; Consumers = 0d; PublishedTotal = 0d
+                DeliveredAckTotal = 0d; DeliveredAutoTotal = 0d; Seen = $false
+            }
+            "contest.judge.dead" = @{
+                Ready = 0d; Unacked = 0d; Consumers = 0d; PublishedTotal = 0d
+                DeliveredAckTotal = 0d; DeliveredAutoTotal = 0d; Seen = $false
+            }
+        }
+
+        foreach ($sample in @($response.data.result)) {
+            $queue = [string]$sample.metric.queue
+            $metricName = [string]$sample.metric.__name__
+            if (-not $queues.ContainsKey($queue) -or -not $fieldsByMetric.ContainsKey($metricName) -or
+                $sample.value.Count -lt 2) {
+                continue
+            }
+            $queues[$queue][$fieldsByMetric[$metricName]] = [double]::Parse(
+                [string]$sample.value[1],
+                [Globalization.CultureInfo]::InvariantCulture)
+            $queues[$queue].Seen = $true
+        }
+
+        if (-not ($queues.Values | Where-Object { $_.Seen })) { return }
+        foreach ($queue in @($queues.Keys | Sort-Object)) {
+            $values = $queues[$queue]
+            if (-not $values.Seen) { continue }
+            $line = @(
+                $Timestamp,
+                $Phase,
+                $queue,
+                (Format-InvariantNumber $values.Ready),
+                (Format-InvariantNumber $values.Unacked),
+                (Format-InvariantNumber $values.Consumers),
+                (Format-InvariantNumber $values.PublishedTotal),
+                (Format-InvariantNumber $values.DeliveredAckTotal),
+                (Format-InvariantNumber $values.DeliveredAutoTotal)
+            ) -join ','
+            Write-CsvLine -Path $rabbitmqCsv -Line $line
+        }
+    }
+    catch {
+        # The observability overlay remains optional for harness users. No queue rows means the
+        # final baseline summary is visibly unavailable rather than manufacturing zeroes.
+    }
+}
+
 function Sample-Containers {
     param([string]$Timestamp)
 
@@ -208,26 +278,46 @@ function Sample-Pipeline {
         $row = & docker compose @composeArgs exec -T mysql mysql -uroot -p1234 -D $DbName -Nse $pipelineSql 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $row) { return }
         $values = ($row | Select-Object -Last 1) -split "`t"
-        if ($values.Count -lt 10) { return }
+        if ($values.Count -lt 11) { return }
 
         $rabbitReady = 0L
         $rabbitUnacked = 0L
-        $queues = @(& docker compose @composeArgs exec -T rabbitmq rabbitmqctl list_queues -q name messages_ready messages_unacknowledged 2>$null)
+        $rabbitLiveReady = 0L
+        $rabbitLiveUnacked = 0L
+        $rabbitLiveConsumers = 0L
+        $rabbitDeadReady = 0L
+        $rabbitDeadUnacked = 0L
+        $rabbitDeadConsumers = 0L
+        $queues = @(& docker compose @composeArgs exec -T rabbitmq rabbitmqctl list_queues -q name messages_ready messages_unacknowledged consumers 2>$null)
         if ($LASTEXITCODE -eq 0) {
             foreach ($queue in $queues) {
                 $fields = ($queue -split '\s+') | Where-Object { $_ }
                 $ready = 0L
                 $unacked = 0L
-                if ($fields.Count -ge 3 -and
-                    [int64]::TryParse($fields[$fields.Count - 2], [ref]$ready) -and
-                    [int64]::TryParse($fields[$fields.Count - 1], [ref]$unacked)) {
+                $consumers = 0L
+                if ($fields.Count -ge 4 -and
+                    [int64]::TryParse($fields[$fields.Count - 3], [ref]$ready) -and
+                    [int64]::TryParse($fields[$fields.Count - 2], [ref]$unacked) -and
+                    [int64]::TryParse($fields[$fields.Count - 1], [ref]$consumers)) {
                     $rabbitReady += $ready
                     $rabbitUnacked += $unacked
+                    if ($fields[0] -eq "contest.judge.live") {
+                        $rabbitLiveReady = $ready
+                        $rabbitLiveUnacked = $unacked
+                        $rabbitLiveConsumers = $consumers
+                    }
+                    elseif ($fields[0] -eq "contest.judge.dead") {
+                        $rabbitDeadReady = $ready
+                        $rabbitDeadUnacked = $unacked
+                        $rabbitDeadConsumers = $consumers
+                    }
                 }
             }
         }
 
-        Write-CsvLine -Path $pipelineCsv -Line ("$Timestamp,$Phase," + ($values -join ',') + ",$rabbitReady,$rabbitUnacked")
+        Write-CsvLine -Path $pipelineCsv -Line ("$Timestamp,$Phase," + ($values -join ',') +
+            ",$rabbitReady,$rabbitUnacked,$rabbitLiveReady,$rabbitLiveUnacked,$rabbitLiveConsumers," +
+            "$rabbitDeadReady,$rabbitDeadUnacked,$rabbitDeadConsumers")
     }
     finally {
         Pop-Location
@@ -238,12 +328,16 @@ if (-not (Test-Path $containerCsv)) {
     Write-CsvLine -Path $containerCsv -Line "timestamp,phase,container,cpuPercent,memUsedMb,memLimitMb,cpuPeriods,cpuThrottledPeriods"
 }
 if (-not (Test-Path $pipelineCsv)) {
-    Write-CsvLine -Path $pipelineCsv -Line ("timestamp,phase,judgeOutboxPending,judgeHeadLagMs,scoreboardPending,scoreboardProcessing," +
+    Write-CsvLine -Path $pipelineCsv -Line ("timestamp,phase,judgeOutboxPending,judgeHeadLagMs,judgeOutboxPublished,scoreboardPending,scoreboardProcessing," +
         "scoreboardFailed,oldestPendingLagMs,submissionRows,resultRows,mysqlThreadsConnected,mysqlThreadsRunning," +
-        "rabbitReady,rabbitUnacked")
+        "rabbitReady,rabbitUnacked,rabbitLiveReady,rabbitLiveUnacked,rabbitLiveConsumers," +
+        "rabbitDeadReady,rabbitDeadUnacked,rabbitDeadConsumers")
 }
 if (-not (Test-Path $jvmCsv)) {
     Write-CsvLine -Path $jvmCsv -Line "timestamp,phase,node,throttleRatio,processStartTimeSeconds,gcPauseSeconds,heapUsedBytes"
+}
+if (-not (Test-Path $rabbitmqCsv)) {
+    Write-CsvLine -Path $rabbitmqCsv -Line "timestamp,phase,queue,ready,unacked,consumers,publishedTotal,deliveredAckTotal,deliveredAutoTotal"
 }
 
 $lastPipelineSample = [DateTime]::MinValue
@@ -255,6 +349,7 @@ while (-not (Test-Path $StopFile)) {
     Sample-Containers -Timestamp $timestamp
     if (($now - $lastPipelineSample).TotalSeconds -ge $PipelineIntervalSeconds) {
         Sample-Pipeline -Timestamp $timestamp
+        Sample-RabbitMqMetrics -Timestamp $timestamp
         $lastPipelineSample = $now
     }
     if (($now - $lastJvmSample).TotalSeconds -ge $PipelineIntervalSeconds) {
