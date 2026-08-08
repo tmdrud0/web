@@ -1,7 +1,7 @@
 # 대회 제출 파이프라인 설계 및 개선 기록
 
-> 최종 갱신: 2026-07-31
-> 작업 브랜치: `codex/scoreboard-commutative-port`
+> 최종 갱신: 2026-08-08
+> 작업 브랜치: `codex/contest-judge-stream-publish`
 > 문서 목적: 과거의 설계 판단부터 현재 구현, 성능 측정, 미해결 문제까지 한 문서에서 다시 파악하고 LLM에 인수인계하기 위한 기록
 
 ## 0. 먼저 읽을 요약
@@ -16,6 +16,7 @@
 6. Kafka 대신 DB outbox와 RabbitMQ quorum queue를 사용하는 work queue 구조로 전환
 7. 제출, relay, 채점 결과, scoreboard 반영을 각각 batch화
 8. 전체 1000 TPS 부하와 JFR 진단으로 현재 병목을 다시 확인
+9. scoreboard outbox를 유지한 채 judge 결과를 RabbitMQ Stream에 confirm 병행 발행하는 A단계 추가
 
 현재 선택한 구조는 다음과 같다.
 
@@ -27,6 +28,8 @@ HTTP 제출
   -> RabbitMQ quorum queue
   -> Judge listener
   -> MySQL: contest_submission_result + contest_submission_outbox (동일 트랜잭션)
+  -> RabbitMQ Stream: contest.judge.result.stream (publisher confirm)
+  -> Judge queue ACK
   -> Scoreboard batch worker
   -> Redis scoreboard
 ```
@@ -36,7 +39,7 @@ HTTP 제출
 - 제출 원본과 중복 제약의 최종 권위는 MySQL이다.
 - RabbitMQ는 원본 저장소가 아니라 채점 작업을 분배하는 durable work queue다.
 - DB와 RabbitMQ 사이에 2PC를 사용하지 않고 outbox와 멱등성으로 at-least-once를 만든다.
-- RabbitMQ consumer ACK는 채점 결과와 scoreboard outbox의 DB commit 이후에만 발생한다.
+- RabbitMQ consumer ACK는 채점 결과와 scoreboard outbox의 DB commit, result stream publisher confirm이 모두 끝난 뒤에만 발생한다.
 - 채점 서버의 긴 꼬리 지연은 `prefetch=1`과 다수 consumer로 서로 격리한다.
 - Redis scoreboard는 파생 상태이며 DB outbox로 재구성할 수 있어야 한다.
 - 채점 완료 순서는 제출 순서와 다르므로 scoreboard 반영은 순서와 중복에 무관해야 한다. 라이브 값과 rebuild 값이 같은 데이터에서 일치하는 것이 기준이다.
@@ -338,6 +341,9 @@ flowchart LR
     RW --> T2["MySQL transaction"]
     T2 --> CR["contest_submission_result"]
     T2 --> SO["contest_submission_outbox"]
+    T2 --> SP["Result stream publisher"]
+    SP --> SMQ["RabbitMQ result stream confirm"]
+    SMQ --> ACK["Judge work queue ACK"]
     SO --> SB["Scoreboard batch worker"]
     SB --> RS["Redis Lua and pipeline"]
 ```
@@ -450,16 +456,18 @@ claim token은 오래된 worker의 완료 결과가 새 claim을 덮어쓰지 �
 
 - live queue: durable quorum queue
 - dead-letter queue: durable quorum queue
+- result stream queue: durable stream queue, `contest.judge.result.stream`
+- result stream retention: `x-max-age=7D`, `x-max-length-bytes=10 GiB`
 - message delivery mode: persistent
 - publisher confirm: correlated
 - mandatory return: enabled
-- consumer concurrency: 64
+- consumer concurrency: judge 인스턴스당 16, Compose 전체 32
 - prefetch: 1
 - acknowledge mode: auto
 - listener retry: 최대 3회, 1초에서 시작해 3배 증가, 최대 10초
 - retry 소진 후 reject하고 DLQ로 이동
 
-`prefetch=1`이므로 consumer 하나는 ACK하지 않은 메시지를 하나만 갖는다. 64개 consumer라면 정상적으로 최대 약 64건이 unacked이고, 나머지는 RabbitMQ ready backlog에 남는다.
+`prefetch=1`이므로 consumer 하나는 ACK하지 않은 메시지를 하나만 갖는다. 현재 두 judge의 32개 consumer라면 정상적으로 최대 약 32건이 unacked이고, 나머지는 RabbitMQ ready backlog에 남는다.
 
 RabbitMQ의 ACK는 요청 스레드 ID로 돌아오는 것이 아니다. Java client가 TCP connection 안의 channel과 channel별 delivery 상태를 관리한다. Spring AMQP listener container가 이 세부 사항을 감추고 listener 성공/실패를 기준으로 ACK 또는 reject를 수행한다.
 
@@ -478,8 +486,10 @@ connection이나 channel이 끊어지면 해당 channel의 unacked 메시지는 
 5. listener thread는 해당 결과 batch의 완료 Future를 기다린다.
 6. batch worker가 transaction 안에서 result와 scoreboard outbox를 저장한다.
 7. transaction interceptor가 commit한 뒤 persistence method가 반환한다.
-8. Future가 완료되고 listener가 정상 반환한다.
-9. Spring AMQP container가 ACK한다.
+8. batch 전체 결과를 `contest.judge.result.stream`에 발행한다.
+9. 모든 메시지의 correlated publisher confirm ACK를 기다리고 mandatory return도 확인한다.
+10. Future가 완료되고 listener가 정상 반환한다.
+11. Spring AMQP container가 ACK한다.
 
 주요 코드:
 
@@ -487,7 +497,7 @@ connection이나 channel이 끊어지면 해당 channel의 unacked 메시지는 
 - [`ContestSubmissionJudgeResultBatchWriter`](../src/main/java/my/oj/web/contest/submission/judge/ContestSubmissionJudgeResultBatchWriter.java)
 - [`JdbcContestSubmissionJudgeResultBatchPersistence`](../src/main/java/my/oj/web/contest/submission/judge/JdbcContestSubmissionJudgeResultBatchPersistence.java)
 
-DB commit 후 ACK 전에 프로세스가 죽으면 RabbitMQ가 메시지를 다시 전달한다. 이를 다음 unique/멱등 처리로 흡수한다.
+DB commit 후 stream confirm 또는 work queue ACK 전에 프로세스가 죽으면 RabbitMQ가 메시지를 다시 전달한다. 저장 결과가 있으면 DB에서 결과 전체를 읽어 judge API를 건너뛰고 stream 발행만 다시 한다. 이를 다음 unique/멱등 처리로 흡수한다.
 
 - `contest_submission_result` PK: `submission_id`
 - 결과 insert: `INSERT IGNORE`
@@ -495,6 +505,8 @@ DB commit 후 ACK 전에 프로세스가 죽으면 RabbitMQ가 메시지를 다�
 - scoreboard outbox insert: `INSERT IGNORE`
 
 ACK 후 DB commit이 취소되는 순서는 현재 구조상 만들지 않았다. 반면 DB와 Rabbit 사이에 원자적 exactly-once는 없으므로 중복 전달은 정상 시나리오로 취급한다.
+
+stream 발행 일부가 confirm된 뒤 나머지가 실패하거나, 전체 confirm 뒤 work queue ACK 전에 judge가 종료되면 stream에는 중복 entry가 생긴다. 이 중복은 누락을 피하기 위한 at-least-once 결과이며 후속 stream consumer가 흡수해야 한다. 발행 예외는 batch Future를 exceptional completion으로 끝내 listener 밖으로 전파하므로 성공 ACK로 바뀌지 않는다. 현재 listener retry를 소진한 메시지는 기존 정책대로 DLQ로 이동하므로 장기 장애 뒤에는 DLQ replay가 필요하다.
 
 ### 4.9 judge projection과 결과 batch
 
@@ -519,7 +531,38 @@ Rabbit 메시지는 submission ID만 담는다. judge는 필요한 필드만 pro
 - queue capacity: 512
 - 최대 batch 대기: 5ms
 
-listener concurrency가 64이고 각 listener가 결과 commit을 기다리므로 실제 producer 수는 최대 약 64다. queue capacity 512가 채워지기 전에 Rabbit prefetch가 먼저 backpressure를 건다.
+각 judge 인스턴스의 listener concurrency가 16이고 각 listener가 결과 commit과 stream confirm을 기다리므로 인스턴스별 실제 producer 수는 최대 약 16이다. queue capacity 512가 채워지기 전에 Rabbit prefetch가 먼저 backpressure를 건다.
+
+### 4.9.1 A단계: judge 결과 Stream 병행 발행
+
+A단계의 목적은 scoreboard 소비 경로를 바로 교체하는 것이 아니라, 기존 `contest_submission_outbox` 행과 stream payload가 같은지 먼저 비교하는 것이다. scoreboard는 계속 기존 outbox worker가 반영하며 stream consumer는 아직 없다.
+
+stream topology:
+
+- exchange/routing: 기존 `contest.judge.exchange`에 `contest.judge.result.stream` routing key를 추가
+- queue: `contest.judge.result.stream`, durable, `x-queue-type=stream`
+- protocol: 현재 Spring AMQP의 AMQP 0.9.1 경로만 사용
+- 미사용: RabbitMQ Stream protocol plugin과 5552 포트
+- Spring AMQP 3.2.3의 `QueueBuilder.stream()`으로 선언
+
+schema version 1 payload:
+
+```text
+schemaVersion, submissionId, contestId, problemId, userId,
+contestStart, submittedTime, judgedAt, result
+```
+
+재전달에서는 먼저 `contest_submission_result`를 조회한다. row가 있으면 submission/contest와 join한 저장값으로 위 payload를 복원하고 재채점 없이 result writer의 재발행 경로로 보낸다. row가 없을 때만 기존 judge projection과 judge API를 호출한다.
+
+retention은 `max-age=7D`, `max-length-bytes=10 GiB`로 시작한다.
+
+- 저장소에서 사용하는 실제/seed 대회 길이는 최대 4시간이며 기본 seed는 2시간이다. 7일은 4시간 대회의 42배다.
+- Compose의 Redis 7은 `save`를 별도로 덮어쓰지 않는다. Redis 기본 RDB 주기는 변경량에 따라 최대 1시간이므로 7일은 snapshot rollback 범위보다 168배 길다.
+- 과거 정상 목표 실행은 27,120건, 짧은 과부하 실행은 약 15,000건이었다. 10 GiB는 이 비교 단계에서 충분한 초기 disk 상한을 제공하되 무제한 증가를 막는다.
+- 실제 복구 가능 범위는 age와 bytes 중 먼저 도달한 제한이다. payload/segment overhead와 운영 제출률을 측정해 `rabbitmq_stream_*` disk 사용량과 함께 재산정해야 한다.
+- stream retention은 segment 단위로 적용되므로 정확히 개별 메시지 시각/byte 경계에서 잘리지는 않는다.
+
+이 순서는 DB와 Rabbit 사이의 2PC를 추가하지 않으면서도 `DB commit 후 publish 전` 장애를 원래 judge work queue 재전달로 복구한다. publish를 commit 앞에 두거나 confirm을 기다리지 않고 listener를 반환하면 이 복구 연결이 끊기므로 허용하지 않는다.
 
 ### 4.10 scoreboard outbox와 Redis pipeline
 
@@ -982,8 +1025,10 @@ estimated_drain_seconds = backlog_count / recent_sustainable_throughput
 ### 9.4 RabbitMQ 운영 보완
 
 - 현재 Compose의 RabbitMQ는 한 노드이므로 quorum queue를 선언해도 실제 replica 장애 내성은 검증되지 않는다.
+- result stream도 단일 node에 leader만 있고 replica가 없으므로 stream replication/failover는 검증되지 않는다. AMQP 0.9.1 publish/confirm과 local disk 기록만 확인한다.
 - production durability 검증에는 최소 3노드 cluster가 필요하다.
 - queue max length/bytes 정책과 disk free limit을 정해야 한다.
+- result stream의 7일/10 GiB retention 중 실제 트래픽에서 어느 제한이 먼저 도달하는지와 segment 단위 삭제 지연을 측정하고 disk free alert를 연결해야 한다.
 - consumer timeout은 정상 최대 judge 시간보다 크게 설정하되 무한정 두지 않는다.
 - DLQ 재처리 도구와 보관 정책이 필요하다.
 - `PUBLISHED` outbox와 `COMPLETED` scoreboard outbox의 archive/purge 정책이 필요하다.

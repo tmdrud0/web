@@ -199,6 +199,7 @@ function Get-RabbitBacklog {
         $ready = 0L
         $unacknowledged = 0L
         if ($parts.Count -ge 3 -and
+            $parts[0] -in @("contest.judge.live", "contest.judge.dead") -and
             [int64]::TryParse($parts[$parts.Count - 2], [ref]$ready) -and
             [int64]::TryParse($parts[$parts.Count - 1], [ref]$unacknowledged)) {
             $total += $ready + $unacknowledged

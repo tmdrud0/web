@@ -2,6 +2,7 @@ package my.oj.web.contest.submission.messaging;
 
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeProcessor;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultBatchWriter;
+import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultStreamPublisher;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultWriterProperties;
 import my.oj.web.contest.submission.judge.JdbcContestSubmissionJudgeResultBatchPersistence;
 import my.oj.web.observability.ContestOutboxDrainMetrics;
@@ -103,6 +104,11 @@ class ContestJudgeRoleProfileActivationTests {
         @Bean
         JdbcContestSubmissionJudgeResultBatchPersistence judgeResultBatchPersistence() {
             return mock(JdbcContestSubmissionJudgeResultBatchPersistence.class);
+        }
+
+        @Bean
+        ContestSubmissionJudgeResultStreamPublisher contestSubmissionJudgeResultStreamPublisher() {
+            return mock(ContestSubmissionJudgeResultStreamPublisher.class);
         }
     }
 }

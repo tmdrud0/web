@@ -13,6 +13,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
@@ -73,6 +74,12 @@ public class ContestSubmissionService {
     public ContestSubmissionJudgeProjection getJudgeProjectionById(Long contestSubmissionId) {
         return repository.findJudgeProjectionById(contestSubmissionId)
                 .orElseThrow(() -> new IllegalStateException("Contest submission not found: " + contestSubmissionId));
+    }
+
+    public Optional<ContestSubmissionStoredJudgeResultProjection> findStoredJudgeResultById(
+            Long contestSubmissionId
+    ) {
+        return resultRepository.findStoredJudgeResultBySubmissionId(contestSubmissionId);
     }
 
     @Transactional(readOnly = true)

@@ -184,7 +184,7 @@ function Sample-RabbitMqMetrics {
         # One instant query returns all retained queue-level gauges and counters. Keeping raw
         # counters in the artifact lets the summary calculate rates over exactly the load phase,
         # without depending on a later Prometheus retention window.
-        $query = '{job="rabbitmq-per-queue",queue=~"contest\\.judge\\.(live|dead)"}'
+        $query = '{job="rabbitmq-per-queue",queue=~"contest\\.judge\\.(live|dead|result\\.stream)"}'
         $encodedQuery = [uri]::EscapeDataString($query)
         $response = Invoke-RestMethod -Uri "$prometheusUrl/api/v1/query?query=$encodedQuery" -TimeoutSec 4
         if ($response.status -ne "success") { return }
@@ -203,6 +203,10 @@ function Sample-RabbitMqMetrics {
                 DeliveredAckTotal = 0d; DeliveredAutoTotal = 0d; Seen = $false
             }
             "contest.judge.dead" = @{
+                Ready = 0d; Unacked = 0d; Consumers = 0d; PublishedTotal = 0d
+                DeliveredAckTotal = 0d; DeliveredAutoTotal = 0d; Seen = $false
+            }
+            "contest.judge.result.stream" = @{
                 Ready = 0d; Unacked = 0d; Consumers = 0d; PublishedTotal = 0d
                 DeliveredAckTotal = 0d; DeliveredAutoTotal = 0d; Seen = $false
             }
@@ -352,14 +356,16 @@ function Sample-Pipeline {
                     [int64]::TryParse($fields[$fields.Count - 3], [ref]$ready) -and
                     [int64]::TryParse($fields[$fields.Count - 2], [ref]$unacked) -and
                     [int64]::TryParse($fields[$fields.Count - 1], [ref]$consumers)) {
-                    $rabbitReady += $ready
-                    $rabbitUnacked += $unacked
                     if ($fields[0] -eq "contest.judge.live") {
+                        $rabbitReady += $ready
+                        $rabbitUnacked += $unacked
                         $rabbitLiveReady = $ready
                         $rabbitLiveUnacked = $unacked
                         $rabbitLiveConsumers = $consumers
                     }
                     elseif ($fields[0] -eq "contest.judge.dead") {
+                        $rabbitReady += $ready
+                        $rabbitUnacked += $unacked
                         $rabbitDeadReady = $ready
                         $rabbitDeadUnacked = $unacked
                         $rabbitDeadConsumers = $consumers

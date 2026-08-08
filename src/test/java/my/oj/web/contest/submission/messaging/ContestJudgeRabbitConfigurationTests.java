@@ -29,4 +29,15 @@ class ContestJudgeRabbitConfigurationTests {
         assertThat(queue.isDurable()).isTrue();
         assertThat(queue.getArguments()).containsEntry("x-queue-type", "quorum");
     }
+
+    @Test
+    void resultStreamIsDurableWithBoundedRecoveryRetention() {
+        Queue queue = configuration.contestJudgeResultStreamQueue();
+
+        assertThat(queue.isDurable()).isTrue();
+        assertThat(queue.getArguments())
+                .containsEntry("x-queue-type", "stream")
+                .containsEntry("x-max-age", "7D")
+                .containsEntry("x-max-length-bytes", 10L * 1024 * 1024 * 1024);
+    }
 }

@@ -4,6 +4,7 @@ import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxPropert
 import my.oj.web.contest.submission.config.ContestSubmissionExecutorProperties;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultWriterProperties;
 import my.oj.web.contest.submission.messaging.ContestJudgeOutboxRelayProperties;
+import my.oj.web.contest.submission.messaging.ContestJudgeResultStreamPublisherProperties;
 import my.oj.web.contest.submission.queue.ContestSubmissionBulkProperties;
 import my.oj.web.contest.submission.queue.ContestSubmissionCompletionProperties;
 import org.junit.jupiter.api.Test;
@@ -34,6 +35,8 @@ class OperationalPropertiesBindingTests {
                     context.getBean(ContestSubmissionCompletionProperties.class);
             ContestSubmissionJudgeResultWriterProperties resultWriter =
                     context.getBean(ContestSubmissionJudgeResultWriterProperties.class);
+            ContestJudgeResultStreamPublisherProperties resultStream =
+                    context.getBean(ContestJudgeResultStreamPublisherProperties.class);
 
             assertThat(executor.corePoolSize()).isEqualTo(2);
             assertThat(executor.maxPoolSize()).isEqualTo(4);
@@ -56,6 +59,7 @@ class OperationalPropertiesBindingTests {
             assertThat(resultWriter.workerCount()).isEqualTo(1);
             assertThat(resultWriter.queueCapacity()).isEqualTo(256);
             assertThat(resultWriter.maxWait()).isEqualTo(Duration.ofMillis(5));
+            assertThat(resultStream.confirmTimeout()).isEqualTo(Duration.ofSeconds(10));
         });
     }
 
@@ -117,7 +121,8 @@ class OperationalPropertiesBindingTests {
             ContestJudgeOutboxRelayProperties.class,
             ContestSubmissionBulkProperties.class,
             ContestSubmissionCompletionProperties.class,
-            ContestSubmissionJudgeResultWriterProperties.class
+            ContestSubmissionJudgeResultWriterProperties.class,
+            ContestJudgeResultStreamPublisherProperties.class
     })
     static class PropertiesConfiguration {
     }

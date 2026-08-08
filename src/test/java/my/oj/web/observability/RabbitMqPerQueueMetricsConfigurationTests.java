@@ -17,6 +17,8 @@ class RabbitMqPerQueueMetricsConfigurationTests {
 
     private static final Path PROMETHEUS = Path.of("observability/prometheus/prometheus.yml");
     private static final Path DASHBOARD = Path.of("observability/grafana/dashboards/oj-bottleneck.json");
+    private static final Path LOAD_SAMPLER = Path.of("gatling/sample-loadtest.ps1");
+    private static final Path LOAD_HARNESS = Path.of("gatling/run-loadtest.ps1");
     private static final Pattern KEEP_REGEX = Pattern.compile("(?m)^\\s*regex:\\s*(rabbitmq_detailed_[^\\r\\n]+)$");
 
     private static final List<String> RETAINED_SERIES = List.of(
@@ -71,5 +73,18 @@ class RabbitMqPerQueueMetricsConfigurationTests {
                 .doesNotContain("rabbitmq_queue_messages_ready")
                 .doesNotContain("rabbitmq_queue_messages_unacked")
                 .doesNotContain("rabbitmq_global_messages_");
+    }
+
+    @Test
+    void resultStreamIsSampledButExcludedFromWorkQueueDrain() throws IOException {
+        String sampler = Files.readString(LOAD_SAMPLER);
+        String harness = Files.readString(LOAD_HARNESS);
+
+        assertThat(sampler)
+                .contains("contest\\\\.judge\\\\.(live|dead|result\\\\.stream)")
+                .contains("\"contest.judge.result.stream\" = @{");
+        assertThat(harness)
+                .contains("$parts[0] -in @(\"contest.judge.live\", \"contest.judge.dead\")")
+                .doesNotContain("$parts[0] -in @(\"contest.judge.live\", \"contest.judge.dead\", \"contest.judge.result.stream\")");
     }
 }

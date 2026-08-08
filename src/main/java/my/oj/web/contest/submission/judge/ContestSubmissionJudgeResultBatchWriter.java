@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -22,6 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class ContestSubmissionJudgeResultBatchWriter implements ContestSubmissionJudgeResultWriter {
 
     private final JdbcContestSubmissionJudgeResultBatchPersistence persistence;
+    private final ContestSubmissionJudgeResultStreamPublisher streamPublisher;
     private final BlockingQueue<PendingResult> queue;
     private final ExecutorService executor;
     private final int batchSize;
@@ -31,9 +33,11 @@ public class ContestSubmissionJudgeResultBatchWriter implements ContestSubmissio
 
     public ContestSubmissionJudgeResultBatchWriter(
             JdbcContestSubmissionJudgeResultBatchPersistence persistence,
+            ContestSubmissionJudgeResultStreamPublisher streamPublisher,
             ContestSubmissionJudgeResultWriterProperties properties
     ) {
         this.persistence = persistence;
+        this.streamPublisher = streamPublisher;
         this.batchSize = properties.effectiveBatchSize();
         this.workerCount = properties.effectiveWorkerCount();
         this.queue = new ArrayBlockingQueue<>(properties.effectiveQueueCapacity());
@@ -64,12 +68,28 @@ public class ContestSubmissionJudgeResultBatchWriter implements ContestSubmissio
         CompletableFuture<Void> completion = new CompletableFuture<>();
         PendingResult pending = new PendingResult(
                 ContestSubmissionJudgeResultCommand.from(submission, result, judgedAt),
+                true,
                 completion
         );
 
+        await(pending);
+    }
+
+    @Override
+    public void republish(ContestSubmissionJudgeResultCommand storedResult) {
+        Objects.requireNonNull(storedResult, "storedResult");
+        PendingResult pending = new PendingResult(
+                storedResult,
+                false,
+                new CompletableFuture<>()
+        );
+        await(pending);
+    }
+
+    private void await(PendingResult pending) {
         try {
             queue.put(pending);
-            completion.join();
+            pending.completion().join();
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("Interrupted while queueing judge result", ex);
@@ -117,7 +137,14 @@ public class ContestSubmissionJudgeResultBatchWriter implements ContestSubmissio
 
     private void process(List<PendingResult> batch) {
         try {
-            persistence.persistAll(batch.stream().map(PendingResult::command).toList());
+            List<ContestSubmissionJudgeResultCommand> newResults = batch.stream()
+                    .filter(PendingResult::persistenceRequired)
+                    .map(PendingResult::command)
+                    .toList();
+            if (!newResults.isEmpty()) {
+                persistence.persistAll(newResults);
+            }
+            streamPublisher.publishAll(batch.stream().map(PendingResult::command).toList());
             batch.forEach(pending -> pending.completion().complete(null));
         } catch (RuntimeException ex) {
             batch.forEach(pending -> pending.completion().completeExceptionally(ex));
@@ -135,7 +162,7 @@ public class ContestSubmissionJudgeResultBatchWriter implements ContestSubmissio
         if (failure instanceof RuntimeException runtimeException) {
             return runtimeException;
         }
-        return new IllegalStateException("Failed to persist judge result batch", failure);
+        return new IllegalStateException("Failed to complete judge result batch", failure);
     }
 
     @PreDestroy
@@ -153,6 +180,7 @@ public class ContestSubmissionJudgeResultBatchWriter implements ContestSubmissio
     }
 
     private record PendingResult(ContestSubmissionJudgeResultCommand command,
+                                 boolean persistenceRequired,
                                  CompletableFuture<Void> completion) {
     }
 }

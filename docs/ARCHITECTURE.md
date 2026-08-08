@@ -8,7 +8,7 @@
 |---|---|---|---|
 | Web | `web-1`, `web-2` | `multi-web` | JSON API 요청, 제출 검증, 제출/outbox 저장 |
 | Batch | `batch-1` | `multi-batch` | judge outbox 발행, scoreboard 반영·복구, rank batch |
-| Judge | `judge-1`, `judge-2` | `multi-judge` | RabbitMQ 소비, 채점, 결과/outbox 저장 |
+| Judge | `judge-1`, `judge-2` | `multi-judge` | RabbitMQ 소비, 채점, 결과/outbox 저장, 결과 stream confirm 발행 |
 | Data | MySQL, Redis, RabbitMQ | 해당 없음 | 원본 데이터, 파생 상태, 메시지 전달 |
 | Edge | Nginx | 해당 없음 | 두 Web 인스턴스 로드밸런싱 |
 
@@ -25,6 +25,7 @@ flowchart LR
     RabbitMQ --> Judge["Judge ×2"]
     Judge --> Result["contest_submission_result"]
     Judge --> ScoreOutbox["contest_submission_outbox"]
+    Judge --> ResultStream["contest.judge.result.stream"]
     ScoreOutbox --> ScoreBatch["Batch scoreboard worker"]
     ScoreBatch --> Redis["Redis scoreboard"]
 ```
@@ -41,8 +42,8 @@ flowchart LR
 | `contest` | 대회 목록·상세와 대회 상태 | `contest/api/ContestApiController`, `ContestService` |
 | `contest/submission/core` | 대회 제출 모델·유스케이스와 저장 포트 | `ContestSubmissionService`, `ContestSubmissionWriter` |
 | `contest/submission/queue` | core 저장 포트의 immediate/batch 구현과 영속화 | `ContestSubmissionBulkWriter`, `ContestSubmissionBulkProcessor` |
-| `contest/submission/messaging` | judge DB outbox와 RabbitMQ 발행/소비 | `ContestJudgeOutboxRelay`, `ContestJudgeRabbitListener` |
-| `contest/submission/judge` | 채점 실행과 결과 batch 저장 | `ContestSubmissionJudgeProcessor`, `ContestSubmissionJudgeResultBatchWriter` |
+| `contest/submission/messaging` | judge DB outbox, RabbitMQ work queue와 결과 stream 발행/소비 | `ContestJudgeOutboxRelay`, `ContestJudgeRabbitListener`, `RabbitContestSubmissionJudgeResultStreamPublisher` |
+| `contest/submission/judge` | 채점 실행, 결과 batch 저장, 저장 결과 재발행 분기 | `ContestSubmissionJudgeProcessor`, `ContestSubmissionJudgeResultBatchWriter` |
 | `contest/submission/support` | ID, 중복 방지, rate limit 지원 | `ContestSubmissionIdGenerator` 구현체 |
 | `contest/scoreboard` | live scoreboard 조회와 Redis 저장 | `ContestScoreboardService`, `ContestScoreboardReader`, `ContestScoreboardApplier` |
 | `contest/scoreboard/api` | scoreboard 읽기 경로. hot(Redis 전용)과 cold(최종·aroundMe) 분리 | `ContestScoreboardApiController`, `ContestScoreboardViewApiController` |
@@ -65,7 +66,8 @@ flowchart LR
 5. `ContestJudgeOutboxRelay`
 6. `ContestJudgeRabbitListener` → `ContestSubmissionJudgeProcessor`
 7. `ContestSubmissionJudgeResultBatchWriter`
-8. `ContestScoreboardOutboxProcessor`
+8. DB commit 뒤 `RabbitContestSubmissionJudgeResultStreamPublisher` confirm 대기
+9. 기존 경로인 `ContestScoreboardOutboxProcessor`
 
 ### 대회 상세과 scoreboard
 
@@ -93,6 +95,8 @@ flowchart LR
 - 뜨거운 읽기 경로에 조회를 되돌리지 않는다. `GET /api/contests/{id}/scoreboard`가 Redis만 읽는 것은 설계이고, 이름·최종 순위처럼 MySQL이 필요한 것은 별도 cold endpoint에 둔다.
 - profile 조건과 운영 설정 key는 역할 계약이므로 리팩터링 중 임의로 바꾸지 않는다.
 - 동시성 실행기와 queue의 종료 정책 변경은 단순 구조 이동과 분리해 검증한다.
+- judge ACK 순서는 `result/outbox DB commit → result stream publisher confirm → listener 정상 반환`이다. stream 발행 실패를 삼키거나 DB commit보다 앞당기지 않는다.
+- A단계에서는 scoreboard가 계속 `contest_submission_outbox` worker를 통해 반영된다. result stream은 내용·복구 범위 비교용 병행 로그이며 아직 소비하지 않는다.
 - scoreboard 반영은 적용 순서와 중복 횟수에 무관해야 한다. Redis live/rebuild는 같은 Lua applier를 공유하고, 메모리 구현도 같은 규칙을 지켜야 한다. 배경은 `CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §4.10.1이다.
 
 ## 5. 설정과 실행 파일
