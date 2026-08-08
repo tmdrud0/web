@@ -133,6 +133,11 @@ class JdbcContestScoreboardOutboxQueueTests {
         ArgumentCaptor<BatchPreparedStatementSetter> setterCaptor =
                 ArgumentCaptor.forClass(BatchPreparedStatementSetter.class);
         verify(jdbcTemplate, times(2)).batchUpdate(sqlCaptor.capture(), setterCaptor.capture());
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .contains("UPDATE contest_submission_outbox o")
+                .contains("LEFT JOIN contest_submission_result r")
+                .contains("o.processed_at = CURRENT_TIMESTAMP(6)")
+                .contains("r.scoreboard_applied_at = CURRENT_TIMESTAMP(6)");
         verify(transactionManager).commit(transactionStatus);
 
         assertThat(sqlCaptor.getAllValues().get(0)).contains("due_at = NULL");

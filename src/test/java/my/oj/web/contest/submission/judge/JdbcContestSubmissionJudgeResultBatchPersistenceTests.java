@@ -34,7 +34,10 @@ class JdbcContestSubmissionJudgeResultBatchPersistenceTests {
         ArgumentCaptor<BatchPreparedStatementSetter> setterCaptor =
                 ArgumentCaptor.forClass(BatchPreparedStatementSetter.class);
         verify(jdbcTemplate, times(2)).batchUpdate(sqlCaptor.capture(), setterCaptor.capture());
-        assertThat(sqlCaptor.getAllValues().get(0)).contains("contest_submission_result");
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .contains("contest_submission_result")
+                .contains("result_saved_at")
+                .contains("CURRENT_TIMESTAMP(6)");
         assertThat(sqlCaptor.getAllValues().get(1)).contains("contest_submission_outbox");
         assertThat(setterCaptor.getAllValues()).allSatisfy(setter -> assertThat(setter.getBatchSize()).isEqualTo(2));
 

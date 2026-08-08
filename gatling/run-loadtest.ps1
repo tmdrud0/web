@@ -383,6 +383,8 @@ function Assert-PipelineMaterialized {
 
     $submissionCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id = $ContestId"
     $resultCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id = $ContestId"
+    $resultTimestampCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id = $ContestId AND result_saved_at IS NOT NULL"
+    $scoreboardTimestampCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id = $ContestId AND scoreboard_applied_at IS NOT NULL"
     $outboxCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_outbox WHERE contest_id = $ContestId"
     $completedCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_outbox WHERE contest_id = $ContestId AND status = 'COMPLETED'"
     $dbParticipantCount = Invoke-LoadSqlScalar "SELECT COUNT(DISTINCT user_id) FROM contest_submission WHERE contest_id = $ContestId"
@@ -394,9 +396,11 @@ function Assert-PipelineMaterialized {
         throw "Persisted only $submissionCount submissions; expected at least $expectedSubmissionCount for the configured RPS."
     }
     if ($resultCount -ne $submissionCount -or
+        $resultTimestampCount -ne $submissionCount -or
+        $scoreboardTimestampCount -ne $submissionCount -or
         $outboxCount -ne $submissionCount -or
         $completedCount -ne $submissionCount) {
-        throw "Pipeline count mismatch: submissions=$submissionCount results=$resultCount outbox=$outboxCount completed=$completedCount"
+        throw "Pipeline count mismatch: submissions=$submissionCount results=$resultCount resultTimestamps=$resultTimestampCount scoreboardTimestamps=$scoreboardTimestampCount outbox=$outboxCount completed=$completedCount"
     }
 
     $scoreboard = Get-ScoreboardSummary -ContestId $ContestId
@@ -406,32 +410,36 @@ function Assert-PipelineMaterialized {
     if ([int64]$scoreboard.totalParticipants -ne $dbParticipantCount) {
         throw "Scoreboard participant mismatch: DB=$dbParticipantCount Redis=$($scoreboard.totalParticipants)"
     }
-    Write-Host "Pipeline materialized: submissions=$submissionCount, results=$resultCount, scoreboardParticipants=$($scoreboard.totalParticipants)"
+    Write-Host "Pipeline materialized: submissions=$submissionCount, results=$resultCount, resultTimestamps=$resultTimestampCount, scoreboardTimestamps=$scoreboardTimestampCount, scoreboardParticipants=$($scoreboard.totalParticipants)"
 }
 
 function Get-EndToEndLatencyDistribution {
     param(
         [Parameter(Mandatory = $true)][long]$ContestId,
         [Parameter(Mandatory = $true)]
-        [ValidateSet("created_at", "processed_at")]
-        [string]$EndColumn,
-        [switch]$RequireResult
+        [ValidateSet("result-saved", "scoreboard-applied", "legacy-result-created", "legacy-scoreboard-processed")]
+        [string]$Endpoint
     )
 
-    $resultJoin = if ($RequireResult) {
-        "JOIN contest_submission_result csr ON csr.submission_id = cs.id"
+    $endExpression = switch ($Endpoint) {
+        "result-saved" { "csr.result_saved_at" }
+        "scoreboard-applied" { "csr.scoreboard_applied_at" }
+        "legacy-result-created" { "o.created_at" }
+        "legacy-scoreboard-processed" { "o.processed_at" }
     }
-    else {
+    $outboxJoin = if ($Endpoint.StartsWith("legacy-")) {
+        "JOIN contest_submission_outbox o ON o.contest_submission_id = cs.id"
+    } else {
         ""
     }
     $sql = @"
 WITH latencies AS (
-    SELECT TIMESTAMPDIFF(MICROSECOND, cs.submitted_time, o.$EndColumn) AS latency_us
+    SELECT TIMESTAMPDIFF(MICROSECOND, cs.submitted_time, $endExpression) AS latency_us
     FROM contest_submission cs
-    JOIN contest_submission_outbox o ON o.contest_submission_id = cs.id
-    $resultJoin
+    JOIN contest_submission_result csr ON csr.submission_id = cs.id
+    $outboxJoin
     WHERE cs.contest_id = $ContestId
-      AND o.$EndColumn IS NOT NULL
+      AND $endExpression IS NOT NULL
 ), ranked AS (
     SELECT latency_us,
            ROW_NUMBER() OVER (ORDER BY latency_us) AS rn,
@@ -472,15 +480,18 @@ function Show-EndToEndStaleness {
         [Parameter(Mandatory = $true)][string]$ScenarioName
     )
 
-    # created_at is stamped after the result batch INSERT and the result/outbox rows commit in the
-    # same transaction. processed_at is stamped only after the Redis apply succeeds.
-    $result = Get-EndToEndLatencyDistribution -ContestId $ContestId -EndColumn "created_at" -RequireResult
-    $scoreboard = Get-EndToEndLatencyDistribution -ContestId $ContestId -EndColumn "processed_at"
-    if ($result.SampleCount -le 0 -or $scoreboard.SampleCount -le 0) {
-        throw "End-to-end staleness has no samples: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount)"
+    # Primary endpoints live on the result row. The outbox endpoints remain side by side only for
+    # transition validation and can be removed once historical comparisons no longer need them.
+    $result = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "result-saved"
+    $scoreboard = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "scoreboard-applied"
+    $legacyResult = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "legacy-result-created"
+    $legacyScoreboard = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "legacy-scoreboard-processed"
+    $distributions = @($result, $scoreboard, $legacyResult, $legacyScoreboard)
+    if (@($distributions | Where-Object { $_.SampleCount -le 0 }).Count -gt 0) {
+        throw "End-to-end staleness has missing samples: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount), legacyResult=$($legacyResult.SampleCount), legacyScoreboard=$($legacyScoreboard.SampleCount)"
     }
-    if ($result.SampleCount -ne $scoreboard.SampleCount) {
-        throw "End-to-end sample count mismatch: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount)"
+    if (@($distributions | Where-Object { $_.SampleCount -ne $result.SampleCount }).Count -gt 0) {
+        throw "End-to-end sample count mismatch: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount), legacyResult=$($legacyResult.SampleCount), legacyScoreboard=$($legacyScoreboard.SampleCount)"
     }
 
     Write-Host "-- end-to-end staleness --"
@@ -496,14 +507,33 @@ function Show-EndToEndStaleness {
         (Format-LatencySeconds $scoreboard.P99Micros),
         (Format-LatencySeconds $scoreboard.MaxMicros),
         $scoreboard.SampleCount)
+    Write-Host ("legacy result      p50 {0}  p95 {1}  p99 {2}  max {3}   n={4}" -f
+        (Format-LatencySeconds $legacyResult.P50Micros),
+        (Format-LatencySeconds $legacyResult.P95Micros),
+        (Format-LatencySeconds $legacyResult.P99Micros),
+        (Format-LatencySeconds $legacyResult.MaxMicros),
+        $legacyResult.SampleCount)
+    Write-Host ("legacy scoreboard  p50 {0}  p95 {1}  p99 {2}  max {3}   n={4}" -f
+        (Format-LatencySeconds $legacyScoreboard.P50Micros),
+        (Format-LatencySeconds $legacyScoreboard.P95Micros),
+        (Format-LatencySeconds $legacyScoreboard.P99Micros),
+        (Format-LatencySeconds $legacyScoreboard.MaxMicros),
+        $legacyScoreboard.SampleCount)
 
     @(
         "scenario,metric,p50Micros,p95Micros,p99Micros,maxMicros,sampleCount",
         "$ScenarioName,result-queryable,$($result.P50Micros),$($result.P95Micros),$($result.P99Micros),$($result.MaxMicros),$($result.SampleCount)",
-        "$ScenarioName,scoreboard-applied,$($scoreboard.P50Micros),$($scoreboard.P95Micros),$($scoreboard.P99Micros),$($scoreboard.MaxMicros),$($scoreboard.SampleCount)"
+        "$ScenarioName,scoreboard-applied,$($scoreboard.P50Micros),$($scoreboard.P95Micros),$($scoreboard.P99Micros),$($scoreboard.MaxMicros),$($scoreboard.SampleCount)",
+        "$ScenarioName,legacy-result-queryable,$($legacyResult.P50Micros),$($legacyResult.P95Micros),$($legacyResult.P99Micros),$($legacyResult.MaxMicros),$($legacyResult.SampleCount)",
+        "$ScenarioName,legacy-scoreboard-applied,$($legacyScoreboard.P50Micros),$($legacyScoreboard.P95Micros),$($legacyScoreboard.P99Micros),$($legacyScoreboard.MaxMicros),$($legacyScoreboard.SampleCount)"
     ) | Set-Content -Path $stalenessCsv -Encoding utf8
 
-    return [pscustomobject]@{ Result = $result; Scoreboard = $scoreboard }
+    return [pscustomobject]@{
+        Result = $result
+        Scoreboard = $scoreboard
+        LegacyResult = $legacyResult
+        LegacyScoreboard = $legacyScoreboard
+    }
 }
 
 function Test-ScoreboardStalenessAgainstHeadLag {

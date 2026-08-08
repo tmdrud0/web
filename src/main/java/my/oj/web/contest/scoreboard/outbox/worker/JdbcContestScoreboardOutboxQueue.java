@@ -132,12 +132,24 @@ class JdbcContestScoreboardOutboxQueue {
         BatchCompletionResult result = transactionTemplate.execute(status -> {
             int[] completedCounts = safeCompleted.isEmpty()
                     ? new int[0]
+                    // Keep both application timestamps on one database clock and behind the same
+                    // claim-token guard. LEFT JOIN preserves outbox completion for a corrupt or
+                    // synthetic row whose result is missing, while the normal pipeline always
+                    // updates both rows.
                     : jdbcTemplate.batchUpdate("""
-                            UPDATE contest_submission_outbox
-                            SET status = 'COMPLETED', redis_seq = ?, processed_at = CURRENT_TIMESTAMP(6),
-                                claim_token = NULL, claimed_at = NULL, due_at = NULL,
-                                next_attempt_at = NULL, last_error_message = NULL
-                            WHERE id = ? AND status = 'PROCESSING' AND claim_token = ?
+                            UPDATE contest_submission_outbox o
+                            LEFT JOIN contest_submission_result r
+                              ON r.submission_id = o.contest_submission_id
+                            SET o.status = 'COMPLETED',
+                                o.redis_seq = ?,
+                                o.processed_at = CURRENT_TIMESTAMP(6),
+                                o.claim_token = NULL,
+                                o.claimed_at = NULL,
+                                o.due_at = NULL,
+                                o.next_attempt_at = NULL,
+                                o.last_error_message = NULL,
+                                r.scoreboard_applied_at = CURRENT_TIMESTAMP(6)
+                            WHERE o.id = ? AND o.status = 'PROCESSING' AND o.claim_token = ?
                             """, new BatchPreparedStatementSetter() {
                         @Override
                         public void setValues(PreparedStatement statement, int index) throws SQLException {

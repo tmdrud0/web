@@ -637,8 +637,16 @@ p50/p95/p99이며 `max`와 표본 수 `n`을 항상 함께 낸다. 단계별 분
 
 | 출력 이름 | 시작 | 종점 | SQL 의미 |
 |---|---|---|---|
-| `result queryable` | `contest_submission.submitted_time` | `contest_submission_outbox.created_at` | `TIMESTAMPDIFF(MICROSECOND, submitted_time, created_at)` |
-| `scoreboard applied` | `contest_submission.submitted_time` | `contest_submission_outbox.processed_at` | `TIMESTAMPDIFF(MICROSECOND, submitted_time, processed_at)` |
+| `result queryable` | `contest_submission.submitted_time` | `contest_submission_result.result_saved_at` | `TIMESTAMPDIFF(MICROSECOND, submitted_time, result_saved_at)` |
+| `scoreboard applied` | `contest_submission.submitted_time` | `contest_submission_result.scoreboard_applied_at` | `TIMESTAMPDIFF(MICROSECOND, submitted_time, scoreboard_applied_at)` |
+
+V17 전환 검증 중에는 아래 legacy 정의도 같은 CSV에 나란히 남긴다. 주 지표는 위 두 행이며,
+legacy 행은 과거 결과와의 연결만을 위한 임시 출력이다.
+
+| CSV 출력 이름 | legacy 종점 |
+|---|---|
+| `legacy-result-queryable` | `contest_submission_outbox.created_at` |
+| `legacy-scoreboard-applied` | `contest_submission_outbox.processed_at` |
 
 시작은 **(가) 요청 처리 중 `SubmissionService`가 `LocalDateTime.now()`로 찍은 서버 시각**이다.
 200 응답 시각이 아니므로 admission semaphore 대기, bulk queue 대기, 제출 DB transaction과
@@ -653,25 +661,30 @@ p99"를 만들지는 않는다. 그 값도 어떤 실제 제출의 p99가 아니
 
 `result queryable`의 종점으로 `provisional_judged_at`을 쓰지 않는다. 그 값은 judge가 result
 writer queue에 넣기 전에 찍혀 queue 대기와 결과 DB 쓰기를 누락한다. 대신 결과 batch INSERT
-직후 생성되는 scoreboard outbox의 `created_at`을 쓴다. 결과 행과 outbox 행은 같은 transaction
-에서 커밋되므로 현재 스키마에서 조회 가능 시점에 가장 가까운 저장 시각이다. 다만 MySQL의
-실제 MVCC commit timestamp는 아니어서, outbox INSERT와 commit에 걸린 아주 짧은 구간은
-포함하지 않는다는 한계가 있다.
+statement가 `result_saved_at = CURRENT_TIMESTAMP(6)`을 함께 쓴다. 결과 행은 transaction이
+commit된 뒤에만 조회 가능하므로 조회 가능 시점에 가까운 저장 시각이면서 outbox 스키마에
+의존하지 않는다. 다만 MySQL의 실제 MVCC commit timestamp는 아니어서, result INSERT 뒤
+outbox INSERT와 commit에 걸린 짧은 구간은 포함하지 않는다는 한계가 있다.
 
-`scoreboard applied`의 `processed_at`은 Redis Lua/pipeline 적용이 성공한 뒤
-`CURRENT_TIMESTAMP(6)`로 기록된다. 따라서 두 번째 분포는 judge와 result writer를 거쳐 Redis
-반영까지의 전체 경로를 포함한다. 두 쿼리 모두 같은 contest의 materialized 행만 읽고,
-`submissions == results == outbox == completed` 검사가 먼저 표본 완전성을 보장한다.
+`scoreboard applied`의 `scoreboard_applied_at`은 Redis Lua/pipeline 적용이 성공한 뒤 outbox의
+`processed_at`과 같은 MySQL statement에서 `CURRENT_TIMESTAMP(6)`로 기록된다. 따라서 두 번째
+분포는 judge와 result writer를 거쳐 Redis 반영까지의 전체 경로를 포함한다. 두 쿼리 모두
+`contest_submission_result`까지만 읽으며, 하네스가 먼저
+`submissions == results == result timestamps == scoreboard timestamps == outbox == completed`인지
+검사해 표본 완전성을 보장한다.
 
-V16부터 관련 시각을 `DATETIME(6)`으로 저장한다. V16 이전 행은 컬럼 형식만 바뀌고 기존 값의
-소수부는 `.000000`으로 남으므로, **마이그레이션 이전 행이 섞인 분포는 신뢰할 수 없다.** 부하
-하네스는 매 실행 새 contest를 seed하므로 실행끼리 표본이 섞이지 않는다.
+V16부터 기존 관련 시각을 `DATETIME(6)`으로 저장하고 V17부터 결과 행의 두 종점도
+`DATETIME(6)`으로 저장한다. V16 이전 행은 기존 시각의 소수부가 `.000000`이고 V17 이전 행은
+새 종점이 `NULL`이므로, **마이그레이션 이전 행이 섞인 분포는 신뢰할 수 없다.** 부하 하네스는
+초기화 뒤 매 실행 새 contest를 seed하며, materialization 검사에서 새 종점의 non-null 행 수도
+확인하므로 실행끼리 또는 migration 전후 표본이 섞이지 않는다.
 
 대표값은 조회와 제출이 동시에 Redis를 쓰는 `mixed`에서 잰다. `smoke`에도 같은 SQL을 적용해
 조용한 scoreboard 조건과 비교한다. 실행별 원시 마이크로초 값은
 `var/loadtest-*/end-to-end-staleness.csv`에 남는다.
 
-첫 실측값이다. `mixed-target`(제출 139→200 RPS, 조회 300 RPS, 사용자 10,000명), web CPU가
+아래 첫 실측값은 V17 이전 legacy/outbox 정의로 측정한 역사적 기준선이다.
+`mixed-target`(제출 139→200 RPS, 조회 300 RPS, 사용자 10,000명), web CPU가
 상한의 35~38%에 머문 조건이므로 자원 상한이 아니라 파이프라인을 잰 값이다.
 
 ```text
@@ -692,9 +705,45 @@ scoreboard applied  p50 0.607s  p95 4.046s  p99 4.921s  max 13.270s   n=35865
 실행을 실패시킨다. 이는 두 값이 같은 통계라는 뜻이 아니라, end-to-end SQL이 scoreboard
 backlog와 무관한 시각을 잘못 빼는 오류를 잡는 자릿수 교차 검증이다.
 
+#### V17 종점 전환 검증과 쓰기 비용
+
+`var/loadtest-20260808-132805`의 `submit-100` 한 실행에서 V17이 적용된 새 contest 21만
+측정했다. Redis와 두 outbox는 실행 전에 모두 0이었고, 재시도·JVM 재시작은 0, 관측 JVM은
+5/5였다. 19,369개 제출 모두 result/outbox 완료 행과 새 시각 두 개를 가졌다.
+
+| 정의 | p50 | p95 | p99 | max | n |
+|---|---:|---:|---:|---:|---:|
+| 새 `result_saved_at` | 0.243134s | 0.627074s | 1.404445s | 5.322052s | 19,369 |
+| legacy `outbox.created_at` | 0.244120s | 0.631241s | 1.406942s | 5.322821s | 19,369 |
+| 새 `scoreboard_applied_at` | 0.436580s | 1.101685s | 7.583841s | 13.363715s | 19,369 |
+| legacy `outbox.processed_at` | 0.436580s | 1.101685s | 7.583841s | 13.363715s | 19,369 |
+
+scoreboard의 새/legacy 시각을 submission별로 직접 비교한 불일치 행은 0이다. 두 컬럼을 같은
+완료 statement의 DB 시계로 찍기 때문이다. 결과 쪽은 legacy가 새 정의보다 submission별
+0.165~96.452ms 늦었고 paired delta(`created_at - result_saved_at`)는 p50 0.473ms,
+p95 1.866ms, p99 16.629ms, 평균 1.045ms였다. 새 시각은 result INSERT statement에서 찍고,
+legacy `created_at`은 그 배치가 끝난 뒤 outbox INSERT를 준비하며 JVM에서 찍으므로 새 정의는
+그 사이 구간을 포함하지 않는다. 다만 이 paired delta에는 DB 시계와 legacy JVM 시계의 상수
+스큐도 섞이므로 1.045ms 전부를 코드 구간 비용으로 해석할 수 없다. 이것이 새 종점 두 개를 모두
+DB 시계로 고정한 이유다. 위 분포의 p95끼리 뺀 4.167ms도 서로 다른 순위의 표본 차이일 수 있어
+paired p95로 해석하지 않는다.
+
+MySQL `performance_schema`의 statement server time으로 추가 쓰기 비용도 같은 환경에서
+측정했다. 기존 완료 UPDATE는 누적 457,672건에서 평균 0.219ms/제출이었고, 결과 행까지 함께
+쓰는 V17 완료 UPDATE는 19,369건에서 평균 0.341ms/제출이었다. 즉 결과 행 한 개를 더 갱신하는
+직접 비용은 **약 0.122ms/제출(+55.7%)**이며 affected row는 1개에서 2개가 된다. result INSERT의
+행당 시간은 legacy 0.122ms, V17 0.108ms로 이 실행에서는 추가 비용이 관측되지 않았다. 두
+statement를 합친 DB server time은 약 0.341ms에서 0.449ms로 **0.108ms/제출(+31.6%)** 늘었다.
+이는 DB statement 비용 측정이지 HTTP latency 인과 추정은 아니다.
+
+실제로 이 실행의 HTTP p95와 staleness p95는 아래 5회 기준선 밖이므로 구현 성능 비교에는
+사용하지 않는다. 목적은 같은 행에서 종점 정의를 교차 검증하고 추가 SQL 쓰기 비용을 재는
+것이며, 구현 비교는 아래 최소 5회 합격 기준을 그대로 적용한다.
+
 ### submit-100 반복 편차와 비교 가능한 실행의 조건
 
-2026-08-08에 애플리케이션 코드 `1c10173`으로 `submit-100`을 5회 반복했다. 모두 기본 설정
+아래 수치는 V17 이전 legacy/outbox 종점 정의다. 2026-08-08에 애플리케이션 코드
+`1c10173`으로 `submit-100`을 5회 반복했다. 모두 기본 설정
 (사용자 10,000명, 문제 5개, 30초 ramp, 180초 hold, 100 RPS), 같은 load-test/observability
 스택과 같은 Compose 상한을 사용했다. 실행 전에 일반 OJ 스택이 꺼져 있는지 확인했고, 매번
 Redis `DBSIZE`와 `contest_submission_outbox`, `contest_judge_outbox`가 모두 0인지 검증했다.

@@ -6,6 +6,7 @@ import jakarta.persistence.EntityManager;
 import my.oj.web.config.TestQuerydslConfig;
 import my.oj.web.contest.Contest;
 import my.oj.web.contest.submission.core.ContestSubmission;
+import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.problem.Problem;
 import my.oj.web.submission.SubmissionResult;
 import my.oj.web.testsupport.ContestScoreboardTestData;
@@ -91,6 +92,11 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
                 List.of(new JdbcContestScoreboardOutboxQueue.CompletedEvent(firstClaim.get(0), 70L)),
                 List.of()
         );
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT scoreboard_applied_at IS NULL FROM contest_submission_result WHERE submission_id = ?",
+                Boolean.class,
+                outbox.getContestSubmissionId()
+        )).isTrue();
         JdbcContestScoreboardOutboxQueue.BatchCompletionResult currentCompletion = outboxQueue.completeAll(
                 List.of(new JdbcContestScoreboardOutboxQueue.CompletedEvent(reclaimed.get(0), 71L)),
                 List.of()
@@ -113,6 +119,12 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
                 Boolean.class,
                 outbox.getId()
         )).isTrue();
+        assertThat(jdbcTemplate.queryForObject("""
+                SELECT r.scoreboard_applied_at = o.processed_at
+                FROM contest_submission_result r
+                JOIN contest_submission_outbox o ON o.contest_submission_id = r.submission_id
+                WHERE o.id = ?
+                """, Boolean.class, outbox.getId())).isTrue();
     }
 
     @Test
@@ -252,6 +264,10 @@ class JdbcContestScoreboardOutboxQueueMySqlIntegrationTests {
         );
         submission.assignId(UUID.randomUUID().getMostSignificantBits() & Long.MAX_VALUE);
         entityManager.persist(submission);
+
+        ContestSubmissionResult result = ContestSubmissionResult.pending(submission);
+        result.recordProvisional(SubmissionResult.ACCEPTED, LocalDateTime.of(2026, 3, 10, 12, 2));
+        entityManager.persist(result);
 
         ContestScoreboardOutbox outbox = ContestScoreboardOutbox.pending(
                 submission.getId(),

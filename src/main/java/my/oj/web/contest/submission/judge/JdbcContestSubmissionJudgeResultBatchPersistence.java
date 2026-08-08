@@ -21,9 +21,10 @@ public class JdbcContestSubmissionJudgeResultBatchPersistence {
                 provisional_result,
                 provisional_judged_at,
                 final_result,
-                final_judged_at
+                final_judged_at,
+                result_saved_at
             )
-            VALUES (?, ?, ?, ?, NULL, NULL)
+            VALUES (?, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP(6))
             """;
 
     /**
