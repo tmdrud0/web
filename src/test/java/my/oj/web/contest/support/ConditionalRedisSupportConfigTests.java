@@ -9,6 +9,8 @@ import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.ContestSubmissionDuplicateRegistryConfig;
 import my.oj.web.contest.submission.support.InMemoryContestSubmissionDuplicateRegistry;
 import my.oj.web.contest.submission.support.RedisContestSubmissionDuplicateRegistry;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
@@ -92,6 +94,11 @@ class ConditionalRedisSupportConfigTests {
         @Bean
         ContestRedisKeyValueClient contestRedisKeyValueClient() {
             return mock(ContestRedisKeyValueClient.class);
+        }
+
+        @Bean
+        MeterRegistry meterRegistry() {
+            return new SimpleMeterRegistry();
         }
     }
 }

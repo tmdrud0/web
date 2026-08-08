@@ -84,6 +84,19 @@ final class InMemoryContestRedisKeyValueClient implements ContestRedisKeyValueCl
     }
 
     @Override
+    public long countHashFieldsWithPrefix(Collection<String> keys, String prefix) {
+        if (keys == null) {
+            return 0L;
+        }
+        return keys.stream()
+                .map(hashes::get)
+                .filter(java.util.Objects::nonNull)
+                .flatMap(hash -> hash.keySet().stream())
+                .filter(field -> field.startsWith(prefix))
+                .count();
+    }
+
+    @Override
     public void zAdd(String key, double score, String member) {
         zsets.computeIfAbsent(key, k -> new ConcurrentHashMap<>()).put(member, score);
     }

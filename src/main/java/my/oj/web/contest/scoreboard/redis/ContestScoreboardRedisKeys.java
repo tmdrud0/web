@@ -34,6 +34,10 @@ final class ContestScoreboardRedisKeys {
         return userPrefix(contestId) + "*";
     }
 
+    static String problemPattern() {
+        return PREFIX + "*:user:*:problem:*";
+    }
+
     private static String userPrefix(long contestId) {
         return PREFIX + contestId + ":user:";
     }

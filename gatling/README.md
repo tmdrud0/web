@@ -95,7 +95,8 @@ docker compose up -d --build
 7. 노드별 수용·거절·in-flight 지표와 OOM 상태 확인
 8. HTTP 성공률/p95, web peak CPU·CPU throttled ratio, 두 outbox peak backlog/head lag와
    RabbitMQ live/DLQ별 depth·unacked·consumer·publish/deliver rate 출력
-9. 제출→결과 조회 가능 및 제출→scoreboard 반영 p50/p95/p99/max와 표본 수 출력
+9. 제출→결과 조회 가능 및 제출→scoreboard 반영 p50/p95/p99/max와 표본 수, 같은 제출의
+   `result_saved_at → scoreboard_applied_at` 분포와 Redis pipeline p99 출력
 10. `-KeepStack`이 없으면 격리 스택 종료, `-RemoveData`면 격리 볼륨도 제거
 
 독립 Gatling JVM은 Gradle daemon의 GC가 서버 한계로 오인되는 것을 막는다. 요청별 DEBUG
@@ -106,6 +107,13 @@ docker compose up -d --build
 phase별 peak depth, consumer 범위, publish/deliver 평균·최대 rate와 counter reset 수를 계산한다.
 observability overlay가 없으면 두 파일의 데이터는 비며, 하네스는 이를 0으로 간주하지 않고
 `baseline unavailable`로 표시한다.
+
+Redis scoreboard 구간은 원본 `redis-scoreboard-metrics.csv`와 집계
+`redis-scoreboard-summary.csv`에 남는다. 후자는 phase histogram delta로 계산한 `applyAll`
+pipeline p99, 같은 제출의 scoreboard 적용 구간 p99와 두 값의 비율, pipeline 호출 수, Lua 오류,
+`w:*` 추정 총량, `w:*` poll p99/실패 수와 counter reset을 담는다. paired scoreboard 구간은
+`end-to-end-staleness.csv`의 `scoreboard-apply-segment` 행에도 남는다. observability overlay가
+없으면 이 요약도 0으로 간주하지 않고 unavailable로 표시한다.
 
 ## 2026-07-23 고정 예산 실측
 

@@ -26,6 +26,8 @@ public interface ContestRedisKeyValueClient {
 
     Map<String, String> hGetAll(String key);
 
+    long countHashFieldsWithPrefix(Collection<String> keys, String prefix);
+
     void zAdd(String key, double score, String member);
 
     List<String> zRevRange(String key, long start, long end);

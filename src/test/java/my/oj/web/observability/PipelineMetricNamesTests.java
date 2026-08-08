@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import my.oj.web.contest.submission.queue.ContestSubmissionBulkMetrics;
+import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplyMetrics;
+import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardWrongAttemptMetrics;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 
@@ -163,6 +165,13 @@ class PipelineMetricNamesTests {
         drain.recordScoreboardBatch(1, 1);
 
         new ContestOutboxBacklogMetrics(mock(JdbcTemplate.class), new ContestOutboxMetricsProperties(1_000))
+                .bindTo(registry);
+
+        RedisContestScoreboardApplyMetrics redisApply = new RedisContestScoreboardApplyMetrics(registry);
+        redisApply.recordPipeline(java.time.Duration.ofMillis(1));
+        redisApply.recordLuaError(new IllegalStateException("synthetic scrape materialisation"));
+        new RedisContestScoreboardWrongAttemptMetrics(mock(
+                my.oj.web.contest.scoreboard.redis.ContestRedisKeyValueClient.class))
                 .bindTo(registry);
 
         return registry.scrape();

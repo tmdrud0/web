@@ -1,9 +1,11 @@
 package my.oj.web.contest.scoreboard;
 
+import io.micrometer.core.instrument.MeterRegistry;
 import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboard;
 import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.redis.ContestRedisKeyValueClient;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplyMetrics;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -34,8 +36,15 @@ public class ContestScoreboardStoreConfig {
 
     @Bean
     @ConditionalOnProperty(prefix = "contest.scoreboard", name = "store", havingValue = "redis")
+    RedisContestScoreboardApplyMetrics redisContestScoreboardApplyMetrics(MeterRegistry meterRegistry) {
+        return new RedisContestScoreboardApplyMetrics(meterRegistry);
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "contest.scoreboard", name = "store", havingValue = "redis")
     ContestScoreboardApplier redisContestScoreboardApplier(StringRedisTemplate redisTemplate,
-                                                           ContestRedisKeyValueClient redisClient) {
-        return new RedisContestScoreboardApplier(redisTemplate, redisClient);
+                                                           ContestRedisKeyValueClient redisClient,
+                                                           RedisContestScoreboardApplyMetrics metrics) {
+        return new RedisContestScoreboardApplier(redisTemplate, redisClient, metrics);
     }
 }

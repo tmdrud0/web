@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.redis;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.submission.SubmissionResult;
@@ -32,6 +33,8 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
     private LettuceConnectionFactory connectionFactory;
     private StringRedisTemplate redisTemplate;
     private RedisContestScoreboardApplier applier;
+    private RedisTemplateContestRedisKeyValueClient redisClient;
+    private SimpleMeterRegistry registry;
 
     @BeforeEach
     void setUp() {
@@ -41,7 +44,13 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
         redisTemplate = new StringRedisTemplate(connectionFactory);
         redisTemplate.afterPropertiesSet();
         flushDatabase();
-        applier = new RedisContestScoreboardApplier(redisTemplate, new RedisTemplateContestRedisKeyValueClient(redisTemplate));
+        redisClient = new RedisTemplateContestRedisKeyValueClient(redisTemplate);
+        registry = new SimpleMeterRegistry();
+        applier = new RedisContestScoreboardApplier(
+                redisTemplate,
+                redisClient,
+                new RedisContestScoreboardApplyMetrics(registry)
+        );
     }
 
     @AfterEach
@@ -201,6 +210,8 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
         assertThat(redisTemplate.opsForValue().get(RedisContestScoreboardApplier.SEQUENCE_KEY)).isNull();
         assertThat(redisTemplate.opsForHash().size("contest:scoreboard:outbox:submission")).isZero();
         assertThat(redisTemplate.opsForSet().size(processedKey())).isZero();
+        assertThat(registry.get("contest.scoreboard.redis.lua.errors")
+                .tag("kind", "unexpected_key_type").counter().count()).isEqualTo(1.0);
     }
 
     @Test
@@ -272,6 +283,20 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
     }
 
     @Test
+    void countsOnlyWrongAttemptFieldsAcrossProblemHashes() {
+        applier.apply(901L, payload(5001L, PROBLEM_ID, SubmissionResult.WRONG_ANSWER, 1));
+        applier.apply(902L, payload(5002L, PROBLEM_ID, SubmissionResult.ACCEPTED, 2));
+        applier.apply(903L, payload(5003L, PROBLEM_ID + 1, SubmissionResult.RUNTIME_ERROR, 3));
+
+        long fields = redisClient.countHashFieldsWithPrefix(
+                redisClient.scan(ContestScoreboardRedisKeys.problemPattern()),
+                "w:"
+        );
+
+        assertThat(fields).isEqualTo(2L);
+    }
+
+    @Test
     void applyAllKeepsSuccessfulResultsAroundAnIndividualScriptFailure() {
         long invalidContestId = CONTEST_ID + 1;
         redisTemplate.opsForValue().set(
@@ -306,6 +331,10 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
         assertThat(redisTemplate.opsForSet().size(
                 "contest:scoreboard:" + invalidContestId + ":processed"
         )).isZero();
+        assertThat(registry.get("contest.scoreboard.redis.lua.errors")
+                .tag("kind", "unexpected_key_type").counter().count())
+                .as("the failed pipeline is classified once by the individual fallback")
+                .isEqualTo(1.0);
     }
 
     /** Applies every event to a freshly flushed database and returns the resulting summary. */

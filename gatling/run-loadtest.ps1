@@ -34,6 +34,7 @@ $httpSummaryCsv = Join-Path $metricsRoot "http-summary.csv"
 $stateResetCsv = Join-Path $metricsRoot "state-reset.csv"
 $jvmSummaryCsv = Join-Path $metricsRoot "jvm-summary.csv"
 $rabbitmqSummaryCsv = Join-Path $metricsRoot "rabbitmq-summary.csv"
+$redisScoreboardSummaryCsv = Join-Path $metricsRoot "redis-scoreboard-summary.csv"
 $runDiagnosticsCsv = Join-Path $metricsRoot "run-diagnostics.csv"
 $script:stalenessCrossCheckFailed = $false
 $script:resetRedisKeys = $null
@@ -330,10 +331,20 @@ function Reset-WebMetrics {
 # the recovery path exists to repair. The drain above guarantees every row is terminal before this
 # runs, so nothing in flight is discarded.
 function Reset-LoadRedis {
-    Invoke-LoadCompose -Arguments @("exec", "-T", "redis", "redis-cli", "FLUSHDB") | Out-Null
-    Invoke-LoadCompose -Arguments @(
-        "exec", "-T", "mysql", "mysql", "-uroot", "-p1234", "-D", $dbName, "-Nse",
-        "DELETE FROM contest_submission_outbox; DELETE FROM contest_judge_outbox;") | Out-Null
+    # Recovery reads terminal DB rows and writes Redis. Clearing Redis first leaves a race in
+    # which it can replay a batch before the following DELETE reaches MySQL. Stop the only owner
+    # of recovery, clear both halves, then start it against the already-empty tables.
+    Invoke-LoadCompose -Arguments @("stop", "batch-1") | Out-Null
+    try {
+        Invoke-LoadCompose -Arguments @(
+            "exec", "-T", "mysql", "mysql", "-uroot", "-p1234", "-D", $dbName, "-Nse",
+            "DELETE FROM contest_submission_outbox; DELETE FROM contest_judge_outbox;") | Out-Null
+        Invoke-LoadCompose -Arguments @("exec", "-T", "redis", "redis-cli", "FLUSHDB") | Out-Null
+    }
+    finally {
+        Invoke-LoadCompose -Arguments @("start", "batch-1") | Out-Null
+    }
+    Wait-Healthy
 
     $script:resetTimestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffK")
     $script:resetRedisKeys = Invoke-LoadRedisScalar -Command "DBSIZE"
@@ -475,6 +486,42 @@ function Format-LatencySeconds {
     return $seconds.ToString("0.######", [Globalization.CultureInfo]::InvariantCulture) + "s"
 }
 
+function Get-ScoreboardApplyLatencyDistribution {
+    param([Parameter(Mandatory = $true)][long]$ContestId)
+
+    $sql = @"
+WITH latencies AS (
+    SELECT TIMESTAMPDIFF(MICROSECOND, csr.result_saved_at, csr.scoreboard_applied_at) AS latency_us
+    FROM contest_submission_result csr
+    WHERE csr.contest_id = $ContestId
+      AND csr.result_saved_at IS NOT NULL
+      AND csr.scoreboard_applied_at IS NOT NULL
+), ranked AS (
+    SELECT latency_us,
+           ROW_NUMBER() OVER (ORDER BY latency_us) AS rn,
+           COUNT(*) OVER () AS sample_count
+    FROM latencies
+)
+SELECT COALESCE(MAX(CASE WHEN rn = CEIL(sample_count * 0.50) THEN latency_us END), 0),
+       COALESCE(MAX(CASE WHEN rn = CEIL(sample_count * 0.95) THEN latency_us END), 0),
+       COALESCE(MAX(CASE WHEN rn = CEIL(sample_count * 0.99) THEN latency_us END), 0),
+       COALESCE(MAX(latency_us), 0),
+       COALESCE(MAX(sample_count), 0)
+FROM ranked
+"@
+    $values = @(Invoke-LoadSqlRow -Sql $sql)
+    if ($values.Count -ne 5) {
+        throw "Expected five scoreboard apply latency fields but received $($values.Count): $($values -join ', ')"
+    }
+    return [pscustomobject]@{
+        P50Micros = [int64]$values[0]
+        P95Micros = [int64]$values[1]
+        P99Micros = [int64]$values[2]
+        MaxMicros = [int64]$values[3]
+        SampleCount = [int64]$values[4]
+    }
+}
+
 function Show-EndToEndStaleness {
     param(
         [Parameter(Mandatory = $true)][long]$ContestId,
@@ -487,7 +534,8 @@ function Show-EndToEndStaleness {
     $scoreboard = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "scoreboard-applied"
     $legacyResult = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "legacy-result-created"
     $legacyScoreboard = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "legacy-scoreboard-processed"
-    $distributions = @($result, $scoreboard, $legacyResult, $legacyScoreboard)
+    $scoreboardApply = Get-ScoreboardApplyLatencyDistribution -ContestId $ContestId
+    $distributions = @($result, $scoreboard, $legacyResult, $legacyScoreboard, $scoreboardApply)
     if (@($distributions | Where-Object { $_.SampleCount -le 0 }).Count -gt 0) {
         throw "End-to-end staleness has missing samples: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount), legacyResult=$($legacyResult.SampleCount), legacyScoreboard=$($legacyScoreboard.SampleCount)"
     }
@@ -520,13 +568,20 @@ function Show-EndToEndStaleness {
         (Format-LatencySeconds $legacyScoreboard.P99Micros),
         (Format-LatencySeconds $legacyScoreboard.MaxMicros),
         $legacyScoreboard.SampleCount)
+    Write-Host ("scoreboard segment p50 {0}  p95 {1}  p99 {2}  max {3}   n={4}" -f
+        (Format-LatencySeconds $scoreboardApply.P50Micros),
+        (Format-LatencySeconds $scoreboardApply.P95Micros),
+        (Format-LatencySeconds $scoreboardApply.P99Micros),
+        (Format-LatencySeconds $scoreboardApply.MaxMicros),
+        $scoreboardApply.SampleCount)
 
     @(
         "scenario,metric,p50Micros,p95Micros,p99Micros,maxMicros,sampleCount",
         "$ScenarioName,result-queryable,$($result.P50Micros),$($result.P95Micros),$($result.P99Micros),$($result.MaxMicros),$($result.SampleCount)",
         "$ScenarioName,scoreboard-applied,$($scoreboard.P50Micros),$($scoreboard.P95Micros),$($scoreboard.P99Micros),$($scoreboard.MaxMicros),$($scoreboard.SampleCount)",
         "$ScenarioName,legacy-result-queryable,$($legacyResult.P50Micros),$($legacyResult.P95Micros),$($legacyResult.P99Micros),$($legacyResult.MaxMicros),$($legacyResult.SampleCount)",
-        "$ScenarioName,legacy-scoreboard-applied,$($legacyScoreboard.P50Micros),$($legacyScoreboard.P95Micros),$($legacyScoreboard.P99Micros),$($legacyScoreboard.MaxMicros),$($legacyScoreboard.SampleCount)"
+        "$ScenarioName,legacy-scoreboard-applied,$($legacyScoreboard.P50Micros),$($legacyScoreboard.P95Micros),$($legacyScoreboard.P99Micros),$($legacyScoreboard.MaxMicros),$($legacyScoreboard.SampleCount)",
+        "$ScenarioName,scoreboard-apply-segment,$($scoreboardApply.P50Micros),$($scoreboardApply.P95Micros),$($scoreboardApply.P99Micros),$($scoreboardApply.MaxMicros),$($scoreboardApply.SampleCount)"
     ) | Set-Content -Path $stalenessCsv -Encoding utf8
 
     return [pscustomobject]@{
@@ -534,6 +589,7 @@ function Show-EndToEndStaleness {
         Scoreboard = $scoreboard
         LegacyResult = $legacyResult
         LegacyScoreboard = $legacyScoreboard
+        ScoreboardApply = $scoreboardApply
     }
 }
 
@@ -714,6 +770,165 @@ function Save-GatlingHttpSummary {
     }
     Add-Content -Path $httpSummaryCsv -Encoding utf8 -Value `
         "$Phase,$total,$ok,$ko,$successPercent,$p95Millis,$($report.Name)"
+}
+
+function Get-HistogramQuantileFromDeltas {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Buckets,
+        [Parameter(Mandatory = $true)][double]$Quantile
+    )
+
+    $ordered = @($Buckets | Sort-Object UpperBound)
+    if ($ordered.Count -eq 0) { return $null }
+    $total = [double]$ordered[-1].Delta
+    if ($total -le 0d) { return $null }
+
+    $target = $total * $Quantile
+    $lowerBound = 0d
+    $lowerCount = 0d
+    foreach ($bucket in $ordered) {
+        $upperBound = [double]$bucket.UpperBound
+        $upperCount = [double]$bucket.Delta
+        if ($upperCount -ge $target) {
+            if ([double]::IsPositiveInfinity($upperBound)) { return $lowerBound }
+            if ($upperCount -le $lowerCount) { return $upperBound }
+            return $lowerBound + (($upperBound - $lowerBound) *
+                (($target - $lowerCount) / ($upperCount - $lowerCount)))
+        }
+        $lowerBound = $upperBound
+        $lowerCount = $upperCount
+    }
+    return $null
+}
+
+function Save-RedisScoreboardMetricsSummary {
+    param(
+        [Parameter(Mandatory = $true)]$Staleness,
+        [Parameter(Mandatory = $true)][string[]]$SubmissionPhases,
+        [Parameter(Mandatory = $true)][string]$ScenarioName
+    )
+
+    $rawCsv = Join-Path $metricsRoot "redis-scoreboard-metrics.csv"
+    if (-not (Test-Path $rawCsv)) {
+        Write-Host "Redis scoreboard metrics unavailable (sampler artifact is missing)."
+        return $false
+    }
+    $rows = @(Import-Csv $rawCsv | Where-Object { $_.phase -in $SubmissionPhases })
+    $bucketRows = @($rows | Where-Object {
+        $_.metric -eq "contest_scoreboard_redis_pipeline_seconds_bucket"
+    })
+    if ($bucketRows.Count -eq 0) {
+        Write-Host "Redis scoreboard metrics unavailable (no pipeline histogram samples)."
+        return $false
+    }
+
+    $resets = 0
+    $buckets = @($bucketRows |
+        Group-Object label |
+        ForEach-Object {
+            $samples = @($_.Group | Sort-Object timestamp)
+            $delta = [double]$samples[-1].value - [double]$samples[0].value
+            if ($delta -lt 0d) {
+                $resets++
+                $delta = [double]$samples[-1].value
+            }
+            $upperBound = if ($_.Name -eq "+Inf") {
+                [double]::PositiveInfinity
+            }
+            else {
+                [double]::Parse($_.Name, [Globalization.CultureInfo]::InvariantCulture)
+            }
+            [pscustomobject]@{ UpperBound = $upperBound; Delta = $delta }
+        })
+    $pipelineP99Seconds = Get-HistogramQuantileFromDeltas -Buckets $buckets -Quantile 0.99
+    $infiniteBucket = $buckets | Where-Object { [double]::IsPositiveInfinity($_.UpperBound) } |
+        Select-Object -First 1
+    $pipelineCalls = if ($null -ne $infiniteBucket) { [int64]$infiniteBucket.Delta } else { 0L }
+
+    $wrongPollBuckets = @($rows |
+        Where-Object { $_.metric -eq "contest_scoreboard_redis_wrong_attempt_poll_seconds_bucket" } |
+        Group-Object label |
+        ForEach-Object {
+            $samples = @($_.Group | Sort-Object timestamp)
+            $delta = [double]$samples[-1].value - [double]$samples[0].value
+            if ($delta -lt 0d) {
+                $resets++
+                $delta = [double]$samples[-1].value
+            }
+            $upperBound = if ($_.Name -eq "+Inf") {
+                [double]::PositiveInfinity
+            }
+            else {
+                [double]::Parse($_.Name, [Globalization.CultureInfo]::InvariantCulture)
+            }
+            [pscustomobject]@{ UpperBound = $upperBound; Delta = $delta }
+        })
+    $wrongPollP99Seconds = Get-HistogramQuantileFromDeltas -Buckets $wrongPollBuckets -Quantile 0.99
+
+    $luaErrors = 0d
+    $pollFailures = 0d
+    foreach ($metric in @(
+        "contest_scoreboard_redis_lua_errors_total",
+        "contest_scoreboard_redis_wrong_attempt_poll_failures_total"
+    )) {
+        $delta = 0d
+        foreach ($series in @($rows | Where-Object { $_.metric -eq $metric } | Group-Object label)) {
+            $samples = @($series.Group | Sort-Object timestamp)
+            $seriesDelta = [double]$samples[-1].value - [double]$samples[0].value
+            if ($seriesDelta -lt 0d) {
+                $resets++
+                $seriesDelta = [double]$samples[-1].value
+            }
+            $delta += $seriesDelta
+        }
+        if ($metric -eq "contest_scoreboard_redis_lua_errors_total") {
+            $luaErrors = $delta
+        }
+        else {
+            $pollFailures = $delta
+        }
+    }
+
+    $wrongFieldsRows = @($rows | Where-Object {
+        $_.metric -eq "contest_scoreboard_redis_wrong_attempt_fields"
+    } | Sort-Object timestamp)
+    $wrongFields = if ($wrongFieldsRows.Count -gt 0) { [int64]$wrongFieldsRows[-1].value } else { $null }
+    $stalenessGapSeconds = [double]$Staleness.ScoreboardApply.P99Micros / 1000000d
+    $ratio = if ($null -ne $pipelineP99Seconds -and
+        $pipelineP99Seconds -gt 0d -and $stalenessGapSeconds -gt 0d) {
+        [math]::Max($pipelineP99Seconds, $stalenessGapSeconds) /
+            [math]::Min($pipelineP99Seconds, $stalenessGapSeconds)
+    }
+    else {
+        $null
+    }
+    $status = if ($null -ne $ratio -and $ratio -lt 10d) { "PASS" } else { "MISMATCH" }
+
+    [pscustomobject]@{
+        Scenario = $ScenarioName
+        PipelineP99Seconds = if ($null -ne $pipelineP99Seconds) { [math]::Round($pipelineP99Seconds, 6) } else { $null }
+        ScoreboardApplySegmentP99Seconds = [math]::Round($stalenessGapSeconds, 6)
+        OrderRatio = if ($null -ne $ratio) { [math]::Round($ratio, 3) } else { $null }
+        PipelineCalls = $pipelineCalls
+        LuaErrors = [int64]$luaErrors
+        WrongAttemptFields = $wrongFields
+        WrongFieldPollP99Seconds = if ($null -ne $wrongPollP99Seconds) { [math]::Round($wrongPollP99Seconds, 6) } else { $null }
+        PollFailures = [int64]$pollFailures
+        CounterResets = $resets
+        Comparison = $status
+    } | Export-Csv -Path $redisScoreboardSummaryCsv -NoTypeInformation -Encoding utf8
+
+    Write-Host ("Redis apply cross-check {0}: pipeline p99={1}s, scoreboard segment p99={2}s, ratio={3}x, calls={4}, Lua errors={5}, w:*={6}, w:* poll p99={7}s, poll failures={8}" -f
+        $status,
+        [math]::Round([double]$pipelineP99Seconds, 6),
+        [math]::Round($stalenessGapSeconds, 6),
+        [math]::Round([double]$ratio, 3),
+        $pipelineCalls,
+        [int64]$luaErrors,
+        $wrongFields,
+        [math]::Round([double]$wrongPollP99Seconds, 6),
+        [int64]$pollFailures)
+    return $status -eq "PASS" -and $resets -eq 0
 }
 
 function Get-NearestRankValue {
@@ -1032,6 +1247,10 @@ function Show-MetricsSummary {
         $crossCheckPassed = Test-ScoreboardStalenessAgainstHeadLag `
             -ScoreboardDistribution $staleness.Scoreboard `
             -SubmissionPhases $submissionPhases
+        [void](Save-RedisScoreboardMetricsSummary `
+            -Staleness $staleness `
+            -SubmissionPhases $submissionPhases `
+            -ScenarioName $ScenarioName)
         if ($ScenarioName -in @("mixed", "mixed-target") -and -not $crossCheckPassed) {
             $script:stalenessCrossCheckFailed = $true
         }

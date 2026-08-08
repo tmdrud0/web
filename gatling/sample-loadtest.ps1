@@ -26,6 +26,7 @@ $containerCsv = Join-Path $OutputDirectory "containers.csv"
 $pipelineCsv = Join-Path $OutputDirectory "pipeline.csv"
 $jvmCsv = Join-Path $OutputDirectory "jvm-metrics.csv"
 $rabbitmqCsv = Join-Path $OutputDirectory "rabbitmq-metrics.csv"
+$redisScoreboardCsv = Join-Path $OutputDirectory "redis-scoreboard-metrics.csv"
 $prometheusUrl = "http://127.0.0.1:9090"
 
 # One statement keeps the whole pipeline snapshot on a single MySQL round trip. The lag subquery
@@ -244,6 +245,58 @@ function Sample-RabbitMqMetrics {
     }
 }
 
+function Sample-RedisScoreboardMetrics {
+    param([string]$Timestamp)
+
+    try {
+        # Keep cumulative bucket/counter values so the final report can calculate an exact phase
+        # delta even when JVMs have been running across several scenarios.
+        $query = '{job="oj-app",__name__=~"contest_scoreboard_redis_(pipeline_seconds_bucket|lua_errors_total|wrong_attempt_fields|wrong_attempt_poll_failures_total|wrong_attempt_poll_seconds_bucket)"}'
+        $encodedQuery = [uri]::EscapeDataString($query)
+        $response = Invoke-RestMethod -Uri "$prometheusUrl/api/v1/query?query=$encodedQuery" -TimeoutSec 4
+        if ($response.status -ne "success") { return }
+
+        $totals = @{}
+        foreach ($sample in @($response.data.result)) {
+            if ($sample.value.Count -lt 2) { continue }
+            $metric = [string]$sample.metric.__name__
+            $label = if ($metric -in @(
+                "contest_scoreboard_redis_pipeline_seconds_bucket",
+                "contest_scoreboard_redis_wrong_attempt_poll_seconds_bucket"
+            )) {
+                [string]$sample.metric.le
+            }
+            elseif ($metric -eq "contest_scoreboard_redis_lua_errors_total") {
+                [string]$sample.metric.kind
+            }
+            else {
+                "all"
+            }
+            $key = "$metric|$label"
+            $value = [double]::Parse(
+                [string]$sample.value[1],
+                [Globalization.CultureInfo]::InvariantCulture)
+            if (-not $totals.ContainsKey($key)) { $totals[$key] = 0d }
+            $totals[$key] += $value
+        }
+
+        foreach ($key in @($totals.Keys | Sort-Object)) {
+            $parts = $key -split '\|', 2
+            Write-CsvLine -Path $redisScoreboardCsv -Line (@(
+                $Timestamp,
+                $Phase,
+                $parts[0],
+                $parts[1],
+                (Format-InvariantNumber $totals[$key])
+            ) -join ',')
+        }
+    }
+    catch {
+        # The optional observability overlay has the same contract as the JVM and RabbitMQ
+        # samplers: missing evidence is reported later, never converted into a healthy zero.
+    }
+}
+
 function Sample-Containers {
     param([string]$Timestamp)
 
@@ -339,6 +392,9 @@ if (-not (Test-Path $jvmCsv)) {
 if (-not (Test-Path $rabbitmqCsv)) {
     Write-CsvLine -Path $rabbitmqCsv -Line "timestamp,phase,queue,ready,unacked,consumers,publishedTotal,deliveredAckTotal,deliveredAutoTotal"
 }
+if (-not (Test-Path $redisScoreboardCsv)) {
+    Write-CsvLine -Path $redisScoreboardCsv -Line "timestamp,phase,metric,label,value"
+}
 
 $lastPipelineSample = [DateTime]::MinValue
 $lastJvmSample = [DateTime]::MinValue
@@ -350,6 +406,7 @@ while (-not (Test-Path $StopFile)) {
     if (($now - $lastPipelineSample).TotalSeconds -ge $PipelineIntervalSeconds) {
         Sample-Pipeline -Timestamp $timestamp
         Sample-RabbitMqMetrics -Timestamp $timestamp
+        Sample-RedisScoreboardMetrics -Timestamp $timestamp
         $lastPipelineSample = $now
     }
     if (($now - $lastJvmSample).TotalSeconds -ge $PipelineIntervalSeconds) {

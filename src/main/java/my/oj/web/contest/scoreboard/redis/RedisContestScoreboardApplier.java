@@ -1,6 +1,7 @@
 package my.oj.web.contest.scoreboard.redis;
 
 import io.lettuce.core.RedisCommandExecutionException;
+import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardPolicy;
@@ -12,6 +13,7 @@ import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -26,12 +28,21 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
 
     private final StringRedisTemplate redisTemplate;
     private final ContestRedisKeyValueClient redisClient;
+    private final RedisContestScoreboardApplyMetrics metrics;
     private volatile String scriptSha;
 
     public RedisContestScoreboardApplier(StringRedisTemplate redisTemplate,
                                          ContestRedisKeyValueClient redisClient) {
+        this(redisTemplate, redisClient,
+                new RedisContestScoreboardApplyMetrics(new CompositeMeterRegistry()));
+    }
+
+    public RedisContestScoreboardApplier(StringRedisTemplate redisTemplate,
+                                         ContestRedisKeyValueClient redisClient,
+                                         RedisContestScoreboardApplyMetrics metrics) {
         this.redisTemplate = redisTemplate;
         this.redisClient = redisClient;
+        this.metrics = metrics;
         if (redisTemplate.getConnectionFactory() instanceof LettuceConnectionFactory connectionFactory) {
             connectionFactory.setPipeliningFlushPolicy(
                     LettuceConnection.PipeliningFlushPolicy.flushOnClose()
@@ -43,11 +54,19 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
     public Long apply(Long eventId, ContestScoreboardUpdate update) {
         validate(eventId, update);
 
-        Long sequence = redisTemplate.execute(
-                ContestScoreboardRedisScript.APPLY,
-                keys(update),
-                (Object[]) arguments(update)
-        );
+        Long sequence;
+        try {
+            sequence = redisTemplate.execute(
+                    ContestScoreboardRedisScript.APPLY,
+                    keys(update),
+                    (Object[]) arguments(update)
+            );
+        } catch (RuntimeException failure) {
+            if (hasCommandExecutionFailure(failure)) {
+                metrics.recordLuaError(failure);
+            }
+            throw failure;
+        }
         if (sequence == null) {
             throw new IllegalStateException("Redis scoreboard script returned no sequence");
         }
@@ -59,70 +78,75 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
         if (requests == null || requests.isEmpty()) {
             return List.of();
         }
-        List<ApplyRequest> safeRequests = List.copyOf(requests);
-        safeRequests.forEach(request -> validate(request.eventId(), request.update()));
-
+        long startedNanos = System.nanoTime();
         try {
-            String loadedScriptSha = scriptSha();
+            List<ApplyRequest> safeRequests = List.copyOf(requests);
+            safeRequests.forEach(request -> validate(request.eventId(), request.update()));
 
-            List<Object> pipelineResults = redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
-                for (ApplyRequest request : safeRequests) {
-                    connection.scriptingCommands().evalSha(
-                            loadedScriptSha,
-                            ReturnType.INTEGER,
-                            SCRIPT_KEY_COUNT,
-                            serializedKeysAndArguments(request.update())
-                    );
-                }
-                return null;
-            });
-            if (pipelineResults.size() != safeRequests.size()) {
-                log.warn(
-                        "Redis scoreboard pipeline returned {} results for {} events",
-                        pipelineResults.size(),
-                        safeRequests.size()
-                );
-                return failedResults(
-                        safeRequests,
-                        "Redis pipeline returned a different number of results than requested"
-                );
-            }
+            try {
+                String loadedScriptSha = scriptSha();
 
-            List<ApplyResult> results = new ArrayList<>(safeRequests.size());
-            for (int index = 0; index < safeRequests.size(); index++) {
-                Object result = pipelineResults.get(index);
-                if (!(result instanceof Number number)) {
+                List<Object> pipelineResults = redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+                    for (ApplyRequest request : safeRequests) {
+                        connection.scriptingCommands().evalSha(
+                                loadedScriptSha,
+                                ReturnType.INTEGER,
+                                SCRIPT_KEY_COUNT,
+                                serializedKeysAndArguments(request.update())
+                        );
+                    }
+                    return null;
+                });
+                if (pipelineResults.size() != safeRequests.size()) {
                     log.warn(
-                            "Redis scoreboard pipeline returned an unexpected result type at index {}: {}",
-                            index,
-                            result == null ? "null" : result.getClass().getName()
+                            "Redis scoreboard pipeline returned {} results for {} events",
+                            pipelineResults.size(),
+                            safeRequests.size()
                     );
                     return failedResults(
                             safeRequests,
-                            "Redis pipeline returned an unexpected result type"
+                            "Redis pipeline returned a different number of results than requested"
                     );
                 }
-                results.add(ApplyResult.success(
-                        safeRequests.get(index).eventId(),
-                        number.longValue()
-                ));
-            }
-            return List.copyOf(results);
-        } catch (RuntimeException exception) {
-            if (hasCommandExecutionFailure(exception)) {
+
+                List<ApplyResult> results = new ArrayList<>(safeRequests.size());
+                for (int index = 0; index < safeRequests.size(); index++) {
+                    Object result = pipelineResults.get(index);
+                    if (!(result instanceof Number number)) {
+                        log.warn(
+                                "Redis scoreboard pipeline returned an unexpected result type at index {}: {}",
+                                index,
+                                result == null ? "null" : result.getClass().getName()
+                        );
+                        return failedResults(
+                                safeRequests,
+                                "Redis pipeline returned an unexpected result type"
+                        );
+                    }
+                    results.add(ApplyResult.success(
+                            safeRequests.get(index).eventId(),
+                            number.longValue()
+                    ));
+                }
+                return List.copyOf(results);
+            } catch (RuntimeException exception) {
+                if (hasCommandExecutionFailure(exception)) {
+                    log.warn(
+                            "Redis scoreboard pipeline command failed; classifying {} events individually",
+                            safeRequests.size(),
+                            exception
+                    );
+                    return ContestScoreboardApplier.super.applyAll(safeRequests);
+                }
                 log.warn(
-                        "Redis scoreboard pipeline command failed; classifying {} events individually",
+                        "Redis scoreboard pipeline failed; deferring {} events for retry",
                         safeRequests.size(),
                         exception
                 );
-                return ContestScoreboardApplier.super.applyAll(safeRequests);
+                return failedResults(safeRequests, errorMessage(exception));
             }
-            log.warn(
-                    "Redis scoreboard pipeline failed; deferring {} events for retry",
-                    safeRequests.size(),
-                    exception
-            );
-            return failedResults(safeRequests, errorMessage(exception));
+        } finally {
+            metrics.recordPipeline(Duration.ofNanos(System.nanoTime() - startedNanos));
         }
     }
 

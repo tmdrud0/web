@@ -88,6 +88,39 @@ public class RedisTemplateContestRedisKeyValueClient implements ContestRedisKeyV
     }
 
     @Override
+    public long countHashFieldsWithPrefix(Collection<String> keys, String prefix) {
+        if (keys == null || keys.isEmpty()) {
+            return 0L;
+        }
+        List<String> orderedKeys = keys.stream().sorted().toList();
+        List<Object> fieldSets = redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+            for (String key : orderedKeys) {
+                byte[] serializedKey = redisTemplate.getStringSerializer().serialize(key);
+                connection.hashCommands().hKeys(serializedKey);
+            }
+            return null;
+        });
+        if (fieldSets.size() != orderedKeys.size()) {
+            throw new IllegalStateException("Redis HKEYS pipeline returned a different number of results than keys");
+        }
+        long count = 0L;
+        for (Object fieldSet : fieldSets) {
+            if (!(fieldSet instanceof Collection<?> fields)) {
+                throw new IllegalStateException("Redis HKEYS pipeline returned an unexpected result type");
+            }
+            for (Object field : fields) {
+                String name = field instanceof byte[] bytes
+                        ? new String(bytes, StandardCharsets.UTF_8)
+                        : String.valueOf(field);
+                if (name.startsWith(prefix)) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    @Override
     public void zAdd(String key, double score, String member) {
         redisTemplate.opsForZSet().add(key, member, score);
     }

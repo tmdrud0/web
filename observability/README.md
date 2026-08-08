@@ -152,10 +152,10 @@ Actuator는 업무 포트가 아니라 별도 포트에서 듣는다(`applicatio
 
 버킷 범위는 5ms~10s로 제한해 시계열 수를 묶어두었다.
 
-파이프라인 내부 지표(§9)의 Timer 3개도 같은 이유로 버킷을 낸다. 다만 이쪽 버킷 경계는
-프로필이 아니라 meter 자체에 속하는 값이므로 `application.properties`가 아니라
-`ContestSubmissionBulkMetrics` 안에 있다. 프로필 조합에 따라 사라질 수 있는 자리에 두지
-않는다.
+파이프라인 내부 지표(§9)의 Timer 3개와 Redis scoreboard Timer 2개(§13)도 같은 이유로
+버킷을 낸다. 다만 이쪽 버킷 경계는 프로필이 아니라 meter 자체에 속하는 값이므로
+`application.properties`가 아니라 각 metrics 클래스 안에 있다. 프로필 조합에 따라 사라질 수
+있는 자리에 두지 않는다.
 
 **Micrometer Timer는 요청하지 않아도 `_max` 시계열을 함께 낸다.** time-decaying 창의
 인스턴스별 최댓값이므로 §5의 규칙에 걸리는 값이다. `http.server.requests`도 마찬가지다.
@@ -274,8 +274,8 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
   PENDING oldest age가 Prometheus에서 조회되고, 부하로 쌓았다 빼는 곡선까지 실측했다(§10).
   남은 것은 같은 문서 §10.1의 async in-flight·Tomcat accept queue·중복 응답 수와
   `ContestSubmissionBatchConsistencyException` 카운트, §10.5의 judge API latency histogram,
-  listener retry/DLQ 이동 수, result writer queue depth, Redis pipeline latency, Lua 오류와
-  `w:*` 필드 총량이다. 이들은 judge 역할과 Redis 경로에 있어 이번 작업 범위 밖이다.
+  listener retry/DLQ 이동 수와 result writer queue depth다. Redis pipeline latency, Lua 오류,
+  `w:*` 필드 총량은 §13에서 채웠다.
 - **알림 임계값은 실측값이 아니다.** 규칙은 `observability/prometheus/rules/oj-pipeline.yml`에
   있고 숫자는 전부 출발점이다. 임계값을 정할 근거가 되는 실행 — 곡선이 나올 만큼 긴 hold,
   위의 "스크레이프 주기와 부하 실행 길이" 항목 — 이 아직 없다. 각 임계값이 무엇의 대리값인지는
@@ -1018,3 +1018,97 @@ ready가 0인 것은 누락이 아니라 `submit-100`이 judge drain rate 아래
 publish/deliver delta도 둘 다 19,495였다. 즉 outbox에 잠깐 쌓인 work가 broker로 이동한 뒤 ready
 backlog를 만들지 않고 즉시 consumer에게 전달됐으며, DLQ 유입이나 유실은 없었다. 대시보드에서
 두 depth가 같은 모양이어야 하는 것이 아니라 이 연속 단계와 보존 관계가 성립해야 한다.
+
+## 13. Redis scoreboard 적용 구간
+
+outbox와 미래 stream 구현이 마지막에 공유하는 `RedisContestScoreboardApplier.applyAll`을 별도
+구간으로 뗐다. 다음 지표는 `OJ - Bottleneck Overview`의 `Redis scoreboard application` 행에서
+함께 본다.
+
+| Micrometer | Prometheus | 의미 |
+|---|---|---|
+| `contest.scoreboard.redis.pipeline` | `contest_scoreboard_redis_pipeline_seconds_*` | `applyAll` 한 번의 전체 시간. command error 뒤 개별 분류 fallback도 포함한다. |
+| `contest.scoreboard.redis.lua.errors{kind}` | `contest_scoreboard_redis_lua_errors_total{kind}` | 개별 Lua 실패. pipeline 예외와 fallback 예외를 이중으로 세지 않는다. |
+| `contest.scoreboard.redis.wrong.attempt` | `contest_scoreboard_redis_wrong_attempt_fields` | 모든 problem hash의 `w:*` 총량 추정값 |
+| `contest.scoreboard.redis.wrong.attempt.poll` | `contest_scoreboard_redis_wrong_attempt_poll_seconds_*` | 예약 폴러 한 번의 시간 |
+| `contest.scoreboard.redis.wrong.attempt.poll.failures` | `contest_scoreboard_redis_wrong_attempt_poll_failures_total` | 폴 실패. 실패하면 gauge는 직전 값을 유지한다. |
+
+pipeline Timer는 1·2·5·10·25·50·100·250·500ms와 1·2s 버킷을 낸다. 폴러 Timer는
+10·25·50·100·250·500ms와 1·2·5s 버킷을 낸다. `_max`나 인스턴스별 percentile이 아니라
+`histogram_quantile(..., sum by (le) (..._bucket))`을 쓰는 이유는 §5와 같다.
+
+Redis applier bean은 Redis store를 쓰는 역할 모두에 등록되므로 실제로 적용하지 않는 역할도
+0인 bucket/count를 낸다. 0은 합산해도 관측 수를 늘리지 않으므로 `sum by (le)`가 정확하다.
+반면 `w:*` gauge와 poll Timer는 `application-batch-role.properties`와
+`application-single-server.properties`에서만 켠다. 여러 역할이 같은 Redis 전체값을 게시하면
+`sum()`이 인스턴스 수만큼 부풀기 때문이다. 따라서 이 행의 질의에는 현재 역할 이름을 가정하는
+`{role=...}` 필터를 넣지 않는다. `PipelineMetricNamesTests`가 series 이름과 이 양쪽 조건을
+고정한다.
+
+Lua `error_reply`와 `error()` 메시지는 그대로 label로 쓰지 않는다. key나 field 같은 동적 문자열이
+cardinality를 늘리기 때문이다. 아래 유한한 `kind`로 분류하고 나머지는 `other`로 모은다.
+
+- `unexpected_key_type`, `invalid_integer_field`, `invalid_submission_id_field`
+- `invalid_numeric_argument`, `invalid_submission_id_argument`
+- `negative_allocator_sequence`, `invalid_submission_sequence`, `missing_sequence_mapping`
+- `invalid_initialized_flag`, `incomplete_accepted_state`, `other`
+
+### `w:*`는 왜 스크레이프에서 세지 않고, 왜 표본인가
+
+게이지 callback은 `AtomicLong`만 읽는다. Redis 작업은 60초 예약 폴러가 하므로 Prometheus의
+5초 scrape/4초 timeout 경로에는 Redis 왕복이 없다. poll이 실패해도 0은 게시하지 않고 직전 값을
+유지하며 failure counter가 stale 값을 구분한다.
+
+처음 구현한 exact poll은 모든 problem key를 `SCAN`한 뒤 모든 hash에 `HKEYS`를 pipeline으로
+보냈다. `submit-100` 뒤 19,510개 `w:*` 필드가 있을 때 cold poll 한 번이 **3.291초**였다. 이 정도
+관측 부하는 비교 대상인 Redis를 흔들 수 있으므로 그대로 두지 않았다. 현재 폴러는 다음처럼
+조회 폭을 제한한다.
+
+1. `contest:scoreboard:*:user:*:problem:*` key는 blocking `KEYS`가 아니라 incremental `SCAN`으로
+   찾는다.
+2. key의 Java hash와 key 문자열 순으로 안정되게 정렬한 뒤 최대 **1,000 hash**만 `HKEYS`한다.
+3. 표본의 hash당 `w:*` 평균에 전체 problem-key 수를 곱해 총량을 추정한다. key가 1,000개
+   이하면 exact다.
+
+같은 19,510 exact 값에 대한 표본 추정은 19,566(+0.29%)이었다. 최종 코드 실행
+`var/loadtest-20260808-152346`에서 drain 뒤 DB의 non-ACCEPTED 결과 19,230건에 대해 안정된 gauge는
+19,088(-0.74%)이었고, 부하 시간창의 warm poll p99는 **0.247초**, poll failure는 0이었다. 표본은
+`HKEYS` 대상 hash 수를 제한하지만 각 표본 hash 안의 `w:*` 개수는 여전히 무상한이고, 전체
+keyspace를 걷는 `SCAN` 비용도 상수로 만들지는 않는다.
+poll Timer가 계속 커지거나 이 오차가 운영 판단에 부족해지면 Redis write 경로에서 contest별
+counter를 유지하거나 별도 exporter로 옮겨야 한다. 지금은 매 제출에 추가 쓰기를 넣어 비교 대상의
+비용을 바꾸는 것보다, 오차와 poll 비용을 함께 노출하는 bounded sample을 택했다.
+
+### 부하 실측과 구간 귀속
+
+하네스는 `redis-scoreboard-metrics.csv`에 누적 bucket/counter를 표본화하고
+`redis-scoreboard-summary.csv`에 phase delta의 pipeline p99, 같은 제출의
+`result_saved_at -> scoreboard_applied_at` p99, Lua 오류, `w:*`, poll 시간과 실패를 남긴다.
+서로 다른 제출의 두 end-to-end p99를 빼지 않고 같은 제출의 두 DB 시각을 직접 빼는 이유는
+percentile의 차이가 구간 percentile이 아니기 때문이다. 이 paired 분포는
+`end-to-end-staleness.csv`에도 `scoreboard-apply-segment`로 남는다.
+
+`var/loadtest-20260808-150859`의 `submit-100`은 HTTP 성공 100%, retry/JVM restart 0이고 최대
+노드 throttle 중앙값 2.4%였다. 결과는 다음과 같다.
+
+| 값 | p99 |
+|---|---:|
+| Redis `applyAll` pipeline | **0.009087s** |
+| 같은 제출의 result saved → scoreboard applied | **0.381443s** |
+| 비율 | **41.97배** |
+
+paired 구간의 p50은 0.173603s였고 scoreboard poll 간격은 0.2s다. 즉 이 구간에는 outbox가 다음
+poll을 기다리는 시간, MySQL claim, Redis pipeline, MySQL 완료 update가 모두 들어가며 Redis
+pipeline만 재는 Timer와 같을 이유가 없다. 요청한 “두 p99가 한 자릿수 비율로 일치” 가설은
+실측에서 성립하지 않았다. 이 불일치가 바로 구간 분리의 결과다. 정상에 가까운 실행에서는 약
+0.372s의 p99가 Redis 밖에 있었다.
+
+최종 표본 폴러 코드 실행 `var/loadtest-20260808-152346`은 초기화 3수치 0, HTTP 성공 100%,
+retry/JVM restart 0이었지만 judge outbox peak 4,071과 result p95 37.717s가 발생한 사고 실행이라
+§9의 구현 비교 기준에서는 제외한다. 여기서도 Redis pipeline p99 0.2255s 대 paired 구간 p99
+4.384563s(19.44배), Lua/poll 오류 0이었다. 전체 지연을 Redis에 귀속할 수 없고, 이 실행의 주된
+대기는 Redis scoreboard 앞의 judge/outbox 구간이라는 결론과 맞는다.
+
+따라서 pipeline p99는 end-to-end 차이를 그대로 재현하는 대체 지표가 아니다. 전자는 공유 Redis
+적용 비용이고 후자는 delivery adapter와 DB 완료까지 포함한 구간이다. 구현 비교에서는 둘을 함께
+보고, paired 구간만 변했는지 pipeline 자체도 변했는지로 비용을 귀속한다.

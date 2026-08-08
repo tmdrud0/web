@@ -1,6 +1,8 @@
 package my.oj.web;
 
 import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProcessor;
+import my.oj.web.contest.scoreboard.redis.ContestRedisKeyValueClient;
+import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardWrongAttemptMetrics;
 import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProperties;
 import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxRecoveryService;
 import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
@@ -39,6 +41,7 @@ class RoleBasedSchedulerActivationTests {
                     TestDependencies.class,
                     ContestScoreboardOutboxScheduler.class,
                     ContestOutboxBacklogMetrics.class,
+                    RedisContestScoreboardWrongAttemptMetrics.class,
                     StreakRankBatchScheduler.class
             );
 
@@ -50,6 +53,7 @@ class RoleBasedSchedulerActivationTests {
             assertThatMissing(context, ContestScoreboardOutboxScheduler.class);
             assertThatMissing(context, StreakRankBatchScheduler.class);
             assertThatMissing(context, ContestOutboxBacklogMetrics.class);
+            assertThatMissing(context, RedisContestScoreboardWrongAttemptMetrics.class);
         }
     }
 
@@ -65,6 +69,7 @@ class RoleBasedSchedulerActivationTests {
             assertThat(properties.recoveryBatchSize()).isEqualTo(10);
             assertThat(properties.claimTimeout()).isEqualTo(java.time.Duration.ofSeconds(30));
             assertThatPresent(context, ContestOutboxBacklogMetrics.class);
+            assertThatPresent(context, RedisContestScoreboardWrongAttemptMetrics.class);
         }
     }
 
@@ -76,6 +81,7 @@ class RoleBasedSchedulerActivationTests {
             assertThatMissing(context, ContestScoreboardOutboxScheduler.class);
             assertThatMissing(context, StreakRankBatchScheduler.class);
             assertThatMissing(context, ContestOutboxBacklogMetrics.class);
+            assertThatMissing(context, RedisContestScoreboardWrongAttemptMetrics.class);
         }
     }
 
@@ -86,6 +92,7 @@ class RoleBasedSchedulerActivationTests {
                     assertThatPresent(context, ContestScoreboardOutboxScheduler.class);
                     assertThatPresent(context, StreakRankBatchScheduler.class);
                     assertThatPresent(context, ContestOutboxBacklogMetrics.class);
+                    assertThatMissing(context, RedisContestScoreboardWrongAttemptMetrics.class);
                 });
     }
 
@@ -156,6 +163,11 @@ class RoleBasedSchedulerActivationTests {
         StreakRankBatchService streakRankBatchService() {
             return mock(StreakRankBatchService.class);
         }
+
+        @Bean
+        ContestRedisKeyValueClient contestRedisKeyValueClient() {
+            return mock(ContestRedisKeyValueClient.class);
+        }
     }
 
     @Configuration(proxyBeanMethods = false)
@@ -163,6 +175,7 @@ class RoleBasedSchedulerActivationTests {
             TestDependencies.class,
             ContestScoreboardOutboxScheduler.class,
             ContestOutboxBacklogMetrics.class,
+            RedisContestScoreboardWrongAttemptMetrics.class,
             StreakRankBatchScheduler.class
     })
     static class ProfileTestConfiguration {
