@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("smoke", "target", "step", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed", "mixed-target")]
+    [ValidateSet("smoke", "target", "step", "submit-100", "submit-139", "submit-200", "submit-1000", "scoreboard-200", "scoreboard-300", "scoreboard-2000", "mixed", "mixed-target")]
     [string]$Scenario = "smoke",
     [int]$UserCount = 10000,
     [int]$ProblemCount = 5,
@@ -97,10 +97,20 @@ function Invoke-LoadCompose {
     }
 }
 
+# `ps` selects on the project label, not on the compose files passed to it, so it returns the
+# observability stack too when that is brought up in the same project - which observability/README.md
+# §1 is what tells you to do. The callers below count on getting exactly the nine application
+# containers, so Wait-Healthy sat out its full timeout against a stack that was already healthy.
+# Scoping the query to the services these files declare keeps the count meaning what it says.
 function Get-LoadContainerIds {
     Push-Location $repoRoot
     try {
-        $ids = & docker compose "-p" $projectName @composeFiles ps -aq
+        $services = @(& docker compose "-p" $projectName @composeFiles config --services)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not list load-test services."
+        }
+        $services = @($services | Where-Object { $_ })
+        $ids = & docker compose "-p" $projectName @composeFiles ps -aq @services
         if ($LASTEXITCODE -ne 0) {
             throw "Could not list load-test containers."
         }
@@ -871,6 +881,25 @@ function Invoke-GatlingScenario {
     )
 
     switch ($SelectedScenario) {
+        # Below the judge's drain rate on every profile in application-loadtest.properties, so the
+        # queue stays empty and end-to-end latency is the pipeline's own cost rather than a wait
+        # behind a backlog. That makes it the scenario to measure anything the backlog would
+        # otherwise dominate - a consumer dying and its unacked messages being redelivered shows up
+        # in `max` here and is invisible at 200.
+        "submit-100" {
+            $simulationClass = "my.oj.perf.ContestSubmissionSimulation"
+            $submitInterval = Get-SubmitIntervalMillis -PeakRps 100
+            $submissions = Get-ScheduledCount -Rps 100 -RampSeconds 30 -HoldSeconds 180
+            $logins = Get-ConcurrentUsers -Rps 100 -IntervalMillis $submitInterval
+            $minRequests = Get-AssertionFloor -Expected ($submissions + $logins)
+            $script:expectedSubmissionCount = Get-AssertionFloor -Expected $submissions
+            $scenarioArgs = @(
+                "-Dperf.targetRps=100",
+                "-Dperf.rampSeconds=30",
+                "-Dperf.holdSeconds=180",
+                "-Dperf.submitIntervalMillis=$submitInterval"
+            ) + $userArgs + $seedArgs
+        }
         "submit-139" {
             $simulationClass = "my.oj.perf.ContestSubmissionSimulation"
             # Submissions follow the rate schedule; the logins do not. Every session authenticates
@@ -1128,16 +1157,21 @@ try {
             -ScoreboardParticipants (Get-ScoreboardParticipants -ContestId $seed.contestId)
     }
     else {
-        Invoke-GatlingScenario -Seed $seed -SelectedScenario $Scenario
+        # gatling/README.md's scenario table calls these overload observation rather than pass
+        # criteria, and the note on AllowAssertionFailure above says an exploration run's assertion
+        # result is data rather than a verdict. Throwing here discards the drain, the materialization
+        # check and the staleness distribution - the measurements the run exists to produce.
+        $exploration = $Scenario -in @("submit-1000", "scoreboard-2000", "mixed")
+        Invoke-GatlingScenario -Seed $seed -SelectedScenario $Scenario -AllowAssertionFailure:$exploration
     }
 
-    if ($Scenario -in @("submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "step")) {
+    if ($Scenario -in @("submit-100", "submit-139", "submit-200", "submit-1000", "mixed", "mixed-target", "step")) {
         Wait-PipelineDrainWithSampling -TimeoutSeconds $DrainTimeoutSeconds -Phase $Scenario
     }
     else {
         Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
     }
-    if ($Scenario -in @("target", "submit-139", "submit-200", "submit-1000", "mixed", "mixed-target")) {
+    if ($Scenario -in @("target", "submit-100", "submit-139", "submit-200", "submit-1000", "mixed", "mixed-target")) {
         Assert-PipelineMaterialized -ContestId $seed.contestId
         $pipelineValidated = $true
     }
