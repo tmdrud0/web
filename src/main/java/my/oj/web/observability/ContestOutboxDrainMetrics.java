@@ -10,7 +10,7 @@ import org.springframework.stereotype.Component;
  * Counts rows leaving each outbox. Paired with {@link ContestOutboxBacklogMetrics}, this is what
  * makes the drain-time estimate of the pipeline history section 9.2 computable:
  *
- * <pre>{@code contest_outbox_backlog_rows / rate(contest_outbox_drained_total[5m])}</pre>
+ * <pre>{@code contest_scoreboard_pending_events / rate(contest_scoreboard_applied_total[5m])}</pre>
  *
  * <p>A backlog count on its own says how much is waiting but not whether it is going anywhere.
  * The two outboxes are the only places in the section 7 table where load accumulates on disk
@@ -47,20 +47,26 @@ public class ContestOutboxDrainMetrics implements MeterBinder {
     /** @param completed rows the worker moved to COMPLETED, {@code retried} rows it moved to FAILED */
     public void recordScoreboardBatch(int completed, int retried) {
         counters.scoreboardDrained().increment(completed);
+        counters.scoreboardApplied().increment(completed);
         counters.scoreboardRetried().increment(retried);
     }
 
     private record Counters(Counter judgeDrained,
                             Counter judgeRetried,
                             Counter scoreboardDrained,
-                            Counter scoreboardRetried) {
+                            Counter scoreboardRetried,
+                            Counter scoreboardApplied) {
 
         private static Counters of(MeterRegistry registry) {
             return new Counters(
                     drained(registry, JUDGE_OUTBOX, "published to RabbitMQ and marked PUBLISHED"),
                     retried(registry, JUDGE_OUTBOX, "publish failed and were returned to PENDING"),
                     drained(registry, SCOREBOARD_OUTBOX, "applied to the Redis scoreboard and marked COMPLETED"),
-                    retried(registry, SCOREBOARD_OUTBOX, "apply failed and were marked FAILED for a backoff retry")
+                    retried(registry, SCOREBOARD_OUTBOX, "apply failed and were marked FAILED for a backoff retry"),
+                    Counter.builder("contest.scoreboard.applied")
+                            .description("Judged results applied to the scoreboard, independent of "
+                                    + "whether delivery uses a database outbox or a stream")
+                            .register(registry)
             );
         }
 

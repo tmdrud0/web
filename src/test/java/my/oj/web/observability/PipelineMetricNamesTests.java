@@ -48,6 +48,8 @@ class PipelineMetricNamesTests {
             Pattern.compile("(?<![:\\w])(contest_submission_[a-z0-9_]+)(\\{[^}]*\\})?");
     private static final Pattern OUTBOX_SELECTOR =
             Pattern.compile("(?<![:\\w])(contest_outbox_[a-z0-9_]+)(\\{[^}]*\\})?");
+    private static final Pattern SCOREBOARD_SELECTOR =
+            Pattern.compile("(?<![:\\w])(contest_scoreboard_[a-z0-9_]+)(\\{[^}]*\\})?");
 
     @Test
     void dashboardQueriesOnlySeriesTheApplicationExports() throws IOException {
@@ -90,6 +92,27 @@ class PipelineMetricNamesTests {
                         .as("%s is scoped to the web role, which never publishes it", matcher.group(1))
                         .doesNotContain("role=\"web\"");
             }
+        }
+    }
+
+    /**
+     * The neutral gauges have one publisher, while the applied counter registers on every role
+     * but stays at zero outside batch-1. Both cases make an unscoped sum exact; a web-role filter
+     * would instead remove the only non-zero series.
+     */
+    @Test
+    void neutralScoreboardQueriesAreNotScopedToTheWebRole() throws IOException {
+        for (String expressions : List.of(readDashboardExpressions(), readRuleExpressions())) {
+            Matcher matcher = SCOREBOARD_SELECTOR.matcher(expressions);
+            int checked = 0;
+            while (matcher.find()) {
+                checked++;
+                assertThat(selectorOf(matcher))
+                        .as("%s is implementation-neutral and must not assume which role owns the adapter",
+                                matcher.group(1))
+                        .doesNotContain("role=");
+            }
+            assertThat(checked).as("no contest_scoreboard_* selector found").isPositive();
         }
     }
 

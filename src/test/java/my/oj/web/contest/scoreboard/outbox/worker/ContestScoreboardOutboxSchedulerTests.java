@@ -65,6 +65,7 @@ class ContestScoreboardOutboxSchedulerTests {
 
         assertThat(counter("contest.outbox.drained")).isEqualTo(12.0);
         assertThat(counter("contest.outbox.retries")).isEqualTo(3.0);
+        assertThat(registry.get("contest.scoreboard.applied").counter().count()).isEqualTo(12.0);
     }
 
     private double counter(String name) {

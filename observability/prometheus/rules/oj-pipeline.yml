@@ -13,73 +13,75 @@
 # five roles, because the beans behind them have to exist for any role's context to start, so an
 # unscoped sum reaches batch-1, judge-1 and judge-2 as well. Their counters sit at zero, which
 # makes an unscoped rate() numerically right by accident rather than by aiming at anything.
-# contest_outbox_* is not scoped and must not be: batch-1 is its only publisher. Throttling is read off the dashboard when interpreting a run, not paged on.
+# contest_scoreboard_* is also unscoped. Its gauges have one publisher, batch-1, and its applied
+# counter is zero on the other roles, so sum() is exact. contest_outbox_* remains an unscoped
+# implementation-diagnostic family published by batch-1. Throttling is read off the dashboard
+# when interpreting a run, not paged on.
 
 groups:
-  - name: oj-outbox-drain
+  - name: oj-scoreboard-drain
     rules:
       # A backlog count says how much is waiting; it does not say whether a contest can wait for
       # it. Pipeline history 9.2 asks for the drain estimate instead, and this is the recording
       # rule behind both the alert below and the dashboard panel.
-      - record: oj:contest_outbox_backlog:rows
-        expr: sum by (outbox) (contest_outbox_backlog_rows)
+      - record: oj:contest_scoreboard_pending:events
+        expr: sum(contest_scoreboard_pending_events)
 
-      - record: oj:contest_outbox_drained:rate5m
-        expr: sum by (outbox) (rate(contest_outbox_drained_total[5m]))
+      - record: oj:contest_scoreboard_applied:rate5m
+        expr: sum(rate(contest_scoreboard_applied_total[5m]))
 
       # Division by a zero drain rate is left as +Inf on purpose. A backlog that is not moving has
       # no finite drain time, and that is the state most worth alerting on; guarding the division
-      # would turn it into a gap in the graph. An empty outbox gives 0/0 = NaN, which compares
+      # would turn it into a gap in the graph. An empty scoreboard pipeline gives 0/0 = NaN, which compares
       # false against every threshold, so an idle stack stays quiet.
-      - record: oj:contest_outbox_estimated_drain:seconds
-        expr: oj:contest_outbox_backlog:rows / oj:contest_outbox_drained:rate5m
+      - record: oj:contest_scoreboard_estimated_drain:seconds
+        expr: oj:contest_scoreboard_pending:events / oj:contest_scoreboard_applied:rate5m
 
-  - name: oj-outbox-alerts
+  - name: oj-scoreboard-alerts
     rules:
       # 120s is a scoreboard staleness budget, not a system property: this is how long a
       # participant would be looking at a scoreboard that does not yet include a judged
       # submission. Replace it with whatever the contest actually tolerates.
       - alert: ContestOutboxDrainTimeTooLong
-        expr: oj:contest_outbox_estimated_drain:seconds > 120
+        expr: oj:contest_scoreboard_estimated_drain:seconds > 120
         for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "{{ $labels.outbox }} outbox needs {{ $value | humanizeDuration }} to drain"
+          summary: "Scoreboard pending events need {{ $value | humanizeDuration }} to drain"
           description: >-
-            Backlog divided by the drain rate of the last five minutes. Sustained for two minutes,
-            so a burst that the workers absorb does not reach here. An infinite value means the
-            backlog is not draining at all. Both outboxes are persistent in MySQL and neither has
-            a purge policy, so this does not self-correct by dropping work.
+            Events not yet applied to the scoreboard divided by the apply rate of the last five
+            minutes. Sustained for two minutes, so a burst that the consumer absorbs does not reach
+            here. An infinite value means the pending work is not draining at all.
 
       # The half the drain estimate cannot see. One row stuck at the head while the rest of the
       # backlog drains normally leaves the estimate healthy, so this reads the age of the head of
       # the queue directly.
       - alert: ContestOutboxHeadOfLineStalled
-        expr: contest_outbox_head_lag_seconds > 60
+        expr: contest_scoreboard_oldest_ready_seconds > 60
         for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "Head of the {{ $labels.outbox }} outbox has waited {{ $value | humanizeDuration }}"
+          summary: "Oldest ready scoreboard event has waited {{ $value | humanizeDuration }}"
           description: >-
-            The oldest claimable row has been claimable this long without being picked up. The
-            judge relay polls every 100ms and the scoreboard worker every 200ms on batch-1, so a
-            minute here is four hundred missed polls rather than a slow one.
+            The oldest event ready for scoreboard application has waited this long without being
+            picked up. Work in retry backoff or an active processing lease is deliberately not
+            included; implementation-specific status metrics carry those states.
 
       # Without this, a poller that stopped querying looks exactly like a backlog that cleared:
       # the gauges hold their last value rather than falling to zero, precisely so that they do
       # not lie in the other direction.
       - alert: ContestOutboxBacklogUnobserved
-        expr: rate(contest_outbox_backlog_poll_failures_total[5m]) > 0
+        expr: rate(contest_scoreboard_observation_failures_total[5m]) > 0
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Outbox backlog queries are failing on {{ $labels.node }}"
+          summary: "Scoreboard pending-work observation is failing on {{ $labels.node }}"
           description: >-
-            Every other alert in this group is reading gauges that are no longer being refreshed.
-            Treat their values as stale rather than as evidence.
+            The pending-events and oldest-ready gauges are no longer being refreshed. Treat their
+            values as stale rather than as evidence.
 
   - name: oj-submission-alerts
     rules:

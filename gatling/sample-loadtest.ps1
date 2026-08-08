@@ -28,8 +28,9 @@ $jvmCsv = Join-Path $OutputDirectory "jvm-metrics.csv"
 $prometheusUrl = "http://127.0.0.1:9090"
 
 # One statement keeps the whole pipeline snapshot on a single MySQL round trip. The lag subquery
-# deliberately matches contest_outbox_head_lag_seconds for both outboxes: PENDING only, ordered
-# through each claim index, with MySQL's clock on both sides of the subtraction.
+# deliberately matches contest_scoreboard_oldest_ready_seconds for the scoreboard and the legacy
+# contest_outbox_head_lag_seconds diagnostic for both outboxes: PENDING only, ordered through each
+# claim index, with MySQL's clock on both sides of the subtraction.
 $pipelineSql = @(
     "SELECT"
     "(SELECT COUNT(*) FROM contest_judge_outbox WHERE status <> 'PUBLISHED'),"

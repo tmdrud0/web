@@ -65,6 +65,7 @@ class ContestJudgeOutboxRelayTests {
 
         assertThat(counter("contest.outbox.drained")).isEqualTo(7.0);
         assertThat(counter("contest.outbox.retries")).isEqualTo(2.0);
+        assertThat(registry.get("contest.scoreboard.applied").counter().count()).isZero();
     }
 
     private double counter(String name) {

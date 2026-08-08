@@ -750,7 +750,7 @@
     {
       "id": 450,
       "type": "row",
-      "title": "Outbox backlog (batch role)",
+      "title": "Scoreboard application health",
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 61 },
       "panels": []
@@ -758,8 +758,8 @@
     {
       "id": 23,
       "type": "timeseries",
-      "title": "Rows waiting in each outbox",
-      "description": "The two positions in the pipeline history section 7 table that hold load in MySQL with no ceiling. Every other queue in that table is bounded - by the admission semaphore, by a fixed executor queue, or by the broker - so a run that overruns capacity settles here. PUBLISHED and COMPLETED rows are deliberately not counted: they are not backlog, and counting them would tie the query cost to table size, which has no purge policy yet (pipeline history 9.4). Read alongside drain rate, never as an absolute. Published by batch-1 alone, since a table's backlog is not a per-process quantity.",
+      "title": "Scoreboard pending events",
+      "description": "Judged results not yet applied to the scoreboard. This is the implementation-neutral comparison axis: the current implementation derives it from all non-terminal scoreboard outbox states, while a stream implementation will publish consumer lag under the same name. Read alongside apply rate, never as an absolute.",
       "gridPos": { "h": 8, "w": 6, "x": 0, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
@@ -777,16 +777,16 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (outbox, status) (contest_outbox_backlog_rows)",
-          "legendFormat": "{{outbox}} {{status}}"
+          "expr": "sum(contest_scoreboard_pending_events)",
+          "legendFormat": "pending"
         }
       ]
     },
     {
       "id": 24,
       "type": "timeseries",
-      "title": "Head-of-line lag",
-      "description": "How long the row at the head of each outbox has been claimable without being claimed, measured on the MySQL clock against the same column the worker claims on. This is the half a drain-rate estimate cannot see: one row stuck at the front while the rest of the backlog drains normally leaves the estimate healthy and moves this instead. Zero also means an empty outbox, so read it next to the row counts.",
+      "title": "Oldest ready scoreboard event",
+      "description": "How long the oldest event ready for scoreboard application has waited. This is the half a drain-rate estimate cannot see: one event stuck at the front while the rest drains normally leaves the estimate healthy and moves this instead. Retry backoff and active processing leases are excluded, so inspect the implementation diagnostics below for those states.",
       "gridPos": { "h": 8, "w": 6, "x": 6, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
@@ -804,16 +804,16 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "contest_outbox_head_lag_seconds",
-          "legendFormat": "{{outbox}}"
+          "expr": "contest_scoreboard_oldest_ready_seconds",
+          "legendFormat": "oldest ready"
         }
       ]
     },
     {
       "id": 25,
       "type": "timeseries",
-      "title": "Drain and retry rate",
-      "description": "Rows per second reaching a terminal state, against rows put back for another attempt. Only applied updates are counted: a claim whose lease had already expired changed no row and left the event in the backlog. A retry rate rising against a flat drain rate is a stuck pipeline rather than a slow one, and the two are indistinguishable from the backlog count alone.",
+      "title": "Scoreboard apply and retry rate",
+      "description": "Events per second applied to the scoreboard, against the current outbox implementation's retries. The apply series is implementation-neutral and counts only successful state changes; the retry series remains an implementation diagnostic.",
       "gridPos": { "h": 8, "w": 6, "x": 12, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
@@ -831,13 +831,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (outbox) (rate(contest_outbox_drained_total[$__rate_interval]))",
-          "legendFormat": "{{outbox}} drained"
+          "expr": "sum(rate(contest_scoreboard_applied_total[$__rate_interval]))",
+          "legendFormat": "applied"
         },
         {
           "refId": "B",
-          "expr": "sum by (outbox) (rate(contest_outbox_retries_total[$__rate_interval]))",
-          "legendFormat": "{{outbox}} retried"
+          "expr": "sum(rate(contest_outbox_retries_total{outbox=\"scoreboard\"}[$__rate_interval]))",
+          "legendFormat": "outbox retried"
         }
       ]
     },
@@ -845,7 +845,7 @@
       "id": 26,
       "type": "timeseries",
       "title": "Estimated drain time",
-      "description": "backlog / recent drain rate, the figure pipeline history 9.2 asks for: a queue depth on its own says nothing about whether a contest can wait for it. From the recording rule in observability/prometheus/rules/oj-pipeline.yml, which is also what the drain-time alert fires on. No line at all means the backlog is empty. A line pinned at the top means the backlog is not moving - the rule leaves that as +Inf on purpose rather than papering over a division by zero.",
+      "description": "scoreboard pending events / recent apply rate, the figure pipeline history 9.2 asks for: a queue depth on its own says nothing about whether a contest can wait for it. From the implementation-neutral recording rule in observability/prometheus/rules/oj-pipeline.yml, which is also what the drain-time alert fires on. No line at all means pending is empty. A line pinned at the top means work is not moving - the rule leaves that as +Inf on purpose rather than papering over a division by zero.",
       "gridPos": { "h": 8, "w": 6, "x": 18, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
@@ -870,7 +870,61 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "oj:contest_outbox_estimated_drain:seconds",
+          "expr": "oj:contest_scoreboard_estimated_drain:seconds",
+          "legendFormat": "scoreboard"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Outbox status diagnostics",
+      "description": "Implementation-specific state counts retained for diagnosis. They explain why pending work is not moving: PENDING is ready, PROCESSING owns a lease, FAILED is in retry backoff, and PUBLISHING is awaiting broker confirmation. A future stream implementation may replace this panel without changing the neutral scoreboard panels above.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 70 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 20, "showPoints": "never", "stacking": { "mode": "normal" } }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outbox, status) (contest_outbox_backlog_rows)",
+          "legendFormat": "{{outbox}} {{status}}"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Outbox PENDING head lag diagnostics",
+      "description": "Implementation-specific PENDING-row age for both outboxes. The scoreboard series is the source of the current implementation-neutral oldest-ready gauge; judge remains a separate relay diagnostic.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 70 },
+      "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": { "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "contest_outbox_head_lag_seconds",
           "legendFormat": "{{outbox}}"
         }
       ]
@@ -880,7 +934,7 @@
       "type": "row",
       "title": "RabbitMQ",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 70 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 78 },
       "panels": []
     },
     {
@@ -888,7 +942,7 @@
       "type": "timeseries",
       "title": "Messages ready (judge backlog)",
       "description": "Aggregated across queues. Per-queue breakdown needs the /metrics/detailed endpoint. Read this together with drain rate, not as an absolute count (pipeline history 10.4).",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 71 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 79 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -919,7 +973,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Publish / deliver / ack rate",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 71 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 79 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
         "defaults": {

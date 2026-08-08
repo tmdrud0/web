@@ -129,12 +129,15 @@ public class ContestOutboxBacklogMetrics implements MeterBinder {
     private final int maxCountedRows;
     private final Map<BacklogKey, AtomicLong> backlogRows = new LinkedHashMap<>();
     private final Map<String, AtomicLong> headLagMicros = new LinkedHashMap<>();
+    private final AtomicLong scoreboardPendingEvents = new AtomicLong();
 
     /**
      * A composite registry with no children discards every recording, so the counter is usable
      * before Spring binds this to the real registry.
      */
     private volatile Counter pollFailures = pollFailureCounter(new CompositeMeterRegistry());
+    private volatile Counter scoreboardObservationFailures =
+            scoreboardObservationFailureCounter(new CompositeMeterRegistry());
 
     public ContestOutboxBacklogMetrics(JdbcTemplate jdbcTemplate, ContestOutboxMetricsProperties properties) {
         this.jdbcTemplate = jdbcTemplate;
@@ -164,7 +167,20 @@ public class ContestOutboxBacklogMetrics implements MeterBinder {
                         + "counts carry those. Unlike a drain-rate estimate this still moves when "
                         + "one row is stuck behind a backlog that is otherwise draining")
                 .register(registry));
+        Gauge.builder("contest.scoreboard.pending", scoreboardPendingEvents, AtomicLong::get)
+                .baseUnit("events")
+                .description("Judged results not yet applied to the scoreboard, independent of "
+                        + "whether the implementation stores them in an outbox or a stream")
+                .register(registry);
+        Gauge.builder("contest.scoreboard.oldest.ready", headLagMicros.get(ContestOutboxDrainMetrics.SCOREBOARD_OUTBOX),
+                        value -> value.get() / 1_000_000.0)
+                .baseUnit("seconds")
+                .description("Age of the oldest event that is ready to be applied to the "
+                        + "scoreboard. Work in retry backoff or an active processing lease is "
+                        + "pending but not ready, so it is deliberately excluded")
+                .register(registry);
         this.pollFailures = pollFailureCounter(registry);
+        this.scoreboardObservationFailures = scoreboardObservationFailureCounter(registry);
     }
 
     private static Counter pollFailureCounter(MeterRegistry registry) {
@@ -172,6 +188,13 @@ public class ContestOutboxBacklogMetrics implements MeterBinder {
                 .description("Backlog queries that failed. The gauges hold their last value "
                         + "rather than falling to zero, so a flat backlog next to a rising count "
                         + "here means the poller stopped looking, not that the backlog cleared")
+                .register(registry);
+    }
+
+    private static Counter scoreboardObservationFailureCounter(MeterRegistry registry) {
+        return Counter.builder("contest.scoreboard.observation.failures")
+                .description("Failures while refreshing the implementation-neutral scoreboard "
+                        + "pending and oldest-ready gauges; their previous values remain visible")
                 .register(registry);
     }
 
@@ -207,11 +230,20 @@ public class ContestOutboxBacklogMetrics implements MeterBinder {
             // queries are PENDING-only, and a PENDING row is due from the moment it is written.
             Long lagMicros = headLag.isEmpty() ? null : headLag.get(0);
             headLagMicros.get(outbox).set(lagMicros == null ? 0L : Math.max(0L, lagMicros));
+            if (ContestOutboxDrainMetrics.SCOREBOARD_OUTBOX.equals(outbox)) {
+                long pending = STATUSES.get(outbox).stream()
+                        .mapToLong(status -> backlogRows.get(new BacklogKey(outbox, status)).get())
+                        .sum();
+                scoreboardPendingEvents.set(pending);
+            }
         } catch (RuntimeException e) {
             // Wider than DataAccessException on purpose. Anything that stops the poll leaves the
             // gauges stale, and the alert that says so reads this counter - so every way of
             // failing has to reach it, not only the ones the JDBC layer translates.
             pollFailures.increment();
+            if (ContestOutboxDrainMetrics.SCOREBOARD_OUTBOX.equals(outbox)) {
+                scoreboardObservationFailures.increment();
+            }
             log.warn("Failed to read {} outbox backlog; gauges keep their previous values", outbox, e);
         }
     }

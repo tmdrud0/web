@@ -180,12 +180,12 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
 4. `histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{role="web"}[5m])))`
    가 값을 반환하는지 본다. 비어 있으면 히스토그램 버킷이 꺼진 것이다.
 5. Grafana의 `OJ` 폴더에 `OJ - Bottleneck Overview` 대시보드가 있는지 본다.
-6. `contest_outbox_backlog_rows`가 **5개 시계열**을 반환하는지 본다. judge 2개(PENDING,
-   PUBLISHING)와 scoreboard 3개(PENDING, PROCESSING, FAILED)다. 이보다 많으면 batch-1 외의
-   역할에서도 폴러가 켜진 것이고, 그러면 `sum()`이 backlog를 인스턴스 수만큼 부풀린다.
-   `count by (node) (contest_outbox_backlog_rows)`가 `batch-1` 하나만 내야 한다.
+6. `contest_scoreboard_pending_events`가 `batch-1`의 **한 시계열**만 반환하는지 본다. 진단용
+   `contest_outbox_backlog_rows`는 judge 2개(PENDING, PUBLISHING)와 scoreboard 3개(PENDING,
+   PROCESSING, FAILED), 합계 5개이며 `count by (node) (...)`는 `batch-1` 하나만 내야 한다.
+   다른 역할에서도 gauge 폴러가 켜지면 `sum()`이 backlog를 인스턴스 수만큼 부풀린다.
 7. Prometheus `Status > Rule Health`에서 규칙 그룹 4개가 모두 `OK`인지 본다.
-   `oj:contest_outbox_estimated_drain:seconds`가 비어 있으면 backlog 지표가 올라오지 않은
+   `oj:contest_scoreboard_estimated_drain:seconds`가 비어 있으면 pending/apply 지표가 올라오지 않은
    것이다(6번). 값이 없는 것과 0인 것은 다르다 — 빈 outbox는 0/0이라 NaN이고, 시계열 자체는
    존재한다.
 8. Prometheus `Status > Runtime & Build Information`의 Alertmanagers에 `alertmanager:9093`이
@@ -245,8 +245,9 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
   폴링 주기만큼 과거다. 질의가 실패하면 게이지는 **0으로 떨어지지 않고 직전 값을 유지한다.**
   0은 "backlog가 없다"는 뜻이라 실패 상황에서 정확히 반대로 읽히기 때문이다. 그래서 "backlog가
   평평하다"와 "보는 것을 멈췄다"는 게이지만으로 구분되지 않는다. 구분해 주는 것은
-  `contest_outbox_backlog_poll_failures_total`이고 `ContestOutboxBacklogUnobserved` 알림이
-  이 값을 본다.
+  공통 계층에서는 `contest_scoreboard_observation_failures_total`이고
+  `ContestOutboxBacklogUnobserved` 알림이 이 값을 본다. 기존
+  `contest_outbox_backlog_poll_failures_total`도 구현 진단용으로 유지한다.
 - **backlog 개수는 상한에서 잘린다.** 질의는 파생 테이블의 `LIMIT`로 스캔을 묶는다
   (`contest.outbox.metrics.max-counted-rows`, 기본 100000). backlog가 상한을 넘으면 게이지는
   상한값을 보고하므로 **실제보다 작은 값**이다. 모든 알림 임계값은 상한보다 한참 아래이므로
@@ -454,11 +455,38 @@ DB outbox 행을 남기면** 다음 실행이 같은 번호를 다시 발급하�
 `gatling/run-loadtest.ps1`의 `Reset-LoadRedis`가 `FLUSHDB`와 함께 두 outbox 테이블을 비우는
 이유가 이것이다. Redis와 그 두 테이블은 한 덩어리 상태이고, 절반만 비우면 안 된다.
 
-## 10. outbox backlog 지표
+## 10. scoreboard pending과 outbox 진단 지표
 
-`docs/CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §7 표에서 상한 없이 자라는 대기 위치는 두
-outbox뿐이다. 나머지는 semaphore, 고정 크기 executor 큐, broker가 각각 묶고 있다. 그래서
-용량을 넘긴 실행은 결국 여기에 앉는다.
+운영 판단의 질문은 저장 구조가 아니라 **"채점은 끝났지만 아직 scoreboard에 반영되지 않은
+결과가 얼마나 많고, 그중 바로 처리할 수 있는 가장 오래된 것은 얼마나 기다렸는가"**다. 현재
+구현에서는 답이 `contest_submission_outbox`에 있지만 RabbitMQ Stream 구현에서는 consumer lag에
+있다. 구현 이름을 직접 읽으면 before/after 공통 축이 사라지므로 지표를 두 층으로 나눈다.
+
+### 왜 두 층인가
+
+| 층 | 목적 | 안정성 |
+|---|---|---|
+| scoreboard 공통 계층 | 구현 비교, recording rule, 알림, 주 대시보드 | outbox/stream 모두 같은 이름과 의미 |
+| 구현 진단 계층 | PENDING·PROCESSING·FAILED·PUBLISHING, retry 등 원인 분해 | 구현과 함께 바뀔 수 있음 |
+
+공통 `pending`은 아직 적용되지 않은 모든 이벤트를 센다. 현재 outbox에서는
+`PENDING + PROCESSING + FAILED`이고, Stream에서는 같은 의미의 consumer lag가 된다. 반면 나이는
+`oldest_unapplied`가 아니라 **`oldest_ready`**라고 부른다. 아래 기존 판단대로 backoff 중인
+FAILED와 lease 안의 PROCESSING은 의도적으로 제외하며, 지금 당장 소비할 수 있는 PENDING만 보기
+때문이다. `unapplied`라고 부르면 한 시간 된 FAILED도 포함한다고 오해하게 된다.
+
+공통 계층은 기존 outbox 폴러와 완료 기록이 가진 값을 그대로 공유한다. 새 DB 질의나 별도 갱신
+주기가 없어서 같은 scrape에서 아래 대응은 정확히 같다.
+
+| 공통 meter | 노출 이름 | 현재 outbox 구현의 원천 | 게시 주체 |
+|---|---|---|---|
+| `contest.scoreboard.pending` | `contest_scoreboard_pending_events` | scoreboard non-terminal 상태 합 | batch-1 |
+| `contest.scoreboard.oldest.ready` | `contest_scoreboard_oldest_ready_seconds` | scoreboard PENDING head lag | batch-1 |
+| `contest.scoreboard.applied` | `contest_scoreboard_applied_total` | scoreboard COMPLETED 적용 수 | 5개 역할 등록, batch-1만 증가 |
+| `contest.scoreboard.observation.failures` | `contest_scoreboard_observation_failures_total` | scoreboard gauge 갱신 실패 | batch-1 |
+
+기존 outbox 전용 지표는 삭제하지 않는다. 상태별 count와 retry는 공통 지표가 나빠진 이유를
+구분하는 데 필요하다.
 
 | meter | 종류 | 노출 이름 | 게시 주체 |
 |---|---|---|---|
@@ -468,19 +496,20 @@ outbox뿐이다. 나머지는 semaphore, 고정 크기 executor 큐, broker가 �
 | `contest.outbox.drained` | Counter (`outbox`) | `contest_outbox_drained_total` | 5개 역할 전부 등록, batch-1만 증가 |
 | `contest.outbox.retries` | Counter (`outbox`) | `contest_outbox_retries_total` | 5개 역할 전부 등록, batch-1만 증가 |
 
-drained/retries 두 카운터는 §9.4의 제출 파이프라인 지표처럼 다섯 역할 전부에서 등록된다.
+applied/drained/retries 세 카운터는 §9.4의 제출 파이프라인 지표처럼 다섯 역할 전부에서 등록된다.
 `ContestOutboxDrainMetrics`가 조건 없는 `@Component`여야 relay와 scheduler가 주입받을 수 있기
 때문이다. 실측으로 web-1·web-2·judge-1에도 시계열이 있는 것을 확인했다.
 
-**그런데 여기에는 `{role=...}` 필터를 붙이지 않았다.** §9.4와 다른 판단이고 이유가 있다.
-증가시키는 코드(relay, scheduler)는 batch-1에만 존재하므로 나머지 네 인스턴스의 값은 영원히
-정확히 0이다. 0인 시계열을 더해도 합은 변하지 않으므로 `sum()`이 정확하다. §9.4에서 필터가
-필요했던 것은 상한 게이지가 **0이 아닌 상수**를 다섯 번 보고해서 분모가 2.5배가 됐기
-때문이다.
+**공통/진단 계층 모두 `{role=...}` 필터를 붙이지 않았다.** applied와 기존 drained/retries를
+증가시키는 코드는 batch-1에만 존재하므로 나머지 네 인스턴스의 값은 영원히 정확히 0이다. 0인
+시계열을 더해도 합은 변하지 않으므로 `sum()`이 정확하다. 공통 gauge와 outbox gauge는
+batch-1에서만 등록된다. §9.4에서 필터가 필요했던 것은 상한 gauge가 **0이 아닌 상수**를 다섯
+번 보고해서 분모가 2.5배가 됐기 때문이다.
 
 즉 판단 기준은 "몇 개 인스턴스가 등록하는가"가 아니라 **"등록만 하는 인스턴스가 0을 보고하는가
-아닌가"**다. 0이면 합산이 정확하고, 상수면 배수가 된다. `contest_outbox_backlog_rows`와
-`head_lag`는 batch-1에서만 등록되므로(위 표) 애초에 이 문제가 없다.
+아닌가"**다. 0이면 합산이 정확하고, 상수면 배수가 된다. 이 양방향은
+`PipelineMetricNamesTests`가 고정한다. `contest_submission_*` 질의에는 role이 필요하고,
+`contest_scoreboard_*`와 `contest_outbox_*` 질의에는 web-role 필터가 없어야 한다.
 
 ### 앱 게이지인가 별도 exporter인가
 
@@ -524,8 +553,9 @@ drained/retries 두 카운터는 §9.4의 제출 파이프라인 지표처럼 �
 소유하므로 읽는 것도 batch-1이 한다. `contest.outbox.metrics.enabled=false`가 web-role과
 judge-role에 있다.
 
-실측으로 `count(contest_outbox_backlog_rows)`가 5개(judge 2개 + scoreboard 3개),
-`count by (node) (...)`가 `batch-1` 하나만 반환하는 것을 확인했다.
+실측으로 `count(contest_scoreboard_pending_events)`가 1개,
+`count(contest_outbox_backlog_rows)`가 5개(judge 2개 + scoreboard 3개)이며 둘 다
+`count by (node) (...)`가 `batch-1` 하나만 반환하는 것을 확인한다.
 
 ### 왜 스크레이프 경로에서 질의하지 않는가
 
@@ -629,6 +659,36 @@ drain 속도만 제한한 것이다.
 3. **17:58:09 → 17:58:13.** worker를 정상 설정으로 되돌리자 2478행이 한 샘플 안에 빠졌다.
    500행/200ms면 약 1초 분량이므로 계산과 맞는다.
 
+### 구현 중립/진단 곡선 등가성 실측
+
+2026-08-08 `submit-100`의 새 contest 22에서 batch-1을 잠깐 pause해 PENDING 행을 만든 뒤,
+MySQL locking read로 그 행들을 잡았다. batch를 다시 살리면 worker는 `SKIP LOCKED`로 건너뛰지만
+metric 폴러와 Prometheus scrape는 계속 동작하므로 backlog와 alert의 상승·회복을 실제 코드로
+검증할 수 있다. 이는 고의 장애 실행이라 하네스의 paused-container 안전검사가 실패했으며 구현
+성능 비교 표본으로 쓰지 않는다.
+
+Prometheus의 같은 시각 range sample에서 새 값과 기존 outbox 값의 절댓값 차이를 계산했다.
+
+| 비교 | sample 수 | 최대 차이 | 0이 아닌 sample |
+|---|---:|---:|---:|
+| `pending_events` vs scoreboard 상태 합 | 105 | 0 | 0 |
+| `oldest_ready` vs scoreboard head lag | 105 | 0s | 0 |
+| `applied_total` vs scoreboard drained | 126 | 0 | 0 |
+| 새/기존 drain `> 120s` predicate | 109 | 0 | 0 |
+| 새/기존 oldest-ready `> 60s` predicate | 105 | 0 | 0 |
+
+잠금 중 관측한 대표 동시 sample은 pending `2052 = 2052`, oldest-ready
+`326.333741s = 326.333741s`, 5분 applied rate `0 = 0`, estimated drain `+Inf`였다.
+`ContestOutboxHeadOfLineStalled`는 14:07:57~14:12:57, `ContestOutboxDrainTimeTooLong`은
+14:12:12~14:12:57에 실제 `firing`이었다. alert ID는 기존 라우팅·대시보드 이력 호환성을 위해
+유지했지만 두 predicate가 모든 sample에서 같으므로 기존 outbox 식도 같은 평가 시점에 같은
+상태가 된다.
+
+정상 부하에서 공통/기존 observation failure counter는 둘 다 0이었다. 단위 테스트는 scoreboard
+질의를 실패시켜 두 counter가 같은 catch 경로에서 함께 1 증가하고 두 공통 gauge가 직전 값을
+유지하는 것도 고정한다. 잠금을 풀자 judge backlog는 0, scoreboard는 19,237건 전부 COMPLETED로
+회복했고 두 alert도 inactive로 돌아왔다.
+
 ### 제출 단위 end-to-end staleness
 
 `gatling/run-loadtest.ps1`은 drain과 정합성 검사가 끝난 뒤, 같은 제출의 시작과 종점을 직접
@@ -700,7 +760,7 @@ scoreboard applied  p50 0.607s  p95 4.046s  p99 4.921s  max 13.270s   n=35865
 먼저 의심한다. 재시도가 섞인 실행에서는 같은 조건인데도 p99가 31초, max가 178초까지 벌어졌다.
 
 하네스는 scoreboard p99와 같은 제출+drain 구간에서 샘플링한
-`contest_outbox_head_lag_seconds{outbox="scoreboard"}` 최댓값의 비율도 계산한다. 두 양수 값의
+`contest_scoreboard_oldest_ready_seconds`와 같은 정의로 샘플링한 최댓값의 비율도 계산한다. 두 양수 값의
 비율이 10배 미만이면 `PASS`, 아니면 `MISMATCH`다. `mixed`에서 샘플이 없거나 `MISMATCH`이면
 실행을 실패시킨다. 이는 두 값이 같은 통계라는 뜻이 아니라, end-to-end SQL이 scoreboard
 backlog와 무관한 시각을 잘못 빼는 오류를 잡는 자릿수 교차 검증이다.
@@ -848,27 +908,30 @@ p95 throttle만 재기동과 함께 순간적으로 올랐다. GC와 heap도 반
 
 규칙은 `observability/prometheus/rules/oj-pipeline.yml`에 있고 Prometheus가 기동 시 문법을
 검사한다. 잘못된 규칙 파일은 그 안의 알림만 조용히 꺼지는 게 아니라 Prometheus를 멈춘다.
+아래 세 `ContestOutbox*` alert ID는 기존 Alertmanager route와 이력을 끊지 않기 위해 유지하지만,
+표현식과 annotation은 `contest_scoreboard_*` 공통 계층만 읽는다.
 
 | 알림 | 조건 | for | 등급 |
 |---|---|---:|---|
-| `ContestOutboxDrainTimeTooLong` | 예상 drain 시간 > 120s | 2m | warning |
-| `ContestOutboxHeadOfLineStalled` | head lag > 60s | 2m | warning |
-| `ContestOutboxBacklogUnobserved` | backlog 질의 실패 발생 | 5m | warning |
+| `ContestOutboxDrainTimeTooLong` | scoreboard 예상 drain 시간 > 120s | 2m | warning |
+| `ContestOutboxHeadOfLineStalled` | scoreboard oldest-ready > 60s | 2m | warning |
+| `ContestOutboxBacklogUnobserved` | scoreboard 공통 gauge 갱신 실패 | 5m | warning |
 | `ContestSubmissionShedding` | 503 shed rate > 0 | 2m | warning |
 | `ContestSubmissionCompletionSaturated` | CallerRuns rate > 0 | 5m | warning |
 | `OjAppInstanceDown` | `up{job="oj-app"} == 0` | 1m | critical |
 | `OjAppInstanceRestarted` | 10분 내 `process_start_time_seconds` 변화 | — | critical |
 
-`estimated_drain_seconds = backlog_count / recent_sustainable_throughput`(파이프라인 히스토리
+`estimated_drain_seconds = scoreboard_pending / recent_scoreboard_apply_rate`(파이프라인 히스토리
 §9.2)는 recording
 rule 3개로 들어갔다. 대시보드 패널과 알림이 같은 규칙을 읽으므로 정의가 하나다.
 
 drain rate가 0이면 결과는 `+Inf`다. 나누기를 방어하지 않은 것은 의도다. 움직이지 않는
-backlog에는 유한한 drain 시간이 없고, 그 상태가 가장 알림이 필요한 상태다. 방어하면 그래프에
-구멍이 생긴다. 빈 outbox는 0/0이라 `NaN`이고 모든 비교에서 false이므로 놀고 있는 스택은
+pending work에는 유한한 drain 시간이 없고, 그 상태가 가장 알림이 필요한 상태다. 방어하면
+그래프에 구멍이 생긴다. 빈 scoreboard pipeline은 0/0이라 `NaN`이고 모든 비교에서 false이므로
+놀고 있는 스택은
 조용하다.
 
-head lag를 따로 두는 이유는 drain rate가 볼 수 없는 절반이 있기 때문이다. 뒤쪽 backlog가
+oldest-ready를 따로 두는 이유는 drain rate가 볼 수 없는 절반이 있기 때문이다. 뒤쪽 backlog가
 정상적으로 빠지는 동안 맨 앞 행 하나가 막혀 있으면 예상 drain 시간은 건강하게 나온다.
 
 **CPU throttling 알림은 일부러 만들지 않았다.** §8이 부하 없이도 모든 인스턴스에서 61~78%를

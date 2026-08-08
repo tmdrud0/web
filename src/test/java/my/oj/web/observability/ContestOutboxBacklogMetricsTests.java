@@ -62,6 +62,7 @@ class ContestOutboxBacklogMetricsTests {
         assertThat(backlog("scoreboard", "PENDING")).isEqualTo(40.0);
         assertThat(backlog("scoreboard", "PROCESSING")).isEqualTo(6.0);
         assertThat(backlog("scoreboard", "FAILED")).isEqualTo(2.0);
+        assertThat(scoreboardPending()).isEqualTo(48.0);
     }
 
     /**
@@ -106,6 +107,7 @@ class ContestOutboxBacklogMetricsTests {
         metrics.poll();
 
         assertThat(headLag("scoreboard")).isEqualTo(4.25);
+        assertThat(scoreboardOldestReady()).isEqualTo(4.25);
     }
 
     /**
@@ -162,6 +164,24 @@ class ContestOutboxBacklogMetricsTests {
         metrics.poll();
 
         assertThat(backlog("scoreboard", "PENDING")).isEqualTo(77.0);
+        assertThat(scoreboardPending()).isEqualTo(77.0);
+        assertThat(registry.get("contest.scoreboard.observation.failures").counter().count()).isZero();
+    }
+
+    @Test
+    void keepsNeutralValuesAndReportsWhenTheScoreboardQueryFails() {
+        stubBacklog("contest_submission_outbox", Map.of("PENDING", 81L, "FAILED", 4L));
+        stubHeadLag("contest_submission_outbox", List.of(7_500_000L));
+        metrics.poll();
+
+        when(jdbcTemplate.query(contains("contest_submission_outbox"), any(RowMapper.class), anyInt()))
+                .thenThrow(new QueryTimeoutException("statement cancelled"));
+        metrics.poll();
+
+        assertThat(scoreboardPending()).isEqualTo(85.0);
+        assertThat(scoreboardOldestReady()).isEqualTo(7.5);
+        assertThat(registry.get("contest.outbox.backlog.poll.failures").counter().count()).isEqualTo(1.0);
+        assertThat(registry.get("contest.scoreboard.observation.failures").counter().count()).isEqualTo(1.0);
     }
 
     /**
@@ -177,6 +197,9 @@ class ContestOutboxBacklogMetricsTests {
         assertThat(prometheus.scrape())
                 .contains("contest_outbox_backlog_rows")
                 .contains("contest_outbox_head_lag_seconds")
+                .contains("contest_scoreboard_pending_events")
+                .contains("contest_scoreboard_oldest_ready_seconds")
+                .contains("contest_scoreboard_observation_failures_total")
                 .contains("outbox=\"judge\"")
                 .contains("outbox=\"scoreboard\"");
     }
@@ -189,6 +212,14 @@ class ContestOutboxBacklogMetricsTests {
 
     private double headLag(String outbox) {
         return registry.get("contest.outbox.head.lag").tag("outbox", outbox).gauge().value();
+    }
+
+    private double scoreboardPending() {
+        return registry.get("contest.scoreboard.pending").gauge().value();
+    }
+
+    private double scoreboardOldestReady() {
+        return registry.get("contest.scoreboard.oldest.ready").gauge().value();
     }
 
     @SuppressWarnings("unchecked")

@@ -70,6 +70,7 @@ class ContestOutboxBacklogMetricsMySqlIntegrationTests {
         double judgePublishingBefore = backlog("judge", "PUBLISHING");
         double scoreboardPendingBefore = backlog("scoreboard", "PENDING");
         double scoreboardFailedBefore = backlog("scoreboard", "FAILED");
+        double neutralPendingBefore = scoreboardPending();
 
         insertJudgeOutbox("PENDING", 0);
         insertJudgeOutbox("PENDING", 0);
@@ -83,6 +84,7 @@ class ContestOutboxBacklogMetricsMySqlIntegrationTests {
         assertThat(backlog("judge", "PUBLISHING") - judgePublishingBefore).isEqualTo(1.0);
         assertThat(backlog("scoreboard", "PENDING") - scoreboardPendingBefore).isEqualTo(1.0);
         assertThat(backlog("scoreboard", "FAILED") - scoreboardFailedBefore).isEqualTo(1.0);
+        assertThat(scoreboardPending() - neutralPendingBefore).isEqualTo(2.0);
     }
 
     /**
@@ -128,6 +130,7 @@ class ContestOutboxBacklogMetricsMySqlIntegrationTests {
         assertThat(backlog("scoreboard", "PENDING")
                 + backlog("scoreboard", "PROCESSING")
                 + backlog("scoreboard", "FAILED")).isEqualTo(2.0);
+        assertThat(scoreboardPending()).isEqualTo(2.0);
     }
 
     /**
@@ -144,6 +147,7 @@ class ContestOutboxBacklogMetricsMySqlIntegrationTests {
 
         assertThat(headLag("judge")).isGreaterThanOrEqualTo(90.0);
         assertThat(headLag("scoreboard")).isGreaterThanOrEqualTo(90.0);
+        assertThat(scoreboardOldestReady()).isEqualTo(headLag("scoreboard"));
     }
 
     /**
@@ -168,6 +172,7 @@ class ContestOutboxBacklogMetricsMySqlIntegrationTests {
         assertThat(headLag("scoreboard"))
                 .as("an hour-old FAILED row is a stuck row, not a deep queue")
                 .isZero();
+        assertThat(scoreboardOldestReady()).isZero();
     }
 
     /** The same row set, plus one PENDING row, which is the one the age is meant to see. */
@@ -181,6 +186,7 @@ class ContestOutboxBacklogMetricsMySqlIntegrationTests {
         metrics.poll();
 
         assertThat(headLag("scoreboard")).isBetween(45.0, 3_000.0);
+        assertThat(scoreboardOldestReady()).isEqualTo(headLag("scoreboard"));
     }
 
     private ContestOutboxBacklogMetrics metrics(int maxCountedRows) {
@@ -198,6 +204,14 @@ class ContestOutboxBacklogMetricsMySqlIntegrationTests {
 
     private double headLag(String outbox) {
         return registry.get("contest.outbox.head.lag").tag("outbox", outbox).gauge().value();
+    }
+
+    private double scoreboardPending() {
+        return registry.get("contest.scoreboard.pending").gauge().value();
+    }
+
+    private double scoreboardOldestReady() {
+        return registry.get("contest.scoreboard.oldest.ready").gauge().value();
     }
 
     /** @param createdSecondsFromNow negative to age the row, on MySQL's clock rather than the JVM's */
