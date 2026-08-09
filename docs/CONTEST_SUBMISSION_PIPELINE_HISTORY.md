@@ -1368,3 +1368,156 @@ RabbitMQ → judge×2 → Redis scoreboard 경로를 격리 스택으로 측정�
 
 `rewriteBatchedStatements=true`는 유지했다. 기능·통합 테스트는 통과했으며, 평균 chunk가
 58보다 커지는지와 2,500 TPS 천장이 유지되는지는 분리 부하 테스트로 다시 확인해야 한다.
+
+## 17. Scoreboard outbox와 RabbitMQ Stream 비교 (C단계)
+
+### 17.1 측정 범위와 판정 한계
+
+2026-08-09에 다음 두 commit을 [`ENVIRONMENT.md`](ENVIRONMENT.md)의 12 CPU/14GB WSL 예산과
+앱 7.5 CPU/9344M, 관측 2.2 CPU/2112M 상한에서 비교했다. 측정 직전 `docker info`도
+12 CPU, 14,655,565,824 bytes로 확인했다.
+
+- outbox: `751b774605f138558759ce68ebb72f54655c250f` (`master`)
+- stream: `925f9f3037edeb71af1a8e46c1574b5b6a8e9f5f` (A단계 `0569884`, B단계 포함)
+
+두 후보 모두 `compose.yaml + compose.loadtest.yaml + compose.observability.yaml`, 깨끗한 volume,
+`submit-100`, user 10,000/problem 5, 같은 자원 상한을 사용했다. 각 실행 전에 Prometheus
+12/12 target, `oj-app` 5/5, Rabbit 상세 exporter 1/1과 batch-1의 구현 중립 지표 한 시계열을
+두 scrape 연속 확인했다. 실행별 HTTP assertion/materialization, OOM, JVM 5개 관측,
+restart 0, throttle 중앙값 10% 이하, 최종 drain과 지표 파일도 검사했다.
+
+0단계의 원래 계약은 후보마다 최소 5회다. 작업 중 반복 시간이 너무 길다는 판단에 따라
+사용자가 후보별 최대 2회로 제한했으므로, 이번에는 시간순 첫 두 유효 실행만 사용했다.
+`summarize-c-stage-runs.ps1`의 기본값 5회는 유지하고 이번 실행에만 `-MinimumRuns 2`를
+명시했다. 따라서 아래 수치는 **제한된 관찰값**이며 통계적으로 확정된 성능 비교가 아니다.
+
+- outbox: `loadtest-20260809-095126`, `loadtest-20260809-095919`
+- stream: `loadtest-20260809-102435`, `loadtest-20260809-103035`
+
+초기 outbox 실행 5개(`085026`, `090022`, `090608`, `091155`, `091739`)는 Redis reset 뒤
+batch JVM이 Prometheus에 다시 나타나기 전에 부하가 시작된 실행이었다. judge outbox가
+3,700~5,300건까지 쌓이고 result p95가 34~48초가 되어 제외했다. 이후 harness에 위
+관측 preflight를 넣었고, 부분 수집 실행(`093308`, `094319`, `102029`)도 비교에서 제외했다.
+제외 실행의 수치는 결론에 사용하지 않았다.
+
+두 유효 실행 자체는 모두 실행별 gate를 통과했다. 그러나 반복 집합 gate는 다음과 같았다.
+
+| 후보 | result p95 IQR/중앙값 | scoreboard p95 IQR/중앙값 | 반복 집합 판정 |
+|---|---:|---:|---|
+| outbox | 22.005% | 11.668% | FAIL (`<= 5%` 불충족) |
+| stream | 1.395% | 0.378% | PASS |
+
+원래 계약이라면 outbox 집합 전체를 버리고 다시 측정해야 한다. 이번에는 2회 상한 때문에
+재측정하지 않았으므로 **end-to-end 성능의 승자를 정하지 않는다.** 특히 outbox result p95
+차이는 judge live queue와 Redis 지표로 귀속되지 않았으므로 결론으로 쓰지 않는다.
+
+### 17.2 submit-100 관찰값
+
+단위는 지연 `ms`, Redis histogram은 `ms`, 나머지는 건수다. `/`는 1회/2회다.
+
+| 지표 | outbox | stream |
+|---|---:|---:|
+| result-queryable p50 | 218.111 / 233.458 | 232.899 / 230.121 |
+| result-queryable p95 | 376.748 / 589.333 | 405.476 / 416.952 |
+| result-queryable p99 | 502.095 / 865.890 | 597.151 / 647.916 |
+| scoreboard-applied p50 | 403.314 / 416.737 | 326.042 / 321.386 |
+| scoreboard-applied p95 | 616.646 / 779.549 | 542.657 / 546.778 |
+| scoreboard-applied p99 | 796.603 / 1,081.942 | 903.899 / 801.530 |
+| scoreboard apply segment p95 | 303.094 / 298.882 | 167.513 / 156.615 |
+| scoreboard pending peak | 42 / 44 | 0 / 0 |
+| scoreboard oldest-ready peak (s) | 0.310 / 0.261 | 0.401 / 0.331 |
+| scoreboard applied total | 19,465 / 19,273 | 19,419 / 19,419 |
+| Redis pipeline p50 | 3.584 / 3.624 | 2.825 / 2.797 |
+| Redis pipeline p95 | 7.902 / 8.620 | 9.257 / 9.343 |
+| Redis pipeline p99 | 75.800 / 77.400 | 56.071 / 53.364 |
+| Redis Lua errors | 0 / 0 | 0 / 0 |
+
+stream의 scoreboard apply segment는 두 번 모두 더 짧았고 Redis pipeline p50/p99도 같은
+방향이지만, Redis p95와 oldest-ready는 반대 방향이다. stream pending peak 0도 5초 tail
+probe와 scrape 사이의 짧은 backlog를 놓칠 수 있다. 차이를 한 구간에 완전히 귀속할 수
+없으므로 이 관찰 역시 채택의 성능 근거로 쓰지 않는다.
+
+Rabbit judge live queue는 두 구현 모두 consumer 32개였다. peak ready/unacked는 outbox가
+`0/24`, `0/24`, stream이 `10/32`, `0/21`이었고 publish/deliver delta는 각 실행의 result 수와
+일치했다. DLQ는 계속 0이었다. stream queue의 peak ready는 두 번 모두 19,419였는데 이는
+미처리 backlog가 아니라 retention 중인 entry 수다. publish delta도 19,419였고 consumer는
+steady-state 1, 최대 2였다. tail 관측 probe가 최대 한 storage chunk를 별도로 ACK하므로
+deliver delta 19,829/19,768은 적용 건수가 아니다. 적용량은
+`contest_scoreboard_applied_total`을 사용한다.
+
+MySQL 쓰기량은 제출당 정규화 단계가 없으므로 측정하거나 결론에 사용하지 않았다.
+
+### 17.3 Redis RDB rollback 복구
+
+복구 harness는 batch consumer만 잠시 멈추고 `SAVE`로 K를 보존한 뒤 새 API 제출 tail을
+완전히 적용한 N의 scoreboard SHA-256 digest를 기록한다. Redis를 SIGKILL하고 K의 RDB를
+되돌린 다음 checkpoint와 전체 scoreboard digest가 N으로 돌아오고 모든 pipeline이 멈출
+때까지 500ms마다 확인한다. Redis key 일부만 지우는 시험이 아니라 scoreboard와 checkpoint가
+같이 되감기는 일관된 RDB rollback이다. 평상시 reset과 `FLUSHDB`의 새 의미는
+[`observability/README.md` §9.5](../observability/README.md#95-redis-초기화와-stream-replay)에
+정리했다.
+
+| 후보/실행 | K→N tail | 기준 scoreboard | 자동 수렴 관찰 | 최종 상태 |
+|---|---:|---:|---:|---|
+| stream 1 | 91 | 5,000명, 19,506 results | 2.533s 이내 | digest/pipeline 수렴, Redis health가 아직 `starting`이라 harness 최종 gate FAIL |
+| stream 2 | 90 | 5,030명, 19,597 results | 2.038s 이내 | applied counter +90, rollback counter +1, digest/pipeline 수렴; batch health가 일시 `unhealthy`라 최종 gate FAIL |
+| outbox 1 | 91 | 30명, 73 results | 30.954s | PASS, operational quiescence 33.043s, 수동 state repair 없음 |
+
+stream은 허용된 두 번 모두 scoreboard와 pipeline이 직접 replay로 수렴했다. 최종 gate 실패는
+두 번 모두 의미 상태 수렴 뒤 Docker health가 회복되기 전 검사한 harness 문제였고, 서비스는
+추가 state 조작 없이 모두 `healthy`로 돌아왔다. 세 번째 실행은 2회 상한 때문에 하지 않았다.
+두 실행 모두 `recovery-summary.csv` 생성 전 실패했으므로 N digest와 수렴 시간을 하나의
+machine-readable summary로 보존하지 못했다. `rdb-metadata.csv`, `recovery-samples.csv`, 실패
+기록과 실행 로그를 함께 보아야 한다. 그러므로 stream의 시간은 정식 PASS 실행의 대표값이나
+독립 재현 가능한 복구 증거가 아니라 수렴 상한 관찰값으로 취급한다.
+
+outbox는 5초 주기, 10행 recovery scan 뒤 DB requeue를 거쳐 91건 rollback을 30.954초에
+복원했다. applied counter가 10~30건 단위로 증가해 scan/requeue 동작도 확인됐다. 시간 절약을
+위해 outbox recovery는 full submit-100을 다시 만들지 않고 축소 기준점을 썼다. 이는 outbox에
+유리한 조건이며 두 시간의 비율을 엄밀한 성능 배수로 인용해서는 안 된다. 다만 두 구현의
+복구 제어 흐름 차이는 그대로 드러난다.
+
+```text
+outbox: Redis K -> 5s scan -> lost-tail/duplicate 탐지 -> DB requeue -> Lua 재적용
+stream: Redis state+offset K -> rollback 감지 -> K+1 stream 직접 replay
+```
+
+두 구현 모두 이 일관된 rollback에서는 수동 scoreboard rebuild가 필요하지 않았다. 차이는
+outbox가 Redis와 DB 사이의 어긋남을 찾아야 하고 실제로 tail보다 많은 적용 작업을 만들 수
+있는 반면, stream은 Redis와 함께 되감긴 offset 자체가 재시작점이라는 점이다. retention 밖의
+offset, 선택적 key 삭제, key type 손상은 별도 문제이며 §5.3~5.4의 contest rebuild 경로가
+필요하다.
+
+### 17.4 판단
+
+**Scoreboard 구동 구조는 RabbitMQ Stream 방식으로 조건부 채택한다.** 이번 판단의 근거는
+성능 우위가 아니라 복구 불변식이 단순해진다는 점과, 실제 RDB rollback에서 offset부터 직접
+replay해 같은 scoreboard로 수렴한 관찰이다. DB lost-tail scan, duplicate `redis_seq` group,
+pagination과 requeue를 운영 정합성 경로에서 제거할 수 있다는 이점이 목적과 일치한다.
+
+다만 다음 두 제한을 결론과 함께 유지한다.
+
+1. n=2 제한과 outbox 반복 집합 FAIL 때문에 end-to-end 성능 우위는 입증되지 않았다. 성능을
+   채택 논거로 쓰려면 0단계의 후보별 5회 기준으로 다시 측정해야 한다.
+2. 현재 Compose는 단일 RabbitMQ node다. stream replication, leader failover와 replica catch-up을
+   검증하지 않았다. 3-node 장애 시험과 retention-gap rebuild 확인 전에는 이 결론을 운영 HA
+   검증 완료로 해석하지 않는다.
+
+따라서 `925f9f3`의 구조를 다음 구현 기준으로 삼되, production 전환 gate는 다중 node stream
+복제/장애 검증으로 남긴다.
+
+### 17.5 검증 도구와 최종 확인
+
+- `run-loadtest.ps1 -RequireObservabilityReady`: reset 뒤 12/12 target과 JVM 5/5가 실제로
+  다시 scrape될 때까지 비교 부하 시작을 막는다.
+- `export-scoreboard-neutral-metrics.ps1`: 기존 세 구현 중립 지표를 Prometheus range query로
+  내보내고 단일 batch-1 시계열, 경계 coverage, 최종 pending/oldest 0을 검증한다.
+- `summarize-c-stage-runs.ps1`: 실행별 gate와 후보별 p95 IQR/3-IQR gate를 재현한다. 기본 최소
+  실행 수는 5이고 이번 제한 실행만 `-MinimumRuns 2`를 사용했다. 새 실행은 모든 gate 뒤에
+  생성되는 `run-verdict.csv`도 요구한다. 이번 네 실행은 sentinel 도입 전 자료라 외부에서
+  확인한 harness exit code를 근거로 `-AllowLegacyMissingRunVerdict`를 명시했다.
+- `run-scoreboard-rdb-recovery.ps1`: 전체 scoreboard API digest를 oracle로 사용해 K/N과 복구
+  시간을 기록하고, 실패하더라도 pause된 batch와 중지된 Redis를 복구한다.
+- `gradlew.bat check -DredisIntegration=true`가 통과했다. 실제 Redis 통합 테스트는
+  `RedisContestScoreboardApplierRedisIntegrationTests` 8개와
+  `ContestScoreboardLiveVersusRebuildRedisIntegrationTests` 1개가 skip 없이 실행됐다.

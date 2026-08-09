@@ -15,7 +15,8 @@ param(
     [int]$StepRampSeconds = 10,
     [int]$StepHoldSeconds = 30,
     [switch]$KeepStack,
-    [switch]$RemoveData
+    [switch]$RemoveData,
+    [switch]$RequireObservabilityReady
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +37,7 @@ $jvmSummaryCsv = Join-Path $metricsRoot "jvm-summary.csv"
 $rabbitmqSummaryCsv = Join-Path $metricsRoot "rabbitmq-summary.csv"
 $redisScoreboardSummaryCsv = Join-Path $metricsRoot "redis-scoreboard-summary.csv"
 $runDiagnosticsCsv = Join-Path $metricsRoot "run-diagnostics.csv"
+$runVerdictCsv = Join-Path $metricsRoot "run-verdict.csv"
 $script:stalenessCrossCheckFailed = $false
 $script:resetRedisKeys = $null
 $script:resetScoreboardOffset = $null
@@ -183,6 +185,66 @@ function Invoke-LoadSqlRow {
         throw "SQL returned no row."
     }
     return $row -split "`t"
+}
+
+# C-stage comparisons must not start while Prometheus is still following an app container that
+# was just recreated or restarted. In particular, the outbox reset stops batch-1; Docker can
+# briefly retain its previous healthy status after `start`, so Wait-Healthy alone can return before
+# the new JVM has exposed metrics. That manufactured a judge-outbox backlog during the first minute
+# of a run. This opt-in gate keeps ordinary harness use independent of the observability overlay,
+# while comparison runs require two consecutive complete scrapes before seeding or injecting load.
+function Wait-ObservabilityReady {
+    if (-not $RequireObservabilityReady) {
+        return
+    }
+
+    $deadline = (Get-Date).AddSeconds($HealthTimeoutSeconds)
+    $stableScrapes = 0
+    while ((Get-Date) -lt $deadline -and $stableScrapes -lt 2) {
+        Start-Sleep -Seconds 5
+        try {
+            $queries = @(
+                'count(up)',
+                'sum(up)',
+                'count(up{job="oj-app"})',
+                'sum(up{job="oj-app"})',
+                'count(contest_scoreboard_pending_events{job="oj-app",node="batch-1"})'
+            )
+            $values = @()
+            foreach ($query in $queries) {
+                $encoded = [uri]::EscapeDataString($query)
+                $response = Invoke-RestMethod `
+                    -Uri "http://127.0.0.1:9090/api/v1/query?query=$encoded" `
+                    -TimeoutSec 5
+                if ($response.status -ne "success" -or @($response.data.result).Count -ne 1) {
+                    throw "Prometheus returned no scalar for $query."
+                }
+                $values += [double]::Parse(
+                    [string]$response.data.result[0].value[1],
+                    [Globalization.CultureInfo]::InvariantCulture)
+            }
+
+            if ($values[0] -eq 12 -and $values[1] -eq 12 -and
+                $values[2] -eq 5 -and $values[3] -eq 5 -and $values[4] -eq 1) {
+                $stableScrapes++
+            }
+            else {
+                $stableScrapes = 0
+            }
+            $preflightStatus = "Observability preflight: targets={0}/{1}, app={2}/{3}, " +
+                "scoreboard-series={4}, stable={5}/2"
+            Write-Host ($preflightStatus -f
+                $values[1], $values[0], $values[3], $values[2], $values[4], $stableScrapes)
+        }
+        catch {
+            $stableScrapes = 0
+            Write-Host "Observability preflight is not ready: $($_.Exception.Message)"
+        }
+    }
+
+    if ($stableScrapes -lt 2) {
+        throw "Observability did not reach 12/12 targets, 5/5 app JVMs, and one batch-1 scoreboard series within $HealthTimeoutSeconds seconds."
+    }
 }
 
 function Invoke-LoadRedisScalar {
@@ -1579,6 +1641,7 @@ try {
     Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
 
     Reset-LoadRedis
+    Wait-ObservabilityReady
     $script:expectedSubmissionCount = 0L
     $seed = New-Seed
     Reset-WebMetrics
@@ -1658,3 +1721,11 @@ finally {
 if ($script:stalenessCrossCheckFailed) {
     throw "$Scenario end-to-end scoreboard p99 did not match the sampled scoreboard head-lag maximum within one order of magnitude."
 }
+
+# Written only after every assertion, materialization/OOM gate, metric cross-check, and finally
+# block has completed successfully. CSVs created by the finally block are intentionally not enough
+# for a comparison validator to infer that the harness itself exited successfully.
+@(
+    "scenario,completedSuccessfully,oomKilledContainers",
+    "$Scenario,true,0"
+) | Set-Content -Path $runVerdictCsv -Encoding utf8
