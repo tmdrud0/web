@@ -1521,3 +1521,128 @@ pagination과 requeue를 운영 정합성 경로에서 제거할 수 있다는 �
 - `gradlew.bat check -DredisIntegration=true`가 통과했다. 실제 Redis 통합 테스트는
   `RedisContestScoreboardApplierRedisIntegrationTests` 8개와
   `ContestScoreboardLiveVersusRebuildRedisIntegrationTests` 1개가 skip 없이 실행됐다.
+
+## 18. submit-200 고부하 단일 관찰
+
+### 18.1 범위와 판정 한계
+
+2026-08-09에 §17과 같은 [`ENVIRONMENT.md`](ENVIRONMENT.md)의 12 CPU/14GB WSL,
+애플리케이션 7.5 CPU/9344M, 관측 2.2 CPU/2112M 예산에서 다음 commit을 비교했다.
+
+- outbox: `751b774605f138558759ce68ebb72f54655c250f`
+- stream: `852285e3d5af8c57f74005cabc19a0a4dd1e4806`
+  (실행 경로 A·B의 마지막 변경은 `925f9f3037edeb71af1a8e46c1574b5b6a8e9f5f`)
+
+각 후보는 완전히 새 volume과 같은 세 Compose overlay에서 정확히 한 번만 실행했다. 사용자 요청에
+따라 재측정하지 않았다. `submit-200`은 30초 동안 1→200 submissions/s로 올리고 120초 유지하며,
+사용자 10,000명, 문제 5개, 동시 session 5,000개와 25초 pace를 사용한다. 명목 제출 수는
+27,015건이고 실제 완료 수는 outbox 26,644건, stream 26,626건으로 0.07% 차이다.
+
+- outbox artifact: `web-c-stage-outbox/var/loadtest-20260809-114309`
+- stream artifact: `web/var/loadtest-20260809-115257`
+
+단일 실행은 IQR과 실행 간 분산을 계산할 수 없다. `summarize-c-stage-runs.ps1`에
+`-SingleRunObservation`을 추가해 이 경우 p95 안정성을 `NOT_EVALUATED`로 표시하고 기존 실행별
+gate는 그대로 적용하도록 했다. 두 실행 모두 깨끗한 시작 뒤 HTTP 오류, OOM, 재시작이나 의미 상태
+미수렴은 없었지만 JVM throttling 중앙값 10% gate를 넘었다. 따라서 아래 값은 **200 RPS에서의
+용량·병목 관찰값**이며, §17의 합격 실행과 같은 성능 비교값이나 구조적 우위의 증거가 아니다.
+
+### 18.2 완결성과 부하 상태
+
+| 항목 | outbox | stream |
+|---|---:|---:|
+| HTTP 성공/실패 | 31,627 / 0 | 31,611 / 0 |
+| HTTP p95 | 3,625ms | 3,800ms |
+| submissions = results = applied | 26,644 | 26,626 |
+| 최종 pending / oldest-ready | 0 / 0 | 0 / 0 |
+| restart / OOM / DLQ / Lua error | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| judge live publish 평균/peak | 167.77 / 275.27 events/s | 166.94 / 306.03 events/s |
+| throttling 중앙값 10% 초과 node | batch-1 11.83%, judge-2 10.12%, web-1 10.80%, web-2 46.80% | batch-1 19.52%, web-1 20.08%, web-2 10.40% |
+| 단일 실행 gate | capacity FAIL | capacity FAIL |
+
+publish 평균은 ramp와 drain을 포함한 관측창 전체의 값이므로 200 RPS 주입 목표와 같은 의미가
+아니다. 두 후보가 거의 같은 결과 수와 judge live publish rate로 완주했다는 교차 확인에만 사용한다.
+깨끗한 시작 뒤 부하가 만든 throttling을 제외 실행으로 버리지 않고 capacity FAIL로 기록하되,
+지연시간의 승패 판정에는 사용하지 않는다.
+
+### 18.3 지연 분포
+
+단위는 `ms`다.
+
+| 구간 | 분위 | outbox | stream | stream 대 outbox |
+|---|---:|---:|---:|---:|
+| result-queryable | p50 | 260.047 | 398.260 | +53.1% |
+|  | p95 | 644.399 | 1,917.364 | +197.5% |
+|  | p99 | 912.072 | 2,384.481 | +161.4% |
+|  | max | 2,421.453 | 2,753.060 | +13.7% |
+| scoreboard-applied | p50 | 477.436 | 534.855 | +12.0% |
+|  | p95 | 1,082.617 | 2,520.830 | +132.8% |
+|  | p99 | 1,725.971 | 3,843.876 | +122.7% |
+|  | max | 3,511.109 | 4,518.245 | +28.7% |
+| scoreboard apply segment | p50 | 206.915 | 136.778 | -33.9% |
+|  | p95 | 475.430 | 947.726 | +99.3% |
+|  | p99 | 899.094 | 1,658.764 | +84.5% |
+|  | max | 1,285.064 | 2,394.544 | +86.3% |
+
+§17의 submit-100 두 실행 중앙값과 비교한 증가율도 탐색값으로만 본다. 특히 outbox의
+submit-100 반복 집합은 이미 안정성 FAIL이므로 증가율을 정밀한 scaling 계수로 인용하면 안 된다.
+
+| 구간/분위 | outbox 100→200 | stream 100→200 |
+|---|---:|---:|
+| result p50 / p95 / p99 | +15.2% / +33.4% / +33.3% | +72.0% / +366.3% / +283.0% |
+| scoreboard p50 / p95 / p99 | +16.4% / +55.1% / +83.8% | +65.2% / +362.8% / +350.8% |
+| apply segment p50 / p95 / p99 | +15.0% / +58.0% / +144.3% | +51.4% / +484.8% / +452.7% |
+
+Stream의 direct consumer는 apply segment p50에서 여전히 outbox보다 33.9% 짧았지만 p95와
+p99 이점은 사라졌다. 즉 낮은 부하의 중앙 경로 이점과 높은 부하의 tail 지연 양상은 별개의 문제다.
+
+### 18.4 구간 귀속
+
+judge 쪽에서는 두 후보 모두 live queue consumer 32개와 unacked peak 32였고, detailed queue의
+ready peak도 outbox 18, stream 17로 비슷했다. 그러나 Rabbit에 들어가기 전 judge outbox
+pending/head lag peak는 outbox `225/389ms`, stream `639/959ms`였다. scoreboard나 Redis가
+관여하기 전인 result-queryable p95부터 stream이 커졌으므로 전체 차이를 Redis 탓으로 돌릴 수
+없다. `batch-1`에는 공통 judge outbox relay와 stream scoreboard consumer가 함께 있으므로
+stream 실행의 더 높은 batch throttling이 relay에도 퍼졌을 수 있다. Stream의 result commit 뒤
+publish confirm이 judge ACK와 다음 작업 회전에 추가한 비용도 가능한 원인이다. confirm 전용
+지표가 없으므로 두 기여도를 이번 단일 실행에서 분리하거나 인과로 확정하지 않는다.
+
+scoreboard와 Redis 관측은 다음과 같다.
+
+| 항목 | outbox | stream |
+|---|---:|---:|
+| neutral pending peak | 73 | 56 |
+| neutral oldest-ready peak | 0.484s | 1.175s |
+| Redis pipeline p50 / p95 / p99 | 4.157 / 71.375 / 221.650ms | 5.684 / 99.000 / 367.273ms |
+| Redis pipeline calls | 489 | 1,084 |
+| 결과/호출, 호출/1,000 results | 54.49 / 18.35 | 24.56 / 40.71 |
+| Redis Lua errors | 0 | 0 |
+
+Stream은 pending 건수 peak는 23% 작았지만 가장 오래 기다린 event는 2.43배 오래됐다. 또한 같은
+결과 수에 Redis pipeline을 2.22배 자주 호출했고 batch-1 throttling 중앙값도 19.52%로 outbox의
+11.83%보다 높았다. Redis container CPU peak는 오히려 stream 13.31%, outbox 15.48%로 낮았으므로
+Redis server CPU 포화로 귀속할 수 없다. 더 작고 잦은 consumer batch, batch JVM throttling과
+pipeline tail 증가가 apply segment p95/p99 악화와 함께 움직였다는 범위까지만 결론 낸다.
+
+Stream queue의 ready 26,626은 미처리 backlog가 아니라 retention entry 수다. tail probe 때문에
+consumer max가 2, delivered delta가 27,090으로 보이지만 실제 적용량은 중립 counter 26,626이며
+중복 적용이나 replay 증거가 아니다.
+
+### 18.5 판단
+
+200 RPS 고정 예산에서 두 구현 모두 정합성, 완결성과 가용성은 유지했지만 기존 성능 합격 gate는
+통과하지 못했다. 특히 Stream은 낮은 부하에서 관찰한 scoreboard tail 이점을 유지하지 못했고,
+result-queryable과 scoreboard 양쪽 tail이 함께 커졌다. 따라서 **Stream을 처리 성능 개선 수단으로
+주장할 근거는 없으며, 현재 자원/배치 설정에서는 오히려 고부하 tail 위험을 추가 관찰했다.**
+
+이 결과는 §17.4의 복구 불변식 단순화를 근거로 한 조건부 채택을 뒤집지는 않는다. 대신 production
+전환 gate에 다음을 추가한다.
+
+1. judge의 stream confirm 대기시간과 judge outbox/head lag를 분리 계측해 앞단 tail 원인을 확인한다.
+2. stream consumer의 prefetch와 적용 batch 크기를 조정해 결과당 pipeline 호출 수를 outbox와 같은
+   수준으로 맞춘 뒤, CPU throttling이 없는 자원 예산에서 다시 비교한다.
+3. 성능 결론이 필요하면 후보별 최소 5회라는 0단계 기준을 복원한다. 이번 사용자 제한 아래서는
+   각 후보 1회만 사용했고 추가 실행으로 숫자를 고르지 않았다.
+4. 단일 node RabbitMQ의 stream replication·leader failover 미검증 제약은 그대로 유지한다.
+
+MySQL 절대 쓰기량은 제출당 정규화가 없으므로 이번에도 비교하거나 결론에 사용하지 않았다.

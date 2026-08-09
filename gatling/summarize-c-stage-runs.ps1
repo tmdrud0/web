@@ -14,6 +14,8 @@ param(
     [ValidateRange(2, 100)]
     [int]$MinimumRuns = 5,
 
+    [switch]$SingleRunObservation,
+
     [switch]$AllowLegacyMissingRunVerdict,
 
     [string]$OutputDirectory
@@ -262,7 +264,8 @@ function Add-DistributionRow {
         [Parameter(Mandatory = $true)][string]$Metric,
         [Parameter(Mandatory = $true)][string]$Unit,
         [Parameter(Mandatory = $true)][double[]]$Values,
-        [switch]$ApplyP95StabilityGate
+        [switch]$ApplyP95StabilityGate,
+        [switch]$P95StabilityNotEvaluated
     )
 
     $statistics = Get-DistributionStatistics -Values $Values
@@ -276,7 +279,10 @@ function Add-DistributionRow {
     $upperFence = $null
     $allWithinFence = $null
 
-    if ($ApplyP95StabilityGate) {
+    if ($ApplyP95StabilityGate -and $P95StabilityNotEvaluated) {
+        $stabilityGate = "NOT_EVALUATED"
+    }
+    elseif ($ApplyP95StabilityGate) {
         if ($statistics.Median -eq 0d) {
             if ($statistics.IQR -eq 0d) {
                 $ratio = 0d
@@ -624,7 +630,10 @@ function Read-CandidateRun {
     }
 }
 
-if ($RunDirectories.Count -lt $MinimumRuns) {
+if ($SingleRunObservation -and $RunDirectories.Count -ne 1) {
+    throw "SingleRunObservation requires exactly one run directory; actual=$($RunDirectories.Count)."
+}
+if (-not $SingleRunObservation -and $RunDirectories.Count -lt $MinimumRuns) {
     throw "At least $MinimumRuns run directories are required; actual=$($RunDirectories.Count)."
 }
 
@@ -702,7 +711,8 @@ foreach ($dimensionEntry in $stalenessDimensions.GetEnumerator()) {
             -Metric $metricEntry.Key `
             -Unit $unit `
             -Values $values `
-            -ApplyP95StabilityGate:$applyGate
+            -ApplyP95StabilityGate:$applyGate `
+            -P95StabilityNotEvaluated:($applyGate -and $SingleRunObservation)
         if ($applyGate) {
             $p95Gates[$dimensionEntry.Key] = $gate
         }
@@ -757,10 +767,20 @@ $candidateRows = [System.Collections.Generic.List[object]]::new()
 foreach ($run in $runs) {
     $resultGate = $p95Gates["result-queryable"]
     $scoreboardGate = $p95Gates["scoreboard-applied"]
-    $resultWithinFence = $run.Result.P95Micros -ge $resultGate.FenceLower -and
-        $run.Result.P95Micros -le $resultGate.FenceUpper
-    $scoreboardWithinFence = $run.Scoreboard.P95Micros -ge $scoreboardGate.FenceLower -and
-        $run.Scoreboard.P95Micros -le $scoreboardGate.FenceUpper
+    $resultWithinFence = if ($SingleRunObservation) {
+        "not_evaluated"
+    }
+    else {
+        ($run.Result.P95Micros -ge $resultGate.FenceLower -and
+            $run.Result.P95Micros -le $resultGate.FenceUpper).ToString().ToLowerInvariant()
+    }
+    $scoreboardWithinFence = if ($SingleRunObservation) {
+        "not_evaluated"
+    }
+    else {
+        ($run.Scoreboard.P95Micros -ge $scoreboardGate.FenceLower -and
+            $run.Scoreboard.P95Micros -le $scoreboardGate.FenceUpper).ToString().ToLowerInvariant()
+    }
 
     $row = [ordered]@{
         Candidate = $Candidate
@@ -773,13 +793,13 @@ foreach ($run in $runs) {
         ResultP99Micros = Format-InvariantNumber $run.Result.P99Micros
         ResultMaxMicros = Format-InvariantNumber $run.Result.MaxMicros
         ResultSampleCount = $run.Result.SampleCount.ToString($invariantCulture)
-        ResultP95WithinFence = $resultWithinFence.ToString().ToLowerInvariant()
+        ResultP95WithinFence = $resultWithinFence
         ScoreboardP50Micros = Format-InvariantNumber $run.Scoreboard.P50Micros
         ScoreboardP95Micros = Format-InvariantNumber $run.Scoreboard.P95Micros
         ScoreboardP99Micros = Format-InvariantNumber $run.Scoreboard.P99Micros
         ScoreboardMaxMicros = Format-InvariantNumber $run.Scoreboard.MaxMicros
         ScoreboardSampleCount = $run.Scoreboard.SampleCount.ToString($invariantCulture)
-        ScoreboardP95WithinFence = $scoreboardWithinFence.ToString().ToLowerInvariant()
+        ScoreboardP95WithinFence = $scoreboardWithinFence
         HttpTotalRequests = $run.HttpTotalRequests.ToString($invariantCulture)
         HttpSuccessfulRequests = $run.HttpSuccessfulRequests.ToString($invariantCulture)
         HttpSuccessPercent = Format-InvariantNumber $run.HttpSuccessPercent
@@ -814,11 +834,18 @@ $distributionPath = Join-Path $resolvedOutput "distribution-summary-$Candidate.c
 $candidateRows | Export-Csv -LiteralPath $candidateRunsPath -NoTypeInformation -Encoding utf8
 $distributionRows | Export-Csv -LiteralPath $distributionPath -NoTypeInformation -Encoding utf8
 
-$failedP95Gates = @($p95Gates.GetEnumerator() | Where-Object {
-    $_.Value.StabilityGate -ne "PASS"
-})
+$failedP95Gates = @()
+if (-not $SingleRunObservation) {
+    $failedP95Gates = @($p95Gates.GetEnumerator() | Where-Object {
+        $_.Value.StabilityGate -ne "PASS"
+    })
+}
 foreach ($endpoint in $stalenessDimensions.Keys) {
     $gate = $p95Gates[$endpoint]
+    if ($SingleRunObservation) {
+        Write-Host "p95 stability ${endpoint}: NOT_EVALUATED (single-run observation; repeat-set stability requires multiple runs)"
+        continue
+    }
     $ratio = if ($null -eq $gate.IqrOverMedian) { "undefined" } else {
         (100d * [double]$gate.IqrOverMedian).ToString("0.###", $invariantCulture) + "%"
     }
@@ -833,6 +860,10 @@ foreach ($endpoint in $stalenessDimensions.Keys) {
 
 Write-Host "candidate runs: $candidateRunsPath"
 Write-Host "distribution summary: $distributionPath"
+if ($SingleRunObservation) {
+    Write-Host "VERDICT OBSERVATION_VALID candidate=$Candidate validRuns=1 scenario=$($scenarios[0]) p95Stability=NOT_EVALUATED"
+    return
+}
 if ($failedP95Gates.Count -gt 0) {
     Write-Host "VERDICT FAIL candidate=$Candidate validRuns=$($runs.Count) p95Stability=$($failedP95Gates.Count)/2 failed"
     throw "C-stage p95 repeat-set stability failed. Discard the whole candidate repeat set and measure it again."
