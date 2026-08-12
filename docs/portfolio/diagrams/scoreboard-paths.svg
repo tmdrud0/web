@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 580" width="100%" role="img" aria-label="스코어보드 전달 경로 비교: DB outbox 방식과 RabbitMQ stream 방식">
+  <style>
+    .bx    { rx: 7; stroke-width: 1.5; }
+    .app   { fill: #f1f5f9; stroke: #64748b; }
+    .sql   { fill: #eff6ff; stroke: #2563eb; }
+    .redis { fill: #fef2f2; stroke: #dc2626; }
+    .mq    { fill: #f5f3ff; stroke: #7c3aed; }
+    .t     { font-family: 'Malgun Gothic','Segoe UI',sans-serif; fill: #1e293b; }
+    .ttl   { font-size: 12.5px; font-weight: 700; }
+    .sub   { font-size: 10.5px; fill: #475569; }
+    .chip  { font-size: 13px; font-weight: 700; fill: #ffffff; }
+    .ln    { stroke: #94a3b8; stroke-width: 1.5; fill: none; }
+    .key   { font-size: 12px; font-weight: 700; }
+  </style>
+  <defs>
+    <marker id="a4" markerWidth="9" markerHeight="9" refX="7.5" refY="3.2" orient="auto">
+      <path d="M0,0 L7.5,3.2 L0,6.4 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="a4r" markerWidth="9" markerHeight="9" refX="7.5" refY="3.2" orient="auto">
+      <path d="M0,0 L7.5,3.2 L0,6.4 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <rect width="900" height="580" fill="#ffffff"/>
+
+  <!-- 배경 컬럼 -->
+  <rect x="24" y="24" width="404" height="470" rx="12" fill="#fdfdfe" stroke="#e2e8f0"/>
+  <rect x="472" y="24" width="404" height="470" rx="12" fill="#fbfefd" stroke="#99f6e4"/>
+
+  <!-- 헤더 -->
+  <rect x="44" y="44" width="150" height="30" rx="6" fill="#94a3b8"/>
+  <text x="119" y="64" class="t chip" text-anchor="middle">기존 — DB outbox</text>
+  <rect x="492" y="44" width="176" height="30" rx="6" fill="#0f766e"/>
+  <text x="580" y="64" class="t chip" text-anchor="middle">채택 — RabbitMQ stream</text>
+
+  <!-- ===== 좌: outbox ===== -->
+  <rect x="44" y="94" width="364" height="42" class="bx app"/>
+  <text x="226" y="120" class="t ttl" text-anchor="middle">Judge — 채점 결과 commit</text>
+  <line x1="226" y1="136" x2="226" y2="158" class="ln" marker-end="url(#a4)"/>
+
+  <rect x="44" y="164" width="364" height="46" class="bx sql"/>
+  <text x="226" y="184" class="t ttl" text-anchor="middle">MySQL: contest_submission_outbox</text>
+  <text x="226" y="201" class="t sub" text-anchor="middle">PENDING → PROCESSING → COMPLETED(redis_seq)</text>
+  <line x1="226" y1="210" x2="226" y2="232" class="ln" marker-end="url(#a4)"/>
+
+  <rect x="44" y="238" width="364" height="46" class="bx app"/>
+  <text x="226" y="258" class="t ttl" text-anchor="middle">Batch worker</text>
+  <text x="226" y="275" class="t sub" text-anchor="middle">200ms 주기 claim · Redis pipeline 전송</text>
+  <line x1="226" y1="284" x2="226" y2="306" class="ln" marker-end="url(#a4)"/>
+
+  <rect x="44" y="312" width="364" height="50" class="bx redis"/>
+  <text x="226" y="332" class="t ttl" text-anchor="middle">Redis Lua</text>
+  <text x="226" y="350" class="t sub" text-anchor="middle">INCR redis_seq + scoreboard 갱신</text>
+
+  <!-- 되돌아가는 화살표: seq를 DB에 기록 -->
+  <path d="M408,337 L432,337 L432,187 L412,187" fill="none" stroke="#dc2626" stroke-width="1.5"
+        stroke-dasharray="5 3" marker-end="url(#a4r)"/>
+  <text x="426" y="231" class="t sub" fill="#b91c1c" text-anchor="end">redis_seq를 DB outbox에 다시 기록</text>
+
+  <!-- checkpoint 결론 -->
+  <rect x="44" y="382" width="364" height="92" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="1.6"/>
+  <text x="60" y="404" class="t key" fill="#991b1b">checkpoint = DB의 redis_seq</text>
+  <text x="60" y="424" class="t sub">Redis는 RDB 스냅샷으로 롤백되지만</text>
+  <text x="60" y="441" class="t sub">DB checkpoint는 롤백되지 않는다.</text>
+  <text x="60" y="463" class="t sub" fill="#b91c1c">→ lost-tail 스캔 · duplicate seq 그룹 · pagination 필요</text>
+
+  <!-- ===== 우: stream ===== -->
+  <rect x="492" y="94" width="364" height="42" class="bx app"/>
+  <text x="674" y="120" class="t ttl" text-anchor="middle">Judge — 결과 commit 후 stream publish</text>
+  <line x1="674" y1="136" x2="674" y2="158" class="ln" marker-end="url(#a4)"/>
+
+  <rect x="492" y="164" width="364" height="46" class="bx mq"/>
+  <text x="674" y="184" class="t ttl" text-anchor="middle">RabbitMQ stream</text>
+  <text x="674" y="201" class="t sub" text-anchor="middle">broker가 offset 발급 · publisher confirm</text>
+  <line x1="674" y1="210" x2="674" y2="232" class="ln" marker-end="url(#a4)"/>
+
+  <rect x="492" y="238" width="364" height="46" class="bx app"/>
+  <text x="674" y="258" class="t ttl" text-anchor="middle">Batch stream consumer</text>
+  <text x="674" y="275" class="t sub" text-anchor="middle">prefetch 500 · offset 순서 fail-fast</text>
+  <line x1="674" y1="284" x2="674" y2="306" class="ln" marker-end="url(#a4)"/>
+
+  <rect x="492" y="312" width="364" height="50" class="bx redis"/>
+  <text x="674" y="331" class="t ttl" text-anchor="middle">Redis Lua — 한 번에 원자적으로</text>
+  <text x="674" y="350" class="t sub" text-anchor="middle">scoreboard + stream offset + db-pending</text>
+
+  <rect x="492" y="382" width="364" height="92" rx="8" fill="#f0fdfa" stroke="#0f766e" stroke-width="1.6"/>
+  <text x="508" y="404" class="t key" fill="#115e59">checkpoint = Redis 안의 offset</text>
+  <text x="508" y="424" class="t sub">상태와 checkpoint가 같은 스냅샷 경계를</text>
+  <text x="508" y="441" class="t sub">공유하므로 롤백될 때 함께 되감긴다.</text>
+  <text x="508" y="463" class="t sub" fill="#0f766e">→ 되감긴 offset + 1 이 곧 재시작점</text>
+
+  <!-- 하단 요약 -->
+  <text x="24" y="528" class="t key" fill="#334155">핵심은 성능이 아니라 단조 증가 키의 소유권을 누가 갖느냐다.</text>
+  <text x="24" y="552" class="t sub">Redis INCR → DB에 checkpoint  ⟹  RabbitMQ offset → Redis 안에 checkpoint</text>
+</svg>
