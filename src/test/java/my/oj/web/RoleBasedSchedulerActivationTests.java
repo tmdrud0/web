@@ -1,12 +1,7 @@
 package my.oj.web;
 
-import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProcessor;
 import my.oj.web.contest.scoreboard.redis.ContestRedisKeyValueClient;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardWrongAttemptMetrics;
-import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProperties;
-import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxRecoveryService;
-import my.oj.web.contest.scoreboard.outbox.ContestScoreboardOutboxRepository;
-import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxScheduler;
 import my.oj.web.observability.ContestOutboxBacklogMetrics;
 import my.oj.web.observability.ContestOutboxDrainMetrics;
 import my.oj.web.observability.ContestOutboxMetricsProperties;
@@ -39,7 +34,6 @@ class RoleBasedSchedulerActivationTests {
     private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
             .withUserConfiguration(
                     TestDependencies.class,
-                    ContestScoreboardOutboxScheduler.class,
                     ContestOutboxBacklogMetrics.class,
                     RedisContestScoreboardWrongAttemptMetrics.class,
                     StreakRankBatchScheduler.class
@@ -50,7 +44,6 @@ class RoleBasedSchedulerActivationTests {
         try (ConfigurableApplicationContext context = runWithProfile("multi-web")) {
             assertThatProfileIsActive(context, "multi-server");
             assertThatProfileIsActive(context, "web-role");
-            assertThatMissing(context, ContestScoreboardOutboxScheduler.class);
             assertThatMissing(context, StreakRankBatchScheduler.class);
             assertThatMissing(context, ContestOutboxBacklogMetrics.class);
             assertThatMissing(context, RedisContestScoreboardWrongAttemptMetrics.class);
@@ -62,12 +55,9 @@ class RoleBasedSchedulerActivationTests {
         try (ConfigurableApplicationContext context = runWithProfile("multi-batch")) {
             assertThatProfileIsActive(context, "multi-server");
             assertThatProfileIsActive(context, "batch-role");
-            assertThatPresent(context, ContestScoreboardOutboxScheduler.class);
             assertThatPresent(context, StreakRankBatchScheduler.class);
-            ContestScoreboardOutboxProperties properties = context.getBean(ContestScoreboardOutboxProperties.class);
-            assertThat(properties.batchSize()).isEqualTo(500);
-            assertThat(properties.recoveryBatchSize()).isEqualTo(10);
-            assertThat(properties.claimTimeout()).isEqualTo(java.time.Duration.ofSeconds(30));
+            assertThat(context.getEnvironment().getProperty(
+                    "contest.scoreboard.stream.consumer.enabled", Boolean.class)).isTrue();
             assertThatPresent(context, ContestOutboxBacklogMetrics.class);
             assertThatPresent(context, RedisContestScoreboardWrongAttemptMetrics.class);
         }
@@ -78,7 +68,6 @@ class RoleBasedSchedulerActivationTests {
         try (ConfigurableApplicationContext context = runWithProfile("multi-judge")) {
             assertThatProfileIsActive(context, "multi-server");
             assertThatProfileIsActive(context, "judge-role");
-            assertThatMissing(context, ContestScoreboardOutboxScheduler.class);
             assertThatMissing(context, StreakRankBatchScheduler.class);
             assertThatMissing(context, ContestOutboxBacklogMetrics.class);
             assertThatMissing(context, RedisContestScoreboardWrongAttemptMetrics.class);
@@ -89,7 +78,6 @@ class RoleBasedSchedulerActivationTests {
     void defaultsEnableSchedulers() {
         contextRunner
                 .run(context -> {
-                    assertThatPresent(context, ContestScoreboardOutboxScheduler.class);
                     assertThatPresent(context, StreakRankBatchScheduler.class);
                     assertThatPresent(context, ContestOutboxBacklogMetrics.class);
                     assertThatMissing(context, RedisContestScoreboardWrongAttemptMetrics.class);
@@ -128,7 +116,6 @@ class RoleBasedSchedulerActivationTests {
 
     @Configuration(proxyBeanMethods = false)
     @EnableConfigurationProperties({
-            ContestScoreboardOutboxProperties.class,
             ContestOutboxMetricsProperties.class
     })
     static class TestDependencies {
@@ -136,21 +123,6 @@ class RoleBasedSchedulerActivationTests {
         @Bean
         org.springframework.jdbc.core.JdbcTemplate jdbcTemplate() {
             return mock(org.springframework.jdbc.core.JdbcTemplate.class);
-        }
-
-        @Bean
-        ContestScoreboardOutboxProcessor contestScoreboardOutboxProcessor() {
-            return mock(ContestScoreboardOutboxProcessor.class);
-        }
-
-        @Bean
-        ContestScoreboardOutboxRecoveryService contestScoreboardOutboxRecoveryService() {
-            return mock(ContestScoreboardOutboxRecoveryService.class);
-        }
-
-        @Bean
-        ContestScoreboardOutboxRepository contestScoreboardOutboxRepository() {
-            return mock(ContestScoreboardOutboxRepository.class);
         }
 
         /** Real rather than mocked: unbound to any registry it discards its recordings anyway. */
@@ -173,7 +145,6 @@ class RoleBasedSchedulerActivationTests {
     @Configuration(proxyBeanMethods = false)
     @Import({
             TestDependencies.class,
-            ContestScoreboardOutboxScheduler.class,
             ContestOutboxBacklogMetrics.class,
             RedisContestScoreboardWrongAttemptMetrics.class,
             StreakRankBatchScheduler.class

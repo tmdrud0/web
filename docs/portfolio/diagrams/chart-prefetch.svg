@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 340" width="760" height="340" font-family="system-ui,-apple-system,Segoe UI,sans-serif">
+<style>.t{font-size:12px;fill:#334155}.ttl{font-size:15px;font-weight:700;fill:#0f172a}.sub{font-size:11.5px;fill:#64748b}.ax{font-size:11px;fill:#64748b}.gr{stroke:#e2e8f0;stroke-width:1}.mk{font-size:11px;font-weight:600}</style>
+<rect width="760" height="340" fill="#ffffff"/>
+<text x="74" y="22" class="ttl">prefetch 별 consumer 로컬 버퍼 (unacked)</text>
+<text x="74" y="38" class="sub">도착·서비스 분포·consumer 수 고정, 디스패치 정책만 변경 · 상한은 32 / 128 / 2,048</text>
+<text x="16" y="38" class="ax">unacked (건)</text>
+<line x1="74" y1="292.0" x2="608" y2="292.0" class="gr"/>
+<text x="66" y="296.0" class="ax" text-anchor="end">0</text>
+<line x1="74" y1="230.5" x2="608" y2="230.5" class="gr"/>
+<text x="66" y="234.5" class="ax" text-anchor="end">125</text>
+<line x1="74" y1="169.0" x2="608" y2="169.0" class="gr"/>
+<text x="66" y="173.0" class="ax" text-anchor="end">250</text>
+<line x1="74" y1="107.5" x2="608" y2="107.5" class="gr"/>
+<text x="66" y="111.5" class="ax" text-anchor="end">375</text>
+<line x1="74" y1="46.0" x2="608" y2="46.0" class="gr"/>
+<text x="66" y="50.0" class="ax" text-anchor="end">500</text>
+<text x="74.0" y="310" class="ax" text-anchor="middle">0s</text>
+<text x="180.8" y="310" class="ax" text-anchor="middle">44s</text>
+<text x="287.6" y="310" class="ax" text-anchor="middle">88s</text>
+<text x="394.4" y="310" class="ax" text-anchor="middle">132s</text>
+<text x="501.2" y="310" class="ax" text-anchor="middle">176s</text>
+<text x="608.0" y="310" class="ax" text-anchor="middle">219s</text>
+<line x1="74" y1="292" x2="608" y2="292" stroke="#94a3b8"/>
+<text x="341.0" y="328" class="ax" text-anchor="middle">부하 시작 이후 경과 시간</text>
+<path d="M74.0,292.0 L91.9,276.3 L110.6,288.6 L130.6,287.6 L147.1,278.2 L165.7,276.3 L186.9,276.3 L204.1,278.7 L218.8,276.3 L235.9,276.3 L252.8,276.3 L267.6,276.3 L284.1,276.3 L302.1,276.3 L316.7,276.3 L333.6,276.3 L350.1,288.6 L364.5,276.3 L383.4,276.3 L400.2,276.3 L416.8,276.3 L432.9,283.6 L449.4,287.1 L467.4,279.2 L481.6,283.6 L500.1,276.3 L516.6,279.2 L533.1,276.3 L549.8,276.3 L566.1,276.3 L583.9,276.3 L601.5,292.0" fill="none" stroke="#0f766e" stroke-width="2" stroke-linejoin="round"/>
+<path d="M74.0,292.0 L91.1,276.3 L108.7,282.2 L123.3,279.7 L139.8,263.0 L156.7,258.5 L171.8,252.6 L190.9,265.9 L207.9,273.8 L224.6,261.0 L239.7,268.4 L256.3,248.7 L274.5,251.2 L291.1,259.0 L307.7,260.0 L324.0,269.9 L339.7,249.7 L356.1,264.4 L372.4,251.2 L390.6,247.2 L407.0,265.4 L423.3,260.5 L439.8,257.1 L456.0,264.0 L474.5,254.6 L490.8,236.9 L507.3,246.7 L523.7,275.8 L539.9,269.4 L558.0,259.0 L574.7,257.1 L591.1,261.5 L607.7,292.0" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linejoin="round"/>
+<path d="M74.0,292.0 L89.2,292.0 L106.0,135.1 L123.0,166.0 L138.3,208.4 L155.6,199.5 L172.4,190.6 L188.8,218.7 L205.8,199.5 L223.8,182.3 L239.9,189.7 L256.9,171.5 L273.8,131.6 L288.4,147.8 L304.9,156.2 L321.9,139.5 L339.7,164.6 L356.4,167.0 L373.1,177.9 L389.4,205.4 L405.5,171.0 L424.5,176.4 L440.9,166.5 L456.5,211.3 L473.1,150.3 L489.5,193.1 L508.8,210.3 L525.4,207.9 L542.0,202.0 L556.4,213.8 L572.9,202.9 L591.4,261.5 L608.0,292.0" fill="none" stroke="#ea580c" stroke-width="2" stroke-linejoin="round"/>
+<line x1="622" y1="52" x2="646" y2="52" stroke="#0f766e" stroke-width="2.5"/>
+<text x="652" y="56" class="t">prefetch=1</text>
+<line x1="622" y1="72" x2="646" y2="72" stroke="#7c3aed" stroke-width="2.5"/>
+<text x="652" y="76" class="t">prefetch=4</text>
+<line x1="622" y1="92" x2="646" y2="92" stroke="#ea580c" stroke-width="2.5"/>
+<text x="652" y="96" class="t">prefetch=64</text>
+</svg>

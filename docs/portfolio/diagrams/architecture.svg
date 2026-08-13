@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 650" width="100%" role="img" aria-label="OJ 시스템 아키텍처">
+  <style>
+    .bx    { rx: 8; stroke-width: 1.6; }
+    .app   { fill: #f1f5f9; stroke: #64748b; }
+    .sql   { fill: #eff6ff; stroke: #2563eb; }
+    .redis { fill: #fef2f2; stroke: #dc2626; }
+    .mq    { fill: #f5f3ff; stroke: #7c3aed; }
+    .edge  { fill: #f8fafc; stroke: #94a3b8; }
+    .t     { font-family: 'Malgun Gothic','Segoe UI',sans-serif; fill: #1e293b; }
+    .ttl   { font-size: 14px; font-weight: 700; }
+    .sub   { font-size: 11.5px; fill: #475569; }
+    .tag   { font-size: 10.5px; font-weight: 700; letter-spacing: .04em; }
+    .lg    { font-size: 11.5px; fill: #475569; }
+    .ln    { stroke: #94a3b8; stroke-width: 1.6; fill: none; }
+    .note  { font-size: 11px; fill: #0f766e; font-style: italic; }
+  </style>
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7.5" refY="3.2" orient="auto">
+      <path d="M0,0 L7.5,3.2 L0,6.4 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect width="900" height="650" fill="#ffffff"/>
+
+  <!-- 범례 -->
+  <g class="t">
+    <rect x="612" y="24" width="264" height="112" rx="8" fill="#ffffff" stroke="#e2e8f0"/>
+    <text x="628" y="46" class="tag" fill="#64748b">범례</text>
+    <rect x="628" y="56" width="13" height="13" rx="3" class="bx sql"/>
+    <text x="650" y="67" class="lg">MySQL — 원본 · 최종 권위</text>
+    <rect x="628" y="77" width="13" height="13" rx="3" class="bx redis"/>
+    <text x="650" y="88" class="lg">Redis — 파생 상태 (재구성 가능)</text>
+    <rect x="628" y="98" width="13" height="13" rx="3" class="bx mq"/>
+    <text x="650" y="109" class="lg">RabbitMQ — 전달 (저장소 아님)</text>
+    <rect x="628" y="119" width="13" height="13" rx="3" class="bx app"/>
+    <text x="650" y="130" class="lg">Spring 애플리케이션</text>
+  </g>
+
+  <!-- Row 1 : 요청 진입 -->
+  <rect x="30"  y="44" width="100" height="46" class="bx edge"/>
+  <text x="80"  y="73" class="t ttl" text-anchor="middle">Client</text>
+
+  <rect x="175" y="44" width="90"  height="46" class="bx edge"/>
+  <text x="220" y="73" class="t ttl" text-anchor="middle">Nginx</text>
+
+  <rect x="310" y="44" width="130" height="46" class="bx app"/>
+  <text x="375" y="66" class="t ttl" text-anchor="middle">Web ×2</text>
+  <text x="375" y="82" class="t sub" text-anchor="middle">검증 · bulk 저장</text>
+
+  <line x1="130" y1="67" x2="169" y2="67" class="ln" marker-end="url(#ah)"/>
+  <line x1="265" y1="67" x2="304" y2="67" class="ln" marker-end="url(#ah)"/>
+  <line x1="375" y1="90" x2="375" y2="118" class="ln" marker-end="url(#ah)"/>
+
+  <!-- Row 2 : 제출 원본 -->
+  <rect x="266" y="124" width="218" height="66" class="bx sql"/>
+  <text x="280" y="143" class="t tag" fill="#1d4ed8">MySQL — 같은 트랜잭션</text>
+  <text x="280" y="161" class="t sub">contest_submission</text>
+  <text x="280" y="178" class="t sub">contest_judge_outbox</text>
+  <line x1="375" y1="190" x2="375" y2="222" class="ln" marker-end="url(#ah)"/>
+
+  <!-- Row 3 : 채점 분배 -->
+  <rect x="290" y="228" width="170" height="46" class="bx app"/>
+  <text x="375" y="250" class="t ttl" text-anchor="middle">Batch relay</text>
+  <text x="375" y="266" class="t sub" text-anchor="middle">SKIP LOCKED · confirm</text>
+
+  <rect x="512" y="228" width="180" height="46" class="bx mq"/>
+  <text x="602" y="250" class="t ttl" text-anchor="middle">quorum queue</text>
+  <text x="602" y="266" class="t sub" text-anchor="middle">prefetch = 1</text>
+
+  <rect x="740" y="228" width="120" height="46" class="bx app"/>
+  <text x="800" y="250" class="t ttl" text-anchor="middle">Judge ×2</text>
+  <text x="800" y="266" class="t sub" text-anchor="middle">동시성 16</text>
+
+  <line x1="460" y1="251" x2="506" y2="251" class="ln" marker-end="url(#ah)"/>
+  <line x1="692" y1="251" x2="734" y2="251" class="ln" marker-end="url(#ah)"/>
+  <line x1="800" y1="274" x2="800" y2="308" class="ln" marker-end="url(#ah)"/>
+
+  <!-- Row 4 : 채점 결과 -->
+  <rect x="660" y="314" width="216" height="52" class="bx sql"/>
+  <text x="674" y="333" class="t tag" fill="#1d4ed8">MySQL</text>
+  <text x="674" y="353" class="t sub">contest_submission_result</text>
+  <line x1="800" y1="366" x2="800" y2="400" class="ln" marker-end="url(#ah)"/>
+
+  <!-- Row 5 : result stream -->
+  <rect x="660" y="406" width="216" height="50" class="bx mq"/>
+  <text x="674" y="425" class="t tag" fill="#6d28d9">RabbitMQ stream</text>
+  <text x="674" y="445" class="t sub">contest.judge.result.stream</text>
+
+  <!-- stream -> consumer (좌향 라우팅) -->
+  <polyline points="768,456 768,478 430,478 430,494" class="ln" marker-end="url(#ah)"/>
+
+  <!-- Row 6 : 스코어보드 반영 -->
+  <rect x="340" y="500" width="180" height="50" class="bx app"/>
+  <text x="430" y="521" class="t ttl" text-anchor="middle">Batch consumer</text>
+  <text x="430" y="538" class="t sub" text-anchor="middle">offset 순서 fail-fast</text>
+
+  <rect x="90"  y="496" width="200" height="58" class="bx redis"/>
+  <text x="104" y="515" class="t tag" fill="#b91c1c">Redis — Lua 원자 갱신</text>
+  <text x="104" y="533" class="t sub">scoreboard + stream offset</text>
+  <text x="104" y="548" class="t sub">+ db-pending marker</text>
+
+  <line x1="340" y1="525" x2="296" y2="525" class="ln" marker-end="url(#ah)"/>
+  <line x1="430" y1="550" x2="430" y2="578" class="ln" marker-end="url(#ah)"/>
+
+  <!-- Row 7 : 적용 완료 기록 -->
+  <rect x="322" y="584" width="216" height="44" class="bx sql"/>
+  <text x="336" y="602" class="t tag" fill="#1d4ed8">MySQL</text>
+  <text x="336" y="620" class="t sub">scoreboard_applied_at (JDBC batch)</text>
+
+  <!-- 순서 계약 주석 -->
+  <text x="612" y="500" class="t note">완료 순서는 고정:</text>
+  <text x="612" y="518" class="t note">result commit → stream confirm → queue ACK</text>
+  <text x="612" y="546" class="t note">Redis Lua → applied_at → stream ACK</text>
+</svg>

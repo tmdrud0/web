@@ -13,8 +13,8 @@
 # five roles, because the beans behind them have to exist for any role's context to start, so an
 # unscoped sum reaches batch-1, judge-1 and judge-2 as well. Their counters sit at zero, which
 # makes an unscoped rate() numerically right by accident rather than by aiming at anything.
-# contest_scoreboard_* is also unscoped. Its gauges have one publisher, batch-1, and its applied
-# counter is zero on the other roles, so sum() is exact. contest_outbox_* remains an unscoped
+# contest_scoreboard_* is also unscoped. Its gauges and applied counter have one publisher,
+# batch-1, so sum() is exact. contest_outbox_* remains an unscoped
 # implementation-diagnostic family published by batch-1. Throttling is read off the dashboard
 # when interpreting a run, not paged on.
 
@@ -69,19 +69,29 @@ groups:
             picked up. Work in retry backoff or an active processing lease is deliberately not
             included; implementation-specific status metrics carry those states.
 
-      # Without this, a poller that stopped querying looks exactly like a backlog that cleared:
-      # the gauges hold their last value rather than falling to zero, precisely so that they do
-      # not lie in the other direction.
-      - alert: ContestOutboxBacklogUnobserved
-        expr: rate(contest_scoreboard_observation_failures_total[5m]) > 0
-        for: 5m
+      # A missing application-derived lag series means the neutral pending count cannot be
+      # evaluated; it is not equivalent to an empty stream.
+      - alert: ContestScoreboardStreamLagUnobserved
+        expr: absent(contest_scoreboard_pending_events)
+        for: 1m
         labels:
           severity: warning
         annotations:
-          summary: "Scoreboard pending-work observation is failing on {{ $labels.node }}"
+          summary: "Scoreboard stream pending offset is not being observed"
           description: >-
-            The pending-events and oldest-ready gauges are no longer being refreshed. Treat their
-            values as stale rather than as evidence.
+            batch-1 is not exporting the AMQP tail offset minus Redis applied offset gauge.
+            Treat pending events as unavailable, not as a zero backlog.
+
+      - alert: ContestScoreboardStreamTailProbeFailed
+        expr: increase(contest_scoreboard_stream_tail_probe_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scoreboard stream tail observation is failing"
+          description: >-
+            The AMQP 0.9.1 x-stream-offset=last probe failed, so pending events can be stale even
+            though the last exported gauge value is still present.
 
   - name: oj-submission-alerts
     rules:

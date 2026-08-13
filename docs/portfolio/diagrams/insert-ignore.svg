@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 640" width="100%" role="img" aria-label="INSERT IGNORE 사후 판별과 불량 요청 격리">
+  <style>
+    .bx   { rx: 7; stroke-width: 1.5; }
+    .app  { fill: #f1f5f9; stroke: #64748b; }
+    .sql  { fill: #eff6ff; stroke: #2563eb; }
+    .warn { fill: #fff7ed; stroke: #ea580c; }
+    .ok   { fill: #f0fdfa; stroke: #0f766e; }
+    .t    { font-family: 'Malgun Gothic','Segoe UI',sans-serif; fill: #1e293b; }
+    .mono { font-family: Consolas,'Courier New',monospace; font-size: 11.5px; fill: #1e3a8a; }
+    .ttl  { font-size: 12.5px; font-weight: 700; }
+    .sub  { font-size: 10.5px; fill: #475569; }
+    .cap  { font-size: 11px; font-weight: 700; fill: #64748b; letter-spacing: .05em; }
+    .chip { font-size: 11.5px; font-weight: 700; fill: #ffffff; }
+    .bad  { font-size: 11px; fill: #c2410c; }
+    .ln   { stroke: #94a3b8; stroke-width: 1.5; fill: none; }
+  </style>
+  <defs>
+    <marker id="a3" markerWidth="9" markerHeight="9" refX="7.5" refY="3.2" orient="auto">
+      <path d="M0,0 L7.5,3.2 L0,6.4 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect width="900" height="640" fill="#ffffff"/>
+
+  <!-- 1단계 : batch insert -->
+  <text x="30" y="28" class="t cap">① 저장 시도</text>
+
+  <rect x="30" y="40" width="150" height="48" class="bx app"/>
+  <text x="105" y="61" class="t ttl" text-anchor="middle">chunk 최대 100건</text>
+  <text x="105" y="77" class="t sub" text-anchor="middle">JVM 내 중복 병합 후</text>
+
+  <rect x="216" y="40" width="342" height="48" class="bx sql"/>
+  <text x="230" y="60" class="mono">INSERT IGNORE INTO contest_submission</text>
+  <text x="230" y="78" class="mono">VALUES (…), (…), (…);</text>
+
+  <rect x="594" y="40" width="276" height="48" class="bx warn"/>
+  <text x="608" y="60" class="t ttl" fill="#9a3412">update count = −2</text>
+  <text x="608" y="78" class="t sub">SUCCESS_NO_INFO — 판별 불가</text>
+
+  <line x1="180" y1="64" x2="210" y2="64" class="ln" marker-end="url(#a3)"/>
+  <line x1="558" y1="64" x2="588" y2="64" class="ln" marker-end="url(#a3)"/>
+
+  <text x="30" y="112" class="t bad">✕ INSERT IGNORE는 unique 충돌뿐 아니라 FK 위반 같은 오류도 조용히 무시한다 — 무엇이 무시됐는지 드라이버가 알려주지 않는다</text>
+
+  <!-- 2단계 : 사후 조회 -->
+  <text x="30" y="152" class="t cap">② 같은 트랜잭션에서 사후 조회</text>
+
+  <rect x="216" y="164" width="342" height="42" class="bx sql"/>
+  <text x="387" y="190" class="t ttl" text-anchor="middle">예약 ID · dedup key 재조회</text>
+  <line x1="387" y1="206" x2="387" y2="228" class="ln" marker-end="url(#a3)"/>
+
+  <!-- 3단계 : 4분기 -->
+  <text x="30" y="252" class="t cap">③ 결과 분류</text>
+
+  <!-- row 1 -->
+  <rect x="30" y="264" width="330" height="40" class="bx ok"/>
+  <text x="44" y="289" class="t sub">예약 ID에 요청과 같은 key의 row 존재</text>
+  <rect x="392" y="266" width="118" height="36" rx="6" fill="#0f766e"/>
+  <text x="451" y="289" class="t chip" text-anchor="middle">새 삽입</text>
+  <text x="536" y="289" class="t sub">예약 ID 반환 · judge outbox 생성</text>
+  <line x1="360" y1="284" x2="386" y2="284" class="ln" marker-end="url(#a3)"/>
+
+  <!-- row 2 -->
+  <rect x="30" y="314" width="330" height="40" class="bx sql"/>
+  <text x="44" y="339" class="t sub">예약 ID 없음 + 같은 dedup key row 존재</text>
+  <rect x="392" y="316" width="118" height="36" rx="6" fill="#2563eb"/>
+  <text x="451" y="339" class="t chip" text-anchor="middle">정상 중복</text>
+  <text x="536" y="339" class="t sub">기존 submission ID 반환 · outbox 없음</text>
+  <line x1="360" y1="334" x2="386" y2="334" class="ln" marker-end="url(#a3)"/>
+
+  <!-- row 3 -->
+  <rect x="30" y="364" width="330" height="40" class="bx warn"/>
+  <text x="44" y="389" class="t sub">예약 ID · dedup key 둘 다 없음 (FK 위반 등)</text>
+  <rect x="392" y="366" width="118" height="36" rx="6" fill="#ea580c"/>
+  <text x="451" y="389" class="t chip" text-anchor="middle">설명 불가 누락</text>
+  <text x="536" y="389" class="t sub">정합성 예외 → 트랜잭션 rollback</text>
+  <line x1="360" y1="384" x2="386" y2="384" class="ln" marker-end="url(#a3)"/>
+
+  <!-- row 4 -->
+  <rect x="30" y="414" width="330" height="40" class="bx warn"/>
+  <text x="44" y="439" class="t sub">예약 ID가 다른 key의 row를 가리킴</text>
+  <rect x="392" y="416" width="118" height="36" rx="6" fill="#b91c1c"/>
+  <text x="451" y="439" class="t chip" text-anchor="middle">ID 충돌</text>
+  <text x="536" y="439" class="t sub">fail-fast → 트랜잭션 rollback</text>
+  <line x1="360" y1="434" x2="386" y2="434" class="ln" marker-end="url(#a3)"/>
+
+  <!-- 4단계 : 불량 격리 -->
+  <polyline points="451,454 451,478 362,478 362,496" class="ln" marker-end="url(#a3)"/>
+  <polyline points="451,454 451,478 660,478 660,496" class="ln" marker-end="url(#a3)"/>
+
+  <text x="30" y="492" class="t cap">④ rollback된 chunk를 두 집합으로 나눠 재처리</text>
+
+  <rect x="72" y="502" width="336" height="70" class="bx warn"/>
+  <text x="240" y="524" class="t ttl" text-anchor="middle" fill="#9a3412">offenders</text>
+  <text x="240" y="542" class="t sub" text-anchor="middle">예외가 지목한 요청 + 같은 dedup key 공유</text>
+  <text x="240" y="560" class="t sub" text-anchor="middle">→ 이 Future만 실패시킨다</text>
+
+  <rect x="492" y="502" width="336" height="70" class="bx ok"/>
+  <text x="660" y="524" class="t ttl" text-anchor="middle" fill="#115e59">survivors</text>
+  <text x="660" y="542" class="t sub" text-anchor="middle">함께 rollback됐을 뿐 정상인 요청</text>
+  <text x="660" y="560" class="t sub" text-anchor="middle">→ 동일 예약 ID로 한 번만 재실행</text>
+
+  <text x="72" y="600" class="t sub">첫 시도가 rollback으로 완전히 취소됐고 요청별 예약 ID가 고정되어 있으므로 재실행이 안전하다.</text>
+  <text x="72" y="620" class="t ttl" fill="#0f766e">재실행에서는 다시 격리하지 않는다 → chunk당 DB 시도 횟수 최대 2회</text>
+</svg>

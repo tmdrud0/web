@@ -2,7 +2,7 @@
 
 이 구성은 다음 실제 분산 경로를 검증한다.
 
-`nginx → web-1/web-2 → MySQL → batch relay → RabbitMQ → judge-1/judge-2 → scoreboard outbox → Redis`
+`nginx → web-1/web-2 → MySQL → batch relay → RabbitMQ → judge-1/judge-2 → result stream → Redis`
 
 RPS(requests per second)는 초당 요청 수다. 이 문서의 모든 RPS는 한 인스턴스의 값이 아니라
 nginx가 `web-1`과 `web-2`로 나눈 합산 값이다.
@@ -34,7 +34,7 @@ nginx가 `web-1`과 `web-2`로 나눈 합산 값이다.
 | `mixed` | 139 평상시 → 1000 피크 | 2000 | 통과 기준이 아닌 과부하 관찰 |
 
 `target`은 제출 부하가 끝난 뒤 judge와 scoreboard 파이프라인이 완전히 drain될 때까지 기다리고,
-DB 제출·결과·outbox 완료 건수가 같은지, DB 고유 참가자 수와 Redis scoreboard 참가자 수가
+DB 제출·결과·`scoreboard_applied_at` 완료 건수가 같은지, DB 고유 참가자 수와 Redis scoreboard 참가자 수가
 같은지 확인한 후 조회 부하를 실행한다. 따라서 비어 있거나 일부만 채워진 scoreboard를 조회해
 빠르게 통과하는 오탐이 없다.
 
@@ -90,10 +90,10 @@ docker compose up -d --build
 2. 격리 스택 기동 및 9개 컨테이너 health 확인
 3. Redis 초기화, 전용 대회·사용자·문제 seed, 두 웹 노드 지표 초기화
 4. Windows의 독립 Gatling JVM(`-Xmx2g`)으로 nginx 경유 부하 실행
-5. judge outbox, RabbitMQ, scoreboard outbox drain 확인
+5. judge outbox, RabbitMQ, scoreboard stream offset drain 확인
 6. 결과 건수와 실제 Redis scoreboard 확인
 7. 노드별 수용·거절·in-flight 지표와 OOM 상태 확인
-8. HTTP 성공률/p95, web peak CPU·CPU throttled ratio, 두 outbox peak backlog/head lag와
+8. HTTP 성공률/p95, web peak CPU·CPU throttled ratio, judge outbox peak backlog/head lag와 scoreboard pending, 그리고
    RabbitMQ live/DLQ별 depth·unacked·consumer·publish/deliver rate 출력
 9. 제출→결과 조회 가능 및 제출→scoreboard 반영 p50/p95/p99/max와 표본 수, 같은 제출의
    `result_saved_at → scoreboard_applied_at` 분포와 Redis pipeline p99 출력

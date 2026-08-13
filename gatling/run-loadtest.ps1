@@ -15,7 +15,8 @@ param(
     [int]$StepRampSeconds = 10,
     [int]$StepHoldSeconds = 30,
     [switch]$KeepStack,
-    [switch]$RemoveData
+    [switch]$RemoveData,
+    [switch]$RequireObservabilityReady
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,10 +37,12 @@ $jvmSummaryCsv = Join-Path $metricsRoot "jvm-summary.csv"
 $rabbitmqSummaryCsv = Join-Path $metricsRoot "rabbitmq-summary.csv"
 $redisScoreboardSummaryCsv = Join-Path $metricsRoot "redis-scoreboard-summary.csv"
 $runDiagnosticsCsv = Join-Path $metricsRoot "run-diagnostics.csv"
+$runVerdictCsv = Join-Path $metricsRoot "run-verdict.csv"
 $script:stalenessCrossCheckFailed = $false
 $script:resetRedisKeys = $null
-$script:resetSubmissionOutboxRows = $null
+$script:resetScoreboardOffset = $null
 $script:resetJudgeOutboxRows = $null
+$script:resetResultStreamMessages = $null
 $script:resetTimestamp = $null
 
 # The per-user cooldown costs a Redis round trip on every submission in production, so a run with
@@ -184,6 +187,66 @@ function Invoke-LoadSqlRow {
     return $row -split "`t"
 }
 
+# C-stage comparisons must not start while Prometheus is still following an app container that
+# was just recreated or restarted. In particular, the outbox reset stops batch-1; Docker can
+# briefly retain its previous healthy status after `start`, so Wait-Healthy alone can return before
+# the new JVM has exposed metrics. That manufactured a judge-outbox backlog during the first minute
+# of a run. This opt-in gate keeps ordinary harness use independent of the observability overlay,
+# while comparison runs require two consecutive complete scrapes before seeding or injecting load.
+function Wait-ObservabilityReady {
+    if (-not $RequireObservabilityReady) {
+        return
+    }
+
+    $deadline = (Get-Date).AddSeconds($HealthTimeoutSeconds)
+    $stableScrapes = 0
+    while ((Get-Date) -lt $deadline -and $stableScrapes -lt 2) {
+        Start-Sleep -Seconds 5
+        try {
+            $queries = @(
+                'count(up)',
+                'sum(up)',
+                'count(up{job="oj-app"})',
+                'sum(up{job="oj-app"})',
+                'count(contest_scoreboard_pending_events{job="oj-app",node="batch-1"})'
+            )
+            $values = @()
+            foreach ($query in $queries) {
+                $encoded = [uri]::EscapeDataString($query)
+                $response = Invoke-RestMethod `
+                    -Uri "http://127.0.0.1:9090/api/v1/query?query=$encoded" `
+                    -TimeoutSec 5
+                if ($response.status -ne "success" -or @($response.data.result).Count -ne 1) {
+                    throw "Prometheus returned no scalar for $query."
+                }
+                $values += [double]::Parse(
+                    [string]$response.data.result[0].value[1],
+                    [Globalization.CultureInfo]::InvariantCulture)
+            }
+
+            if ($values[0] -eq 12 -and $values[1] -eq 12 -and
+                $values[2] -eq 5 -and $values[3] -eq 5 -and $values[4] -eq 1) {
+                $stableScrapes++
+            }
+            else {
+                $stableScrapes = 0
+            }
+            $preflightStatus = "Observability preflight: targets={0}/{1}, app={2}/{3}, " +
+                "scoreboard-series={4}, stable={5}/2"
+            Write-Host ($preflightStatus -f
+                $values[1], $values[0], $values[3], $values[2], $values[4], $stableScrapes)
+        }
+        catch {
+            $stableScrapes = 0
+            Write-Host "Observability preflight is not ready: $($_.Exception.Message)"
+        }
+    }
+
+    if ($stableScrapes -lt 2) {
+        throw "Observability did not reach 12/12 targets, 5/5 app JVMs, and one batch-1 scoreboard series within $HealthTimeoutSeconds seconds."
+    }
+}
+
 function Invoke-LoadRedisScalar {
     param([Parameter(Mandatory = $true)][string]$Command)
 
@@ -199,12 +262,28 @@ function Get-RabbitBacklog {
         $ready = 0L
         $unacknowledged = 0L
         if ($parts.Count -ge 3 -and
+            $parts[0] -in @("contest.judge.live", "contest.judge.dead") -and
             [int64]::TryParse($parts[$parts.Count - 2], [ref]$ready) -and
             [int64]::TryParse($parts[$parts.Count - 1], [ref]$unacknowledged)) {
             $total += $ready + $unacknowledged
         }
     }
     return $total
+}
+
+function Get-ResultStreamMessageCount {
+    $lines = @(Invoke-LoadCompose -Arguments @(
+        "exec", "-T", "rabbitmq", "rabbitmqctl", "list_queues", "-q", "name", "messages"))
+    foreach ($line in $lines) {
+        $parts = ($line -split '\s+') | Where-Object { $_ }
+        $count = 0L
+        if ($parts.Count -ge 2 -and
+            $parts[0] -eq "contest.judge.result.stream" -and
+            [int64]::TryParse($parts[$parts.Count - 1], [ref]$count)) {
+            return $count
+        }
+    }
+    throw "RabbitMQ did not report contest.judge.result.stream."
 }
 
 function Wait-PipelineDrain {
@@ -214,13 +293,13 @@ function Wait-PipelineDrain {
     while ((Get-Date) -lt $deadline) {
         Assert-AllLoadContainersRunning
         $judgePending = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_judge_outbox WHERE status <> 'PUBLISHED'"
-        $scoreboardPending = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_outbox WHERE status <> 'COMPLETED'"
+        $scoreboardPending = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE scoreboard_applied_at IS NULL"
         $rabbitPending = Get-RabbitBacklog
         if ($judgePending -eq 0 -and $scoreboardPending -eq 0 -and $rabbitPending -eq 0) {
-            Write-Host "Pipeline drained (judge outbox=0, Rabbit=0, scoreboard outbox=0)."
+            Write-Host "Pipeline drained (judge outbox=0, Rabbit judge queues=0, scoreboard unapplied results=0)."
             return
         }
-        Write-Host "Waiting for drain: judge outbox=$judgePending, Rabbit=$rabbitPending, scoreboard outbox=$scoreboardPending"
+        Write-Host "Waiting for drain: judge outbox=$judgePending, Rabbit judge queues=$rabbitPending, scoreboard unapplied results=$scoreboardPending"
         Start-Sleep -Seconds 2
     }
     throw "Pipeline did not drain within $TimeoutSeconds seconds."
@@ -318,51 +397,33 @@ function Reset-WebMetrics {
     }
 }
 
-# FLUSHDB resets the Redis sequence counter to zero, so every redis_seq already stored in the
-# database becomes a value the next run will hand out again. That is exactly the signal section 5
-# of the pipeline history defines as a Redis rollback, and the recovery worker acts on it: it
-# requeues COMPLETED rows whose sequence now looks duplicated, they are applied a second time, and
-# their processed_at is rewritten long after the run. Measured on the first completing run - 946
-# sequence values shared between the previous contest and the current one, 924 rows at attempts=2,
-# and a scoreboard-applied tail of p99 31s and max 178s against 4.5s for everything that ran once.
-# The requeue loop was still firing five minutes after the load stopped.
-#
-# Redis and these two tables are one piece of state. Clearing half of it manufactures the failure
-# the recovery path exists to repair. The drain above guarantees every row is terminal before this
-# runs, so nothing in flight is discarded.
+# The stream offset is part of the Redis scoreboard snapshot. A load-test reset therefore keeps
+# Redis intact: FLUSHDB would intentionally rewind both projection and offset and trigger replay
+# from the retained stream. The old requirement to clear contest_submission_outbox alongside
+# Redis is gone because that table no longer participates in scoreboard recovery.
 function Reset-LoadRedis {
-    # Recovery reads terminal DB rows and writes Redis. Clearing Redis first leaves a race in
-    # which it can replay a batch before the following DELETE reaches MySQL. Stop the only owner
-    # of recovery, clear both halves, then start it against the already-empty tables.
-    Invoke-LoadCompose -Arguments @("stop", "batch-1") | Out-Null
-    try {
-        Invoke-LoadCompose -Arguments @(
-            "exec", "-T", "mysql", "mysql", "-uroot", "-p1234", "-D", $dbName, "-Nse",
-            "DELETE FROM contest_submission_outbox; DELETE FROM contest_judge_outbox;") | Out-Null
-        Invoke-LoadCompose -Arguments @("exec", "-T", "redis", "redis-cli", "FLUSHDB") | Out-Null
-    }
-    finally {
-        Invoke-LoadCompose -Arguments @("start", "batch-1") | Out-Null
-    }
-    Wait-Healthy
+    Invoke-LoadCompose -Arguments @(
+        "exec", "-T", "mysql", "mysql", "-uroot", "-p1234", "-D", $dbName, "-Nse",
+        "DELETE FROM contest_judge_outbox WHERE status = 'PUBLISHED';") | Out-Null
 
     $script:resetTimestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffK")
     $script:resetRedisKeys = Invoke-LoadRedisScalar -Command "DBSIZE"
-    $script:resetSubmissionOutboxRows = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_outbox"
+    $offsetValue = Invoke-LoadCompose -Arguments @(
+        "exec", "-T", "redis", "redis-cli", "--raw", "GET", "contest:scoreboard:stream:offset")
+    $script:resetScoreboardOffset = [int64]($offsetValue | Select-Object -Last 1)
     $script:resetJudgeOutboxRows = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_judge_outbox"
+    $script:resetResultStreamMessages = Get-ResultStreamMessageCount
 
     New-Item -ItemType Directory -Force -Path $metricsRoot | Out-Null
     @(
-        "timestamp,redisKeys,submissionOutboxRows,judgeOutboxRows",
-        "$($script:resetTimestamp),$($script:resetRedisKeys),$($script:resetSubmissionOutboxRows),$($script:resetJudgeOutboxRows)"
+        "timestamp,redisKeys,scoreboardStreamOffset,judgeOutboxRows,resultStreamMessages",
+        "$($script:resetTimestamp),$($script:resetRedisKeys),$($script:resetScoreboardOffset),$($script:resetJudgeOutboxRows),$($script:resetResultStreamMessages)"
     ) | Set-Content -Path $stateResetCsv -Encoding utf8
 
-    if ($script:resetRedisKeys -ne 0 -or
-        $script:resetSubmissionOutboxRows -ne 0 -or
-        $script:resetJudgeOutboxRows -ne 0) {
-        throw "Load state reset was incomplete: Redis=$($script:resetRedisKeys), submission outbox=$($script:resetSubmissionOutboxRows), judge outbox=$($script:resetJudgeOutboxRows)."
+    if ($script:resetJudgeOutboxRows -ne 0) {
+        throw "Load state reset was incomplete: judge outbox=$($script:resetJudgeOutboxRows)."
     }
-    Write-Host "Load state reset verified (Redis=0, submission outbox=0, judge outbox=0)."
+    Write-Host "Load state reset verified (Redis and stream offset preserved; published judge outbox rows removed)."
 }
 
 # Reads the product's own scoreboard endpoint rather than a /perf mirror of it. The mirror
@@ -397,9 +458,8 @@ function Assert-PipelineMaterialized {
     $resultCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id = $ContestId"
     $resultTimestampCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id = $ContestId AND result_saved_at IS NOT NULL"
     $scoreboardTimestampCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id = $ContestId AND scoreboard_applied_at IS NOT NULL"
-    $outboxCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_outbox WHERE contest_id = $ContestId"
-    $completedCount = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_outbox WHERE contest_id = $ContestId AND status = 'COMPLETED'"
     $dbParticipantCount = Invoke-LoadSqlScalar "SELECT COUNT(DISTINCT user_id) FROM contest_submission WHERE contest_id = $ContestId"
+    $resultStreamDelta = (Get-ResultStreamMessageCount) - $script:resetResultStreamMessages
 
     if ($submissionCount -le 0) {
         throw "No contest submissions were persisted for contest $ContestId."
@@ -409,10 +469,11 @@ function Assert-PipelineMaterialized {
     }
     if ($resultCount -ne $submissionCount -or
         $resultTimestampCount -ne $submissionCount -or
-        $scoreboardTimestampCount -ne $submissionCount -or
-        $outboxCount -ne $submissionCount -or
-        $completedCount -ne $submissionCount) {
-        throw "Pipeline count mismatch: submissions=$submissionCount results=$resultCount resultTimestamps=$resultTimestampCount scoreboardTimestamps=$scoreboardTimestampCount outbox=$outboxCount completed=$completedCount"
+        $scoreboardTimestampCount -ne $submissionCount) {
+        throw "Pipeline count mismatch: submissions=$submissionCount results=$resultCount resultTimestamps=$resultTimestampCount scoreboardTimestamps=$scoreboardTimestampCount"
+    }
+    if ($resultStreamDelta -ne $resultCount) {
+        throw "Result stream count mismatch: streamDelta=$resultStreamDelta results=$resultCount. A larger stream delta means a judge redelivery republished a stored result."
     }
 
     $scoreboard = Get-ScoreboardSummary -ContestId $ContestId
@@ -422,34 +483,26 @@ function Assert-PipelineMaterialized {
     if ([int64]$scoreboard.totalParticipants -ne $dbParticipantCount) {
         throw "Scoreboard participant mismatch: DB=$dbParticipantCount Redis=$($scoreboard.totalParticipants)"
     }
-    Write-Host "Pipeline materialized: submissions=$submissionCount, results=$resultCount, resultTimestamps=$resultTimestampCount, scoreboardTimestamps=$scoreboardTimestampCount, scoreboardParticipants=$($scoreboard.totalParticipants)"
+    Write-Host "Pipeline materialized: submissions=$submissionCount, results=$resultCount, resultStreamMessages=$resultStreamDelta, resultTimestamps=$resultTimestampCount, scoreboardTimestamps=$scoreboardTimestampCount, scoreboardParticipants=$($scoreboard.totalParticipants)"
 }
 
 function Get-EndToEndLatencyDistribution {
     param(
         [Parameter(Mandatory = $true)][long]$ContestId,
         [Parameter(Mandatory = $true)]
-        [ValidateSet("result-saved", "scoreboard-applied", "legacy-result-created", "legacy-scoreboard-processed")]
+        [ValidateSet("result-saved", "scoreboard-applied")]
         [string]$Endpoint
     )
 
     $endExpression = switch ($Endpoint) {
         "result-saved" { "csr.result_saved_at" }
         "scoreboard-applied" { "csr.scoreboard_applied_at" }
-        "legacy-result-created" { "o.created_at" }
-        "legacy-scoreboard-processed" { "o.processed_at" }
-    }
-    $outboxJoin = if ($Endpoint.StartsWith("legacy-")) {
-        "JOIN contest_submission_outbox o ON o.contest_submission_id = cs.id"
-    } else {
-        ""
     }
     $sql = @"
 WITH latencies AS (
     SELECT TIMESTAMPDIFF(MICROSECOND, cs.submitted_time, $endExpression) AS latency_us
     FROM contest_submission cs
     JOIN contest_submission_result csr ON csr.submission_id = cs.id
-    $outboxJoin
     WHERE cs.contest_id = $ContestId
       AND $endExpression IS NOT NULL
 ), ranked AS (
@@ -528,19 +581,15 @@ function Show-EndToEndStaleness {
         [Parameter(Mandatory = $true)][string]$ScenarioName
     )
 
-    # Primary endpoints live on the result row. The outbox endpoints remain side by side only for
-    # transition validation and can be removed once historical comparisons no longer need them.
     $result = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "result-saved"
     $scoreboard = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "scoreboard-applied"
-    $legacyResult = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "legacy-result-created"
-    $legacyScoreboard = Get-EndToEndLatencyDistribution -ContestId $ContestId -Endpoint "legacy-scoreboard-processed"
     $scoreboardApply = Get-ScoreboardApplyLatencyDistribution -ContestId $ContestId
-    $distributions = @($result, $scoreboard, $legacyResult, $legacyScoreboard, $scoreboardApply)
+    $distributions = @($result, $scoreboard, $scoreboardApply)
     if (@($distributions | Where-Object { $_.SampleCount -le 0 }).Count -gt 0) {
-        throw "End-to-end staleness has missing samples: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount), legacyResult=$($legacyResult.SampleCount), legacyScoreboard=$($legacyScoreboard.SampleCount)"
+        throw "End-to-end staleness has missing samples: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount)"
     }
     if (@($distributions | Where-Object { $_.SampleCount -ne $result.SampleCount }).Count -gt 0) {
-        throw "End-to-end sample count mismatch: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount), legacyResult=$($legacyResult.SampleCount), legacyScoreboard=$($legacyScoreboard.SampleCount)"
+        throw "End-to-end sample count mismatch: result=$($result.SampleCount), scoreboard=$($scoreboard.SampleCount)"
     }
 
     Write-Host "-- end-to-end staleness --"
@@ -556,18 +605,6 @@ function Show-EndToEndStaleness {
         (Format-LatencySeconds $scoreboard.P99Micros),
         (Format-LatencySeconds $scoreboard.MaxMicros),
         $scoreboard.SampleCount)
-    Write-Host ("legacy result      p50 {0}  p95 {1}  p99 {2}  max {3}   n={4}" -f
-        (Format-LatencySeconds $legacyResult.P50Micros),
-        (Format-LatencySeconds $legacyResult.P95Micros),
-        (Format-LatencySeconds $legacyResult.P99Micros),
-        (Format-LatencySeconds $legacyResult.MaxMicros),
-        $legacyResult.SampleCount)
-    Write-Host ("legacy scoreboard  p50 {0}  p95 {1}  p99 {2}  max {3}   n={4}" -f
-        (Format-LatencySeconds $legacyScoreboard.P50Micros),
-        (Format-LatencySeconds $legacyScoreboard.P95Micros),
-        (Format-LatencySeconds $legacyScoreboard.P99Micros),
-        (Format-LatencySeconds $legacyScoreboard.MaxMicros),
-        $legacyScoreboard.SampleCount)
     Write-Host ("scoreboard segment p50 {0}  p95 {1}  p99 {2}  max {3}   n={4}" -f
         (Format-LatencySeconds $scoreboardApply.P50Micros),
         (Format-LatencySeconds $scoreboardApply.P95Micros),
@@ -579,16 +616,12 @@ function Show-EndToEndStaleness {
         "scenario,metric,p50Micros,p95Micros,p99Micros,maxMicros,sampleCount",
         "$ScenarioName,result-queryable,$($result.P50Micros),$($result.P95Micros),$($result.P99Micros),$($result.MaxMicros),$($result.SampleCount)",
         "$ScenarioName,scoreboard-applied,$($scoreboard.P50Micros),$($scoreboard.P95Micros),$($scoreboard.P99Micros),$($scoreboard.MaxMicros),$($scoreboard.SampleCount)",
-        "$ScenarioName,legacy-result-queryable,$($legacyResult.P50Micros),$($legacyResult.P95Micros),$($legacyResult.P99Micros),$($legacyResult.MaxMicros),$($legacyResult.SampleCount)",
-        "$ScenarioName,legacy-scoreboard-applied,$($legacyScoreboard.P50Micros),$($legacyScoreboard.P95Micros),$($legacyScoreboard.P99Micros),$($legacyScoreboard.MaxMicros),$($legacyScoreboard.SampleCount)",
         "$ScenarioName,scoreboard-apply-segment,$($scoreboardApply.P50Micros),$($scoreboardApply.P95Micros),$($scoreboardApply.P99Micros),$($scoreboardApply.MaxMicros),$($scoreboardApply.SampleCount)"
     ) | Set-Content -Path $stalenessCsv -Encoding utf8
 
     return [pscustomobject]@{
         Result = $result
         Scoreboard = $scoreboard
-        LegacyResult = $legacyResult
-        LegacyScoreboard = $legacyScoreboard
         ScoreboardApply = $scoreboardApply
     }
 }
@@ -1133,16 +1166,11 @@ function Show-MetricsSummary {
         Import-Csv $pipelineCsv |
             Group-Object phase |
             ForEach-Object {
-                $peakScoreboardOutbox = ($_.Group | ForEach-Object {
-                    [int64]$_.scoreboardPending + [int64]$_.scoreboardProcessing + [int64]$_.scoreboardFailed
-                } | Measure-Object -Maximum).Maximum
                 [pscustomobject]@{
                     Phase = $_.Name
                     PeakJudgeOutbox = ($_.Group | Measure-Object -Property judgeOutboxPending -Maximum).Maximum
                     PeakJudgeHeadLagMs = ($_.Group | Measure-Object -Property judgeHeadLagMs -Maximum).Maximum
-                    PeakScoreboardOutbox = $peakScoreboardOutbox
                     PeakScoreboardPending = ($_.Group | Measure-Object -Property scoreboardPending -Maximum).Maximum
-                    PeakScoreboardFailed = ($_.Group | Measure-Object -Property scoreboardFailed -Maximum).Maximum
                     PeakScoreboardHeadLagMs = ($_.Group | Measure-Object -Property oldestPendingLagMs -Maximum).Maximum
                     PeakRabbitReady = ($_.Group | Measure-Object -Property rabbitReady -Maximum).Maximum
                     PeakRabbitUnacked = ($_.Group | Measure-Object -Property rabbitUnacked -Maximum).Maximum
@@ -1228,14 +1256,14 @@ function Show-MetricsSummary {
     }
 
     if ($ContestId -gt 0) {
-        $retryRows = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_outbox WHERE contest_id = $ContestId AND attempts > 1"
+        $unappliedRows = Invoke-LoadSqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id = $ContestId AND scoreboard_applied_at IS NULL"
         $restartChanges = ($jvmSummaries | Measure-Object -Property RestartChanges -Sum).Sum
         $observedJvmNodes = @($jvmSummaries | Select-Object -ExpandProperty Node -Unique).Count
         @(
-            "scenario,contestId,resetTimestamp,resetRedisKeys,resetSubmissionOutboxRows,resetJudgeOutboxRows,scoreboardRetryRows,jvmRestartChanges,observedJvmNodes",
-            "$ScenarioName,$ContestId,$($script:resetTimestamp),$($script:resetRedisKeys),$($script:resetSubmissionOutboxRows),$($script:resetJudgeOutboxRows),$retryRows,$restartChanges,$observedJvmNodes"
+            "scenario,contestId,resetTimestamp,resetRedisKeys,resetScoreboardOffset,resetJudgeOutboxRows,resetResultStreamMessages,scoreboardUnappliedRows,jvmRestartChanges,observedJvmNodes",
+            "$ScenarioName,$ContestId,$($script:resetTimestamp),$($script:resetRedisKeys),$($script:resetScoreboardOffset),$($script:resetJudgeOutboxRows),$($script:resetResultStreamMessages),$unappliedRows,$restartChanges,$observedJvmNodes"
         ) | Set-Content -Path $runDiagnosticsCsv -Encoding utf8
-        Write-Host "Run diagnostics: attempts>1=$retryRows, JVM restart changes=$restartChanges, observed JVM nodes=$observedJvmNodes/5"
+        Write-Host "Run diagnostics: scoreboard unapplied=$unappliedRows, JVM restart changes=$restartChanges, observed JVM nodes=$observedJvmNodes/5"
 
         $staleness = Show-EndToEndStaleness -ContestId $ContestId -ScenarioName $ScenarioName
         $submissionPhases = switch ($ScenarioName) {
@@ -1613,6 +1641,7 @@ try {
     Wait-PipelineDrain -TimeoutSeconds $DrainTimeoutSeconds
 
     Reset-LoadRedis
+    Wait-ObservabilityReady
     $script:expectedSubmissionCount = 0L
     $seed = New-Seed
     Reset-WebMetrics
@@ -1692,3 +1721,11 @@ finally {
 if ($script:stalenessCrossCheckFailed) {
     throw "$Scenario end-to-end scoreboard p99 did not match the sampled scoreboard head-lag maximum within one order of magnitude."
 }
+
+# Written only after every assertion, materialization/OOM gate, metric cross-check, and finally
+# block has completed successfully. CSVs created by the finally block are intentionally not enough
+# for a comparison validator to infer that the harness itself exited successfully.
+@(
+    "scenario,completedSuccessfully,oomKilledContainers",
+    "$Scenario,true,0"
+) | Set-Content -Path $runVerdictCsv -Encoding utf8

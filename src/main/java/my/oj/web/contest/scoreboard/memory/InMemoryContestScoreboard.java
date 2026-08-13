@@ -16,7 +16,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Live scoreboard held in process. {@link InMemoryContestScoreboardReader} and
@@ -30,30 +29,18 @@ public class InMemoryContestScoreboard {
 
     private final Map<Long, ContestState> contests = new ConcurrentHashMap<>();
     /**
-     * Mirrors the Redis sequence allocator: one number per submission, stable across retries
-     * and rebuilds, and never rewound by {@link #reset(long)}.
-     */
-    private final Map<Long, Long> submissionSequences = new ConcurrentHashMap<>();
-    private final AtomicLong sequenceAllocator = new AtomicLong();
-
-    /**
      * Records one attempt and rewrites what its problem contributes to the user totals.
      * Recomputing from every attempt seen for the problem makes the result independent of
      * judgement arrival order.
      */
-    public long apply(ContestScoreboardUpdate update) {
+    public void apply(ContestScoreboardUpdate update) {
         long submissionId = update.contestSubmissionId();
-        long sequence = submissionSequences.computeIfAbsent(
-                submissionId,
-                id -> sequenceAllocator.incrementAndGet()
-        );
-
         ContestState state = getContestState(update.contestId(), update.contestStart());
         if (!state.appliedSubmissions.add(submissionId)) {
-            return sequence;
+            return;
         }
         if (update.result() == SubmissionResult.PENDING) {
-            return sequence;
+            return;
         }
 
         UserState userState = state.users.computeIfAbsent(update.userId(), id -> new UserState());
@@ -79,11 +66,6 @@ public class InMemoryContestScoreboard {
         }
 
         state.updateUserScore(update.userId(), userState);
-        return sequence;
-    }
-
-    public long currentSequence() {
-        return sequenceAllocator.get();
     }
 
     public void reset(long contestId) {

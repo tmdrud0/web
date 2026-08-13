@@ -1,9 +1,10 @@
 package my.oj.web;
 
-import my.oj.web.contest.scoreboard.outbox.worker.ContestScoreboardOutboxProperties;
+import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamConsumerProperties;
 import my.oj.web.contest.submission.config.ContestSubmissionExecutorProperties;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultWriterProperties;
 import my.oj.web.contest.submission.messaging.ContestJudgeOutboxRelayProperties;
+import my.oj.web.contest.submission.messaging.ContestJudgeResultStreamPublisherProperties;
 import my.oj.web.contest.submission.queue.ContestSubmissionBulkProperties;
 import my.oj.web.contest.submission.queue.ContestSubmissionCompletionProperties;
 import org.junit.jupiter.api.Test;
@@ -25,8 +26,8 @@ class OperationalPropertiesBindingTests {
         contextRunner.run(context -> {
             ContestSubmissionExecutorProperties executor =
                     context.getBean(ContestSubmissionExecutorProperties.class);
-            ContestScoreboardOutboxProperties scoreboard =
-                    context.getBean(ContestScoreboardOutboxProperties.class);
+            ContestScoreboardStreamConsumerProperties scoreboard =
+                    context.getBean(ContestScoreboardStreamConsumerProperties.class);
             ContestJudgeOutboxRelayProperties judgeRelay =
                     context.getBean(ContestJudgeOutboxRelayProperties.class);
             ContestSubmissionBulkProperties bulk = context.getBean(ContestSubmissionBulkProperties.class);
@@ -34,13 +35,21 @@ class OperationalPropertiesBindingTests {
                     context.getBean(ContestSubmissionCompletionProperties.class);
             ContestSubmissionJudgeResultWriterProperties resultWriter =
                     context.getBean(ContestSubmissionJudgeResultWriterProperties.class);
+            ContestJudgeResultStreamPublisherProperties resultStream =
+                    context.getBean(ContestJudgeResultStreamPublisherProperties.class);
 
             assertThat(executor.corePoolSize()).isEqualTo(2);
             assertThat(executor.maxPoolSize()).isEqualTo(4);
             assertThat(executor.queueCapacity()).isEqualTo(1000);
-            assertThat(scoreboard.batchSize()).isEqualTo(50);
-            assertThat(scoreboard.recoveryBatchSize()).isEqualTo(50);
-            assertThat(scoreboard.claimTimeout()).isEqualTo(Duration.ofSeconds(30));
+            assertThat(scoreboard.batchSize()).isEqualTo(500);
+            assertThat(scoreboard.prefetch()).isEqualTo(500);
+            assertThat(scoreboard.receiveTimeout()).isEqualTo(Duration.ofMillis(50));
+            assertThat(scoreboard.retryBackoff()).isEqualTo(Duration.ofSeconds(1));
+            assertThat(scoreboard.offsetCheckInterval()).isEqualTo(Duration.ofSeconds(1));
+            assertThat(scoreboard.tailProbeInterval()).isEqualTo(Duration.ofSeconds(5));
+            assertThat(scoreboard.tailProbeQuietPeriod()).isEqualTo(Duration.ofMillis(50));
+            assertThat(scoreboard.tailProbeTimeout()).isEqualTo(Duration.ofSeconds(2));
+            assertThat(scoreboard.tailProbePrefetch()).isEqualTo(4096);
             assertThat(judgeRelay.batchSize()).isEqualTo(50);
             assertThat(judgeRelay.claimTimeout()).isEqualTo(Duration.ofSeconds(30));
             assertThat(judgeRelay.confirmTimeout()).isEqualTo(Duration.ofSeconds(10));
@@ -56,6 +65,7 @@ class OperationalPropertiesBindingTests {
             assertThat(resultWriter.workerCount()).isEqualTo(1);
             assertThat(resultWriter.queueCapacity()).isEqualTo(256);
             assertThat(resultWriter.maxWait()).isEqualTo(Duration.ofMillis(5));
+            assertThat(resultStream.confirmTimeout()).isEqualTo(Duration.ofSeconds(10));
         });
     }
 
@@ -66,8 +76,9 @@ class OperationalPropertiesBindingTests {
                         "contest.submission.async.core-pool-size=1",
                         "contest.submission.async.max-pool-size=0",
                         "contest.submission.async.queue-capacity=0",
-                        "contest.outbox.batch-size=0",
-                        "contest.outbox.recovery-batch-size=0",
+                        "contest.scoreboard.stream.consumer.batch-size=0",
+                        "contest.scoreboard.stream.consumer.prefetch=0",
+                        "contest.scoreboard.stream.consumer.tail-probe-prefetch=0",
                         "contest.submission.judge.rabbit.publisher.batch-size=0",
                         "contest.submission.bulk.batch-size=0",
                         "contest.submission.bulk.worker-count=0",
@@ -82,8 +93,8 @@ class OperationalPropertiesBindingTests {
                 .run(context -> {
                     ContestSubmissionExecutorProperties executor =
                             context.getBean(ContestSubmissionExecutorProperties.class);
-                    ContestScoreboardOutboxProperties scoreboard =
-                            context.getBean(ContestScoreboardOutboxProperties.class);
+                    ContestScoreboardStreamConsumerProperties scoreboard =
+                            context.getBean(ContestScoreboardStreamConsumerProperties.class);
                     ContestJudgeOutboxRelayProperties judgeRelay =
                             context.getBean(ContestJudgeOutboxRelayProperties.class);
                     ContestSubmissionBulkProperties bulk = context.getBean(ContestSubmissionBulkProperties.class);
@@ -96,7 +107,8 @@ class OperationalPropertiesBindingTests {
                     assertThat(executor.effectiveMaxPoolSize()).isEqualTo(1);
                     assertThat(executor.effectiveQueueCapacity()).isEqualTo(1);
                     assertThat(scoreboard.effectiveBatchSize()).isEqualTo(1);
-                    assertThat(scoreboard.effectiveRecoveryBatchSize()).isEqualTo(1);
+                    assertThat(scoreboard.effectivePrefetch()).isEqualTo(1);
+                    assertThat(scoreboard.effectiveTailProbePrefetch()).isEqualTo(1);
                     assertThat(judgeRelay.effectiveBatchSize()).isEqualTo(1);
                     assertThat(bulk.effectiveBatchSize()).isEqualTo(1);
                     assertThat(bulk.effectiveWorkerCount()).isEqualTo(1);
@@ -113,11 +125,12 @@ class OperationalPropertiesBindingTests {
     @Configuration(proxyBeanMethods = false)
     @EnableConfigurationProperties({
             ContestSubmissionExecutorProperties.class,
-            ContestScoreboardOutboxProperties.class,
+            ContestScoreboardStreamConsumerProperties.class,
             ContestJudgeOutboxRelayProperties.class,
             ContestSubmissionBulkProperties.class,
             ContestSubmissionCompletionProperties.class,
-            ContestSubmissionJudgeResultWriterProperties.class
+            ContestSubmissionJudgeResultWriterProperties.class,
+            ContestJudgeResultStreamPublisherProperties.class
     })
     static class PropertiesConfiguration {
     }

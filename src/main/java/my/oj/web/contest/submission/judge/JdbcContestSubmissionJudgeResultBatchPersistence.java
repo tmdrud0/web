@@ -27,32 +27,6 @@ public class JdbcContestSubmissionJudgeResultBatchPersistence {
             VALUES (?, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP(6))
             """;
 
-    /**
-     * {@code due_at} drives which rows the scoreboard worker claims and is compared against the
-     * database clock, so every writer stamps it with {@code CURRENT_TIMESTAMP(6)} rather than a
-     * JVM timestamp - otherwise a JVM in a different time zone makes rows claimable too early or
-     * never at all.
-     */
-    private static final String OUTBOX_INSERT_SQL = """
-            INSERT IGNORE INTO contest_submission_outbox (
-                contest_submission_id,
-                contest_id,
-                problem_id,
-                user_id,
-                contest_start,
-                submitted_time,
-                judged_at,
-                result,
-                status,
-                created_at,
-                due_at,
-                processed_at,
-                last_error_message,
-                redis_seq
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, CURRENT_TIMESTAMP(6), NULL, NULL, NULL)
-            """;
-
     private final JdbcTemplate jdbcTemplate;
 
     public JdbcContestSubmissionJudgeResultBatchPersistence(JdbcTemplate jdbcTemplate) {
@@ -73,28 +47,6 @@ public class JdbcContestSubmissionJudgeResultBatchPersistence {
                 statement.setLong(2, command.contestId());
                 statement.setString(3, command.result().name());
                 statement.setTimestamp(4, timestamp(command.judgedAt()));
-            }
-
-            @Override
-            public int getBatchSize() {
-                return commands.size();
-            }
-        });
-
-        LocalDateTime createdAt = LocalDateTime.now();
-        jdbcTemplate.batchUpdate(OUTBOX_INSERT_SQL, new BatchPreparedStatementSetter() {
-            @Override
-            public void setValues(PreparedStatement statement, int index) throws SQLException {
-                ContestSubmissionJudgeResultCommand command = commands.get(index);
-                statement.setLong(1, command.submissionId());
-                statement.setLong(2, command.contestId());
-                statement.setLong(3, command.problemId());
-                statement.setLong(4, command.userId());
-                statement.setTimestamp(5, timestamp(command.contestStart()));
-                statement.setTimestamp(6, timestamp(command.submittedTime()));
-                statement.setTimestamp(7, timestamp(command.judgedAt()));
-                statement.setString(8, command.result().name());
-                statement.setTimestamp(9, timestamp(createdAt));
             }
 
             @Override

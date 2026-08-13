@@ -29,19 +29,19 @@ $rabbitmqCsv = Join-Path $OutputDirectory "rabbitmq-metrics.csv"
 $redisScoreboardCsv = Join-Path $OutputDirectory "redis-scoreboard-metrics.csv"
 $prometheusUrl = "http://127.0.0.1:9090"
 
-# One statement keeps the whole pipeline snapshot on a single MySQL round trip. The lag subquery
-# deliberately matches contest_scoreboard_oldest_ready_seconds for the scoreboard and the legacy
-# contest_outbox_head_lag_seconds diagnostic for both outboxes: PENDING only, ordered through each
-# claim index, with MySQL's clock on both sides of the subtraction.
+# One statement keeps the MySQL side of the pipeline snapshot on a single round trip. The
+# scoreboard SQL count is a fallback when the optional observability overlay is absent. When Prometheus is
+# available, Sample-Pipeline replaces it with the implementation-neutral stream-tail minus Redis
+# applied-offset gauge exported by batch-1.
 $pipelineSql = @(
     "SELECT"
     "(SELECT COUNT(*) FROM contest_judge_outbox WHERE status <> 'PUBLISHED'),"
     "(SELECT COALESCE((SELECT TIMESTAMPDIFF(MICROSECOND, created_at, CURRENT_TIMESTAMP(6)) DIV 1000 FROM contest_judge_outbox WHERE status = 'PENDING' ORDER BY claimed_at, id LIMIT 1), 0)),"
     "(SELECT COUNT(*) FROM contest_judge_outbox WHERE status = 'PUBLISHED'),"
-    "(SELECT COUNT(*) FROM contest_submission_outbox WHERE status = 'PENDING'),"
-    "(SELECT COUNT(*) FROM contest_submission_outbox WHERE status = 'PROCESSING'),"
-    "(SELECT COUNT(*) FROM contest_submission_outbox WHERE status = 'FAILED'),"
-    "(SELECT COALESCE((SELECT TIMESTAMPDIFF(MICROSECOND, due_at, CURRENT_TIMESTAMP(6)) DIV 1000 FROM contest_submission_outbox WHERE status = 'PENDING' ORDER BY claimed_at, created_at, id LIMIT 1), 0)),"
+    "(SELECT COUNT(*) FROM contest_submission_result WHERE scoreboard_applied_at IS NULL),"
+    "0,"
+    "0,"
+    "(SELECT COALESCE((SELECT TIMESTAMPDIFF(MICROSECOND, result_saved_at, CURRENT_TIMESTAMP(6)) DIV 1000 FROM contest_submission_result WHERE scoreboard_applied_at IS NULL ORDER BY result_saved_at, submission_id LIMIT 1), 0)),"
     "(SELECT COUNT(*) FROM contest_submission),"
     "(SELECT COUNT(*) FROM contest_submission_result),"
     "(SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Threads_connected'),"
@@ -184,7 +184,7 @@ function Sample-RabbitMqMetrics {
         # One instant query returns all retained queue-level gauges and counters. Keeping raw
         # counters in the artifact lets the summary calculate rates over exactly the load phase,
         # without depending on a later Prometheus retention window.
-        $query = '{job="rabbitmq-per-queue",queue=~"contest\\.judge\\.(live|dead)"}'
+        $query = '{job="rabbitmq-per-queue",queue=~"contest\\.judge\\.(live|dead|result\\.stream)"}'
         $encodedQuery = [uri]::EscapeDataString($query)
         $response = Invoke-RestMethod -Uri "$prometheusUrl/api/v1/query?query=$encodedQuery" -TimeoutSec 4
         if ($response.status -ne "success") { return }
@@ -203,6 +203,10 @@ function Sample-RabbitMqMetrics {
                 DeliveredAckTotal = 0d; DeliveredAutoTotal = 0d; Seen = $false
             }
             "contest.judge.dead" = @{
+                Ready = 0d; Unacked = 0d; Consumers = 0d; PublishedTotal = 0d
+                DeliveredAckTotal = 0d; DeliveredAutoTotal = 0d; Seen = $false
+            }
+            "contest.judge.result.stream" = @{
                 Ready = 0d; Unacked = 0d; Consumers = 0d; PublishedTotal = 0d
                 DeliveredAckTotal = 0d; DeliveredAutoTotal = 0d; Seen = $false
             }
@@ -333,6 +337,12 @@ function Sample-Pipeline {
         $values = ($row | Select-Object -Last 1) -split "`t"
         if ($values.Count -lt 11) { return }
 
+        $streamPending = Get-PrometheusValuesByNode -Query `
+            'max by (node) (contest_scoreboard_pending_events)'
+        if ($null -ne $streamPending -and $streamPending.Count -gt 0) {
+            $values[3] = [double](($streamPending.Values | Measure-Object -Sum).Sum)
+        }
+
         $rabbitReady = 0L
         $rabbitUnacked = 0L
         $rabbitLiveReady = 0L
@@ -352,14 +362,16 @@ function Sample-Pipeline {
                     [int64]::TryParse($fields[$fields.Count - 3], [ref]$ready) -and
                     [int64]::TryParse($fields[$fields.Count - 2], [ref]$unacked) -and
                     [int64]::TryParse($fields[$fields.Count - 1], [ref]$consumers)) {
-                    $rabbitReady += $ready
-                    $rabbitUnacked += $unacked
                     if ($fields[0] -eq "contest.judge.live") {
+                        $rabbitReady += $ready
+                        $rabbitUnacked += $unacked
                         $rabbitLiveReady = $ready
                         $rabbitLiveUnacked = $unacked
                         $rabbitLiveConsumers = $consumers
                     }
                     elseif ($fields[0] -eq "contest.judge.dead") {
+                        $rabbitReady += $ready
+                        $rabbitUnacked += $unacked
                         $rabbitDeadReady = $ready
                         $rabbitDeadUnacked = $unacked
                         $rabbitDeadConsumers = $consumers

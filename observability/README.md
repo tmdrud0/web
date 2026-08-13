@@ -190,8 +190,8 @@ docker compose -f compose.yaml -f compose.observability.yaml ps
    가 값을 반환하는지 본다. 비어 있으면 히스토그램 버킷이 꺼진 것이다.
 6. Grafana의 `OJ` 폴더에 `OJ - Bottleneck Overview` 대시보드가 있는지 본다.
 7. `contest_scoreboard_pending_events`가 `batch-1`의 **한 시계열**만 반환하는지 본다. 진단용
-   `contest_outbox_backlog_rows`는 judge 2개(PENDING, PUBLISHING)와 scoreboard 3개(PENDING,
-   PROCESSING, FAILED), 합계 5개이며 `count by (node) (...)`는 `batch-1` 하나만 내야 한다.
+   `contest_outbox_backlog_rows`는 남아 있는 judge 2개(PENDING, PUBLISHING)뿐이며
+   `count by (node) (...)`는 `batch-1` 하나만 내야 한다.
    다른 역할에서도 gauge 폴러가 켜지면 `sum()`이 backlog를 인스턴스 수만큼 부풀린다.
 8. Prometheus `Status > Rule Health`에서 규칙 그룹 4개가 모두 `OK`인지 본다.
    `oj:contest_scoreboard_estimated_drain:seconds`가 비어 있으면 pending/apply 지표가 올라오지 않은
@@ -433,38 +433,80 @@ Admission 패널은 1600 대 4000, 여유 60%로 읽힌다. 유휴 상태에서�
 `contest_outbox_*`에는 `{role="web"}`을 붙이면 안 된다. batch-1이 유일한 게시자이므로
 아무것도 선택되지 않는다. 두 방향 모두 `PipelineMetricNamesTests`가 고정한다.
 
-### 9.5 staleness 꼬리를 읽기 전에 재시도부터 확인한다
+### 9.5 Redis 초기화와 stream replay
 
-`redis_seq`는 Redis의 sequence 카운터가 발급하고 DB outbox에 저장된다. 그래서 **Redis만 비우고
-DB outbox 행을 남기면** 다음 실행이 같은 번호를 다시 발급하고, 그것이
-`docs/CONTEST_SUBMISSION_PIPELINE_HISTORY.md` §5.2가 정의한 **Redis 롤백 신호와 구별되지 않는다.**
-복구 워커는 정상 동작한다 — 없는 장애를 만들어 준 쪽이 잘못이다.
+B단계에서는 RabbitMQ가 offset을 발급하고 Redis Lua가 scoreboard와 offset을 함께 저장한다.
+따라서 예전처럼 Redis를 비울 때 `contest_submission_outbox`와 `contest_judge_outbox`를 함께
+비워야 하는 오염 조건은 사라졌다. scoreboard outbox는 현재 쓰지 않으며 judge outbox는 별개의
+publish 복구 경로다.
 
-이때 나타나는 모양은 다음과 같다. 실측이다.
+다만 `FLUSHDB`의 의미 자체가 더 강해졌다. scoreboard와 저장 offset을 함께 지우므로 consumer가
+retention의 첫 event부터 replay해야 한다. retention 첫 offset이 0보다 크면 consumer가 gap을
+감지하고 MySQL 결과로 전체 contest를 rebuild한 뒤 첫 보존 offset부터 이어간다. 그러므로 운영
+복구 시험은 다음 순서를 사용한다.
 
-| | 오염된 실행 | 정상 실행 |
-|---|---:|---:|
-| 겹친 `redis_seq` 값 | 946 | 0 |
-| `attempts > 1` 행 | 924 | **0** |
-| `scoreboard applied` p99 | 31.4s | **4.9s** |
-| `scoreboard applied` max | 178s | **13.3s** |
+1. batch consumer를 중지한다.
+2. Redis 전체 snapshot 또는 scoreboard key와 `contest:scoreboard:stream:offset`을 함께 비운다.
+3. batch consumer를 시작한다.
+4. `contest_scoreboard_pending_events`가 0이 되고 Redis scoreboard가 DB rebuild와 같아질 때까지 기다린다.
+5. `scoreboard_applied_at`은 최초 시각을 보존하는 JDBC batch와 Redis `db-pending` repair set으로
+   다시 확인한다.
 
-`attempts = 1`인 행만 보면 오염된 실행에서도 최대 4.5초였다. **꼬리 전체가 재시도였다.**
+부하 비교 harness의 평상시 reset은 의도치 않은 전체 replay 비용을 측정에 섞지 않도록 Redis와
+stream offset을 보존한다. `state-reset.csv`에는 보존한 Redis key 수와 offset, 정리한 judge
+outbox 행 수, 비교 기준 result stream 메시지 수를 기록한다. 전체 Redis 삭제는 별도의 복구
+시나리오로만 실행한다.
 
-부수 증상이 두 가지 더 있다. `Wait-PipelineDrain`이 0을 보고 끝난 뒤 복구 워커가 `COMPLETED`
-행을 다시 큐에 넣으므로 **`processed_at`이 드레인 완료 후에 갱신되고**, 샘플러는 이미 멈춘
-뒤라 head-lag 교차 검증이 서로 다른 시간 구간을 비교해 `MISMATCH`를 낸다. 실측 실행에서
-샘플링은 07:46:18에 끝났는데 처리는 07:49:23까지 이어졌다. 그리고 이 되돌림은 수렴하지 않아
-**부하가 끝난 지 5분이 지나도 requeue 로그가 계속 찍혔다.**
+## 10. scoreboard pending과 outbox 진단 지표(A단계까지의 설계 기록)
 
-`gatling/run-loadtest.ps1`의 `Reset-LoadRedis`가 `FLUSHDB`와 함께 두 outbox 테이블을 비우는
-이유가 이것이다. Redis와 그 두 테이블은 한 덩어리 상태이고, 절반만 비우면 안 된다.
+### 10.0 B단계 현재 계약
 
-## 10. scoreboard pending과 outbox 진단 지표
+현재 구현 중립 지표는 다음 원천을 사용한다.
+
+| 노출 이름 | 원천 | 의미 |
+|---|---|---|
+| `contest_scoreboard_pending_events` | batch-1의 AMQP 0.9.1 tail probe + Redis Lua checkpoint | 관측한 stream 최신 offset - Redis 적용 offset |
+| `contest_scoreboard_oldest_ready_seconds` | batch-1 stream consumer | 현재 적용 또는 retry 중인 head batch의 `judgedAt` 나이 |
+| `contest_scoreboard_applied_total` | batch-1 stream consumer | Redis Lua와 `scoreboard_applied_at` JDBC batch를 모두 완료한 새 offset 수 |
+
+AMQP 0.9.1 consumer는 RabbitMQ의 broker-managed offset tracking 대상이 아니므로
+`stream_consumer_metrics`에 lag sample을 만들지 않는다. batch-1은 5초마다
+`x-stream-offset=last` consumer로 마지막 저장 chunk를 drain해 최신 offset을 관측한다. 따라서 pending
+곡선은 최대 한 probe 주기만큼 늦을 수 있다. probe 실패는 값을 0으로 덮지 않고
+`contest_scoreboard_stream_tail_probe_failures_total`과 `ContestScoreboardStreamTailProbeFailed`로 드러낸다.
+`/metrics/detailed`의 기존 queue family에는 stream queue 자체의 consumer/ready/delivery 지표가 계속 잡힌다.
+tail probe도 짧게 consumer로 등록되므로 probe의 50ms 구간과 scrape가 겹치면 stream queue consumer
+수가 순간적으로 2로 보일 수 있고, steady-state 소유 consumer 수는 1이다.
+
+**B단계 실측(2026-08-09, `submit-100`)**
+
+격리된 `submit-100`(30초 ramp + 180초 hold)을 B단계 코드로 다시 실행했다.
+
+- `contest_submission` = `contest_submission_result` = result stream 증가분 =
+  `scoreboard_applied_at IS NOT NULL`: 각각 19,386
+- 최종 judge outbox, judge work queue, scoreboard unapplied: 모두 0
+- HTTP: 24,376/24,378 성공(99.9918%), p95 2.609초
+- scoreboard staleness: p50 0.348초, p95 45.865초, p99 57.530초, max 64.718초
+- sampler의 DB fallback pending peak 4,777, head lag peak 50.119초, OOM 0
+
+이 실행에는 load stack용 Prometheus target이 없어 `contest_scoreboard_pending_events` 자체 대신 같은
+완료 의미의 DB fallback(`scoreboard_applied_at IS NULL`)을 표본화했다. 실제 Rabbit/Redis 통합
+테스트는 consumer 정지 중 app pending gauge가 0→1, 재개 후 1→0이 되는 것과
+`/metrics/detailed` queue family에 `contest.judge.result.stream`이 잡히는 것을 별도로 고정한다.
+
+judge 장애와 같은 재전달은 별도 AMQP consumer가 unacked message를 가진 채 connection abort되도록
+검증했다. 저장 결과 1행은
+그대로 유지되고 result stream만 1건 늘었으며 `ContestSubmissionJudgement` 호출은 0회였다. 즉
+프로세스 종료가 만드는 것과 같은 broker redelivery도 저장 결과 재발행 경로를 사용하며 재채점하지 않는다.
+
+`contest_outbox_*`는 이제 `{outbox="judge"}`만 게시한다. scoreboard의 PENDING/PROCESSING/FAILED,
+retry, observation-failure series는 제거했다. 아래 내용은 공통 축을 처음 도입한 A단계의 판단과
+측정 이력을 보존한 것이며 현재 scoreboard adapter의 구현 설명은 아니다.
 
 운영 판단의 질문은 저장 구조가 아니라 **"채점은 끝났지만 아직 scoreboard에 반영되지 않은
 결과가 얼마나 많고, 그중 바로 처리할 수 있는 가장 오래된 것은 얼마나 기다렸는가"**다. 현재
-구현에서는 답이 `contest_submission_outbox`에 있지만 RabbitMQ Stream 구현에서는 consumer lag에
+과거 구현에서는 답이 `contest_submission_outbox`에 있었지만 RabbitMQ Stream 구현에서는 tail offset과
+Redis 적용 offset의 차이에
 있다. 구현 이름을 직접 읽으면 before/after 공통 축이 사라지므로 지표를 두 층으로 나눈다.
 
 ### 왜 두 층인가
@@ -475,7 +517,7 @@ DB outbox 행을 남기면** 다음 실행이 같은 번호를 다시 발급하�
 | 구현 진단 계층 | PENDING·PROCESSING·FAILED·PUBLISHING, retry 등 원인 분해 | 구현과 함께 바뀔 수 있음 |
 
 공통 `pending`은 아직 적용되지 않은 모든 이벤트를 센다. 현재 outbox에서는
-`PENDING + PROCESSING + FAILED`이고, Stream에서는 같은 의미의 consumer lag가 된다. 반면 나이는
+`PENDING + PROCESSING + FAILED`이었고, Stream에서는 같은 의미의 tail-applied offset 차가 된다. 반면 나이는
 `oldest_unapplied`가 아니라 **`oldest_ready`**라고 부른다. 아래 기존 판단대로 backoff 중인
 FAILED와 lease 안의 PROCESSING은 의도적으로 제외하며, 지금 당장 소비할 수 있는 PENDING만 보기
 때문이다. `unapplied`라고 부르면 한 시간 된 FAILED도 포함한다고 오해하게 된다.
@@ -486,7 +528,7 @@ FAILED와 lease 안의 PROCESSING은 의도적으로 제외하며, 지금 당장
 | 공통 meter | 노출 이름 | 현재 outbox 구현의 원천 | 게시 주체 |
 |---|---|---|---|
 | `contest.scoreboard.pending` | `contest_scoreboard_pending_events` | scoreboard non-terminal 상태 합 | batch-1 |
-| `contest.scoreboard.oldest.ready` | `contest_scoreboard_oldest_ready_seconds` | scoreboard PENDING head lag | batch-1 |
+| `contest.scoreboard.oldest.ready` | `contest_scoreboard_oldest_ready_seconds` | stream 처리/retry 중 head lag | batch-1 |
 | `contest.scoreboard.applied` | `contest_scoreboard_applied_total` | scoreboard COMPLETED 적용 수 | 5개 역할 등록, batch-1만 증가 |
 | `contest.scoreboard.observation.failures` | `contest_scoreboard_observation_failures_total` | scoreboard gauge 갱신 실패 | batch-1 |
 
@@ -705,13 +747,8 @@ p50/p95/p99이며 `max`와 표본 수 `n`을 항상 함께 낸다. 단계별 분
 | `result queryable` | `contest_submission.submitted_time` | `contest_submission_result.result_saved_at` | `TIMESTAMPDIFF(MICROSECOND, submitted_time, result_saved_at)` |
 | `scoreboard applied` | `contest_submission.submitted_time` | `contest_submission_result.scoreboard_applied_at` | `TIMESTAMPDIFF(MICROSECOND, submitted_time, scoreboard_applied_at)` |
 
-V17 전환 검증 중에는 아래 legacy 정의도 같은 CSV에 나란히 남긴다. 주 지표는 위 두 행이며,
-legacy 행은 과거 결과와의 연결만을 위한 임시 출력이다.
-
-| CSV 출력 이름 | legacy 종점 |
-|---|---|
-| `legacy-result-queryable` | `contest_submission_outbox.created_at` |
-| `legacy-scoreboard-applied` | `contest_submission_outbox.processed_at` |
+B단계부터 scoreboard outbox 행이 생성되지 않으므로 legacy outbox 종점은 CSV에서 제거했다.
+과거 수치는 아래 역사적 기준선 표에서만 유지한다.
 
 시작은 **(가) 요청 처리 중 `SubmissionService`가 `LocalDateTime.now()`로 찍은 서버 시각**이다.
 200 응답 시각이 아니므로 admission semaphore 대기, bulk queue 대기, 제출 DB transaction과
@@ -728,15 +765,15 @@ p99"를 만들지는 않는다. 그 값도 어떤 실제 제출의 p99가 아니
 writer queue에 넣기 전에 찍혀 queue 대기와 결과 DB 쓰기를 누락한다. 대신 결과 batch INSERT
 statement가 `result_saved_at = CURRENT_TIMESTAMP(6)`을 함께 쓴다. 결과 행은 transaction이
 commit된 뒤에만 조회 가능하므로 조회 가능 시점에 가까운 저장 시각이면서 outbox 스키마에
-의존하지 않는다. 다만 MySQL의 실제 MVCC commit timestamp는 아니어서, result INSERT 뒤
-outbox INSERT와 commit에 걸린 짧은 구간은 포함하지 않는다는 한계가 있다.
+의존하지 않는다. 다만 MySQL의 실제 MVCC commit timestamp는 아니어서 result INSERT 뒤
+transaction commit까지의 짧은 구간은 포함하지 않는다.
 
-`scoreboard applied`의 `scoreboard_applied_at`은 Redis Lua/pipeline 적용이 성공한 뒤 outbox의
-`processed_at`과 같은 MySQL statement에서 `CURRENT_TIMESTAMP(6)`로 기록된다. 따라서 두 번째
-분포는 judge와 result writer를 거쳐 Redis 반영까지의 전체 경로를 포함한다. 두 쿼리 모두
-`contest_submission_result`까지만 읽으며, 하네스가 먼저
-`submissions == results == result timestamps == scoreboard timestamps == outbox == completed`인지
-검사해 표본 완전성을 보장한다.
+`scoreboard applied`의 `scoreboard_applied_at`은 stream consumer가 Redis Lua 적용을 성공한 뒤
+submission ID 전체를 JDBC batch update하며 `CURRENT_TIMESTAMP(6)`로 기록한다. 따라서 두 번째
+분포는 judge와 result writer, stream publish/consume, Redis 반영까지의 전체 경로를 포함한다.
+두 쿼리 모두 `contest_submission_result`까지만 읽으며, 하네스가 먼저
+`submissions == results == result timestamps == scoreboard timestamps`인지 검사해 표본 완전성을
+보장한다.
 
 V16부터 기존 관련 시각을 `DATETIME(6)`으로 저장하고 V17부터 결과 행의 두 종점도
 `DATETIME(6)`으로 저장한다. V16 이전 행은 기존 시각의 소수부가 `.000000`이고 V17 이전 행은
@@ -890,10 +927,10 @@ p95 throttle만 재기동과 함께 순간적으로 올랐다. GC와 heap도 반
 1. 비교하려는 구현 외에는 같은 호스트/WSL 예산, Compose 파일과 자원 상한, observability
    overlay, 시나리오 파라미터와 환경 변수를 사용한다. 일반 OJ 스택이나 다른 부하 작업을 함께
    실행하지 않는다.
-2. 실행마다 `state-reset.csv`의 Redis·두 outbox가 모두 0이어야 한다. 하나라도 0이 아니면
-   즉시 무효다.
+2. 실행마다 `state-reset.csv`에서 judge outbox가 0이어야 한다. Redis key 수와 scoreboard
+   stream offset은 의도적으로 보존하며, 갑작스러운 감소는 rollback/replay 신호로 취급한다.
 3. Gatling assertion과 materialization 검사를 통과하고 OOMKilled=false여야 한다.
-   `run-diagnostics.csv`는 `attempts > 1 = 0`, JVM restart=0, observed JVM nodes=5여야 한다.
+   `run-diagnostics.csv`는 scoreboard unapplied=0, JVM restart=0, observed JVM nodes=5여야 한다.
 4. 부하 구간의 앱 노드별 throttle 중앙값이 모두 **10% 이하**여야 한다. 이번 정상값 0~0.4%에
    충분한 여유를 주면서 §8의 61~78%가 지속되는 자원 상한 실행을 배제하는 경계다. GC와 heap은
    함께 보고하되, 구현 자체가 바꾸려는 값일 수 있으므로 기준선과 다르다는 이유만으로 버리지
@@ -959,7 +996,7 @@ batch-1이 내려가면 outbox warning들은 독립된 발견이 아니라 criti
 기본 `rabbitmq` job은 노드 전체 상태를 보는 저비용 합산 `/metrics`를 그대로 유지한다. 큐를
 구분하는 `rabbitmq-per-queue` job만 `/metrics/detailed`를 추가로 긁는다. 전체 per-object 모드를
 켜지 않은 이유는 연결·채널 수가 늘 때 시계열도 함께 늘기 때문이다. RabbitMQ 4.1은 detailed
-endpoint에서 family를 고를 수 있으므로 다음 네 개만 요청한다
+endpoint에서 family를 고를 수 있으므로 다음 다섯 개만 요청한다
 ([공식 Prometheus 지표 목록](https://www.rabbitmq.com/docs/4.1/prometheus)).
 
 | family | 이 리포에서 쓰는 값 |
@@ -969,10 +1006,12 @@ endpoint에서 family를 고를 수 있으므로 다음 네 개만 요청한다
 | `queue_delivery_metrics` | 큐별 manual/auto-ack deliver counter |
 | `queue_exchange_metrics` | exchange를 거쳐 큐에 들어온 publish counter |
 
-그 응답에서도 dashboard와 부하 하네스가 읽는 6개 metric 이름만 metric relabeling으로 남긴다.
+그 응답에서도 dashboard와 부하 하네스가 읽는 queue metric만 metric
+relabeling으로 남긴다.
 채널 ID가 붙는 `channel_queue_metrics`와 `channel_queue_exchange_metrics`는 사용하지 않는다.
 현재 32개 consumer channel에서 `channel_queue_metrics`만 직접 요청해도 230 samples였지만, 선택한
-네 family의 원 응답은 26 samples이고 relabel 뒤 RabbitMQ payload는 **9 series**다. 마지막으로
+기존 네 family의 원 응답은 26 samples였고 relabel 뒤 RabbitMQ payload는 9 series였다. B단계의
+offset pending은 Rabbit exporter가 아니라 batch-1 application meter가 게시한다. 마지막으로
 `sample_limit: 100`을 둔다. 새 queue/stream을 잘못 무제한 노출하면 target 전체가 `up=0`이 되어
 조용한 TSDB 증가가 아니라 명시적인 관측 실패가 된다.
 

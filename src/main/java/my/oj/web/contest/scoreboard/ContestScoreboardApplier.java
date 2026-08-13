@@ -1,56 +1,52 @@
 package my.oj.web.contest.scoreboard;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
- * The only write path into the live scoreboard. The outbox worker drives it in steady state
- * and a rebuild drives it after {@link #reset(long)}, so the scoring rules live in one place
- * per backing store.
+ * The only write path into the live scoreboard. The RabbitMQ Stream consumer drives it in steady
+ * state and a rebuild drives it after {@link #reset(long)}, so the scoring rules live in one
+ * place per backing store.
  *
- * <p>Deduplication keys off {@link ContestScoreboardUpdate#contestSubmissionId()}. The
- * {@code eventId} carried by {@link ApplyRequest} is a caller-side correlation token — it maps
- * a result back to the outbox row that produced it and has no effect on what gets applied.
+ * <p>Deduplication keys off {@link ContestScoreboardUpdate#contestSubmissionId()}. A live request
+ * also carries the broker-assigned stream offset. Redis implementations persist that offset in
+ * the same Lua invocation that mutates the scoreboard. Rebuild requests deliberately carry no
+ * offset: rebuilding one contest must never move the global stream checkpoint.
  */
 public interface ContestScoreboardApplier {
 
-    /**
-     * Applies one judgement and returns the sequence assigned to its submission. The sequence
-     * is allocated once per submission and stays stable across retries and rebuilds.
-     */
-    Long apply(Long eventId, ContestScoreboardUpdate update);
+    Long apply(ApplyRequest request);
 
     /**
-     * Applies a batch, returning one result per request in the same order. Implementations may
-     * apply the batch in one round trip; the default falls back to applying one at a time so a
-     * single bad event cannot fail the rest.
+     * Applies a batch in request order and stops at the first failure. A stream checkpoint must
+     * never jump over one bad event and make it unreachable on restart.
      */
     default List<ApplyResult> applyAll(List<ApplyRequest> requests) {
         if (requests == null || requests.isEmpty()) {
             return List.of();
         }
-        return List.copyOf(requests).stream()
-                .map(request -> {
-                    try {
-                        return ApplyResult.success(
-                                request.eventId(),
-                                apply(request.eventId(), request.update())
-                        );
-                    } catch (RuntimeException exception) {
-                        return ApplyResult.failure(request.eventId(), errorMessage(exception));
-                    }
-                })
-                .toList();
+        List<ApplyRequest> safeRequests = List.copyOf(requests);
+        List<ApplyResult> results = new ArrayList<>(safeRequests.size());
+        for (ApplyRequest request : safeRequests) {
+            try {
+                results.add(ApplyResult.success(request.correlationId(), apply(request)));
+            } catch (RuntimeException exception) {
+                results.add(ApplyResult.failure(request.correlationId(), errorMessage(exception)));
+                break;
+            }
+        }
+        return List.copyOf(results);
     }
 
     /**
-     * Highest sequence handed out so far. Recovery compares it against the sequences recorded
-     * in the outbox to spot a store that lost data and needs those rows replayed.
+     * Highest RabbitMQ Stream offset atomically reflected in this scoreboard, or {@code -1} when
+     * no live stream event has been applied. Redis rollback rewinds this value with the state.
      */
-    long currentSequence();
+    long currentStreamOffset();
 
     /**
-     * Clears one contest's standings. Sequences survive, so a rebuild re-applies the same
-     * judgements onto empty standings without renumbering them.
+     * Clears one contest's standings and processed-submission set. The global stream offset
+     * survives: a contest rebuild repairs derived state but does not claim unrelated stream work.
      */
     void reset(long contestId);
 
@@ -60,22 +56,43 @@ public interface ContestScoreboardApplier {
         return cause.getClass().getSimpleName() + (message == null ? "" : ": " + message);
     }
 
-    record ApplyRequest(long eventId, ContestScoreboardUpdate update) {
+    record ApplyRequest(long correlationId,
+                        Long streamOffset,
+                        boolean allowOffsetGap,
+                        ContestScoreboardUpdate update) {
         public ApplyRequest {
             if (update == null) {
                 throw new IllegalArgumentException("Scoreboard update is required");
             }
+            if (streamOffset != null && streamOffset < 0) {
+                throw new IllegalArgumentException("Scoreboard stream offset must not be negative");
+            }
+            if (allowOffsetGap && streamOffset == null) {
+                throw new IllegalArgumentException("Only a stream request can allow an offset gap");
+            }
+        }
+
+        public static ApplyRequest stream(long offset, ContestScoreboardUpdate update) {
+            return new ApplyRequest(offset, offset, false, update);
+        }
+
+        public static ApplyRequest streamAfterRebuild(long offset, ContestScoreboardUpdate update) {
+            return new ApplyRequest(offset, offset, true, update);
+        }
+
+        public static ApplyRequest rebuild(long correlationId, ContestScoreboardUpdate update) {
+            return new ApplyRequest(correlationId, null, false, update);
         }
     }
 
-    record ApplyResult(long eventId, Long sequence, String errorMessage) {
+    record ApplyResult(long correlationId, Long appliedOffset, String errorMessage) {
 
-        public static ApplyResult success(long eventId, Long sequence) {
-            return new ApplyResult(eventId, sequence, null);
+        public static ApplyResult success(long correlationId, Long appliedOffset) {
+            return new ApplyResult(correlationId, appliedOffset, null);
         }
 
-        public static ApplyResult failure(long eventId, String errorMessage) {
-            return new ApplyResult(eventId, null, errorMessage);
+        public static ApplyResult failure(long correlationId, String errorMessage) {
+            return new ApplyResult(correlationId, null, errorMessage);
         }
 
         public boolean succeeded() {

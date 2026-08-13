@@ -7,6 +7,8 @@ import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import my.oj.web.contest.submission.queue.ContestSubmissionBulkMetrics;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplyMetrics;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardWrongAttemptMetrics;
+import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamConsumerProperties;
+import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamMetrics;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 
@@ -18,6 +20,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -98,9 +101,8 @@ class PipelineMetricNamesTests {
     }
 
     /**
-     * The neutral gauges have one publisher, while the applied counter registers on every role
-     * but stays at zero outside batch-1. Both cases make an unscoped sum exact; a web-role filter
-     * would instead remove the only non-zero series.
+     * The neutral gauges and applied counter have one publisher, batch-1. An unscoped sum is
+     * therefore exact; a web-role filter would instead remove the only series.
      */
     @Test
     void neutralScoreboardQueriesAreNotScopedToTheWebRole() throws IOException {
@@ -139,9 +141,11 @@ class PipelineMetricNamesTests {
                 .as("no contest_* series found in %s - the extraction stopped matching", source)
                 .isNotEmpty();
         String scrape = scrape();
-        assertThat(series).allSatisfy(name -> assertThat(scrape)
-                .as("%s queries %s, which nothing exports", source, name)
-                .contains(name));
+        Set<String> recordingRules = recordingRuleNames();
+        assertThat(series).allSatisfy(name -> assertThat(
+                        scrape.contains(name) || recordingRules.contains(name))
+                .as("%s queries %s, which neither the application nor a recording rule exports", source, name)
+                .isTrue());
     }
 
     /** Every meter this repository registers, materialised by one recording each. */
@@ -162,7 +166,6 @@ class PipelineMetricNamesTests {
         ContestOutboxDrainMetrics drain = new ContestOutboxDrainMetrics();
         drain.bindTo(registry);
         drain.recordJudgeRelay(1, 1);
-        drain.recordScoreboardBatch(1, 1);
 
         new ContestOutboxBacklogMetrics(mock(JdbcTemplate.class), new ContestOutboxMetricsProperties(1_000))
                 .bindTo(registry);
@@ -173,8 +176,28 @@ class PipelineMetricNamesTests {
         new RedisContestScoreboardWrongAttemptMetrics(mock(
                 my.oj.web.contest.scoreboard.redis.ContestRedisKeyValueClient.class))
                 .bindTo(registry);
+        new ContestScoreboardStreamMetrics(
+                registry,
+                new ContestScoreboardStreamConsumerProperties(
+                        500, 500, Duration.ofMillis(50), Duration.ofSeconds(1), Duration.ofSeconds(1),
+                        Duration.ofSeconds(5), Duration.ofMillis(50), Duration.ofSeconds(2), 4096)
+        );
 
         return registry.scrape();
+    }
+
+    private static Set<String> recordingRuleNames() {
+        try {
+            Set<String> names = new LinkedHashSet<>();
+            Files.readAllLines(RULES).stream()
+                    .map(String::trim)
+                    .filter(line -> line.startsWith("- record:"))
+                    .map(line -> line.substring("- record:".length()).trim())
+                    .forEach(names::add);
+            return names;
+        } catch (IOException failure) {
+            throw new IllegalStateException(failure);
+        }
     }
 
     private static Set<String> seriesIn(String text) {

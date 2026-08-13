@@ -24,7 +24,9 @@ import org.springframework.context.annotation.Configuration;
 
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnExpression("'${contest.submission.judge.rabbit.publisher.enabled:false}' == 'true' || "
-        + "'${contest.submission.judge.rabbit.listener.enabled:false}' == 'true'")
+        + "'${contest.submission.judge.rabbit.listener.enabled:false}' == 'true' || "
+        + "'${contest.submission.judge.result-stream.publisher.enabled:false}' == 'true' || "
+        + "'${contest.scoreboard.stream.consumer.enabled:false}' == 'true'")
 class ContestJudgeRabbitConfiguration {
 
     @Bean
@@ -61,6 +63,18 @@ class ContestJudgeRabbitConfiguration {
     }
 
     @Bean
+    Queue contestJudgeResultStreamQueue() {
+        return QueueBuilder.durable(ContestJudgeRabbitTopology.RESULT_STREAM_QUEUE)
+                .stream()
+                .withArgument("x-max-age", ContestJudgeRabbitTopology.RESULT_STREAM_MAX_AGE)
+                .withArgument(
+                        "x-max-length-bytes",
+                        ContestJudgeRabbitTopology.RESULT_STREAM_MAX_LENGTH_BYTES
+                )
+                .build();
+    }
+
+    @Bean
     Binding contestJudgeLiveBinding(Queue contestJudgeLiveQueue, DirectExchange contestJudgeExchange) {
         return BindingBuilder.bind(contestJudgeLiveQueue)
                 .to(contestJudgeExchange)
@@ -75,16 +89,44 @@ class ContestJudgeRabbitConfiguration {
                 .with(ContestJudgeRabbitTopology.DEAD_LETTER_ROUTING_KEY);
     }
 
+    @Bean
+    Binding contestJudgeResultStreamBinding(Queue contestJudgeResultStreamQueue,
+                                            DirectExchange contestJudgeExchange) {
+        return BindingBuilder.bind(contestJudgeResultStreamQueue)
+                .to(contestJudgeExchange)
+                .with(ContestJudgeRabbitTopology.RESULT_STREAM_ROUTING_KEY);
+    }
+
     @Bean("contestJudgeRabbitTemplate")
     @ConditionalOnProperty(prefix = "contest.submission.judge.rabbit.publisher", name = "enabled", havingValue = "true")
     RabbitTemplate contestJudgeRabbitTemplate(ConnectionFactory connectionFactory,
                                               Jackson2JsonMessageConverter contestJudgeMessageConverter) {
+        return publisherConfirmRabbitTemplate(connectionFactory, contestJudgeMessageConverter);
+    }
+
+    @Bean("contestJudgeResultStreamRabbitTemplate")
+    @ConditionalOnProperty(
+            prefix = "contest.submission.judge.result-stream.publisher",
+            name = "enabled",
+            havingValue = "true"
+    )
+    RabbitTemplate contestJudgeResultStreamRabbitTemplate(
+            ConnectionFactory connectionFactory,
+            Jackson2JsonMessageConverter contestJudgeMessageConverter
+    ) {
+        return publisherConfirmRabbitTemplate(connectionFactory, contestJudgeMessageConverter);
+    }
+
+    private static RabbitTemplate publisherConfirmRabbitTemplate(
+            ConnectionFactory connectionFactory,
+            Jackson2JsonMessageConverter messageConverter
+    ) {
         if (connectionFactory instanceof CachingConnectionFactory cachingConnectionFactory) {
             cachingConnectionFactory.setPublisherConfirmType(CachingConnectionFactory.ConfirmType.CORRELATED);
             cachingConnectionFactory.setPublisherReturns(true);
         }
         RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
-        rabbitTemplate.setMessageConverter(contestJudgeMessageConverter);
+        rabbitTemplate.setMessageConverter(messageConverter);
         rabbitTemplate.setMandatory(true);
         return rabbitTemplate;
     }

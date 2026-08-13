@@ -2,34 +2,26 @@ package my.oj.web.contest.scoreboard.redis;
 
 import io.lettuce.core.RedisCommandExecutionException;
 import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
-import lombok.extern.slf4j.Slf4j;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardPolicy;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
-import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.connection.lettuce.LettuceConnection;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
-import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-@Slf4j
 public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
 
-    static final String SEQUENCE_KEY = ContestScoreboardRedisKeys.OUTBOX_SEQUENCE;
-
-    private static final int SCRIPT_KEY_COUNT = 6;
+    public static final String STREAM_OFFSET_KEY = ContestScoreboardRedisKeys.STREAM_OFFSET;
+    public static final String STREAM_DB_PENDING_KEY = ContestScoreboardRedisKeys.STREAM_DB_PENDING;
 
     private final StringRedisTemplate redisTemplate;
     private final ContestRedisKeyValueClient redisClient;
     private final RedisContestScoreboardApplyMetrics metrics;
-    private volatile String scriptSha;
 
     public RedisContestScoreboardApplier(StringRedisTemplate redisTemplate,
                                          ContestRedisKeyValueClient redisClient) {
@@ -51,15 +43,14 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
     }
 
     @Override
-    public Long apply(Long eventId, ContestScoreboardUpdate update) {
-        validate(eventId, update);
-
-        Long sequence;
+    public Long apply(ApplyRequest request) {
+        validate(request);
+        Long appliedOffset;
         try {
-            sequence = redisTemplate.execute(
+            appliedOffset = redisTemplate.execute(
                     ContestScoreboardRedisScript.APPLY,
-                    keys(update),
-                    (Object[]) arguments(update)
+                    keys(request.update()),
+                    (Object[]) arguments(request)
             );
         } catch (RuntimeException failure) {
             if (hasCommandExecutionFailure(failure)) {
@@ -67,102 +58,40 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
             }
             throw failure;
         }
-        if (sequence == null) {
-            throw new IllegalStateException("Redis scoreboard script returned no sequence");
+        if (appliedOffset == null) {
+            throw new IllegalStateException("Redis scoreboard script returned no stream offset");
         }
-        return sequence;
+        return appliedOffset;
     }
 
+    /**
+     * Live stream batches are intentionally executed in offset order rather than pipelined.
+     * Redis continues executing commands after one pipelined EVAL fails, which could advance a
+     * later offset past poison. Fail-fast ordering is the recovery contract; MySQL completion is
+     * still a JDBC batch so transport comparisons retain the same database write shape.
+     */
     @Override
     public List<ApplyResult> applyAll(List<ApplyRequest> requests) {
-        if (requests == null || requests.isEmpty()) {
-            return List.of();
-        }
         long startedNanos = System.nanoTime();
         try {
-            List<ApplyRequest> safeRequests = List.copyOf(requests);
-            safeRequests.forEach(request -> validate(request.eventId(), request.update()));
-
-            try {
-                String loadedScriptSha = scriptSha();
-
-                List<Object> pipelineResults = redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
-                    for (ApplyRequest request : safeRequests) {
-                        connection.scriptingCommands().evalSha(
-                                loadedScriptSha,
-                                ReturnType.INTEGER,
-                                SCRIPT_KEY_COUNT,
-                                serializedKeysAndArguments(request.update())
-                        );
-                    }
-                    return null;
-                });
-                if (pipelineResults.size() != safeRequests.size()) {
-                    log.warn(
-                            "Redis scoreboard pipeline returned {} results for {} events",
-                            pipelineResults.size(),
-                            safeRequests.size()
-                    );
-                    return failedResults(
-                            safeRequests,
-                            "Redis pipeline returned a different number of results than requested"
-                    );
-                }
-
-                List<ApplyResult> results = new ArrayList<>(safeRequests.size());
-                for (int index = 0; index < safeRequests.size(); index++) {
-                    Object result = pipelineResults.get(index);
-                    if (!(result instanceof Number number)) {
-                        log.warn(
-                                "Redis scoreboard pipeline returned an unexpected result type at index {}: {}",
-                                index,
-                                result == null ? "null" : result.getClass().getName()
-                        );
-                        return failedResults(
-                                safeRequests,
-                                "Redis pipeline returned an unexpected result type"
-                        );
-                    }
-                    results.add(ApplyResult.success(
-                            safeRequests.get(index).eventId(),
-                            number.longValue()
-                    ));
-                }
-                return List.copyOf(results);
-            } catch (RuntimeException exception) {
-                if (hasCommandExecutionFailure(exception)) {
-                    log.warn(
-                            "Redis scoreboard pipeline command failed; classifying {} events individually",
-                            safeRequests.size(),
-                            exception
-                    );
-                    return ContestScoreboardApplier.super.applyAll(safeRequests);
-                }
-                log.warn(
-                        "Redis scoreboard pipeline failed; deferring {} events for retry",
-                        safeRequests.size(),
-                        exception
-                );
-                return failedResults(safeRequests, errorMessage(exception));
-            }
+            return ContestScoreboardApplier.super.applyAll(requests);
         } finally {
             metrics.recordPipeline(Duration.ofNanos(System.nanoTime() - startedNanos));
         }
     }
 
     @Override
-    public long currentSequence() {
-        String value = redisTemplate.opsForValue().get(SEQUENCE_KEY);
+    public long currentStreamOffset() {
+        String value = redisTemplate.opsForValue().get(STREAM_OFFSET_KEY);
         if (value == null || value.isBlank()) {
-            return 0L;
+            return -1L;
         }
         return Long.parseLong(value);
     }
 
     /**
-     * Drops the contest's standings and its applied-submission set. The global sequence
-     * allocator and the submission-to-sequence map are deliberately left alone so a rebuild
-     * replays onto empty standings without renumbering anything.
+     * Drops one contest's standings and duplicate-work marker. The global stream offset and the
+     * DB-completion repair set survive because neither is scoped to one contest.
      */
     @Override
     public void reset(long contestId) {
@@ -183,63 +112,22 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
         return false;
     }
 
-    private static List<ApplyResult> failedResults(List<ApplyRequest> requests, String errorMessage) {
-        return requests.stream()
-                .map(request -> ApplyResult.failure(request.eventId(), errorMessage))
-                .toList();
-    }
-
-    private static String errorMessage(Throwable throwable) {
-        Throwable cause = throwable.getCause() == null ? throwable : throwable.getCause();
-        String message = cause.getMessage();
-        return cause.getClass().getSimpleName() + (message == null ? "" : ": " + message);
-    }
-
-    private String scriptSha() {
-        String loaded = scriptSha;
-        if (loaded != null) {
-            return loaded;
-        }
-        synchronized (this) {
-            if (scriptSha == null) {
-                scriptSha = redisTemplate.execute((RedisCallback<String>) connection ->
-                        connection.scriptingCommands().scriptLoad(
-                                ContestScoreboardRedisScript.TEXT.getBytes(StandardCharsets.UTF_8)
-                        )
-                );
-                if (scriptSha == null || scriptSha.isBlank()) {
-                    throw new IllegalStateException("Redis scoreboard script could not be loaded");
-                }
-            }
-            return scriptSha;
-        }
-    }
-
-    private byte[][] serializedKeysAndArguments(ContestScoreboardUpdate update) {
-        List<String> values = new ArrayList<>(SCRIPT_KEY_COUNT + 7);
-        values.addAll(keys(update));
-        values.addAll(List.of(arguments(update)));
-        return values.stream()
-                .map(value -> redisTemplate.getStringSerializer().serialize(value))
-                .toArray(byte[][]::new);
-    }
-
-    private static void validate(Long eventId, ContestScoreboardUpdate update) {
-        if (eventId == null
-                || update == null
+    private static void validate(ApplyRequest request) {
+        ContestScoreboardUpdate update = request == null ? null : request.update();
+        if (request == null
                 || update.contestSubmissionId() == null
                 || update.contestId() == null
                 || update.problemId() == null
                 || update.userId() == null
                 || update.result() == null) {
-            throw new IllegalArgumentException("Scoreboard outbox event and update fields are required");
+            throw new IllegalArgumentException("Scoreboard event and update fields are required");
         }
     }
 
     private static List<String> keys(ContestScoreboardUpdate update) {
         return List.of(
-                SEQUENCE_KEY,
-                ContestScoreboardRedisKeys.OUTBOX_SUBMISSION_SEQUENCE,
+                STREAM_OFFSET_KEY,
+                STREAM_DB_PENDING_KEY,
                 ContestScoreboardRedisKeys.ranking(update.contestId()),
                 ContestScoreboardRedisKeys.summary(update.contestId(), update.userId()),
                 ContestScoreboardRedisKeys.problem(update.contestId(), update.userId(), update.problemId()),
@@ -247,8 +135,11 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
         );
     }
 
-    private static String[] arguments(ContestScoreboardUpdate update) {
+    private static String[] arguments(ApplyRequest request) {
+        ContestScoreboardUpdate update = request.update();
         return new String[]{
+                request.streamOffset() == null ? "" : Long.toString(request.streamOffset()),
+                request.allowOffsetGap() ? "1" : "0",
                 Long.toString(update.contestSubmissionId()),
                 update.result().name(),
                 Long.toString(ContestScoreboardPolicy.computeContestMinutes(

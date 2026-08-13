@@ -5,8 +5,7 @@ import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.binder.MeterBinder;
 import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -17,44 +16,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Publishes how many rows are waiting in each outbox and how long the row at the head of the
- * queue has been waiting.
- *
- * <p>These are the two positions in the pipeline history section 7 table that hold load in MySQL
- * with no ceiling. Every other queue in that table is bounded - by a semaphore, by a fixed
- * executor queue, or by the broker - so a run that overruns capacity ends up here, and until now
- * nothing reported it.
- *
- * <p><strong>Off the scrape path.</strong> The queries run on a scheduler and the gauges read the
- * result they left behind. Prometheus scrapes at 5s with a 4s timeout, and a scrape that overruns
- * that drops every metric for the instance, not just this one - so no DB round trip may sit
- * between a scrape and its response.
- *
- * <p><strong>Bounded queries.</strong> The counting query is capped by a LIMIT inside a derived
- * table, so its cost does not grow with the backlog it exists to measure. Neither outbox has a
- * purge policy yet (pipeline history section 9.4), so the terminal rows - PUBLISHED and COMPLETED
- * - accumulate forever; every query here is restricted to the non-terminal statuses so that it
- * scans the backlog rather than the table. A saturated gauge reports the cap. That is well above
- * any alert threshold, so saturation cannot hide an alert - it can only understate a backlog that
- * is already firing one.
- *
- * <p>Published from a single role. Five instances polling would multiply the query load by five
- * and produce five identical series, where summing across instances - the correct operation for
- * every other application metric here - would give five times the real backlog.
- */
+/** MySQL backlog diagnostics for the remaining judge outbox only. */
 @Component
 @ConditionalOnProperty(prefix = "contest.outbox.metrics", name = "enabled", havingValue = "true", matchIfMissing = true)
+@Slf4j
 public class ContestOutboxBacklogMetrics implements MeterBinder {
 
-    private static final Logger log = LoggerFactory.getLogger(ContestOutboxBacklogMetrics.class);
-
-    /**
-     * Counting is an index-only range scan over the non-terminal statuses: PENDING sorts before
-     * PUBLISHING in {@code idx_contest_judge_outbox_claim (status, claimed_at, id)}, and the
-     * derived table's LIMIT stops the scan.
-     */
-    private static final String JUDGE_BACKLOG_SQL = """
+    private static final String BACKLOG_SQL = """
             SELECT status, COUNT(*) AS row_count
             FROM (SELECT status
                   FROM contest_judge_outbox
@@ -63,18 +31,7 @@ public class ContestOutboxBacklogMetrics implements MeterBinder {
             GROUP BY status
             """;
 
-    /**
-     * A PENDING row always has a NULL {@code claimed_at} - claiming sets both columns together and
-     * the failure path clears both - so within {@code status = 'PENDING'} the claim index is
-     * ordered by id alone and its first entry is the oldest row. That makes this one index entry
-     * and one row lookup regardless of backlog depth.
-     *
-     * <p>A row that is stuck in PUBLISHING is not reached by this: it shows up in the backlog
-     * count, not in the age.
-     *
-     * <p>The subtraction happens in MySQL so the age never mixes two clocks.
-     */
-    private static final String JUDGE_HEAD_LAG_SQL = """
+    private static final String HEAD_LAG_SQL = """
             SELECT TIMESTAMPDIFF(MICROSECOND, created_at, CURRENT_TIMESTAMP(6))
             FROM contest_judge_outbox
             WHERE status = 'PENDING'
@@ -82,173 +39,62 @@ public class ContestOutboxBacklogMetrics implements MeterBinder {
             LIMIT 1
             """;
 
-    private static final String SCOREBOARD_BACKLOG_SQL = """
-            SELECT status, COUNT(*) AS row_count
-            FROM (SELECT status
-                  FROM contest_submission_outbox
-                  WHERE status IN ('PENDING', 'PROCESSING', 'FAILED')
-                  LIMIT ?) capped
-            GROUP BY status
-            """;
-
-    /**
-     * PENDING only, matching the judge query, because the three active statuses are three
-     * different signals. A FAILED row is legitimately old while its exponential backoff runs, and
-     * a PROCESSING row is legitimately old while its lease runs; neither means work is piling up.
-     * Ranging over all three would put "throughput is short" and "one row has been retrying for
-     * an hour" into one number. The FAILED count carries the second on its own.
-     *
-     * <p>PENDING needs no "and it is due" clause: {@code due_at} is stamped at insert, so a
-     * PENDING row is claimable from the moment it exists.
-     *
-     * <p>Claiming sets status and {@code claimed_at} together and both completion paths clear
-     * them, so PENDING implies a NULL {@code claimed_at}. Within that range
-     * {@code idx_cs_outbox_claim (status, claimed_at, created_at, id)} is ordered by
-     * {@code created_at}, making the first index entry the oldest row - one index entry, then one
-     * row lookup for {@code due_at}.
-     *
-     * <p>The value comes from {@code due_at} rather than the {@code created_at} the ordering uses,
-     * because {@code created_at} is written by the JVM while {@code due_at} is stamped by
-     * {@code CURRENT_TIMESTAMP(6)}. Subtracting a JVM timestamp from MySQL's clock would fold the
-     * skew between them into every reading as a constant bias.
-     */
-    private static final String SCOREBOARD_HEAD_LAG_SQL = """
-            SELECT TIMESTAMPDIFF(MICROSECOND, due_at, CURRENT_TIMESTAMP(6))
-            FROM contest_submission_outbox
-            WHERE status = 'PENDING'
-            ORDER BY claimed_at, created_at, id
-            LIMIT 1
-            """;
-
-    private static final Map<String, List<String>> STATUSES = Map.of(
-            ContestOutboxDrainMetrics.JUDGE_OUTBOX, List.of("PENDING", "PUBLISHING"),
-            ContestOutboxDrainMetrics.SCOREBOARD_OUTBOX, List.of("PENDING", "PROCESSING", "FAILED")
-    );
+    private static final List<String> STATUSES = List.of("PENDING", "PUBLISHING");
 
     private final JdbcTemplate jdbcTemplate;
     private final int maxCountedRows;
-    private final Map<BacklogKey, AtomicLong> backlogRows = new LinkedHashMap<>();
-    private final Map<String, AtomicLong> headLagMicros = new LinkedHashMap<>();
-    private final AtomicLong scoreboardPendingEvents = new AtomicLong();
-
-    /**
-     * A composite registry with no children discards every recording, so the counter is usable
-     * before Spring binds this to the real registry.
-     */
+    private final Map<String, AtomicLong> backlogRows = new LinkedHashMap<>();
+    private final AtomicLong headLagMicros = new AtomicLong();
     private volatile Counter pollFailures = pollFailureCounter(new CompositeMeterRegistry());
-    private volatile Counter scoreboardObservationFailures =
-            scoreboardObservationFailureCounter(new CompositeMeterRegistry());
 
     public ContestOutboxBacklogMetrics(JdbcTemplate jdbcTemplate, ContestOutboxMetricsProperties properties) {
         this.jdbcTemplate = jdbcTemplate;
         this.maxCountedRows = properties.effectiveMaxCountedRows();
-        STATUSES.forEach((outbox, statuses) -> {
-            statuses.forEach(status -> backlogRows.put(new BacklogKey(outbox, status), new AtomicLong()));
-            headLagMicros.put(outbox, new AtomicLong());
-        });
+        STATUSES.forEach(status -> backlogRows.put(status, new AtomicLong()));
     }
 
     @Override
     public void bindTo(MeterRegistry registry) {
-        backlogRows.forEach((key, rows) -> Gauge.builder("contest.outbox.backlog", rows, AtomicLong::get)
-                .tags("outbox", key.outbox(), "status", key.status())
+        backlogRows.forEach((status, rows) -> Gauge.builder("contest.outbox.backlog", rows, AtomicLong::get)
+                .tags("outbox", ContestOutboxDrainMetrics.JUDGE_OUTBOX, "status", status)
                 .baseUnit("rows")
-                .description("Rows waiting in this outbox, capped at the configured scan "
-                        + "limit. Terminal rows are not counted: they are not backlog and "
-                        + "counting them would make the query grow with table size")
+                .description("Rows waiting in the judge outbox, capped at the configured scan limit")
                 .register(registry));
-        headLagMicros.forEach((outbox, micros) -> Gauge.builder(
-                        "contest.outbox.head.lag", micros, value -> value.get() / 1_000_000.0)
-                .tag("outbox", outbox)
+        Gauge.builder("contest.outbox.head.lag", headLagMicros, value -> value.get() / 1_000_000.0)
+                .tag("outbox", ContestOutboxDrainMetrics.JUDGE_OUTBOX)
                 .baseUnit("seconds")
-                .description("How long the oldest PENDING row has been waiting. PENDING only: a "
-                        + "row in retry backoff or inside a processing lease is old for a reason "
-                        + "that is not a shortage of throughput, and the FAILED and PUBLISHING "
-                        + "counts carry those. Unlike a drain-rate estimate this still moves when "
-                        + "one row is stuck behind a backlog that is otherwise draining")
-                .register(registry));
-        Gauge.builder("contest.scoreboard.pending", scoreboardPendingEvents, AtomicLong::get)
-                .baseUnit("events")
-                .description("Judged results not yet applied to the scoreboard, independent of "
-                        + "whether the implementation stores them in an outbox or a stream")
-                .register(registry);
-        Gauge.builder("contest.scoreboard.oldest.ready", headLagMicros.get(ContestOutboxDrainMetrics.SCOREBOARD_OUTBOX),
-                        value -> value.get() / 1_000_000.0)
-                .baseUnit("seconds")
-                .description("Age of the oldest event that is ready to be applied to the "
-                        + "scoreboard. Work in retry backoff or an active processing lease is "
-                        + "pending but not ready, so it is deliberately excluded")
+                .description("How long the oldest PENDING judge outbox row has been waiting")
                 .register(registry);
         this.pollFailures = pollFailureCounter(registry);
-        this.scoreboardObservationFailures = scoreboardObservationFailureCounter(registry);
     }
 
     private static Counter pollFailureCounter(MeterRegistry registry) {
         return Counter.builder("contest.outbox.backlog.poll.failures")
-                .description("Backlog queries that failed. The gauges hold their last value "
-                        + "rather than falling to zero, so a flat backlog next to a rising count "
-                        + "here means the poller stopped looking, not that the backlog cleared")
+                .description("Judge outbox backlog queries that failed; gauges keep their previous value")
                 .register(registry);
     }
 
-    private static Counter scoreboardObservationFailureCounter(MeterRegistry registry) {
-        return Counter.builder("contest.scoreboard.observation.failures")
-                .description("Failures while refreshing the implementation-neutral scoreboard "
-                        + "pending and oldest-ready gauges; their previous values remain visible")
-                .register(registry);
-    }
-
-    /**
-     * Runs on the shared scheduling pool, alongside the relay and the scoreboard worker. Both
-     * queries are index-only and bounded, but the pool defaults to a single thread outside
-     * batch-role, where a long query would delay the drains this metric is measuring.
-     */
     @Scheduled(fixedDelayString = "${contest.outbox.metrics.poll-interval-ms:5000}")
     public void poll() {
-        readBacklog(ContestOutboxDrainMetrics.JUDGE_OUTBOX, JUDGE_BACKLOG_SQL, JUDGE_HEAD_LAG_SQL);
-        readBacklog(ContestOutboxDrainMetrics.SCOREBOARD_OUTBOX, SCOREBOARD_BACKLOG_SQL, SCOREBOARD_HEAD_LAG_SQL);
-    }
-
-    private void readBacklog(String outbox, String backlogSql, String headLagSql) {
         try {
-            List<StatusCount> counts = jdbcTemplate.query(backlogSql,
+            List<StatusCount> counts = jdbcTemplate.query(
+                    BACKLOG_SQL,
                     (resultSet, rowNum) -> new StatusCount(
-                            resultSet.getString("status"), resultSet.getLong("row_count")),
-                    maxCountedRows);
-            // Applied only after both queries succeed, so a partial read never publishes a zero
-            // for a status that simply was not reached.
-            List<Long> headLag = jdbcTemplate.queryForList(headLagSql, Long.class);
-
+                            resultSet.getString("status"),
+                            resultSet.getLong("row_count")
+                    ),
+                    maxCountedRows
+            );
+            List<Long> headLag = jdbcTemplate.queryForList(HEAD_LAG_SQL, Long.class);
             Map<String, Long> byStatus = new LinkedHashMap<>();
             counts.forEach(count -> byStatus.put(count.status(), count.rows()));
-            // A status that has drained to nothing returns no row at all, so every status is
-            // written on every poll. Leaving one untouched would pin it at its last value.
-            STATUSES.get(outbox).forEach(status ->
-                    backlogRows.get(new BacklogKey(outbox, status)).set(byStatus.getOrDefault(status, 0L)));
-            // Empty means no PENDING row, which is a lag of zero rather than an unknown one. The
-            // floor is for clock movement between the insert and the read, not for backoff: both
-            // queries are PENDING-only, and a PENDING row is due from the moment it is written.
-            Long lagMicros = headLag.isEmpty() ? null : headLag.get(0);
-            headLagMicros.get(outbox).set(lagMicros == null ? 0L : Math.max(0L, lagMicros));
-            if (ContestOutboxDrainMetrics.SCOREBOARD_OUTBOX.equals(outbox)) {
-                long pending = STATUSES.get(outbox).stream()
-                        .mapToLong(status -> backlogRows.get(new BacklogKey(outbox, status)).get())
-                        .sum();
-                scoreboardPendingEvents.set(pending);
-            }
-        } catch (RuntimeException e) {
-            // Wider than DataAccessException on purpose. Anything that stops the poll leaves the
-            // gauges stale, and the alert that says so reads this counter - so every way of
-            // failing has to reach it, not only the ones the JDBC layer translates.
+            STATUSES.forEach(status -> backlogRows.get(status).set(byStatus.getOrDefault(status, 0L)));
+            Long micros = headLag.isEmpty() ? null : headLag.get(0);
+            headLagMicros.set(micros == null ? 0L : Math.max(0L, micros));
+        } catch (RuntimeException failure) {
             pollFailures.increment();
-            if (ContestOutboxDrainMetrics.SCOREBOARD_OUTBOX.equals(outbox)) {
-                scoreboardObservationFailures.increment();
-            }
-            log.warn("Failed to read {} outbox backlog; gauges keep their previous values", outbox, e);
+            log.warn("Failed to read judge outbox backlog; gauges keep their previous values", failure);
         }
-    }
-
-    private record BacklogKey(String outbox, String status) {
     }
 
     private record StatusCount(String status, long rows) {

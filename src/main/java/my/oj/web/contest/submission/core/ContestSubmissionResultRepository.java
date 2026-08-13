@@ -12,6 +12,26 @@ import java.util.Optional;
 
 public interface ContestSubmissionResultRepository extends JpaRepository<ContestSubmissionResult, Long> {
 
+    @Query("select distinct csr.contestId from ContestSubmissionResult csr order by csr.contestId")
+    List<Long> findDistinctContestIds();
+
+    @Query("""
+            select csr.id as submissionId,
+                   csr.contestId as contestId,
+                   s.problem.id as problemId,
+                   s.user.id as userId,
+                   s.contest.startTime as contestStart,
+                   s.submittedTime as submittedTime,
+                   csr.provisionalResult as result,
+                   csr.provisionalJudgedAt as judgedAt
+            from ContestSubmissionResult csr
+            join csr.submission s
+            where csr.id = :submissionId
+            """)
+    Optional<ContestSubmissionStoredJudgeResultProjection> findStoredJudgeResultBySubmissionId(
+            @Param("submissionId") Long submissionId
+    );
+
     @Query("""
             select csr.submission.id
             from ContestSubmissionResult csr

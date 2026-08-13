@@ -2,8 +2,8 @@ package my.oj.web.contest.scoreboard.redis;
 
 final class ContestScoreboardRedisKeys {
 
-    static final String OUTBOX_SEQUENCE = "contest:scoreboard:outbox:seq";
-    static final String OUTBOX_SUBMISSION_SEQUENCE = "contest:scoreboard:outbox:submission";
+    static final String STREAM_OFFSET = "contest:scoreboard:stream:offset";
+    static final String STREAM_DB_PENDING = "contest:scoreboard:stream:db-pending";
 
     private static final String PREFIX = "contest:scoreboard:";
 

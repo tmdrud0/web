@@ -10,4 +10,6 @@ public interface ContestSubmissionJudgeResultWriter {
     void persist(ContestSubmissionJudgeProjection submission,
                  SubmissionResult result,
                  LocalDateTime judgedAt);
+
+    void republish(ContestSubmissionJudgeResultCommand storedResult);
 }

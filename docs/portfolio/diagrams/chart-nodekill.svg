@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 340" width="760" height="340" font-family="system-ui,-apple-system,Segoe UI,sans-serif">
+<style>.t{font-size:12px;fill:#334155}.ttl{font-size:15px;font-weight:700;fill:#0f172a}.sub{font-size:11.5px;fill:#64748b}.ax{font-size:11px;fill:#64748b}.gr{stroke:#e2e8f0;stroke-width:1}.mk{font-size:11px;font-weight:600}</style>
+<rect width="760" height="340" fill="#ffffff"/>
+<text x="74" y="22" class="ttl">judge 노드 하나를 SIGKILL — 회수와 복구</text>
+<rect x="236.0" y="46" width="129.1" height="246" fill="#ea580c" opacity="0.07"/>
+<text x="74" y="38" class="sub">var/loadtest-20260808-115115(주입) vs -114654(무주입) · 도착 100/s · prefetch=1이라 unacked 수 = 살아 있는 consumer 수</text>
+<text x="16" y="38" class="ax">건</text>
+<line x1="74" y1="292.0" x2="608" y2="292.0" class="gr"/>
+<text x="66" y="296.0" class="ax" text-anchor="end">0</text>
+<line x1="74" y1="230.5" x2="608" y2="230.5" class="gr"/>
+<text x="66" y="234.5" class="ax" text-anchor="end">250</text>
+<line x1="74" y1="169.0" x2="608" y2="169.0" class="gr"/>
+<text x="66" y="173.0" class="ax" text-anchor="end">500</text>
+<line x1="74" y1="107.5" x2="608" y2="107.5" class="gr"/>
+<text x="66" y="111.5" class="ax" text-anchor="end">750</text>
+<line x1="74" y1="46.0" x2="608" y2="46.0" class="gr"/>
+<text x="66" y="50.0" class="ax" text-anchor="end">1,000</text>
+<text x="74.0" y="310" class="ax" text-anchor="middle">0s</text>
+<text x="180.8" y="310" class="ax" text-anchor="middle">44s</text>
+<text x="287.6" y="310" class="ax" text-anchor="middle">88s</text>
+<text x="394.4" y="310" class="ax" text-anchor="middle">131s</text>
+<text x="501.2" y="310" class="ax" text-anchor="middle">175s</text>
+<text x="608.0" y="310" class="ax" text-anchor="middle">219s</text>
+<line x1="74" y1="292" x2="608" y2="292" stroke="#94a3b8"/>
+<text x="341.0" y="328" class="ax" text-anchor="middle">부하 시작 이후 경과 시간</text>
+<path d="M74.0,292.0 L91.4,276.6 L109.8,245.9 L126.3,69.1 L146.2,161.3 L162.3,261.2 L178.7,215.1 L195.0,192.1 L213.5,145.9 L236.0,169.0 L253.3,169.0 L269.8,169.0 L286.5,169.0 L305.8,169.0 L325.3,169.0 L346.0,169.0 L365.1,46.0 L385.0,46.0 L407.9,46.0 L426.7,222.8 L443.2,46.0 L458.5,130.6 L476.6,253.6 L497.3,145.9 L514.1,53.7 L532.4,46.0 L550.5,222.8 L568.8,192.1 L587.6,292.0 L608.0,292.0" fill="none" stroke="#64748b" stroke-width="1.8" stroke-dasharray="6 3" stroke-linejoin="round"/>
+<path d="M74.0,292.0 L90.5,292.0 L108.6,292.0 L128.6,292.0 L149.3,292.0 L164.6,291.8 L181.5,292.0 L198.4,292.0 L214.7,292.0 L231.5,292.0 L249.1,292.0 L270.0,292.0 L287.4,292.0 L305.0,292.0 L322.3,292.0 L337.9,292.0 L356.9,289.5 L373.1,292.0 L393.0,292.0 L410.7,292.0 L428.5,292.0 L446.3,292.0 L462.7,290.8 L482.6,292.0 L499.2,292.0 L516.8,292.0 L534.1,292.0 L552.1,292.0 L572.1,292.0 L588.3,292.0 L607.6,292.0" fill="none" stroke="#0f766e" stroke-width="1.6" stroke-dasharray="3 3" stroke-linejoin="round"/>
+<path d="M74.0,292.0 L91.4,292.0 L109.8,292.0 L126.3,292.0 L146.2,292.0 L162.3,292.0 L178.7,292.0 L195.0,292.0 L213.5,292.0 L236.0,279.2 L253.3,261.7 L269.8,250.7 L286.5,225.8 L305.8,182.0 L325.3,177.4 L346.0,130.9 L365.1,152.5 L385.0,232.2 L407.9,291.8 L426.7,292.0 L443.2,290.3 L458.5,292.0 L476.6,292.0 L497.3,292.0 L514.1,292.0 L532.4,291.5 L550.5,292.0 L568.8,292.0 L587.6,292.0 L608.0,292.0" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linejoin="round"/>
+<line x1="236.0" y1="46" x2="236.0" y2="292" stroke="#ea580c" stroke-width="1.4" stroke-dasharray="4 3"/>
+<text x="241.0" y="60" class="mk" fill="#ea580c">SIGKILL · unacked 32→16</text>
+<line x1="365.1" y1="46" x2="365.1" y2="292" stroke="#0f766e" stroke-width="1.4" stroke-dasharray="4 3"/>
+<text x="370.1" y="78" class="mk" fill="#0f766e">53초 뒤 32 복귀</text>
+<circle cx="346.0" cy="130.9" r="4" fill="#7c3aed"/>
+<text x="354.0" y="121.9" class="mk" fill="#7c3aed" text-anchor="start">피크 655</text>
+<line x1="622" y1="52" x2="646" y2="52" stroke="#64748b" stroke-width="2.5" stroke-dasharray="6 3"/>
+<text x="652" y="56" class="t">unacked (0–32 스케일)</text>
+<line x1="622" y1="72" x2="646" y2="72" stroke="#0f766e" stroke-width="2.5" stroke-dasharray="3 3"/>
+<text x="652" y="76" class="t">ready — 무주입 짝</text>
+<line x1="622" y1="92" x2="646" y2="92" stroke="#7c3aed" stroke-width="2.5"/>
+<text x="652" y="96" class="t">ready — SIGKILL</text>
+</svg>

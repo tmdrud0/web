@@ -65,7 +65,8 @@ Check these after the run:
 
 - `contest_submission`
 - `contest_submission_result`
-- `contest_submission_outbox`
+- `contest_submission_result.scoreboard_applied_at`
+- batch-1 `contest_scoreboard_pending_events`(AMQP tail offset - Redis 적용 offset)
 - `judge-1` logs
 - `batch-1` logs
 
