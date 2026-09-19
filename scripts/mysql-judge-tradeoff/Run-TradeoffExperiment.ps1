@@ -241,15 +241,12 @@ function Get-GatlingSubmitRequests {
 
 function Get-PromMetricSum {
     param([string]$Label, [string]$Metric, [string]$RequiredTag = "", [string]$OnlyNode = "")
-    $sum = 0.0; $found = $false; $snapshotAvailable = $false
+    $sum = 0.0; $found = $false
     foreach ($node in @("judge-1", "judge-2")) {
         if ($OnlyNode -and $node -ne $OnlyNode) { continue }
         $path = Join-Path $runDirectory "metrics\$Label-$node.prom"
         if (-not (Test-Path $path)) { continue }
         $snapshot = @(Get-Content $path)
-        if ($snapshot.Count -gt 0 -and -not ($snapshot -match '^# unavailable:')) {
-            $snapshotAvailable = $true
-        }
         foreach ($line in $snapshot) {
             if ($line -match ("^" + [regex]::Escape($Metric) + '(?:\{([^}]*)\})?\s+([^\s]+)$')) {
                 # Save captures before another -match/-notmatch overwrites PowerShell's
@@ -265,7 +262,7 @@ function Get-PromMetricSum {
             }
         }
     }
-    if (-not $found) { return $(if ($snapshotAvailable) { 0.0 } else { $null }) }
+    if (-not $found) { return $null }
     return $sum
 }
 
@@ -280,10 +277,11 @@ function Get-PromMetricDelta {
         if ($null -eq $start) { $start = 0.0 }
         if ($FaultEnabled -and $node -eq $KilledNode) {
             $beforeKill = Get-PromMetricSum "pre-fault" $Metric $RequiredTag $node
-            $afterRestart = Get-PromMetricSum "post-restart" $Metric $RequiredTag $node
             if ($null -eq $beforeKill) { $beforeKill = 0.0 }
-            if ($null -eq $afterRestart) { $afterRestart = 0.0 }
-            $total += [math]::Max(0, $beforeKill - $start) + [math]::Max(0, $end - $afterRestart)
+            # The killed JVM contributes start..pre-fault. Its replacement JVM
+            # starts counters at zero, so its complete end value is the recovery
+            # contribution; subtracting a post-restart scrape would drop work.
+            $total += [math]::Max(0, $beforeKill - $start) + [math]::Max(0, $end)
         } else {
             $total += [math]::Max(0, $end - $start)
         }
