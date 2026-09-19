@@ -57,6 +57,9 @@ Rabbit의 노드별 실제 running/local-waiting/reserved gauge는 현재 노출
 빈 값이며 `worker-count × prefetch`는 관측값이 아니라 설정된 정규화 상한으로만 보고한다.
 중복 judge 시간은 lease 특성상 평균 시간 배분을 쓰지 않고 deterministic profile의 50ms~2000ms
 범위와 중복 invocation 추정 수를 곱한 하한/상한으로 보고한다.
+SIGKILL 실행은 마지막 pre-fault scrape 뒤의 killed JVM counter 증가분을 잃을 수 있으므로 invocation과
+completion counter를 하한으로 표시하며, 이 실행의 중복 invocation/time은 unavailable로 둔다. 반면
+outbox `attempts` 기반 duplicate claim 수는 durable DB 값이다.
 
 ## 실행 전 확인과 pilot
 
