@@ -4,7 +4,9 @@ import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamConsumerProper
 import my.oj.web.contest.submission.config.ContestSubmissionExecutorProperties;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultWriterProperties;
 import my.oj.web.contest.submission.messaging.ContestJudgeOutboxRelayProperties;
+import my.oj.web.contest.submission.messaging.ContestJudgeDispatchProperties;
 import my.oj.web.contest.submission.messaging.ContestJudgeResultStreamPublisherProperties;
+import my.oj.web.contest.submission.messaging.MysqlContestJudgeProperties;
 import my.oj.web.contest.submission.queue.ContestSubmissionBulkProperties;
 import my.oj.web.contest.submission.queue.ContestSubmissionCompletionProperties;
 import org.junit.jupiter.api.Test;
@@ -37,6 +39,8 @@ class OperationalPropertiesBindingTests {
                     context.getBean(ContestSubmissionJudgeResultWriterProperties.class);
             ContestJudgeResultStreamPublisherProperties resultStream =
                     context.getBean(ContestJudgeResultStreamPublisherProperties.class);
+            ContestJudgeDispatchProperties dispatch = context.getBean(ContestJudgeDispatchProperties.class);
+            MysqlContestJudgeProperties mysql = context.getBean(MysqlContestJudgeProperties.class);
 
             assertThat(executor.corePoolSize()).isEqualTo(2);
             assertThat(executor.maxPoolSize()).isEqualTo(4);
@@ -66,6 +70,12 @@ class OperationalPropertiesBindingTests {
             assertThat(resultWriter.queueCapacity()).isEqualTo(256);
             assertThat(resultWriter.maxWait()).isEqualTo(Duration.ofMillis(5));
             assertThat(resultStream.confirmTimeout()).isEqualTo(Duration.ofSeconds(10));
+            assertThat(dispatch.dispatchMode()).isEqualTo(ContestJudgeDispatchProperties.DispatchMode.RABBIT);
+            assertThat(mysql.workerCount()).isEqualTo(16);
+            assertThat(mysql.claimBatchSize()).isEqualTo(32);
+            assertThat(mysql.maxInFlight()).isEqualTo(128);
+            assertThat(mysql.claimTimeout()).isEqualTo(Duration.ofSeconds(30));
+            assertThat(mysql.pollInterval()).isEqualTo(Duration.ofMillis(100));
         });
     }
 
@@ -127,6 +137,8 @@ class OperationalPropertiesBindingTests {
             ContestSubmissionExecutorProperties.class,
             ContestScoreboardStreamConsumerProperties.class,
             ContestJudgeOutboxRelayProperties.class,
+            ContestJudgeDispatchProperties.class,
+            MysqlContestJudgeProperties.class,
             ContestSubmissionBulkProperties.class,
             ContestSubmissionCompletionProperties.class,
             ContestSubmissionJudgeResultWriterProperties.class,

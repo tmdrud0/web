@@ -40,7 +40,10 @@ public class LatencyProfileContestJudgement implements ContestSubmissionJudgemen
 
     @Override
     public SubmissionResult judgeSubmission(ContestSubmissionJudgeProjection submission) {
-        sleep(properties.isSlow(ThreadLocalRandom.current().nextDouble())
+        double draw = properties.seed() == null
+                ? ThreadLocalRandom.current().nextDouble()
+                : properties.deterministicDraw(submission.getSubmissionId());
+        sleep(properties.isSlow(draw)
                 ? properties.effectiveSlowMillis()
                 : properties.effectiveBaseMillis());
         return SubmissionResult.PARTIAL_ACCEPTED;

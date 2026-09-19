@@ -1,6 +1,6 @@
 package my.oj.web.contest.submission.messaging;
 
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
@@ -10,14 +10,14 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.sql.Timestamp;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
 @Component
-@ConditionalOnProperty(prefix = "contest.submission.judge.rabbit.publisher", name = "enabled", havingValue = "true")
+@ConditionalOnExpression(
+        "'${contest.submission.judge.dispatch-mode:rabbit}' == 'mysql' || "
+                + "'${contest.submission.judge.rabbit.publisher.enabled:false}' == 'true'")
 class ContestJudgeOutboxStore {
 
     private static final int MAX_ERROR_LENGTH = 1000;
@@ -32,26 +32,28 @@ class ContestJudgeOutboxStore {
 
     List<ClaimedEvent> claim(int batchSize, Duration lease) {
         List<ClaimedEvent> claimed = transactionTemplate.execute(status -> {
-            Instant staleBefore = Instant.now().minus(lease);
             List<OutboxRow> rows = jdbcTemplate.query("""
-                            SELECT id, submission_id
+                            SELECT id, submission_id, status
                             FROM contest_judge_outbox
                             WHERE status = 'PENDING'
-                               OR (status = 'PUBLISHING' AND claimed_at < ?)
+                               OR (status = 'PUBLISHING' AND claimed_at <
+                                   DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND))
                             ORDER BY id
                             LIMIT ?
                             FOR UPDATE SKIP LOCKED
                             """,
                     (resultSet, rowNum) -> new OutboxRow(
                             resultSet.getLong("id"),
-                            resultSet.getLong("submission_id")
+                            resultSet.getLong("submission_id"),
+                            "PUBLISHING".equals(resultSet.getString("status"))
                     ),
-                    Timestamp.from(staleBefore),
+                    Math.max(0L, lease.toNanos() / 1_000L),
                     batchSize
             );
 
             List<ClaimedEvent> events = rows.stream()
-                    .map(row -> new ClaimedEvent(row.eventId(), row.submissionId(), UUID.randomUUID().toString()))
+                    .map(row -> new ClaimedEvent(
+                            row.eventId(), row.submissionId(), UUID.randomUUID().toString(), row.staleReclaim()))
                     .toList();
             if (events.isEmpty()) {
                 return events;
@@ -159,7 +161,16 @@ class ContestJudgeOutboxStore {
                 : safeError.substring(0, MAX_ERROR_LENGTH);
     }
 
-    record ClaimedEvent(long eventId, long submissionId, String claimToken) {
+    /**
+     * PUBLISHING is deliberately shared by Rabbit publication and direct MySQL judging: in both
+     * cases it means that one token owns a leased unit of work. PUBLISHED means that transport or
+     * judging completed. Keeping those meanings avoids a schema/status migration for the
+     * experiment while token-fenced updates prevent an expired owner from completing a new lease.
+     */
+    record ClaimedEvent(long eventId, long submissionId, String claimToken, boolean staleReclaim) {
+        ClaimedEvent(long eventId, long submissionId, String claimToken) {
+            this(eventId, submissionId, claimToken, false);
+        }
     }
 
     record FailedEvent(ClaimedEvent event, String error) {
@@ -178,6 +189,6 @@ class ContestJudgeOutboxStore {
         }
     }
 
-    private record OutboxRow(long eventId, long submissionId) {
+    private record OutboxRow(long eventId, long submissionId, boolean staleReclaim) {
     }
 }

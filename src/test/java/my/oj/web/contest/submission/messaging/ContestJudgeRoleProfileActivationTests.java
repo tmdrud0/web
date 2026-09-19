@@ -48,16 +48,40 @@ class ContestJudgeRoleProfileActivationTests {
         }
     }
 
-    private static ConfigurableApplicationContext runWithProfile(String profile) {
+    @Test
+    void mysqlModeReplacesRabbitListenerOnJudgeRole() {
+        try (ConfigurableApplicationContext context = runWithProfile(
+                "multi-judge",
+                "--contest.submission.judge.dispatch-mode=mysql",
+                "--contest.submission.judge.mysql.poll-interval=1h")) {
+            assertThatMissing(context, ContestJudgeOutboxRelay.class);
+            assertThatMissing(context, ContestJudgeRabbitListener.class);
+            assertThatPresent(context, MysqlContestJudgeDispatcher.class);
+        }
+    }
+
+    @Test
+    void mysqlModeDoesNotStartClaimantOnBatchRole() {
+        try (ConfigurableApplicationContext context = runWithProfile(
+                "multi-batch",
+                "--contest.submission.judge.dispatch-mode=mysql")) {
+            assertThatMissing(context, ContestJudgeOutboxRelay.class);
+            assertThatMissing(context, ContestJudgeRabbitListener.class);
+            assertThatMissing(context, MysqlContestJudgeDispatcher.class);
+        }
+    }
+
+    private static ConfigurableApplicationContext runWithProfile(String profile, String... extraArguments) {
         SpringApplication application = new SpringApplication(ProfileTestConfiguration.class);
         application.setWebApplicationType(WebApplicationType.NONE);
         application.setRegisterShutdownHook(false);
-        return application.run(
-                "--spring.profiles.active=" + profile,
-                "--spring.config.location=file:./src/main/resources/",
-                "--spring.main.banner-mode=off",
-                "--spring.jmx.enabled=false"
-        );
+        String[] arguments = new String[extraArguments.length + 4];
+        arguments[0] = "--spring.profiles.active=" + profile;
+        arguments[1] = "--spring.config.location=file:./src/main/resources/";
+        arguments[2] = "--spring.main.banner-mode=off";
+        arguments[3] = "--spring.jmx.enabled=false";
+        System.arraycopy(extraArguments, 0, arguments, 4, extraArguments.length);
+        return application.run(arguments);
     }
 
     private static void assertThatPresent(ConfigurableApplicationContext context, Class<?> type) {
@@ -76,6 +100,8 @@ class ContestJudgeRoleProfileActivationTests {
     @Import({
             ContestJudgeOutboxRelay.class,
             ContestJudgeRabbitListener.class,
+            MysqlContestJudgeMetrics.class,
+            MysqlContestJudgeDispatcher.class,
             ContestSubmissionJudgeResultBatchWriter.class
     })
     static class ProfileTestConfiguration {
@@ -99,6 +125,12 @@ class ContestJudgeRoleProfileActivationTests {
         @Bean
         ContestSubmissionJudgeProcessor contestSubmissionJudgeProcessor() {
             return mock(ContestSubmissionJudgeProcessor.class);
+        }
+
+        @Bean
+        MysqlContestJudgeProperties mysqlContestJudgeProperties() {
+            return new MysqlContestJudgeProperties(1, 1, 1, java.time.Duration.ofSeconds(30),
+                    java.time.Duration.ofHours(1));
         }
 
         @Bean

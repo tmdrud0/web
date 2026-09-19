@@ -2,11 +2,13 @@ package my.oj.web.contest.submission.messaging;
 
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeProcessor;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.stereotype.Component;
 
 @Component
-@ConditionalOnProperty(prefix = "contest.submission.judge.rabbit.listener", name = "enabled", havingValue = "true")
+@ConditionalOnExpression(
+        "'${contest.submission.judge.dispatch-mode:rabbit}' == 'rabbit' && "
+                + "'${contest.submission.judge.rabbit.listener.enabled:false}' == 'true'")
 class ContestJudgeRabbitListener {
 
     private final ContestSubmissionJudgeProcessor judgeProcessor;

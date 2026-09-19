@@ -17,7 +17,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public record ContestJudgeLatencyProperties(boolean enabled,
                                             Double slowRatio,
                                             Long slowMillis,
-                                            Long baseMillis) {
+                                            Long baseMillis,
+                                            Long seed) {
 
     private static final double DEFAULT_SLOW_RATIO = 0.01d;
     private static final long DEFAULT_SLOW_MILLIS = 2000L;
@@ -42,5 +43,21 @@ public record ContestJudgeLatencyProperties(boolean enabled,
      */
     public boolean isSlow(double draw) {
         return draw < effectiveSlowRatio();
+    }
+
+    /**
+     * Returns a repeatable draw when a load-test seed is configured. Mixing the seed with the
+     * submission id makes retries and both dispatch strategies select the same slow submissions;
+     * with no seed the caller keeps the previous ThreadLocalRandom behavior.
+     */
+    public double deterministicDraw(long submissionId) {
+        if (seed == null) {
+            throw new IllegalStateException("No deterministic judge latency seed is configured");
+        }
+        long value = seed ^ submissionId;
+        value = (value ^ (value >>> 30)) * 0xbf58476d1ce4e5b9L;
+        value = (value ^ (value >>> 27)) * 0x94d049bb133111ebL;
+        value ^= value >>> 31;
+        return (value >>> 11) * 0x1.0p-53;
     }
 }

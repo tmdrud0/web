@@ -6,7 +6,7 @@ import org.springframework.amqp.core.MessageDeliveryMode;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -17,7 +17,9 @@ import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Component
-@ConditionalOnProperty(prefix = "contest.submission.judge.rabbit.publisher", name = "enabled", havingValue = "true")
+@ConditionalOnExpression(
+        "'${contest.submission.judge.dispatch-mode:rabbit}' == 'rabbit' && "
+                + "'${contest.submission.judge.rabbit.publisher.enabled:false}' == 'true'")
 class ContestJudgeOutboxRelay {
 
     static final int SCHEMA_VERSION = 1;
