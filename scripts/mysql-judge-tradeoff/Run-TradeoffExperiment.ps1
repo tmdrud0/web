@@ -68,7 +68,9 @@ function Invoke-Compose {
 function Invoke-SqlRows {
     param([Parameter(Mandatory = $true)][string]$Sql)
     $oneLine = ($Sql -replace "\r?\n", " ").Trim()
-    return @(Invoke-Compose exec -T mysql mysql -uroot -p1234 -D $dbName -N -B -e $oneLine)
+    $output = @(Invoke-Compose -Arguments @("exec", "-T", "mysql", "env", "MYSQL_PWD=1234", "mysql", "-uroot", "-D", $dbName, "-N", "-B", "-e", $oneLine))
+    return @($output | ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notmatch '^(Container|Network|mysql:) ' })
 }
 
 function Get-SqlScalar {
@@ -81,7 +83,7 @@ function Get-SqlScalar {
 function Wait-Healthy {
     $deadline = (Get-Date).AddMinutes(5)
     while ((Get-Date) -lt $deadline) {
-        $ids = @(Invoke-Compose ps -q | Where-Object { $_ })
+        $ids = @(Invoke-Compose -Arguments @("ps", "-q") | Where-Object { $_ })
         if ($ids.Count -eq 9) {
             $bad = @(& docker inspect --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $ids | Where-Object { $_ -notmatch '^true (healthy|none)$' })
             if ($LASTEXITCODE -eq 0 -and $bad.Count -eq 0) { return }
@@ -89,6 +91,21 @@ function Wait-Healthy {
         Start-Sleep -Seconds 2
     }
     throw "Load-test stack did not become healthy in five minutes."
+}
+
+function Wait-JudgeMetrics {
+    param([Parameter(Mandatory = $true)][string]$Node)
+    $port = if ($Node -eq "judge-1") { 19001 } else { 19002 }
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$port/actuator/prometheus" | Out-Null
+            return
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    throw "$Node metrics endpoint did not become available within 60 seconds."
 }
 
 function Save-MetricsSnapshot {
@@ -142,7 +159,7 @@ function Observe-FaultRecovery {
     param([string]$Phase)
     Save-BacklogSample $Phase | Out-Null
     if ($null -eq $events.firstStaleReclaimObservedAt -and $events.contestId) {
-        $reclaimed = Get-SqlScalar "SELECT COUNT(*) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId) AND o.attempts > 1"
+        $reclaimed = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(o.attempts - 1, 0)), 0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId)"
         if ($reclaimed -gt $events.staleAttemptsBeforeFault) {
             # attempts is durable after the reclaim completes, unlike claimed_at/updated_at. Polling
             # once a second gives an explicit bounded observation error instead of pretending the
@@ -191,7 +208,13 @@ ORDER BY cs.id;
     $restart = if ($Events.nodeRestartedAt) { [datetimeoffset]::Parse($Events.nodeRestartedAt) } else { $null }
     $claimed = @{}; foreach ($id in @($ClaimSnapshot.ids)) { $claimed[[string]$id] = $true }
     $objects = foreach ($line in $rows) {
-        $p = $line -split "`t", -1; $submitted = [datetimeoffset]::Parse($p[1] + "Z")
+        # PowerShell's regex -split treats a negative count as "do not split".
+        # String.Split preserves the tabular fields emitted by mysql -B, including NULL markers.
+        $p = $line.Split([char]9)
+        $submitted = [datetimeoffset]::MinValue
+        if ($p.Count -lt 9 -or -not [datetimeoffset]::TryParse($p[1] + "Z", [ref]$submitted)) {
+            continue
+        }
         $cohorts = New-Object System.Collections.Generic.List[string]
         if ($fault) {
             if ($submitted -lt $fault.AddSeconds(-5)) { $cohorts.Add("pre-fault-normal") }
@@ -218,23 +241,31 @@ function Get-GatlingSubmitRequests {
 
 function Get-PromMetricSum {
     param([string]$Label, [string]$Metric, [string]$RequiredTag = "", [string]$OnlyNode = "")
-    $sum = 0.0; $found = $false
+    $sum = 0.0; $found = $false; $snapshotAvailable = $false
     foreach ($node in @("judge-1", "judge-2")) {
         if ($OnlyNode -and $node -ne $OnlyNode) { continue }
         $path = Join-Path $runDirectory "metrics\$Label-$node.prom"
         if (-not (Test-Path $path)) { continue }
-        foreach ($line in Get-Content $path) {
+        $snapshot = @(Get-Content $path)
+        if ($snapshot.Count -gt 0 -and -not ($snapshot -match '^# unavailable:')) {
+            $snapshotAvailable = $true
+        }
+        foreach ($line in $snapshot) {
             if ($line -match ("^" + [regex]::Escape($Metric) + '(?:\{([^}]*)\})?\s+([^\s]+)$')) {
-                if ($RequiredTag -and $Matches[1] -notmatch [regex]::Escape($RequiredTag)) { continue }
+                # Save captures before another -match/-notmatch overwrites PowerShell's
+                # automatic $Matches variable.
+                $tags = $Matches[1]
+                $rawValue = $Matches[2]
+                if ($RequiredTag -and $tags -notmatch [regex]::Escape($RequiredTag)) { continue }
                 $value = 0.0
-                if ([double]::TryParse($Matches[2], [Globalization.NumberStyles]::Float,
+                if ([double]::TryParse($rawValue, [Globalization.NumberStyles]::Float,
                         [Globalization.CultureInfo]::InvariantCulture, [ref]$value)) {
                     $sum += $value; $found = $true
                 }
             }
         }
     }
-    if (-not $found) { return $null }
+    if (-not $found) { return $(if ($snapshotAvailable) { 0.0 } else { $null }) }
     return $sum
 }
 
@@ -244,11 +275,14 @@ function Get-PromMetricDelta {
     foreach ($node in @("judge-1", "judge-2")) {
         $start = Get-PromMetricSum "start" $Metric $RequiredTag $node
         $end = Get-PromMetricSum "end" $Metric $RequiredTag $node
-        if ($null -eq $start -or $null -eq $end) { return $null }
+        if ($null -eq $end) { return $null }
+        # Lazy Micrometer meters do not exist in the startup scrape until first use.
+        if ($null -eq $start) { $start = 0.0 }
         if ($FaultEnabled -and $node -eq $KilledNode) {
             $beforeKill = Get-PromMetricSum "pre-fault" $Metric $RequiredTag $node
             $afterRestart = Get-PromMetricSum "post-restart" $Metric $RequiredTag $node
-            if ($null -eq $beforeKill -or $null -eq $afterRestart) { return $null }
+            if ($null -eq $beforeKill) { $beforeKill = 0.0 }
+            if ($null -eq $afterRestart) { $afterRestart = 0.0 }
             $total += [math]::Max(0, $beforeKill - $start) + [math]::Max(0, $end - $afterRestart)
         } else {
             $total += [math]::Max(0, $end - $start)
@@ -275,7 +309,7 @@ $env:CONTEST_RATE_LIMIT_STORE = "redis"
 $env:CONTEST_RATE_LIMIT_COOLDOWN_MILLIS = "2000"
 
 if ($DryRun) {
-    Invoke-Compose config | Set-Content (Join-Path $runDirectory "compose-config.yaml") -Encoding utf8
+    Invoke-Compose -Arguments @("config") | Set-Content (Join-Path $runDirectory "compose-config.yaml") -Encoding utf8
     "Dry run only; no containers or load were started." | Set-Content (Join-Path $runDirectory "DRY_RUN.txt") -Encoding utf8
     Write-Host "Dry run valid. Parameters and rendered Compose config: $runDirectory"
     exit 0
@@ -285,7 +319,7 @@ $events = [ordered]@{ runStartedAt=$null; loadStartedAt=$null; faultInjectedAt=$
 $started = $false
 $claimSnapshot = [pscustomobject]@{ exact=$false; ids=@(); observedActiveClaimCount=0 }
 try {
-    Invoke-Compose config | Set-Content (Join-Path $runDirectory "compose-config.yaml") -Encoding utf8
+    Invoke-Compose -Arguments @("config") | Set-Content (Join-Path $runDirectory "compose-config.yaml") -Encoding utf8
     Push-Location $repoRoot
     try {
         & .\gradlew.bat bootJar :gatling:prepareStandaloneGatling --console=plain
@@ -293,9 +327,9 @@ try {
     } finally { Pop-Location }
     $events.runStartedAt = [datetimeoffset]::UtcNow.ToString("o")
     $started = $true
-    Invoke-Compose up -d --build
+    Invoke-Compose -Arguments @("up", "-d", "--build")
     Wait-Healthy
-    Invoke-Compose restart nginx
+    Invoke-Compose -Arguments @("restart", "nginx")
     Wait-Healthy
     $workloadPrefix = "tradeoff_seed_$LatencySeed"
     $seedRequest = @{ prefix=$workloadPrefix; userCount=$UserCount; problemCount=5; durationMinutes=60; reset=$true } | ConvertTo-Json -Compress
@@ -315,17 +349,32 @@ try {
         "-cp", $classpath, "io.gatling.app.Gatling", "-s", "my.oj.perf.ContestSubmissionSimulation",
         "-rf", $resultsFolder, "-rd", "mysql-judge-tradeoff-$RunId"
     )
-    $events.loadStartedAt = [datetimeoffset]::UtcNow.ToString("o")
     $gatlingStarted = Get-Date
     $gatling = Start-Process -FilePath (Get-Command java.exe).Source -ArgumentList $javaArgs -PassThru -NoNewWindow
+    # Java/Gatling startup can take longer than a short fault offset. Anchor the
+    # experiment clock to the first persisted submission, not process creation.
+    $loadStartDeadline = (Get-Date).AddSeconds(60)
+    do {
+        $startedSubmissions = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id=$($seed.contestId)"
+        if ($startedSubmissions -gt 0) { break }
+        if ($gatling.HasExited) { throw "Gatling exited before the first submission was persisted." }
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $loadStartDeadline)
+    if ($startedSubmissions -eq 0) { throw "No submission was persisted within 60 seconds of starting Gatling." }
+    $events.loadStartedAt = [datetimeoffset]::UtcNow.ToString("o")
     Save-CapacitySample "load-start"
     if ($FaultEnabled) {
-        Start-Sleep -Seconds $FaultAtSeconds
+        $faultDeadline = (Get-Date).AddSeconds($FaultAtSeconds)
+        while ((Get-Date) -lt $faultDeadline -and -not $gatling.HasExited) {
+            Save-BacklogSample "pre-fault" | Out-Null
+            Save-CapacitySample "pre-fault"
+            Start-Sleep -Seconds 1
+        }
         Save-MetricsSnapshot "pre-fault"
         $claimSnapshot = Save-ClaimSnapshot
-        $events.staleAttemptsBeforeFault = Get-SqlScalar "SELECT COUNT(*) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId) AND o.attempts > 1"
+        $events.staleAttemptsBeforeFault = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(o.attempts - 1, 0)), 0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId)"
         $events.faultInjectedAt = [datetimeoffset]::UtcNow.ToString("o")
-        Invoke-Compose kill $KilledNode
+        Invoke-Compose -Arguments @("kill", $KilledNode)
         Observe-FaultRecovery "fault"
         $downDeadline = (Get-Date).AddSeconds($DownDurationSeconds)
         while ((Get-Date) -lt $downDeadline) {
@@ -333,9 +382,10 @@ try {
             Observe-FaultRecovery "node-down"
             Save-CapacitySample "node-down"
         }
-        Invoke-Compose start $KilledNode
+        Invoke-Compose -Arguments @("start", $KilledNode)
         $events.nodeRestartedAt = [datetimeoffset]::UtcNow.ToString("o")
         Wait-Healthy
+        Wait-JudgeMetrics $KilledNode
         Save-MetricsSnapshot "post-restart"
     }
     if ($FaultEnabled) {
@@ -390,20 +440,18 @@ try {
     $storedRepublishes = Get-PromMetricDelta "contest_judge_stored_result_republish_total"
     $unavailable = New-Object System.Collections.Generic.List[string]
     if ($null -eq $judgeInvocations) { $unavailable.Add("judge invocation count: contest_judge_invocations_total was not exposed") }
-    $unavailable.Add("duplicate judge time cannot be exactly attributed by aggregate timers; raw total judge duration is reported")
+    $unavailable.Add("duplicate judge time is bounded by the deterministic 50ms/2000ms profile; exact per-claim attribution is unavailable")
+    if ($DispatchMode -eq "rabbit") { $unavailable.Add("Rabbit per-node running/local-waiting/reserved gauges are unavailable; worker-count x prefetch is recorded only as the configured normalized ceiling") }
     $unavailable.Add("MySQL CPU is not exposed by the stock mysql:8.0 container; connection and InnoDB lock counters are captured instead")
     if (-not $claimSnapshot.exact -and $FaultEnabled) { $unavailable.Add("killed-node claim attribution: schema has no claimed_by column; killed-node-claims.csv contains all active claims at kill time") }
     if ($null -eq $requests) { $unavailable.Add("HTTP submission request count: Gatling simulation.log was not found") }
     $duplicateJudgements = if ($null -eq $judgeInvocations) { $null } else { [math]::Max(0, $judgeInvocations - $resultCount) }
-    $duplicateJudgeMillisEstimate = if ($null -eq $duplicateJudgements -or $null -eq $judgeDurationSeconds -or $judgeInvocations -le 0) {
-        $null
-    } else {
-        [math]::Round(($judgeDurationSeconds * 1000.0) * ($duplicateJudgements / $judgeInvocations), 3)
-    }
+    $duplicateJudgeMillisLowerBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 50 }
+    $duplicateJudgeMillisUpperBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 2000 }
     $verification = [ordered]@{
         counts = @{ requests=$requests; accepted=$submissionCount; uniqueSubmissions=$uniqueCount; results=$resultCount; scoreboardApplied=$scoreboardCount }
         integrity = @{ lostOrIncomplete=($submissionCount-$resultCount); finalResultMismatch=($resultCount-$scoreboardCount); passed=($submissionCount -eq $uniqueCount -and $submissionCount -eq $resultCount -and $resultCount -eq $scoreboardCount) }
-        workCost = @{ duplicateClaimEstimate=$duplicateEstimate; duplicateJudgementEstimate=$duplicateJudgements; judgeInvocations=$judgeInvocations; totalJudgeMillis=if ($null -eq $judgeDurationSeconds) {$null} else {[math]::Round($judgeDurationSeconds*1000,3)}; duplicateJudgeMillisEstimate=$duplicateJudgeMillisEstimate; claimCalls=$claimCalls; claimedRows=$claimRows; staleReclaims=$staleReclaims; completionSuccess=$completionSuccess; completionFailure=$completionFailure; staleTokenCompletions=$staleCompletions; storedResultRepublishes=$storedRepublishes; claimAttemptsFile="claim-attempts.tsv"; killedNodeClaimCount=if ($claimSnapshot.exact) {@($claimSnapshot.ids).Count} else {$null}; allActiveClaimsAtKill=$claimSnapshot.observedActiveClaimCount }
+        workCost = @{ duplicateClaimEstimate=$duplicateEstimate; duplicateJudgementEstimate=$duplicateJudgements; judgeInvocations=$judgeInvocations; totalJudgeMillis=if ($null -eq $judgeDurationSeconds) {$null} else {[math]::Round($judgeDurationSeconds*1000,3)}; duplicateJudgeMillisLowerBound=$duplicateJudgeMillisLowerBound; duplicateJudgeMillisUpperBound=$duplicateJudgeMillisUpperBound; claimCalls=$claimCalls; claimedRows=$claimRows; staleReclaims=$staleReclaims; completionSuccess=$completionSuccess; completionFailure=$completionFailure; staleTokenCompletions=$staleCompletions; storedResultRepublishes=$storedRepublishes; claimAttemptsFile="claim-attempts.tsv"; killedNodeClaimCount=if ($claimSnapshot.exact) {@($claimSnapshot.ids).Count} else {$null}; allActiveClaimsAtKill=$claimSnapshot.observedActiveClaimCount }
         cohortAvailability = @{ killedNodeClaimed=[bool]$claimSnapshot.exact }
         mysql = @{ statusSnapshots="metrics/*-mysql-status.tsv"; cpu=$null; lockAndConnectionCounters="captured" }
         unavailable = @($unavailable)
@@ -417,7 +465,7 @@ try {
     throw
 } finally {
     if ($started -and -not $KeepStack) {
-        try { Invoke-Compose down } catch { Write-Warning $_ }
+        try { Invoke-Compose -Arguments @("down") } catch { Write-Warning $_ }
     }
 }
 

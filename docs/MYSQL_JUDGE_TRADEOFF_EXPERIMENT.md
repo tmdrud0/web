@@ -51,6 +51,10 @@ fault 시각, killed node, down duration을 받는다. loadtest judge는 base 50
 첫 stale 회수 시각과 backlog는 장애 후 1초 간격으로 관찰하므로 최대 약 1초의 관찰 오차가 있다.
 현재 schema에 claim owner가 없으면 `killed-node-claimed` 분포는 비어 있는 값이 아니라 명시적인
 `available=false`로 출력하고, kill 시점의 전체 active claim 수만 upper bound로 보존한다.
+Rabbit의 노드별 실제 running/local-waiting/reserved gauge는 현재 노출되지 않으므로 capacity CSV에서
+빈 값이며 `worker-count × prefetch`는 관측값이 아니라 설정된 정규화 상한으로만 보고한다.
+중복 judge 시간은 lease 특성상 평균 시간 배분을 쓰지 않고 deterministic profile의 50ms~2000ms
+범위와 중복 invocation 추정 수를 곱한 하한/상한으로 보고한다.
 
 ## 실행 전 확인과 pilot
 

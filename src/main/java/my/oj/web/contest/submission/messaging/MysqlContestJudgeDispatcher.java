@@ -39,7 +39,10 @@ class MysqlContestJudgeDispatcher {
         this.properties = properties;
         this.metrics = metrics;
         int workers = properties.effectiveWorkerCount();
-        int queueCapacity = Math.max(1, properties.effectiveMaxInFlight() - workers);
+        // A worker decrements the logical reservation immediately before the
+        // ThreadPoolExecutor marks that worker idle. Keep a bounded handoff
+        // buffer so a replacement claim is not spuriously rejected in that gap.
+        int queueCapacity = properties.effectiveMaxInFlight();
         AtomicInteger threadSequence = new AtomicInteger();
         ThreadFactory threadFactory = task -> {
             Thread thread = new Thread(task, "contest-mysql-judge-" + threadSequence.incrementAndGet());
@@ -54,7 +57,7 @@ class MysqlContestJudgeDispatcher {
     }
 
     @Scheduled(fixedDelayString = "${contest.submission.judge.mysql.poll-interval:100ms}")
-    void poll() {
+    synchronized void poll() {
         int capacity = properties.effectiveMaxInFlight() - reserved.get();
         int claimSize = Math.min(properties.effectiveClaimBatchSize(), capacity);
         if (claimSize <= 0) {
