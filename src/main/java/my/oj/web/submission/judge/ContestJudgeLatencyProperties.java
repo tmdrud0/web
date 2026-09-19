@@ -18,7 +18,8 @@ public record ContestJudgeLatencyProperties(boolean enabled,
                                             Double slowRatio,
                                             Long slowMillis,
                                             Long baseMillis,
-                                            Long seed) {
+                                            Long seed,
+                                            String keySource) {
 
     private static final double DEFAULT_SLOW_RATIO = 0.01d;
     private static final long DEFAULT_SLOW_MILLIS = 2000L;
@@ -46,18 +47,35 @@ public record ContestJudgeLatencyProperties(boolean enabled,
     }
 
     /**
-     * Returns a repeatable draw when a load-test seed is configured. Mixing the seed with the
-     * submission id makes retries and both dispatch strategies select the same slow submissions;
-     * with no seed the caller keeps the previous ThreadLocalRandom behavior.
+     * Returns a repeatable draw when a load-test seed is configured. The default key is the
+     * submission id, so retries select the same latency. The comparison harness opts into a
+     * stable code key because Snowflake ids differ between otherwise identical isolated runs.
+     * With no seed the caller keeps the previous ThreadLocalRandom behavior.
      */
     public double deterministicDraw(long submissionId) {
+        return deterministicDraw(submissionId, null);
+    }
+
+    public double deterministicDraw(long submissionId, String code) {
         if (seed == null) {
             throw new IllegalStateException("No deterministic judge latency seed is configured");
         }
-        long value = seed ^ submissionId;
+        long key = "code".equalsIgnoreCase(keySource) && code != null
+                ? stableHash(code)
+                : submissionId;
+        long value = seed ^ key;
         value = (value ^ (value >>> 30)) * 0xbf58476d1ce4e5b9L;
         value = (value ^ (value >>> 27)) * 0x94d049bb133111ebL;
         value ^= value >>> 31;
         return (value >>> 11) * 0x1.0p-53;
+    }
+
+    private static long stableHash(String value) {
+        long hash = 0xcbf29ce484222325L;
+        for (int index = 0; index < value.length(); index++) {
+            hash ^= value.charAt(index);
+            hash *= 0x100000001b3L;
+        }
+        return hash;
     }
 }

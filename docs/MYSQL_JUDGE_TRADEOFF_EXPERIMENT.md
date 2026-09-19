@@ -32,7 +32,9 @@ reserved-but-unfinished 상한이다. MySQL의 대응 축은 `max-in-flight`다.
 `Run-TradeoffExperiment.ps1`은 dispatch mode, target RPS, ramp/hold duration, 노드당 worker,
 claim batch, max in-flight, claim timeout, poll interval, Rabbit prefetch, deterministic seed,
 fault 시각, killed node, down duration을 받는다. loadtest judge는 base 50 ms, 5% 확률의 2 s
-작업을 submission ID와 seed로 결정한다.
+작업을 안정적인 생성 코드와 seed로 결정한다. 일반 loadtest 외 실행은 기본적으로 submission ID를
+사용하므로 기존 동작은 유지된다. Gatling의 jitter, problem 선택, 코드와 사용자 prefix도 같은 seed로
+고정되어 Rabbit/MySQL 실행이 같은 논리 workload를 사용한다.
 
 결과는 Git에서 무시되는 `results/mysql-judge-tradeoff/<run-id>/`에 기록된다.
 
@@ -40,12 +42,15 @@ fault 시각, killed node, down duration을 받는다. loadtest judge는 base 50
 - `latency.csv`: 제출별 세 지연, attempts, cohort.
 - `metrics/*.prom`, `metrics/*-mysql-status.tsv`: JVM counter/gauge와 MySQL connection/lock snapshot.
 - `killed-node-claims.csv`, `claim-attempts.tsv`, `stale-reclaims.csv`, `backlog.csv`: claim/recovery 증거.
+- `capacity.csv`: 실행 중 노드별 running/local-waiting/reserved 1초 시계열.
 - `db-verification.json`: request/accepted/unique/result/scoreboard 수, 유실/불일치, 비용 지표.
 - `summary.json`, `summary.md`: 기계/사람이 읽는 cohort 분포와 recovery 결과.
 
 측정할 수 없는 값은 0으로 만들지 않고 `unavailable` 배열에 이유를 쓴다. 기본 MySQL
 컨테이너는 CPU exporter를 제공하지 않으므로 connection과 InnoDB lock counter만 저장한다.
 첫 stale 회수 시각과 backlog는 장애 후 1초 간격으로 관찰하므로 최대 약 1초의 관찰 오차가 있다.
+현재 schema에 claim owner가 없으면 `killed-node-claimed` 분포는 비어 있는 값이 아니라 명시적인
+`available=false`로 출력하고, kill 시점의 전체 active claim 수만 upper bound로 보존한다.
 
 ## 실행 전 확인과 pilot
 
@@ -104,6 +109,8 @@ JIT/cache warm-up 편향을 드러낸다.
 2. 정상 cohort의 tail latency와 장애 cohort의 복구/최대 지연을 분리해 비교한다.
 3. stale reclaim 시간과 backlog 정상화 시간뿐 아니라 attempts, judge invocation, duplicate judge
    time, claim 횟수/batch, 노드별 running/local-waiting/reserved, DB lock/connection 비용을 함께 본다.
+   Rabbit outbox `attempts`는 publish claim, MySQL outbox `attempts`는 direct judge claim이므로 서로
+   같은 실행 횟수로 해석하지 않고 실제 judge invocation을 공통 비용 축으로 사용한다.
 4. 중복 채점은 결과 정합성 오류가 아니라 자원 비용이다. 비포화에서 지연이 늘지 않았어도
    비용이 없다고 일반화하지 않는다.
 5. 차이가 반복 간 오차 범위이면 승자를 만들지 않고 운영 복잡성, 설정 민감도, 장애 범위만

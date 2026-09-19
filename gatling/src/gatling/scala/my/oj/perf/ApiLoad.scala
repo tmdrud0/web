@@ -21,6 +21,20 @@ import scala.util.Random
  */
 object ApiLoad {
 
+  private val workloadSeed = Option(System.getProperty("perf.workloadSeed")).map(_.toLong)
+
+  private def mix(seed: Long, text: String, sequence: Long): Long = {
+    var hash = 0xcbf29ce484222325L ^ seed
+    text.foreach { character =>
+      hash ^= character.toLong
+      hash *= 0x100000001b3L
+    }
+    var value = hash ^ (sequence * 0x9e3779b97f4a7c15L)
+    value = (value ^ (value >>> 30)) * 0xbf58476d1ce4e5b9L
+    value = (value ^ (value >>> 27)) * 0x94d049bb133111ebL
+    value ^ (value >>> 31)
+  }
+
   /**
    * How many users a closed model needs to deliver a rate.
    *
@@ -57,13 +71,32 @@ object ApiLoad {
    * behind the schedule and never catches up.
    */
   def initialJitter(intervalMillis: Long): ChainBuilder =
-    exec(pause(_ => (if (intervalMillis > 0L) Random.between(0L, intervalMillis) else 0L).millis))
+    exec(pause(session => {
+      val delay = workloadSeed match {
+        case Some(seed) if intervalMillis > 0L =>
+          Math.floorMod(mix(seed, session("userName").as[String], 0L), intervalMillis)
+        case _ if intervalMillis > 0L => Random.between(0L, intervalMillis)
+        case _ => 0L
+      }
+      delay.millis
+    }))
 
   def randomSubmissionData(problemIdStart: Long, problemIdEnd: Long, tag: String): ChainBuilder =
     exec { session =>
-      val problemId = Random.between(problemIdStart, problemIdEnd + 1)
-      val code = s"// $tag-${session("userName").as[String]}-${java.util.UUID.randomUUID()}%0Aint main(){return 0;}"
-      session.set("problemId", problemId).set("code", code)
+      workloadSeed match {
+        case Some(seed) =>
+          val sequence = session("workloadSequence").asOption[Long].getOrElse(0L) + 1L
+          val userName = session("userName").as[String]
+          val key = mix(seed, s"$tag:$userName", sequence)
+          val problemCount = problemIdEnd - problemIdStart + 1L
+          val problemId = problemIdStart + Math.floorMod(key, problemCount)
+          val code = s"// $tag-seed$seed-$userName-$sequence%0Aint main(){return 0;}"
+          session.set("workloadSequence", sequence).set("problemId", problemId).set("code", code)
+        case None =>
+          val problemId = Random.between(problemIdStart, problemIdEnd + 1)
+          val code = s"// $tag-${session("userName").as[String]}-${java.util.UUID.randomUUID()}%0Aint main(){return 0;}"
+          session.set("problemId", problemId).set("code", code)
+      }
     }
 
   /**

@@ -42,7 +42,7 @@ public class LatencyProfileContestJudgement implements ContestSubmissionJudgemen
     public SubmissionResult judgeSubmission(ContestSubmissionJudgeProjection submission) {
         double draw = properties.seed() == null
                 ? ThreadLocalRandom.current().nextDouble()
-                : properties.deterministicDraw(submission.getSubmissionId());
+                : properties.deterministicDraw(submission.getSubmissionId(), submission.getCode());
         sleep(properties.isSlow(draw)
                 ? properties.effectiveSlowMillis()
                 : properties.effectiveBaseMillis());

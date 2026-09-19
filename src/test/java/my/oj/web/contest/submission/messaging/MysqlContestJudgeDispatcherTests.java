@@ -55,6 +55,32 @@ class MysqlContestJudgeDispatcherTests {
     }
 
     @Test
+    void nextClaimIsLimitedToPartiallyRemainingCapacity() throws Exception {
+        ContestJudgeOutboxStore store = mock(ContestJudgeOutboxStore.class);
+        ContestSubmissionJudgeProcessor processor = mock(ContestSubmissionJudgeProcessor.class);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            release.await(5, TimeUnit.SECONDS);
+            return null;
+        }).when(processor).judge(org.mockito.ArgumentMatchers.anyLong());
+        when(store.claim(2, Duration.ofSeconds(30))).thenReturn(List.of(event(1), event(2)));
+        when(store.claim(1, Duration.ofSeconds(30))).thenReturn(List.of(event(3)));
+        when(store.completeAll(anyList(), anyList()))
+                .thenReturn(new ContestJudgeOutboxStore.BatchCompletionResult(1, 1, 0, 0));
+        dispatcher = dispatcher(store, processor, 1, 2, 3);
+
+        dispatcher.poll();
+        await().untilAsserted(() -> assertThat(dispatcher.reservedCount()).isEqualTo(2));
+        dispatcher.poll();
+
+        verify(store).claim(2, Duration.ofSeconds(30));
+        verify(store).claim(1, Duration.ofSeconds(30));
+        await().untilAsserted(() -> assertThat(dispatcher.reservedCount()).isEqualTo(3));
+        release.countDown();
+        await().untilAsserted(() -> assertThat(dispatcher.reservedCount()).isZero());
+    }
+
+    @Test
     void judgeFailureReturnsClaimToPending() {
         ContestJudgeOutboxStore store = mock(ContestJudgeOutboxStore.class);
         ContestSubmissionJudgeProcessor processor = mock(ContestSubmissionJudgeProcessor.class);

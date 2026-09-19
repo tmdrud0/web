@@ -45,8 +45,29 @@ $rows = if (Test-Path $latencyPath) { @(Import-Csv $latencyPath) } else { @() }
 $cohortNames = @("all", "pre-fault-normal", "fault-window", "killed-node-claimed", "post-fault-arrivals")
 $cohorts = [ordered]@{}
 foreach ($cohortName in $cohortNames) {
-    $selected = if ($cohortName -eq "all") { $rows } else { @($rows | Where-Object { $_.cohorts -split ';' -contains $cohortName }) }
-    $cohorts[$cohortName] = Get-LatencySummary $selected
+    if ($cohortName -eq "killed-node-claimed" -and -not $verification.cohortAvailability.killedNodeClaimed) {
+        $cohorts[$cohortName] = [ordered]@{ available=$false; reason="claim owner is not stored; all-active snapshot is only an upper bound" }
+    } else {
+        $selected = if ($cohortName -eq "all") { $rows } else { @($rows | Where-Object { $_.cohorts -split ';' -contains $cohortName }) }
+        $cohorts[$cohortName] = Get-LatencySummary $selected
+    }
+}
+
+$capacity = [ordered]@{}
+$capacityPath = Join-Path $runPath "capacity.csv"
+if (Test-Path $capacityPath) {
+    foreach ($node in @("judge-1", "judge-2")) {
+        $nodeRows = @(Import-Csv $capacityPath | Where-Object node -eq $node)
+        $capacity[$node] = [ordered]@{}
+        foreach ($metric in @("running", "localWaiting", "reserved")) {
+            $values = @($nodeRows | ForEach-Object { if ([string]$_.$metric -ne "") { [double]$_.$metric } })
+            $capacity[$node][$metric] = [ordered]@{
+                samples=$values.Count
+                max=if ($values.Count) { ($values | Measure-Object -Maximum).Maximum } else { $null }
+                average=if ($values.Count) { [math]::Round(($values | Measure-Object -Average).Average, 3) } else { $null }
+            }
+        }
+    }
 }
 
 $backlogRecoverySeconds = $null
@@ -81,6 +102,7 @@ $summary = [ordered]@{
         backlogNormalizedSeconds = $backlogRecoverySeconds
     }
     workCost = $verification.workCost
+    capacity = $capacity
     mysql = $verification.mysql
     unavailable = @($verification.unavailable)
 }
@@ -97,9 +119,24 @@ $lines = @(
     "|---|---|---:|---:|---:|---:|---:|"
 )
 foreach ($cohortName in $cohortNames) {
+    if ($cohorts[$cohortName].available -eq $false) {
+        $lines += "| $cohortName | unavailable | 0 |  |  |  |  |"
+        continue
+    }
     foreach ($metricName in @("L_result_ms", "L_scoreboard_ms", "L_total_ms")) {
         $metric = $cohorts[$cohortName][$metricName]
         $lines += "| $cohortName | $metricName | $($metric.count) | $($metric.p50) | $($metric.p95) | $($metric.p99) | $($metric.max) |"
+    }
+}
+$lines += @("", "## Executor capacity", "", "| Node | Metric | samples | max | average |", "|---|---|---:|---:|---:|")
+foreach ($node in @("judge-1", "judge-2")) {
+    foreach ($metricName in @("running", "localWaiting", "reserved")) {
+        $metric = if ($capacity[$node]) {
+            $capacity[$node][$metricName]
+        } else {
+            [ordered]@{ samples=0; max=$null; average=$null }
+        }
+        $lines += "| $node | $metricName | $($metric.samples) | $($metric.max) | $($metric.average) |"
     }
 }
 $lines += @("", "## Explicitly unavailable", "")

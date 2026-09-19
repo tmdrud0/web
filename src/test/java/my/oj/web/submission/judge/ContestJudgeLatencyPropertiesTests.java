@@ -10,7 +10,7 @@ class ContestJudgeLatencyPropertiesTests {
     @Test
     void seedAndSubmissionIdProduceStableButIdSpecificDraws() {
         ContestJudgeLatencyProperties properties =
-                new ContestJudgeLatencyProperties(true, 0.1, 2_000L, 10L, 42L);
+                new ContestJudgeLatencyProperties(true, 0.1, 2_000L, 10L, 42L, "submission-id");
 
         double first = properties.deterministicDraw(101L);
 
@@ -22,7 +22,7 @@ class ContestJudgeLatencyPropertiesTests {
     @Test
     void missingSeedKeepsDeterministicPathDisabled() {
         ContestJudgeLatencyProperties properties =
-                new ContestJudgeLatencyProperties(true, null, null, null, null);
+                new ContestJudgeLatencyProperties(true, null, null, null, null, null);
 
         assertThatThrownBy(() -> properties.deterministicDraw(1L))
                 .isInstanceOf(IllegalStateException.class);
@@ -31,9 +31,9 @@ class ContestJudgeLatencyPropertiesTests {
     @Test
     void deterministicAssignmentsFollowConfiguredRatioAndChangeWithSeed() {
         ContestJudgeLatencyProperties first =
-                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 123L);
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 123L, "submission-id");
         ContestJudgeLatencyProperties second =
-                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 456L);
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 456L, "submission-id");
         int sampleSize = 20_000;
         int firstSlow = 0;
         int changedAssignments = 0;
@@ -50,5 +50,16 @@ class ContestJudgeLatencyPropertiesTests {
 
         assertThat((double) firstSlow / sampleSize).isBetween(0.04, 0.06);
         assertThat(changedAssignments).isGreaterThan(0);
+    }
+
+    @Test
+    void codeKeyKeepsTheSameWorkloadItemStableAcrossGeneratedSubmissionIds() {
+        ContestJudgeLatencyProperties properties =
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 123L, "code");
+
+        assertThat(properties.deterministicDraw(1L, "stable-work-item"))
+                .isEqualTo(properties.deterministicDraw(999L, "stable-work-item"));
+        assertThat(properties.deterministicDraw(1L, "other-work-item"))
+                .isNotEqualTo(properties.deterministicDraw(1L, "stable-work-item"));
     }
 }
