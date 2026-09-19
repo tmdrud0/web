@@ -50,7 +50,8 @@ fault 시각, killed node, down duration을 받는다. loadtest judge는 base 50
 컨테이너는 CPU exporter를 제공하지 않으므로 connection과 InnoDB lock counter만 저장한다.
 Gatling `maxDuration` 종료 시 진행 중 요청은 서버에 저장된 뒤 client log에 완료로 남지 않을 수
 있으므로 총 HTTP 시도 수는 unavailable이며, `completedHttpRequests`와 DB accepted를 분리해 기록한다.
-첫 stale 회수 시각과 backlog는 장애 후 1초 간격으로 관찰하므로 최대 약 1초의 관찰 오차가 있다.
+첫 stale 회수 시각과 backlog는 장애 후 약 1초 간격으로 관찰하며 probe 실행 시간만큼 추가 오차가
+생길 수 있다. `faultScheduledAt`, 실제 `faultInjectedAt`, `faultTimingErrorSeconds`를 함께 저장한다.
 현재 schema에 claim owner가 없으면 `killed-node-claimed` 분포는 비어 있는 값이 아니라 명시적인
 `available=false`로 출력하고, kill 시점의 전체 active claim 수만 upper bound로 보존한다.
 Rabbit의 노드별 실제 running/local-waiting/reserved gauge는 현재 노출되지 않으므로 capacity CSV에서

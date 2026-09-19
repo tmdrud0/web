@@ -94,10 +94,17 @@ function Wait-Healthy {
 }
 
 function Wait-JudgeMetrics {
-    param([Parameter(Mandatory = $true)][string]$Node)
+    param(
+        [Parameter(Mandatory = $true)][string]$Node,
+        [switch]$ObserveRecovery
+    )
     $port = if ($Node -eq "judge-1") { 19001 } else { 19002 }
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline) {
+        if ($ObserveRecovery) {
+            Observe-FaultRecovery "restart-wait"
+            Save-CapacitySample "restart-wait"
+        }
         try {
             Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$port/actuator/prometheus" | Out-Null
             return
@@ -313,7 +320,7 @@ if ($DryRun) {
     exit 0
 }
 
-$events = [ordered]@{ runStartedAt=$null; loadStartedAt=$null; faultInjectedAt=$null; staleAttemptsBeforeFault=0; firstStaleReclaimObservedAt=$null; nodeRestartedAt=$null; loadEndedAt=$null; runEndedAt=$null; contestId=$null }
+$events = [ordered]@{ runStartedAt=$null; loadStartedAt=$null; faultScheduledAt=$null; faultInjectedAt=$null; faultTimingErrorSeconds=$null; staleAttemptsBeforeFault=0; firstStaleReclaimObservedAt=$null; nodeRestartedAt=$null; loadEndedAt=$null; runEndedAt=$null; contestId=$null }
 $started = $false
 $claimSnapshot = [pscustomobject]@{ exact=$false; ids=@(); observedActiveClaimCount=0 }
 try {
@@ -363,16 +370,26 @@ try {
     Save-CapacitySample "load-start"
     if ($FaultEnabled) {
         $faultDeadline = (Get-Date).AddSeconds($FaultAtSeconds)
-        while ((Get-Date) -lt $faultDeadline -and -not $gatling.HasExited) {
+        $events.faultScheduledAt = $faultDeadline.ToUniversalTime().ToString("o")
+        # Leave a guard window for the synchronous pre-kill metric scrape. Without
+        # it, probe latency itself moves a short configured fault several seconds.
+        $captureDeadline = $faultDeadline.AddSeconds(-5)
+        while ((Get-Date) -lt $captureDeadline -and -not $gatling.HasExited) {
             Save-BacklogSample "pre-fault" | Out-Null
             Save-CapacitySample "pre-fault"
-            Start-Sleep -Seconds 1
+            $remainingMillis = [math]::Floor(($captureDeadline - (Get-Date)).TotalMilliseconds)
+            if ($remainingMillis -gt 0) { Start-Sleep -Milliseconds ([math]::Min(1000, $remainingMillis)) }
         }
         Save-MetricsSnapshot "pre-fault"
+        $remainingMillis = [math]::Floor(($faultDeadline - (Get-Date)).TotalMilliseconds)
+        if ($remainingMillis -gt 0) { Start-Sleep -Milliseconds $remainingMillis }
+        Invoke-Compose -Arguments @("kill", $KilledNode)
+        $events.faultInjectedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $events.faultTimingErrorSeconds = [math]::Round(((Get-Date) - $faultDeadline).TotalSeconds, 3)
+        # Capture after kill so synchronous SQL inspection cannot postpone the
+        # fault. Without claimed_by this remains an all-node active upper bound.
         $claimSnapshot = Save-ClaimSnapshot
         $events.staleAttemptsBeforeFault = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(o.attempts - 1, 0)), 0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId)"
-        $events.faultInjectedAt = [datetimeoffset]::UtcNow.ToString("o")
-        Invoke-Compose -Arguments @("kill", $KilledNode)
         Observe-FaultRecovery "fault"
         $downDeadline = (Get-Date).AddSeconds($DownDurationSeconds)
         while ((Get-Date) -lt $downDeadline) {
@@ -383,7 +400,7 @@ try {
         Invoke-Compose -Arguments @("start", $KilledNode)
         $events.nodeRestartedAt = [datetimeoffset]::UtcNow.ToString("o")
         Wait-Healthy
-        Wait-JudgeMetrics $KilledNode
+        Wait-JudgeMetrics $KilledNode -ObserveRecovery
         Save-MetricsSnapshot "post-restart"
     }
     if ($FaultEnabled) {
