@@ -381,6 +381,7 @@ try {
             if ($remainingMillis -gt 0) { Start-Sleep -Milliseconds ([math]::Min(1000, $remainingMillis)) }
         }
         Save-MetricsSnapshot "pre-fault"
+        $events.staleAttemptsBeforeFault = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(o.attempts - 1, 0)), 0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId)"
         $remainingMillis = [math]::Floor(($faultDeadline - (Get-Date)).TotalMilliseconds)
         if ($remainingMillis -gt 0) { Start-Sleep -Milliseconds $remainingMillis }
         Invoke-Compose -Arguments @("kill", $KilledNode)
@@ -389,7 +390,6 @@ try {
         # Capture after kill so synchronous SQL inspection cannot postpone the
         # fault. Without claimed_by this remains an all-node active upper bound.
         $claimSnapshot = Save-ClaimSnapshot
-        $events.staleAttemptsBeforeFault = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(o.attempts - 1, 0)), 0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId)"
         Observe-FaultRecovery "fault"
         $downDeadline = (Get-Date).AddSeconds($DownDurationSeconds)
         while ((Get-Date) -lt $downDeadline) {
