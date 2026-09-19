@@ -112,7 +112,7 @@ $lines = @(
     "# MySQL judge tradeoff run $($parameters.runId)", "",
     "- Dispatch: $($parameters.dispatchMode)",
     "- Git commit: $($parameters.gitCommit)",
-    "- Requests / accepted / unique / results / scoreboard: $($verification.counts.requests) / $($verification.counts.accepted) / $($verification.counts.uniqueSubmissions) / $($verification.counts.results) / $($verification.counts.scoreboardApplied)",
+    "- Completed HTTP / accepted / unique / results / scoreboard: $($verification.counts.completedHttpRequests) / $($verification.counts.accepted) / $($verification.counts.uniqueSubmissions) / $($verification.counts.results) / $($verification.counts.scoreboardApplied)",
     "- First stale reclaim after fault: $(if ($null -eq $firstStaleReclaimSeconds) { 'unavailable' } else { [string]$firstStaleReclaimSeconds + 's' })",
     "- Backlog normalization after fault: $(if ($null -eq $backlogRecoverySeconds) { 'unavailable' } else { [string]$backlogRecoverySeconds + 's' })", "",
     "| Cohort | Metric | count | p50 ms | p95 ms | p99 ms | max ms |",

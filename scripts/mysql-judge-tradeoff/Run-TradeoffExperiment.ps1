@@ -420,7 +420,7 @@ try {
     $resultCount = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($seed.contestId)"
     $scoreboardCount = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($seed.contestId) AND scoreboard_applied_at IS NOT NULL"
     $uniqueCount = Get-SqlScalar "SELECT COUNT(DISTINCT id) FROM contest_submission WHERE contest_id=$($seed.contestId)"
-    $requests = Get-GatlingSubmitRequests $gatlingStarted
+    $completedHttpRequests = Get-GatlingSubmitRequests $gatlingStarted
     $attemptRows = Invoke-SqlRows "SELECT attempts, COUNT(*) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($seed.contestId) GROUP BY attempts ORDER BY attempts"
     @("attempts`trows") + $attemptRows | Set-Content (Join-Path $runDirectory "claim-attempts.tsv") -Encoding utf8
     $reclaimRows = Invoke-SqlRows "SELECT updated_at, submission_id, attempts FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($seed.contestId) AND attempts > 1 ORDER BY updated_at"
@@ -442,12 +442,15 @@ try {
     if ($DispatchMode -eq "rabbit") { $unavailable.Add("Rabbit per-node running/local-waiting/reserved gauges are unavailable; worker-count x prefetch is recorded only as the configured normalized ceiling") }
     $unavailable.Add("MySQL CPU is not exposed by the stock mysql:8.0 container; connection and InnoDB lock counters are captured instead")
     if (-not $claimSnapshot.exact -and $FaultEnabled) { $unavailable.Add("killed-node claim attribution: schema has no claimed_by column; killed-node-claims.csv contains all active claims at kill time") }
-    if ($null -eq $requests) { $unavailable.Add("HTTP submission request count: Gatling simulation.log was not found") }
+    if ($null -eq $completedHttpRequests) {
+        $unavailable.Add("completed HTTP submission count: Gatling simulation.log was not found")
+    }
+    $unavailable.Add("total HTTP submission attempts are unavailable because requests still in flight at Gatling maxDuration can persist after the client log closes; completedHttpRequests is reported separately")
     $duplicateJudgements = if ($null -eq $judgeInvocations) { $null } else { [math]::Max(0, $judgeInvocations - $resultCount) }
     $duplicateJudgeMillisLowerBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 50 }
     $duplicateJudgeMillisUpperBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 2000 }
     $verification = [ordered]@{
-        counts = @{ requests=$requests; accepted=$submissionCount; uniqueSubmissions=$uniqueCount; results=$resultCount; scoreboardApplied=$scoreboardCount }
+        counts = @{ requests=$null; completedHttpRequests=$completedHttpRequests; accepted=$submissionCount; uniqueSubmissions=$uniqueCount; results=$resultCount; scoreboardApplied=$scoreboardCount }
         integrity = @{ lostOrIncomplete=($submissionCount-$resultCount); finalResultMismatch=($resultCount-$scoreboardCount); passed=($submissionCount -eq $uniqueCount -and $submissionCount -eq $resultCount -and $resultCount -eq $scoreboardCount) }
         workCost = @{ duplicateClaimEstimate=$duplicateEstimate; duplicateJudgementEstimate=$duplicateJudgements; judgeInvocations=$judgeInvocations; totalJudgeMillis=if ($null -eq $judgeDurationSeconds) {$null} else {[math]::Round($judgeDurationSeconds*1000,3)}; duplicateJudgeMillisLowerBound=$duplicateJudgeMillisLowerBound; duplicateJudgeMillisUpperBound=$duplicateJudgeMillisUpperBound; claimCalls=$claimCalls; claimedRows=$claimRows; staleReclaims=$staleReclaims; completionSuccess=$completionSuccess; completionFailure=$completionFailure; staleTokenCompletions=$staleCompletions; storedResultRepublishes=$storedRepublishes; claimAttemptsFile="claim-attempts.tsv"; killedNodeClaimCount=if ($claimSnapshot.exact) {@($claimSnapshot.ids).Count} else {$null}; allActiveClaimsAtKill=$claimSnapshot.observedActiveClaimCount }
         cohortAvailability = @{ killedNodeClaimed=[bool]$claimSnapshot.exact }

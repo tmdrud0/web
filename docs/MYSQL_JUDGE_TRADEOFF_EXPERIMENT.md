@@ -43,11 +43,13 @@ fault 시각, killed node, down duration을 받는다. loadtest judge는 base 50
 - `metrics/*.prom`, `metrics/*-mysql-status.tsv`: JVM counter/gauge와 MySQL connection/lock snapshot.
 - `killed-node-claims.csv`, `claim-attempts.tsv`, `stale-reclaims.csv`, `backlog.csv`: claim/recovery 증거.
 - `capacity.csv`: 실행 중 노드별 running/local-waiting/reserved 1초 시계열.
-- `db-verification.json`: request/accepted/unique/result/scoreboard 수, 유실/불일치, 비용 지표.
+- `db-verification.json`: completed HTTP/accepted/unique/result/scoreboard 수, 유실/불일치, 비용 지표.
 - `summary.json`, `summary.md`: 기계/사람이 읽는 cohort 분포와 recovery 결과.
 
 측정할 수 없는 값은 0으로 만들지 않고 `unavailable` 배열에 이유를 쓴다. 기본 MySQL
 컨테이너는 CPU exporter를 제공하지 않으므로 connection과 InnoDB lock counter만 저장한다.
+Gatling `maxDuration` 종료 시 진행 중 요청은 서버에 저장된 뒤 client log에 완료로 남지 않을 수
+있으므로 총 HTTP 시도 수는 unavailable이며, `completedHttpRequests`와 DB accepted를 분리해 기록한다.
 첫 stale 회수 시각과 backlog는 장애 후 1초 간격으로 관찰하므로 최대 약 1초의 관찰 오차가 있다.
 현재 schema에 claim owner가 없으면 `killed-node-claimed` 분포는 비어 있는 값이 아니라 명시적인
 `available=false`로 출력하고, kill 시점의 전체 active claim 수만 upper bound로 보존한다.
