@@ -321,7 +321,7 @@ if ($DryRun) {
     exit 0
 }
 
-$events = [ordered]@{ runStartedAt=$null; loadStartedAt=$null; faultScheduledAt=$null; faultInjectedAt=$null; faultTimingErrorSeconds=$null; staleAttemptsBeforeFault=0; firstStaleReclaimObservedAt=$null; nodeRestartedAt=$null; loadEndedAt=$null; runEndedAt=$null; contestId=$null }
+$events = [ordered]@{ runStartedAt=$null; loadStartedAt=$null; faultScheduledAt=$null; faultInjectedAt=$null; faultTimingErrorSeconds=$null; staleAttemptsBeforeFault=0; firstStaleReclaimObservedAt=$null; restartRequestedAt=$null; nodeRestartedAt=$null; nodeReadyAt=$null; loadEndedAt=$null; runEndedAt=$null; contestId=$null }
 $started = $false
 $claimSnapshot = [pscustomobject]@{ exact=$false; ids=@(); observedActiveClaimCount=0 }
 try {
@@ -398,10 +398,12 @@ try {
             $remainingMillis = [math]::Floor(($downDeadline - (Get-Date)).TotalMilliseconds)
             if ($remainingMillis -gt 0) { Start-Sleep -Milliseconds ([math]::Min(1000, $remainingMillis)) }
         }
+        $events.restartRequestedAt = [datetimeoffset]::UtcNow.ToString("o")
         Invoke-Compose -Arguments @("start", $KilledNode)
         $events.nodeRestartedAt = [datetimeoffset]::UtcNow.ToString("o")
         Wait-Healthy -ObserveRecovery
         Wait-JudgeMetrics $KilledNode -ObserveRecovery
+        $events.nodeReadyAt = [datetimeoffset]::UtcNow.ToString("o")
         Save-MetricsSnapshot "post-restart"
     }
     if ($FaultEnabled) {
