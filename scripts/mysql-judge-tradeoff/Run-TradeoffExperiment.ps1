@@ -81,8 +81,10 @@ function Get-SqlScalar {
 }
 
 function Wait-Healthy {
+    param([switch]$ObserveRecovery)
     $deadline = (Get-Date).AddMinutes(5)
     while ((Get-Date) -lt $deadline) {
+        if ($ObserveRecovery) { Observe-FaultRecovery "health-wait" }
         $ids = @(Invoke-Compose -Arguments @("ps", "-q") | Where-Object { $_ })
         if ($ids.Count -eq 9) {
             $bad = @(& docker inspect --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $ids | Where-Object { $_ -notmatch '^true (healthy|none)$' })
@@ -103,7 +105,6 @@ function Wait-JudgeMetrics {
     while ((Get-Date) -lt $deadline) {
         if ($ObserveRecovery) {
             Observe-FaultRecovery "restart-wait"
-            Save-CapacitySample "restart-wait"
         }
         try {
             Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$port/actuator/prometheus" | Out-Null
@@ -387,19 +388,19 @@ try {
         Invoke-Compose -Arguments @("kill", $KilledNode)
         $events.faultInjectedAt = [datetimeoffset]::UtcNow.ToString("o")
         $events.faultTimingErrorSeconds = [math]::Round(((Get-Date) - $faultDeadline).TotalSeconds, 3)
+        $downDeadline = (Get-Date).AddSeconds($DownDurationSeconds)
         # Capture after kill so synchronous SQL inspection cannot postpone the
         # fault. Without claimed_by this remains an all-node active upper bound.
         $claimSnapshot = Save-ClaimSnapshot
         Observe-FaultRecovery "fault"
-        $downDeadline = (Get-Date).AddSeconds($DownDurationSeconds)
         while ((Get-Date) -lt $downDeadline) {
-            Start-Sleep -Seconds 1
             Observe-FaultRecovery "node-down"
-            Save-CapacitySample "node-down"
+            $remainingMillis = [math]::Floor(($downDeadline - (Get-Date)).TotalMilliseconds)
+            if ($remainingMillis -gt 0) { Start-Sleep -Milliseconds ([math]::Min(1000, $remainingMillis)) }
         }
         Invoke-Compose -Arguments @("start", $KilledNode)
         $events.nodeRestartedAt = [datetimeoffset]::UtcNow.ToString("o")
-        Wait-Healthy
+        Wait-Healthy -ObserveRecovery
         Wait-JudgeMetrics $KilledNode -ObserveRecovery
         Save-MetricsSnapshot "post-restart"
     }
