@@ -11,6 +11,9 @@
 RabbitMQ 비교축은 raw prefetch가 아니라 `worker-count × prefetch`, 즉 노드당
 reserved-but-unfinished 상한이다. MySQL의 대응 축은 `max-in-flight`다.
 
+fault 없이 `max-in-flight` 자체가 정상상태 처리 용량을 어떻게 바꾸는지는 별도 문서
+`docs/MYSQL_JUDGE_MAX_IN_FLIGHT_CAPACITY.md`에서 다룬다.
+
 ## 지연과 cohort 정의
 
 - `L_result`: `contest_submission.submitted_time`부터
