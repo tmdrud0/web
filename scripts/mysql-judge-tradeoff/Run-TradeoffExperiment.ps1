@@ -31,7 +31,14 @@ param(
     [double]$OverloadThresholdRowsPerSec = 1.0,
     [int]$AssertMinSuccessPercent = 95,
     [int]$AssertP95Millis = 60000,
-    [int]$TraceAlignmentToleranceSeconds = 5
+    [int]$TraceAlignmentToleranceSeconds = 5,
+    # Fault-free claim-timeout experiment. One stack and one server JVM lifetime hold two phases: a
+    # warm-up phase in its own contest, a full drain to quiescence, then a measured phase in a second
+    # contest. -TargetRps is the load for both phases and -MySqlClaimTimeout is the variable under
+    # test; -Staircase and -NormalTimeout are separate experiments and are not combined.
+    [switch]$NormalTimeout,
+    [int]$WarmupSeconds = 30,
+    [int]$MeasurementSeconds = 60
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,12 +71,51 @@ if ($Staircase) {
     if ($DrainTimeoutSeconds -lt 300) { throw "Staircase runs require -DrainTimeoutSeconds of at least 300." }
 }
 
+# The two staged experiments share the machinery - a traced hold analysed per window, one stack for
+# the whole run - but not their parameters: the staircase sweeps a ladder of rates in one run, while
+# the normal-timeout run holds a single rate so that the claim timeout is the only thing that changes
+# between runs. They are kept apart rather than merged into one mode because the staircase's ladder
+# is what defines its stage labels.
+$stagedLoad = [bool]$Staircase -or [bool]$NormalTimeout
+if ($Staircase -and $NormalTimeout) { throw "-Staircase and -NormalTimeout are different experiments; pass one of them." }
+$warmupPrefix = ""
+$measurementPrefix = ""
+$measurementHoldSeconds = 0
+if ($NormalTimeout) {
+    if ($DispatchMode -ne "mysql") { throw "-NormalTimeout measures MySQL claim dispatch, so -DispatchMode must be mysql." }
+    if ($FaultEnabled) { throw "-NormalTimeout measures the fault-free steady state and does not inject faults." }
+    if (-not $PSBoundParameters.ContainsKey("TargetRps")) { throw "-NormalTimeout requires an explicit -TargetRps: the offered rate is an input to the comparison across timeouts, not a default." }
+    if ($WarmupSeconds -lt 12) { throw "-WarmupSeconds must be at least 12, or the warm-up phase is not long enough to reach a steady state." }
+    if ($MeasurementSeconds -lt 12) { throw "-MeasurementSeconds must be at least 12 so a measured window has enough samples to classify." }
+    if ($SteadyGuardSeconds -lt 0) { throw "-SteadyGuardSeconds must not be negative." }
+    if ($UserCount -lt 1000) { throw "Normal-timeout runs require -UserCount of at least 1000." }
+    if ($DrainTimeoutSeconds -lt 300) { throw "Normal-timeout runs require -DrainTimeoutSeconds of at least 300." }
+    # Each phase is its own Gatling invocation with one stage, so warmupStageCount is 0: the phase
+    # boundary is the harness draining the pipeline between the two runs, not a warm-up stage inside
+    # one schedule. The hold carries the steady guard on top of the measured window, so the window
+    # the percentiles are read over is exactly -MeasurementSeconds long.
+    $stageRpsList = @([double]$TargetRps)
+    $WarmupStageCount = 0
+    $measurementHoldSeconds = $MeasurementSeconds + $SteadyGuardSeconds
+    # Both contests are seeded from the seed alone, so a rerun of the same timeout reseeds the same
+    # users and therefore the same code strings: the 5% slow-job split is keyed on the code, and an
+    # identical code set is what makes the synthetic judge work reproducible across the six runs.
+    $warmupPrefix = "norm_warm_$LatencySeed"
+    $measurementPrefix = "norm_meas_$LatencySeed"
+}
+$effectiveHoldSeconds = if ($NormalTimeout) { $measurementHoldSeconds } else { $StageHoldSeconds }
+$workloadPrefix = if ($NormalTimeout) { $measurementPrefix } else { "tradeoff_seed_$LatencySeed" }
+
 # The staircase drives the stack into overload on purpose, where the API rate limiter refuses
 # requests the judge never saw. Those refusals are part of the measurement, not a fault, so the
 # staircase default is looser than the fault experiments' 95%; an explicit value still wins, and
 # Gatling exiting 2 over it is recorded rather than treated as a failed run.
 $assertMinSuccess = if ($Staircase) {
     if ($PSBoundParameters.ContainsKey("AssertMinSuccessPercent")) { $AssertMinSuccessPercent } else { 80 }
+} elseif ($NormalTimeout) {
+    # A normal-timeout run is offered about 70% of the measured knee, so it stays well inside the
+    # rate limiter and the staircase's looser bound is not needed; an explicit value still wins.
+    if ($PSBoundParameters.ContainsKey("AssertMinSuccessPercent")) { $AssertMinSuccessPercent } else { 95 }
 } else { 95 }
 
 $neededUsers = if ($Staircase) {
@@ -91,6 +137,22 @@ if ($Staircase) {
         segmentCount = 1 + $stageRpsList.Count + ($stageRpsList.Count - 1)
         totalSeconds = ($RampSeconds + $StageHoldSeconds) * $stageRpsList.Count
         measuredStageCount = $stageRpsList.Count - $WarmupStageCount
+    }
+} elseif ($NormalTimeout) {
+    $population = [int][math]::Max(1, [math]::Ceiling($TargetRps * 3100 / 1000))
+    $expectedPlan = [ordered]@{
+        targetRps = $TargetRps
+        population = $population
+        warmupPhase = [ordered]@{
+            contestPrefix = $warmupPrefix; rampSeconds = $RampSeconds
+            holdSeconds = $WarmupSeconds; seconds = $RampSeconds + $WarmupSeconds
+        }
+        measurementPhase = [ordered]@{
+            contestPrefix = $measurementPrefix; rampSeconds = $RampSeconds
+            holdSeconds = $measurementHoldSeconds; steadyGuardSeconds = $SteadyGuardSeconds
+            measuredWindowSeconds = $MeasurementSeconds; seconds = $RampSeconds + $measurementHoldSeconds
+        }
+        totalSeconds = 2 * $RampSeconds + $WarmupSeconds + $measurementHoldSeconds
     }
 }
 
@@ -127,6 +189,24 @@ if ($Staircase) {
         traceAlignmentToleranceSeconds = $TraceAlignmentToleranceSeconds
         simulationClass = "my.oj.perf.ContestSubmissionStepLoadSimulation"
         stageTraceFile = "stage-trace.csv"
+        expectedPlan = $expectedPlan
+    }
+}
+if ($NormalTimeout) {
+    $parameters.normalTimeout = [ordered]@{
+        enabled = $true
+        targetRps = $TargetRps
+        warmupSeconds = $WarmupSeconds
+        measurementSeconds = $MeasurementSeconds
+        measurementHoldSeconds = $measurementHoldSeconds
+        steadyGuardSeconds = $SteadyGuardSeconds
+        warmupPrefix = $warmupPrefix
+        measurementPrefix = $measurementPrefix
+        simulationClass = "my.oj.perf.ContestSubmissionStepLoadSimulation"
+        # One stage per Gatling invocation, so the measured window is labelled stage-0 in
+        # timeseries.csv and stages.json rather than "measurement".
+        measuredStageLabel = "stage-0"
+        measurementWindowBasis = "the hold minus steadyGuardSeconds; the preceding ramp is part of the schedule but outside every measured window"
         expectedPlan = $expectedPlan
     }
 }
@@ -396,13 +476,193 @@ function Get-GatlingLastRequestMillis {
 }
 
 function Copy-GatlingArtifacts {
-    param([datetime]$StartedAt)
+    param([datetime]$StartedAt, [string]$NamePrefix = "")
     $log = Find-GatlingReport -StartedAt $StartedAt
     if ($null -eq $log) { return $null }
-    Copy-Item $log.FullName (Join-Path $runDirectory "gatling-simulation.log") -Force
+    Copy-Item $log.FullName (Join-Path $runDirectory "$($NamePrefix)gatling-simulation.log") -Force
     $stats = Join-Path $log.Directory.FullName "js\global_stats.json"
-    if (Test-Path $stats) { Copy-Item $stats (Join-Path $runDirectory "gatling-global-stats.json") -Force }
+    if (Test-Path $stats) { Copy-Item $stats (Join-Path $runDirectory "$($NamePrefix)gatling-global-stats.json") -Force }
     return $log.Directory.FullName
+}
+
+function Start-GatlingProcess {
+    param([Parameter(Mandatory = $true)][string[]]$JavaArgs)
+    # Start-Process -PassThru -NoNewWindow hands back a Process whose ExitCode stays empty on this
+    # PowerShell 5.1 even after WaitForExit(), which made the assertion check read $null and fail
+    # every run with "Gatling exited with code .". System.Diagnostics.Process populates it, and
+    # UseShellExecute = $false without output redirection still lets Gatling write to this console.
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = (Get-Command java.exe).Source
+    $startInfo.UseShellExecute = $false
+    $startInfo.Arguments = (($JavaArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+    return [System.Diagnostics.Process]::Start($startInfo)
+}
+
+function Start-GatlingLoadPhase {
+    param(
+        [Parameter(Mandatory = $true)][string]$PhaseName,
+        [Parameter(Mandatory = $true)]$Seed,
+        [Parameter(Mandatory = $true)][string]$UserPrefix,
+        [Parameter(Mandatory = $true)][int]$HoldSeconds,
+        [string]$TracePath = ""
+    )
+    # Used by the normal-timeout warm-up phase only. The measured phase keeps its own inline
+    # invocation: that path already carries the load-start capacity sample, the fault scheduling and
+    # the first-submission anchor that the already-published runs were measured with, and rewriting
+    # it to share this helper would put a refactor between those numbers and the code that produced
+    # them for no gain here.
+    $phaseArgs = @(
+        "-Xms256m", "-Xmx1g", "-Dperf.baseUrl=$baseUrl", "-Dperf.assert.minRequests=1",
+        "-Dperf.assert.minSuccessPercent=$assertMinSuccess", "-Dperf.assert.p95Millis=$AssertP95Millis",
+        "-Dperf.submitIntervalMillis=3100", "-Dperf.userPrefix=$UserPrefix", "-Dperf.workloadSeed=$LatencySeed",
+        "-Dperf.userIndex.start=1", "-Dperf.userIndex.end=$UserCount",
+        "-Dperf.contestId=$($Seed.contestId)", "-Dperf.problemId.start=$($Seed.firstProblemId)", "-Dperf.problemId.end=$($Seed.lastProblemId)",
+        "-Dperf.rampSeconds=$RampSeconds", "-Dperf.stepHoldSeconds=$HoldSeconds",
+        "-Dperf.stageRps=$TargetRps", "-Dperf.warmupStageCount=0",
+        "-cp", $classpath, "io.gatling.app.Gatling", "-s", "my.oj.perf.ContestSubmissionStepLoadSimulation"
+    )
+    if ($TracePath) { $phaseArgs += "-Dperf.stageTraceFile=$TracePath" }
+    $phaseArgs += @("-rf", $resultsFolder, "-rd", "mysql-judge-tradeoff-$RunId-$PhaseName")
+    $startedAt = Get-Date
+    $process = Start-GatlingProcess -JavaArgs $phaseArgs
+    # Anchor the phase clock to the first persisted submission rather than to process creation:
+    # Java and Gatling startup can take longer than the ramp.
+    $deadline = (Get-Date).AddSeconds(60)
+    $persisted = $null
+    do {
+        $persisted = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id=$($Seed.contestId)"
+        if ($null -ne $persisted -and $persisted -gt 0) { break }
+        if ($process.HasExited) { throw "Gatling exited during the $PhaseName phase before the first submission was persisted." }
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+    if ($null -eq $persisted -or $persisted -eq 0) { throw "No submission was persisted within 60 seconds of starting the $PhaseName phase." }
+    return [pscustomobject]@{
+        process = $process
+        startedAt = $startedAt
+        firstSubmissionAt = [datetimeoffset]::UtcNow.ToString("o")
+    }
+}
+
+function Get-JudgeLiveState {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    # One scrape for everything the quiescence gate needs. A counter read from a live endpoint is
+    # what makes "no warm-up work is still running" decidable: the measured phase's judge-invocation
+    # delta is end minus start, so any invocation counter increment after the baseline is charged to
+    # the measured window. An unreachable node returns nulls, never zeros.
+    $state = @{ running = $null; queued = $null; reserved = $null; invocations = $null }
+    try {
+        $content = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$Port/actuator/prometheus").Content
+        foreach ($metric in @("running", "queued", "reserved")) {
+            $match = [regex]::Match($content, "(?m)^contest_judge_executor_$metric(?:\{[^}]*\})?\s+([^\s]+)$")
+            if ($match.Success) { $state[$metric] = [double]$match.Groups[1].Value }
+        }
+        $invocation = [regex]::Match($content, "(?m)^contest_judge_invocations_total(?:\{[^}]*\})?\s+([^\s]+)$")
+        if ($invocation.Success) { $state.invocations = [double]$invocation.Groups[1].Value }
+    } catch {
+        $state = @{ running = $null; queued = $null; reserved = $null; invocations = $null }
+    }
+    return $state
+}
+
+function Wait-GatlingWithSamples {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        $Trace,
+        [Parameter(Mandatory = $true)][long]$ContestId,
+        [Parameter(Mandatory = $true)][string]$Phase
+    )
+    # The warm-up phase's tick loop. It is the measured phase's loop minus the boundary snapshots,
+    # which only exist for the per-stage counter deltas of a staircase, and it exists separately
+    # rather than by rewriting the measured loop so that the loop the published capacity runs were
+    # sampled with stays exactly as it was measured.
+    $script:staircaseLastTickUtc = $null
+    $nextTick = [datetimeoffset]::UtcNow
+    while (-not $Process.HasExited) {
+        $nextTick = $nextTick.AddSeconds(1)
+        Save-StaircaseSample -Phase $Phase -Trace $Trace -ContestId $ContestId | Out-Null
+        $remaining = ($nextTick - [datetimeoffset]::UtcNow).TotalMilliseconds
+        if ($remaining -gt 0) {
+            Start-Sleep -Milliseconds ([math]::Round($remaining))
+        } elseif ($remaining -lt -1000) {
+            $nextTick = [datetimeoffset]::UtcNow
+        }
+    }
+}
+
+function Wait-PipelineQuiescent {
+    param(
+        [Parameter(Mandatory = $true)][long]$ContestId,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [int]$StableSeconds = 3,
+        [string]$Purpose = "this contest"
+    )
+    # A single "backlog reads zero" sample is not enough to place a metric baseline. Three gaps make
+    # it insufficient. First, a row is PUBLISHED the moment it is handed to a worker, so an
+    # unfinished count of zero does not mean the judges are idle: the judge invocation counter is
+    # incremented in the worker's own finally block, after the row has already stopped being
+    # "unfinished". Second, the judge-result batch writer persists results up to one linger behind
+    # its last publish, so a result row can appear after the invocation was counted, and the reverse
+    # ordering is possible too. Third, work that starts after the baseline is charged to the
+    # measured window's counter delta, so the baseline is only clean if nothing else is still
+    # running. Quiescence is therefore this whole predicate held for consecutive seconds: nothing
+    # unfinished anywhere in the outbox, no judge holding a claim, this contest's submissions all
+    # judged and all applied to the scoreboard, and the judge invocation total unchanged.
+    $startedAt = [datetimeoffset]::UtcNow
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $streak = 0
+    $lastAccepted = $null
+    $lastInvocations = $null
+    $reason = "no reading was taken for $Purpose"
+    $invocationsAtQuiescence = $null
+    while ((Get-Date) -lt $deadline) {
+        $unfinished = Get-SqlScalar "SELECT COUNT(*) FROM contest_judge_outbox WHERE status <> 'PUBLISHED'"
+        $accepted = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id=$ContestId"
+        $results = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$ContestId"
+        $applied = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$ContestId AND scoreboard_applied_at IS NOT NULL"
+        $reserved = 0.0
+        $invocations = 0.0
+        $readable = $true
+        foreach ($port in @(19001, 19002)) {
+            $state = Get-JudgeLiveState -Port $port
+            if ($null -eq $state.reserved -or $null -eq $state.invocations) { $readable = $false } else {
+                $reserved += $state.reserved
+                $invocations += $state.invocations
+            }
+        }
+        $quiet = $false
+        if ($readable -and $null -ne $unfinished -and $null -ne $accepted -and $null -ne $results -and $null -ne $applied) {
+            $reason = "outbox unfinished $unfinished, judge reserved $reserved, accepted $accepted, results $results, scoreboard applied $applied, judge invocations $invocations"
+            $quiet = ($unfinished -eq 0 -and $reserved -eq 0 -and $results -eq $accepted -and $applied -eq $accepted -and
+                ($null -eq $lastInvocations -or $invocations -eq $lastInvocations))
+        } else {
+            $reason = "at least one reading was unavailable or the judge endpoints could not be scraped (outbox $unfinished, accepted $accepted, results $results, applied $applied, both nodes readable $readable)"
+        }
+        # A count that moves restarts the streak even if every predicate happens to hold, so a
+        # submission arriving mid-window cannot be averaged into a "stable" window.
+        if ($quiet -and ($null -eq $lastAccepted -or $accepted -eq $lastAccepted)) { $streak++ } else { $streak = 0 }
+        $lastAccepted = $accepted
+        $lastInvocations = $invocations
+        if ($quiet -and $streak -ge $StableSeconds) {
+            $invocationsAtQuiescence = $invocations
+            return [pscustomobject]@{
+                quiescent = $true
+                seconds = [math]::Round(([datetimeoffset]::UtcNow - $startedAt).TotalSeconds, 3)
+                stableSeconds = $StableSeconds
+                accepted = $accepted
+                judgeInvocations = $invocationsAtQuiescence
+                reason = $reason
+            }
+        }
+        Start-Sleep -Seconds 1
+    }
+    return [pscustomobject]@{
+        quiescent = $false
+        seconds = [math]::Round(([datetimeoffset]::UtcNow - $startedAt).TotalSeconds, 3)
+        stableSeconds = $StableSeconds
+        accepted = $lastAccepted
+        judgeInvocations = $invocationsAtQuiescence
+        reason = $reason
+    }
 }
 
 function Get-StaircaseTrace {
@@ -648,11 +908,15 @@ $gatlingStarted = $null
 if ($DryRun) {
     Invoke-Compose -Arguments @("config") | Set-Content (Join-Path $runDirectory "compose-config.yaml") -Encoding utf8
     "Dry run only; no containers or load were started." | Set-Content (Join-Path $runDirectory "DRY_RUN.txt") -Encoding utf8
-    if ($Staircase) {
+    if ($stagedLoad) {
         # The boundaries themselves come from the JVM trace at run time; this only states the
         # shape the parameters imply, so a wrong ladder is caught before the stack is built.
         $expectedPlan | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDirectory "expected-plan.json") -Encoding utf8
-        Write-Host "Staircase: $($stageRpsList -join ',') RPS, warm-up stages $WarmupStageCount, hold ${StageHoldSeconds}s, guard ${SteadyGuardSeconds}s, total $($expectedPlan.totalSeconds)s, top population $($expectedPlan.maxConcurrentUsers)."
+        if ($NormalTimeout) {
+            Write-Host "Normal timeout: warm-up at $TargetRps RPS for ${WarmupSeconds}s in '$warmupPrefix', full drain, then measurement at $TargetRps RPS for ${MeasurementSeconds}s in '$measurementPrefix' (hold ${effectiveHoldSeconds}s = measurement + ${SteadyGuardSeconds}s guard), claim timeout $MySqlClaimTimeout, total $($expectedPlan.totalSeconds)s, population $($expectedPlan.population)."
+        } else {
+            Write-Host "Staircase: $($stageRpsList -join ',') RPS, warm-up stages $WarmupStageCount, hold ${StageHoldSeconds}s, guard ${SteadyGuardSeconds}s, total $($expectedPlan.totalSeconds)s, top population $($expectedPlan.maxConcurrentUsers)."
+        }
     }
     Write-Host "Dry run valid. Parameters and rendered Compose config: $runDirectory"
     exit 0
@@ -663,7 +927,11 @@ $events.warmupEndedAt = $null; $events.measurementStartedAt = $null
 $events.drainStartedAt = $null; $events.drainEndedAt = $null; $events.drainSeconds = $null
 $events.traceAnchorUtc = $null; $events.tracePlanEndUtc = $null; $events.stageWindowAlignment = $null
 $events.stageWindowAlignmentErrorSeconds = $null; $events.gatlingExitCode = $null; $events.gatlingAssertionFailed = $false
+$events.warmupContestId = $null; $events.warmupPhaseStartedAt = $null; $events.warmupPhaseEndedAt = $null
+$events.warmupQuiescedAt = $null; $events.warmupQuiescenceSeconds = $null; $events.warmupGatlingExitCode = $null
 $staircaseTrace = $null; $staircaseStages = @(); $capturedBoundaries = @{}
+$warmupSeed = $null; $warmupTrace = $null; $warmupStages = @(); $warmupQuiescence = $null
+$warmupAcceptedAtBaseline = $null
 $started = $false
 $claimSnapshot = [pscustomobject]@{ exact=$false; ids=@(); observedActiveClaimCount=0 }
 try {
@@ -679,18 +947,38 @@ try {
     Wait-Healthy
     Invoke-Compose -Arguments @("restart", "nginx")
     Wait-Healthy
-    $workloadPrefix = "tradeoff_seed_$LatencySeed"
-    $seedRequest = @{ prefix=$workloadPrefix; userCount=$UserCount; problemCount=5; durationMinutes=60; reset=$true } | ConvertTo-Json -Compress
-    $seed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" -Body $seedRequest -TimeoutSec 60
+    if ($NormalTimeout) {
+        # Two contests inside one stack lifetime. The warm-up writes to one and the measurement to
+        # the other, so no warm-up row can be counted inside a measured window. The duplicate
+        # registry is keyed by (contestId, problemId, userId, codeHash), so the identical
+        # user/problem/code workload can be replayed in the measurement contest without the second
+        # phase being deduplicated away. Both contests are seeded up front: seeding between the
+        # phases would put database work inside the run and move the load it is meant to precede.
+        $seedBody = @{ userCount=$UserCount; problemCount=5; durationMinutes=60; reset=$true }
+        $warmupSeed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" `
+            -Body (@{ prefix=$warmupPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec 60
+        $seed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" `
+            -Body (@{ prefix=$measurementPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec 60
+        if ([long]$warmupSeed.contestId -eq [long]$seed.contestId) {
+            throw "The warm-up and measurement contests resolved to the same contest id, so the phases would not be isolated."
+        }
+        $events.warmupContestId = [long]$warmupSeed.contestId
+    } else {
+        $workloadPrefix = "tradeoff_seed_$LatencySeed"
+        $seedRequest = @{ prefix=$workloadPrefix; userCount=$UserCount; problemCount=5; durationMinutes=60; reset=$true } | ConvertTo-Json -Compress
+        $seed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" -Body $seedRequest -TimeoutSec 60
+    }
     $events.contestId = [long]$seed.contestId
     $contestId = [long]$seed.contestId
-    Save-MetricsSnapshot "start"
+    # In a normal-timeout run this first snapshot is the warm-up phase's starting point; the baseline
+    # the measured window is read against is taken again once the warm-up has drained.
+    Save-MetricsSnapshot $(if ($NormalTimeout) { "warmup-start" } else { "start" })
 
-    if ($Staircase) {
+    if ($stagedLoad) {
         # The per-second sampler reads these in the same statement as the backlog counts; prove
         # they are readable now rather than discovering it once a four minute load is under way.
         $probe = @(Invoke-SqlRows "SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Threads_connected'")
-        if ($probe.Count -eq 0) { throw "performance_schema.global_status is not readable; the staircase sampler needs it." }
+        if ($probe.Count -eq 0) { throw "performance_schema.global_status is not readable; the staged sampler needs it." }
         # Every backlog number in this experiment is a difference, so nothing may be left over
         # from an earlier run: a stale row would be charged to the first stage's growth rate.
         $leftover = Get-SqlScalar "SELECT COUNT(*) FROM contest_judge_outbox WHERE status <> 'PUBLISHED'"
@@ -700,6 +988,48 @@ try {
     $classpath = (Get-Content (Join-Path $repoRoot "gatling\build\standalone-gatling\classpath.txt") -Raw).Trim()
     $resultsFolder = Join-Path $repoRoot "gatling\build\reports\gatling"
     $tracePath = (Join-Path $runDirectory "stage-trace.csv") -replace '\\', '/'
+
+    if ($NormalTimeout) {
+        # Warm-up phase. It is offered the same rate and the same workload as the measurement and
+        # differs only in which contest it writes to, so the measurement starts against a stack that
+        # has already been through the same code paths (JIT, connection pool, buffer pool). Its
+        # results are never part of the measured aggregates: the measured contest is a different
+        # contest, so nothing it does can be counted by any query scoped to the measurement.
+        $warmupTracePath = (Join-Path $runDirectory "warmup-stage-trace.csv") -replace '\\', '/'
+        $events.warmupPhaseStartedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $warmupPhase = Start-GatlingLoadPhase -PhaseName "warmup" -Seed $warmupSeed -UserPrefix $warmupPrefix `
+            -HoldSeconds $WarmupSeconds -TracePath $warmupTracePath
+        $warmupStarted = $warmupPhase.startedAt
+        $warmupTrace = Get-StaircaseTrace -Path (Join-Path $runDirectory "warmup-stage-trace.csv")
+        if ($null -eq $warmupTrace) {
+            throw "The warm-up phase's trace file is missing or incomplete, so its window cannot be placed."
+        }
+        $warmupStages = @(Get-StaircaseStages -Trace $warmupTrace)
+        Wait-GatlingWithSamples -Process $warmupPhase.process -Trace $warmupTrace -ContestId $events.warmupContestId -Phase "warmup"
+        $warmupPhase.process.WaitForExit()
+        $events.warmupGatlingExitCode = $warmupPhase.process.ExitCode
+        $events.warmupPhaseEndedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $events.warmupEndedAt = $events.warmupPhaseEndedAt
+        # The warm-up has no separate report requirement: its only job is to have exercised the
+        # stack, and its HTTP outcomes are recorded in its own gatling log. A non-zero exit is
+        # recorded rather than fatal, but a *missing* report would make that log unreadable.
+        if ($null -eq (Find-GatlingReport -StartedAt $warmupStarted)) {
+            throw "The warm-up phase produced no Gatling report, so its log cannot be inspected."
+        }
+        Copy-GatlingArtifacts -StartedAt $warmupStarted -NamePrefix "warmup-" | Out-Null
+        # The measured window's counters are taken as a delta from the scrape below, so the warm-up
+        # must be fully finished - judged, applied and no worker still inside a judge call - before
+        # it is taken. Otherwise warm-up work is charged to the measured phase.
+        $warmupQuiescence = Wait-PipelineQuiescent -ContestId $events.warmupContestId -TimeoutSeconds 300 -Purpose "the warm-up contest"
+        if (-not $warmupQuiescence.quiescent) {
+            throw "The warm-up phase never reached quiescence ($($warmupQuiescence.reason)); without it the measured window has no clean baseline."
+        }
+        $events.warmupQuiescedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $events.warmupQuiescenceSeconds = $warmupQuiescence.seconds
+        Save-MetricsSnapshot "start"
+        $warmupAcceptedAtBaseline = $warmupQuiescence.accepted
+    }
+
     $javaArgs = @(
         "-Xms256m", "-Xmx1g", "-Dperf.baseUrl=$baseUrl", "-Dperf.assert.minRequests=1",
         "-Dperf.assert.minSuccessPercent=$assertMinSuccess", "-Dperf.assert.p95Millis=$AssertP95Millis",
@@ -707,9 +1037,9 @@ try {
         "-Dperf.userIndex.start=1", "-Dperf.userIndex.end=$UserCount",
         "-Dperf.contestId=$($seed.contestId)", "-Dperf.problemId.start=$($seed.firstProblemId)", "-Dperf.problemId.end=$($seed.lastProblemId)"
     )
-    if ($Staircase) {
+    if ($stagedLoad) {
         $javaArgs += @(
-            "-Dperf.rampSeconds=$RampSeconds", "-Dperf.stepHoldSeconds=$StageHoldSeconds",
+            "-Dperf.rampSeconds=$RampSeconds", "-Dperf.stepHoldSeconds=$effectiveHoldSeconds",
             "-Dperf.stageRps=$($stageRpsList -join ',')", "-Dperf.warmupStageCount=$WarmupStageCount",
             "-Dperf.stageTraceFile=$tracePath",
             "-cp", $classpath, "io.gatling.app.Gatling", "-s", "my.oj.perf.ContestSubmissionStepLoadSimulation"
@@ -787,7 +1117,7 @@ try {
             Start-Sleep -Seconds 1
         }
         Observe-FaultRecovery "load-end"
-    } elseif ($Staircase) {
+    } elseif ($stagedLoad) {
         # Each round trip costs most of a second, so a loop that sleeps a further full second
         # samples at about 1.5s. This one sleeps only up to the next tick and records the period
         # it actually achieved, which is what the per-stage windows are read against.
@@ -796,9 +1126,12 @@ try {
             throw "The staircase trace file is missing or incomplete, so stage boundaries cannot be placed."
         }
         $staircaseStages = Get-StaircaseStages -Trace $staircaseTrace
-        $warmupStages = @($staircaseStages | Where-Object { $_.isWarmup })
-        if ($warmupStages.Count -gt 0) {
-            $events.warmupEndedAt = [datetimeoffset]::FromUnixTimeMilliseconds($warmupStages[-1].endMillis).ToString("o")
+        # Kept under its own name: in a normal-timeout run $warmupStages already holds the warm-up
+        # phase's stages from its own trace, and this filter would empty it, because the measured
+        # phase's trace has warmupStageCount 0 and therefore no warm-up stage to find.
+        $traceWarmupStages = @($staircaseStages | Where-Object { $_.isWarmup })
+        if ($traceWarmupStages.Count -gt 0) {
+            $events.warmupEndedAt = [datetimeoffset]::FromUnixTimeMilliseconds($traceWarmupStages[-1].endMillis).ToString("o")
         }
         $measuredStages = @($staircaseStages | Where-Object { -not $_.isWarmup })
         if ($measuredStages.Count -gt 0) {
@@ -836,13 +1169,13 @@ try {
     if ($null -eq $gatling.ExitCode) { throw "Gatling's exit code could not be read after it exited; the run's outcome is unknown." }
     if ($gatling.ExitCode -ne 0) {
         # Exit 2 is an assertion failure, and the report is written before assertions are
-        # evaluated. A staircase deliberately drives the stack into overload, so the measurement
-        # is still valid and its HTTP outcomes are accounted per stage; a missing report is not
+        # evaluated. A staged load deliberately drives the stack into overload, so the measurement
+        # is still valid and its HTTP outcomes are accounted per phase; a missing report is not
         # an assertion failure and stays fatal.
-        $reportLog = if ($Staircase -and $gatling.ExitCode -eq 2) { Find-GatlingReport -StartedAt $gatlingStarted } else { $null }
+        $reportLog = if ($stagedLoad -and $gatling.ExitCode -eq 2) { Find-GatlingReport -StartedAt $gatlingStarted } else { $null }
         if ($null -ne $reportLog -and (Test-Path (Join-Path $reportLog.Directory.FullName "js\global_stats.json"))) {
             $events.gatlingAssertionFailed = $true
-            Write-Warning "Gatling reported an assertion failure (exit 2); keeping the run and reporting per-stage HTTP outcomes instead."
+            Write-Warning "Gatling reported an assertion failure (exit 2); keeping the run and reporting per-phase HTTP outcomes instead."
         } else {
             throw "Gatling exited with code $($gatling.ExitCode)."
         }
@@ -852,7 +1185,7 @@ try {
     $deadline = (Get-Date).AddSeconds($DrainTimeoutSeconds)
     $backlog = $null
     do {
-        if ($Staircase) {
+        if ($stagedLoad) {
             # This run's own work, not every contest row in the database.
             $drainSample = Save-StaircaseSample -Phase "drain" -Trace $staircaseTrace -ContestId $contestId
             # A tick whose counts did not arrive leaves the backlog unknown, not zero. Reading it as
@@ -878,7 +1211,21 @@ try {
     }
     if ($backlog -ne 0) { throw "Pipeline did not drain within $DrainTimeoutSeconds seconds." }
     Save-MetricsSnapshot "end"
-    if ($Staircase) {
+    if ($NormalTimeout) {
+        # The measured window's judge-invocation delta is end minus start, so warm-up work that ran
+        # after the baseline would be charged to the measurement. The baseline was taken at
+        # quiescence and the warm-up contest's own submissions are the observable part of that work:
+        # if any warm-up submission was persisted after the baseline, the delta is contaminated and
+        # the run cannot be reported as a clean measurement.
+        $warmupAcceptedAtEnd = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id=$($events.warmupContestId)"
+        if ($null -eq $warmupAcceptedAtEnd -or $null -eq $warmupAcceptedAtBaseline) {
+            throw "The warm-up contest's submission count could not be read at both ends, so warm-up contamination of the measured window is undecided."
+        }
+        if ($warmupAcceptedAtEnd -ne $warmupAcceptedAtBaseline) {
+            throw "The warm-up contest accepted $($warmupAcceptedAtEnd - $warmupAcceptedAtBaseline) more submissions after the baseline was taken, so the measured window's counter delta includes warm-up work."
+        }
+    }
+    if ($stagedLoad) {
         Copy-GatlingArtifacts -StartedAt $gatlingStarted | Out-Null
         # The predicted plan is only useful if it lands where the traffic actually ran. Gatling
         # stops the injector at maxDuration, so the last completed request is the observable end of
@@ -919,12 +1266,42 @@ try {
                 prometheusEndLagMs = if ($capturedBoundaries.ContainsKey($endLabel)) { $capturedBoundaries[$endLabel] - $_.endMillis } else { $null }
             }
         })
+        $warmupDocument = $null
+        if ($NormalTimeout) {
+            $warmupDocument = [ordered]@{
+                contestId = $events.warmupContestId
+                contestPrefix = $warmupPrefix
+                userPrefix = $warmupPrefix
+                targetRps = $TargetRps
+                holdSeconds = $WarmupSeconds
+                traceAnchorUtc = [datetimeoffset]::FromUnixTimeMilliseconds($warmupTrace.anchorMillis).ToString("o")
+                tracePlanEndUtc = [datetimeoffset]::FromUnixTimeMilliseconds($warmupTrace.planEndMillis).ToString("o")
+                phaseStartedAt = $events.warmupPhaseStartedAt
+                phaseEndedAt = $events.warmupPhaseEndedAt
+                gatlingExitCode = $events.warmupGatlingExitCode
+                quiescedAt = $events.warmupQuiescedAt
+                quiescenceSeconds = $events.warmupQuiescenceSeconds
+                quiescenceReason = $warmupQuiescence.reason
+                acceptedAtBaseline = $warmupAcceptedAtBaseline
+                # A nonzero value here would mean the baseline was contaminated; the run throws
+                # before writing this file if it is nonzero, so zero is the only reachable value.
+                acceptedGrowthAfterBaseline = $warmupAcceptedAtEnd - $warmupAcceptedAtBaseline
+                stages = @($warmupStages | ForEach-Object {
+                    [ordered]@{
+                        stageIndex = $_.stageIndex; label = $_.label; targetRps = $_.targetRps; population = $_.population
+                        startMillis = $_.startMillis; endMillis = $_.endMillis
+                        start = [datetimeoffset]::FromUnixTimeMilliseconds($_.startMillis).ToString("o")
+                        end = [datetimeoffset]::FromUnixTimeMilliseconds($_.endMillis).ToString("o")
+                    }
+                })
+            }
+        }
         [ordered]@{
-            mode = "staircase"
+            mode = if ($NormalTimeout) { "normal-timeout" } else { "staircase" }
             stageRps = $stageRpsList
             warmupStageCount = $WarmupStageCount
             transitionRampSeconds = $RampSeconds
-            stageHoldSeconds = $StageHoldSeconds
+            stageHoldSeconds = $effectiveHoldSeconds
             steadyGuardSeconds = $SteadyGuardSeconds
             overloadThresholdRowsPerSec = $OverloadThresholdRowsPerSec
             traceAlignmentToleranceSeconds = $TraceAlignmentToleranceSeconds
@@ -938,6 +1315,9 @@ try {
             drainStartedAt = $events.drainStartedAt
             drainEndedAt = $events.drainEndedAt
             drainSeconds = $events.drainSeconds
+            # Set only in normal-timeout mode. In staircase mode the warm-up is a stage of the same
+            # run and is described by `stages` instead.
+            warmupPhase = $warmupDocument
             segments = $segmentsDocument
             stages = $stagesDocument
         } | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $runDirectory "stages.json") -Encoding utf8
@@ -988,6 +1368,37 @@ try {
     $duplicateJudgements = if ($null -eq $judgeInvocations -or $null -eq $resultCount -or $FaultEnabled) { $null } else { [math]::Max(0, $judgeInvocations - $resultCount) }
     $duplicateJudgeMillisLowerBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 50 }
     $duplicateJudgeMillisUpperBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 2000 }
+    $warmupVerification = $null
+    if ($NormalTimeout) {
+        $warmupAcceptedAtEndRead = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id=$($events.warmupContestId)"
+        $warmupResults = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($events.warmupContestId)"
+        $warmupDuplicateClaims = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(attempts - 1, 0)),0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.warmupContestId)"
+        $warmupAttemptsHistogram = @{}
+        foreach ($row in @(Invoke-SqlRows "SELECT attempts, COUNT(*) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.warmupContestId) GROUP BY attempts ORDER BY attempts")) {
+            $p = $row -split "`t"; if ($p.Count -ge 2) { $warmupAttemptsHistogram[$p[0]] = [long]$p[1] }
+        }
+        $warmupVerification = [ordered]@{
+            # The baseline the measured window's counter deltas are taken against is only clean if
+            # no warm-up work ran after it. Both halves are recorded: the quiescence gate that was
+            # required to pass, and the warm-up contest's own counts at both ends.
+            contestId = $events.warmupContestId
+            contestPrefix = $warmupPrefix
+            quiescenceRequired = $true
+            quiescent = $warmupQuiescence.quiescent
+            quiescenceReason = $warmupQuiescence.reason
+            quiescenceSeconds = $events.warmupQuiescenceSeconds
+            quiescedAt = $events.warmupQuiescedAt
+            judgeInvocationsAtQuiescence = $warmupQuiescence.judgeInvocations
+            acceptedAtBaseline = $warmupAcceptedAtBaseline
+            acceptedAtEnd = $warmupAcceptedAtEndRead
+            acceptedGrowthAfterBaseline = if ($null -eq $warmupAcceptedAtEndRead -or $null -eq $warmupAcceptedAtBaseline) { $null } else { $warmupAcceptedAtEndRead - $warmupAcceptedAtBaseline }
+            results = $warmupResults
+            duplicateClaimsInWarmup = $warmupDuplicateClaims
+            attemptsHistogram = $warmupAttemptsHistogram
+            excludedFromMeasuredAggregates = @("latency", "accepted", "results", "scoreboard", "duplicateClaims", "judgeInvocationDelta", "throughput")
+            gatlingLog = "warmup-gatling-simulation.log"
+        }
+    }
     $verification = [ordered]@{
         counts = @{ requests=$null; completedHttpRequests=$completedHttpRequests; accepted=$submissionCount; uniqueSubmissions=$uniqueCount; results=$resultCount; scoreboardApplied=$scoreboardCount }
         integrity = @{
@@ -1002,6 +1413,7 @@ try {
         workCost = @{ duplicateClaimEstimate=$duplicateEstimate; duplicateJudgementEstimate=$duplicateJudgements; judgeInvocations=$judgeInvocations; judgeInvocationsLowerBound=[bool]$FaultEnabled; totalJudgeMillis=if ($null -eq $judgeDurationSeconds) {$null} else {[math]::Round($judgeDurationSeconds*1000,3)}; duplicateJudgeMillisLowerBound=$duplicateJudgeMillisLowerBound; duplicateJudgeMillisUpperBound=$duplicateJudgeMillisUpperBound; claimCalls=$claimCalls; claimedRows=$claimRows; staleReclaims=$staleReclaims; completionSuccess=$completionSuccess; completionFailure=$completionFailure; staleTokenCompletions=$staleCompletions; storedResultRepublishes=$storedRepublishes; claimAttemptsFile="claim-attempts.tsv"; killedNodeClaimCount=if ($claimSnapshot.exact) {@($claimSnapshot.ids).Count} else {$null}; allActiveClaimsAtKill=$claimSnapshot.observedActiveClaimCount }
         cohortAvailability = @{ killedNodeClaimed=[bool]$claimSnapshot.exact }
         mysql = @{ statusSnapshots="metrics/*-mysql-status.tsv"; cpu=$null; lockAndConnectionCounters="captured" }
+        warmup = $warmupVerification
         unavailable = @($unavailable)
     }
     $verification | ConvertTo-Json -Depth 7 | Set-Content (Join-Path $runDirectory "db-verification.json") -Encoding utf8
@@ -1012,7 +1424,7 @@ try {
     $_ | Out-String | Set-Content (Join-Path $runDirectory "failure.txt") -Encoding utf8
     # A failed run keeps what it already collected so the reason can be read against the numbers,
     # and stays out of the capacity comparison either way.
-    foreach ($artifact in @("timeseries.csv", "stage-trace.csv", "capacity.csv", "backlog.csv")) {
+    foreach ($artifact in @("timeseries.csv", "stage-trace.csv", "warmup-stage-trace.csv", "capacity.csv", "backlog.csv")) {
         $candidate = Join-Path $runDirectory $artifact
         if (Test-Path $candidate) { Write-Host "Preserved for diagnosis: $candidate" }
     }
