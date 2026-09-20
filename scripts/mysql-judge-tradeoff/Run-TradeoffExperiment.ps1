@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet("rabbit", "mysql")][string]$DispatchMode = "rabbit",
     [double]$TargetRps = 20,
@@ -39,6 +39,12 @@ param(
     [switch]$NormalTimeout,
     [int]$WarmupSeconds = 30,
     [int]$MeasurementSeconds = 60,
+    # The warm-up phase's own offered rate. 0 means "the same as -TargetRps", which is what every
+    # earlier phased run used and is what keeps this an added knob rather than a changed one. A burst
+    # experiment needs the two phases to differ: warming up at the measured rate would build the very
+    # backlog the measurement exists to observe, and the quiescence gate would then have to drain it
+    # before the baseline could be taken.
+    [double]$WarmupTargetRps = 0,
     # Fail-stop recovery comparison. Same two-phase machinery as -NormalTimeout - a warm-up contest,
     # a full drain to quiescence, then a measured contest - but the measured phase SIGKILLs one judge
     # node once that node actually holds work, keeps the load running through the outage, restarts the
@@ -180,11 +186,32 @@ if ($phasedLoad) {
     }
     if ($FaultEnabled) { throw "A phased-load run drives the fault from its own trigger, so -FaultEnabled does not apply to it." }
     if (-not $PSBoundParameters.ContainsKey("TargetRps")) { throw "A phased-load run requires an explicit -TargetRps: the offered rate is an input to the comparison, not a default." }
-    if ($WarmupSeconds -lt 12) { throw "-WarmupSeconds must be at least 12, or the warm-up phase is not long enough to reach a steady state." }
-    if ($MeasurementSeconds -lt 12) { throw "-MeasurementSeconds must be at least 12 so a measured window has enough samples to classify." }
+    # The floor is 10s rather than 12: a burst experiment holds exactly ten seconds of steady load on
+    # purpose, and a hold lengthened to satisfy a validation floor is not the burst that was asked for.
+    # The old floor existed so that a measured window would hold at least the ten backlog samples the
+    # classifier reads, and a 10s window at the sampler's ~1s tick sits exactly on that edge. When it
+    # falls short the analyzer reports the stage as unclassified and says why - a recorded outcome,
+    # not a lost run - so the guarantee this floor protected is now carried by the report instead.
+    if ($WarmupSeconds -lt 10) { throw "-WarmupSeconds must be at least 10, or the warm-up phase is too short to have warmed anything." }
+    if ($MeasurementSeconds -lt 10) { throw "-MeasurementSeconds must be at least 10 so a measured window has enough samples to read." }
     if ($SteadyGuardSeconds -lt 0) { throw "-SteadyGuardSeconds must not be negative." }
     if ($UserCount -lt 1000) { throw "Phased-load runs require -UserCount of at least 1000." }
     if ($DrainTimeoutSeconds -lt 300) { throw "Phased-load runs require -DrainTimeoutSeconds of at least 300." }
+    # The warm-up phase's rate, resolved under a name that is not the parameter: variable names are
+    # case-insensitive on this PowerShell, so a local named like the -WarmupTargetRps parameter is
+    # the parameter itself, and the earlier form of this block assigned the default over the caller's
+    # value before testing it - the dry run printed the warm-up at the measured rate while looking
+    # correct. The resolved rate therefore lives in $warmupPhaseRps, which is not the parameter.
+    # Assigned in a branch rather than as `$x = if (...) {...} else {...}`, because an if used as an
+    # expression unrolls its output.
+    if ($WarmupTargetRps -lt 0) { throw "-WarmupTargetRps must not be negative; 0 means the warm-up is offered -TargetRps." }
+    $warmupPhaseRps = [double]$TargetRps
+    if ($WarmupTargetRps -gt 0) { $warmupPhaseRps = [double]$WarmupTargetRps }
+    # Its population comes out of the same user pool, and a warm-up above the measured rate needs more
+    # users than -TargetRps alone asks for. Checked here because the failure would otherwise be a
+    # warm-up phase that quietly offers less than its rate.
+    $warmupPopulation = [int][math]::Max(1, [math]::Ceiling($warmupPhaseRps * 3100 / 1000))
+    if ($UserCount -lt $warmupPopulation) { throw "UserCount must be at least $warmupPopulation for the warm-up phase's 3100ms per-user pace." }
     # Each phase is its own Gatling invocation with one stage, so warmupStageCount is 0: the phase
     # boundary is the harness draining the pipeline between the two runs, not a warm-up stage inside
     # one schedule. The hold carries the steady guard on top of the measured window, so the window
@@ -275,6 +302,7 @@ if ($Staircase) {
         population = $population
         warmupPhase = [ordered]@{
             contestPrefix = $warmupPrefix; rampSeconds = $RampSeconds
+            targetRps = $warmupPhaseRps; population = $warmupPopulation
             holdSeconds = $WarmupSeconds; seconds = $RampSeconds + $WarmupSeconds
         }
         measurementPhase = [ordered]@{
@@ -364,6 +392,7 @@ if ($NormalTimeout) {
     $parameters.normalTimeout = [ordered]@{
         enabled = $true
         targetRps = $TargetRps
+        warmupTargetRps = $warmupPhaseRps
         warmupSeconds = $WarmupSeconds
         measurementSeconds = $MeasurementSeconds
         measurementHoldSeconds = $measurementHoldSeconds
@@ -784,6 +813,7 @@ function Start-GatlingLoadPhase {
         [Parameter(Mandatory = $true)][string]$PhaseName,
         [Parameter(Mandatory = $true)]$Seed,
         [Parameter(Mandatory = $true)][string]$UserPrefix,
+        [Parameter(Mandatory = $true)][double]$Rps,
         [Parameter(Mandatory = $true)][int]$HoldSeconds,
         [string]$TracePath = ""
     )
@@ -803,7 +833,7 @@ function Start-GatlingLoadPhase {
         "-Dperf.userIndex.start=1", "-Dperf.userIndex.end=$UserCount",
         "-Dperf.contestId=$($Seed.contestId)", "-Dperf.problemId.start=$($Seed.firstProblemId)", "-Dperf.problemId.end=$($Seed.lastProblemId)",
         "-Dperf.rampSeconds=$RampSeconds", "-Dperf.stepHoldSeconds=$HoldSeconds",
-        "-Dperf.stageRps=$TargetRps", "-Dperf.warmupStageCount=0"
+        "-Dperf.stageRps=$Rps", "-Dperf.warmupStageCount=0"
     )
     if ($TracePath) { $phaseProperties += "-Dperf.stageTraceFile=$TracePath" }
     $phaseArgs = $phaseProperties + @(
@@ -2078,7 +2108,7 @@ if ($DryRun) {
         # shape the parameters imply, so a wrong ladder is caught before the stack is built.
         $expectedPlan | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDirectory "expected-plan.json") -Encoding utf8
         if ($NormalTimeout) {
-            Write-Host "Normal timeout: warm-up at $TargetRps RPS for ${WarmupSeconds}s in '$warmupPrefix', full drain, then measurement at $TargetRps RPS for ${MeasurementSeconds}s in '$measurementPrefix' (hold ${effectiveHoldSeconds}s = measurement + ${SteadyGuardSeconds}s guard), claim timeout $MySqlClaimTimeout, total $($expectedPlan.totalSeconds)s, population $($expectedPlan.population)."
+            Write-Host "Normal timeout: warm-up at $warmupPhaseRps RPS for ${WarmupSeconds}s in '$warmupPrefix' (population $warmupPopulation), full drain, then measurement at $TargetRps RPS for ${MeasurementSeconds}s in '$measurementPrefix' (hold ${effectiveHoldSeconds}s = measurement + ${SteadyGuardSeconds}s guard), claim timeout $MySqlClaimTimeout, total $($expectedPlan.totalSeconds)s, population $($expectedPlan.population)."
         } elseif ($FaultRecovery) {
             # One contiguous string rather than a `+` join: the earlier split landed the operator inside
             # the first fragment's quotes, so the message printed the window as "from 30 + s" instead of
@@ -2196,7 +2226,7 @@ try {
         $warmupTracePath = (Join-Path $runDirectory "warmup-stage-trace.csv") -replace '\\', '/'
         $events.warmupPhaseStartedAt = [datetimeoffset]::UtcNow.ToString("o")
         $warmupPhase = Start-GatlingLoadPhase -PhaseName "warmup" -Seed $warmupSeed -UserPrefix $warmupPrefix `
-            -HoldSeconds $WarmupSeconds -TracePath $warmupTracePath
+            -Rps $warmupPhaseRps -HoldSeconds $WarmupSeconds -TracePath $warmupTracePath
         $warmupStarted = $warmupPhase.startedAt
         $warmupTrace = Get-StaircaseTrace -Path (Join-Path $runDirectory "warmup-stage-trace.csv")
         if ($null -eq $warmupTrace) {
@@ -2500,7 +2530,8 @@ try {
                 contestId = $events.warmupContestId
                 contestPrefix = $warmupPrefix
                 userPrefix = $warmupPrefix
-                targetRps = $TargetRps
+                targetRps = $warmupPhaseRps
+                population = $warmupPopulation
                 holdSeconds = $WarmupSeconds
                 traceAnchorUtc = [datetimeoffset]::FromUnixTimeMilliseconds($warmupTrace.anchorMillis).ToString("o")
                 tracePlanEndUtc = [datetimeoffset]::FromUnixTimeMilliseconds($warmupTrace.planEndMillis).ToString("o")
