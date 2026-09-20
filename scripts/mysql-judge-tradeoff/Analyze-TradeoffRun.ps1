@@ -1119,10 +1119,35 @@ function Export-RabbitFaultResultSummary {
 
     # -- cohorts ------------------------------------------------------------------------------------
     $cohortTable = [ordered]@{}
+    $cohortsNotReported = New-Object System.Collections.Generic.List[object]
     if ($null -ne $Cohorts) {
         foreach ($name in @($Cohorts.Keys)) {
             $cohort = $Cohorts[$name]
             if ($null -eq $cohort) { continue }
+            # Key presence, not property presence: a cohort is an OrderedDictionary, and
+            # PSObject.Properties does not see a dictionary's keys - only its own members. Member
+            # access like $cohort.available does reach the key, which is why the unavailable branch
+            # below works, but it answers null for a key that is absent as well as for one set to
+            # null, so it cannot tell the two apart on its own.
+            $declaresAvailability = if ($cohort -is [System.Collections.IDictionary]) {
+                $cohort.Contains("available")
+            } else {
+                $null -ne $cohort.PSObject.Properties["available"]
+            }
+            if (-not $declaresAvailability) {
+                # The run-level cohort set carries windows that predate this experiment - `all`,
+                # `pre-fault-normal`, `fault-window`, `post-fault-arrivals` - which carry latency
+                # quartets and nothing else. They declare no availability and no latency-class split,
+                # so a reader that treated "not marked unavailable" as "available" would publish them
+                # as measured cohorts with a null submission count, a null class split and null
+                # over-threshold shares. Section 8 names its own cohorts, so these are recorded as not
+                # reported instead of being dressed up as ones that were.
+                $cohortsNotReported.Add([pscustomobject]@{
+                    name = $name
+                    reason = "a run-level window cohort: latency quartets only, with no availability and no latency-class split declared, so it is not one of section 8's cohorts and is not reported as one"
+                })
+                continue
+            }
             if ($cohort.available -eq $false) {
                 # `reason` as well as `unavailableReason`: the run-level cohorts name their
                 # unavailability with the first spelling and the fault cohorts with the second, and a
@@ -1436,6 +1461,11 @@ function Export-RabbitFaultResultSummary {
     $metrics.Add((New-RabbitSummaryMetric -Metric "single_node_sustainable_verdict" -Value $singleNode.verdict -Unit "verdict" -Basis $singleNode.basis))
     $metrics.Add((New-RabbitSummaryMetric -Metric "fast_failover_verdict" -Value $fastFailover.verdict -Unit "verdict" -Basis $fastFailover.basis))
 
+    # The window cohorts the run-level set carries that section 8 does not name, listed rather than
+    # silently dropped, so a reader can see that they exist and why they are not in the table above.
+    # Handed over as an array rather than through @(): PowerShell 5.1 refuses @() around a generic
+    # List[object] with "Argument types do not match".
+    $document.cohortsNotReported = $cohortsNotReported.ToArray()
     $document.verdicts.singleNodeSustainableCriteria = @($singleNode.criteria)
     $document.verdicts.fastFailoverCriteria = @($fastFailover.criteria)
     $document.verdicts.singleNodeSustainableFailedCriteria = @($singleNode.failedCriteria)
