@@ -340,6 +340,108 @@ SELECT CONCAT('SBRE_SQLTEST_INSERTED=', (SELECT COUNT(*) FROM contest_submission
                 -EvidencePath (Join-Path $artifacts "non-interference-after-cleanup.json"))
     }
 
+    Test-Case "a cleanup that has already run refuses a second one instead of failing inside the name check" {
+        # The run's own finally block calls the cleanup again when it cannot tell whether the first call
+        # got through. Whether it can tell depends on this flag, which the cleanup clears once its rows
+        # are out: the scope then names a contest that no longer exists, so a second call has to be
+        # refused at the guard rather than run its statements against a stale id and throw from the name
+        # check - a failure a reader would have to go and diagnose, and the wrong one at that.
+        $config = Get-RecoveryConfig
+        Assert-Equal $false $config.ContestScopeFromSeed "cleaning up cleared the scope it used"
+        Assert-Throws { [void](Remove-ExperimentData -EvidenceDirectory $artifacts) } `
+            "a second cleanup is refused"
+        Assert-Equal $false $config.ContestScopeFromSeed "and refusing it does not re-arm the scope"
+    }
+
+    # --- leftovers from an interrupted run ---------------------------------------------------------
+    #
+    # Last, and after the fixture's cleanup, because these cases write rows on purpose. A run that was
+    # interrupted has to be repeatable from the same command, and the only way to know that the
+    # recovery path works is to leave the two shapes an interruption leaves behind and take them out
+    # again. Its own evidence directory, so re-seeding does not overwrite the fixture's seed.json.
+    $leftoverArtifacts = Join-Path $artifacts "leftovers"
+
+    Test-Case "a prefix-wide read finds nothing once this run has been cleaned up" {
+        $found = Get-ExperimentRowsInDatabase
+        Assert-Equal 0 $found.ContestCount "no contest carries the experiment prefix"
+        Assert-Equal 0 $found.UserCount "no user carries the experiment prefix"
+    }
+
+    Test-Case "taking back leftovers that do not exist is a no-op, not a failure" {
+        $leftovers = Remove-ExperimentLeftovers -EvidenceDirectory $leftoverArtifacts
+        Assert-Equal $false $leftovers.cleaned "it reports that it cleaned nothing"
+        Assert-Equal 0 @($leftovers.ourContest).Count "and names no contest as its own"
+        Assert-Equal 0 @($leftovers.otherRunsContests).Count "and blames no other run"
+    }
+
+    # The first shape: the seed completed and the run died before the cleanup, so the contest and its
+    # users are both there.
+    $script:leftoverSeed = New-ExperimentSeed -UserCount 3 -ProblemCount 2 -ContestDurationMinutes 30 `
+        -EvidenceDirectory $leftoverArtifacts
+    try {
+        Test-Case "leftover rows are attributed to the run id that wrote them" {
+            $found = Get-ExperimentRowsInDatabase
+            Assert-Equal 1 $found.ContestCount "the seeded contest is found by prefix"
+            Assert-Equal 3 $found.UserCount "the seeded users are found by prefix"
+            Assert-Equal (Get-RecoveryConfig).RunId $found.Contests[0].RunId "the contest is attributed to this run"
+            Assert-SequenceEqual @("sqltest", "sqltest", "sqltest") @($found.Users | ForEach-Object { $_.RunId }) `
+                "and so is every user"
+
+            $leftovers = Remove-ExperimentLeftovers -EvidenceDirectory $leftoverArtifacts
+            Assert-Equal $true $leftovers.cleaned "the leftovers are taken back"
+            Assert-Equal 6 $leftovers.removed.totalDeleted "one contest, two problems and three users"
+            Assert-Equal 1 @($leftovers.ourContest).Count "the record names the contest it adopted"
+            Assert-Equal 0 @($leftovers.otherRunsContests).Count "and found no other run's rows to report"
+            Assert-Equal $false (Get-RecoveryConfig).ContestScopeFromSeed `
+                "taking a leftover back clears the scope it adopted on the way"
+            [void](Assert-ExperimentDataAbsent -Phase "after taking back an interrupted run")
+        }
+
+        # The second shape: the contest is gone but its users are not, which is what an interruption
+        # between the two deletes leaves. The contest has to go first for the scope to be gone with it,
+        # and its problems before it - `problem.contest_id` is ON DELETE SET NULL, so deleting the
+        # contest first would leave them orphaned with no column left to scope them by.
+        $script:leftoverSeed = New-ExperimentSeed -UserCount 3 -ProblemCount 2 -ContestDurationMinutes 30 `
+            -EvidenceDirectory $leftoverArtifacts
+        $orphanedContest = $script:leftoverSeed.ContestId
+        [void](Invoke-SqlScript -Sql "DELETE FROM problem WHERE contest_id = $orphanedContest" `
+                -Description "problems of the interrupted run's contest")
+        [void](Invoke-SqlScript -Sql "DELETE FROM contest WHERE id = $orphanedContest" `
+                -Description "the interrupted run's contest, leaving its users")
+
+        Test-Case "a run whose contest is gone still takes its own users back" {
+            $found = Get-ExperimentRowsInDatabase
+            Assert-Equal 0 $found.ContestCount "the contest is gone"
+            Assert-Equal 3 $found.UserCount "its users are not"
+
+            $leftovers = Remove-ExperimentLeftovers -EvidenceDirectory $leftoverArtifacts
+            Assert-Equal $true $leftovers.cleaned "the users are taken back"
+            Assert-Equal 3 $leftovers.removed.totalDeleted "three users and nothing else"
+            Assert-True (([string]$leftovers.removed.scope) -like "*user*") "the record names the scope it used"
+            Assert-Equal $false (Get-RecoveryConfig).ContestScopeFromSeed `
+                "the users-only path clears the scope too, though it never used it"
+            [void](Assert-ExperimentDataAbsent -Phase "after taking back the users of an interrupted run")
+        }
+    }
+    finally {
+        # The cases above clean up after themselves when they pass. A failure would leave rows behind
+        # with the fixture's own cleanup already done, so the guard is repeated here.
+        if ((Get-RecoveryConfig).ContestScopeFromSeed) {
+            $remaining = Get-ExperimentRowsInDatabase
+            if ($remaining.ContestCount -gt 0 -or $remaining.UserCount -gt 0) {
+                Write-Output ""
+                Write-Output "  leftovers after a failure: $($remaining.ContestCount) contest(s), $($remaining.UserCount) user(s)"
+                try {
+                    [void](Remove-ExperimentLeftovers -EvidenceDirectory $leftoverArtifacts)
+                }
+                catch {
+                    Write-Output "  taking them back also failed: $($_.Exception.Message)"
+                    if ($null -eq $script:setupError) { Set-TestSetupError $_ }
+                }
+            }
+        }
+    }
+
 }
 catch {
     Set-TestSetupError $_

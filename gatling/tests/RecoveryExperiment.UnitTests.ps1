@@ -364,6 +364,27 @@ Test-Case "each recovery log line is recognised as the event it reports" {
     Assert-Equal $null (Get-FirstRecoveryEvent -Events $events -Kinds @("nothing-like-this")) "an absent event is null rather than a fabricated one"
 }
 
+# --- leftovers -------------------------------------------------------------------------------------
+
+Test-Case "a leftover row's name is attributed to the run id that wrote it" {
+    Assert-Equal "fullreplay_1" (Get-RunIdFromContestName -Name "sbrec_fullreplay_1_contest") "the run id is read out of a contest name"
+    Assert-Equal "redisseq_3" (Get-RunIdFromContestName -Name "sbrec_redisseq_3_contest") "and out of one whose run id carries no underscore"
+    Assert-Equal "streamoffset_12" (Get-RunIdFromContestName -Name "sbrec_streamoffset_12_contest") "and out of a two-digit run index"
+
+    Assert-Equal "fullreplay_1" (Get-RunIdFromUserName -Name "sbrec_fullreplay_1_user_7") "the run id is read out of a user name"
+    Assert-Equal "streamoffset_12" (Get-RunIdFromUserName -Name "sbrec_streamoffset_12_user_200") "and out of the last user of the population"
+
+    # Names this experiment never writes. Each has to answer `$null` rather than a substring, because a
+    # wrong answer here is a leftover attributed to the wrong run - and the cleanup it feeds deletes
+    # rows by run id.
+    Assert-Equal $null (Get-RunIdFromContestName -Name "sbrec_fullreplay_1_problem_2") "a problem name is not a contest name"
+    Assert-Equal $null (Get-RunIdFromContestName -Name "loadtest_contest") "a name without the prefix is not this experiment's"
+    Assert-Equal $null (Get-RunIdFromContestName -Name "sbrec__contest") "an empty run id is refused rather than read as one"
+    Assert-Equal $null (Get-RunIdFromUserName -Name "sbrec_fullreplay_1_contest") "a contest name is not a user name"
+    Assert-Equal $null (Get-RunIdFromUserName -Name "sbrec_fullreplay_1_user_") "a user name with no index is not a seeded user"
+    Assert-Equal $null (Get-RunIdFromUserName -Name "sbrec_fullreplay_1_user_7x") "a trailing character in the index is not a seeded user"
+}
+
 # --- report -------------------------------------------------------------------------------------
 
 Write-TestSummary -Suite "RecoveryExperiment unit tests"

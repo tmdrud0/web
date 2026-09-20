@@ -377,6 +377,13 @@ function Remove-ExperimentData {
     $record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory "removed-rows.json") -Encoding utf8
 
     [void](Assert-ExperimentDataAbsent -Phase "after cleanup of run '$($config.RunId)'")
+
+    # Cleared once the rows are gone, because the scope no longer names anything: the contest it was
+    # set from has just been deleted. Left set, a second cleanup would run its statements against an id
+    # that no longer exists and fail inside the name check - which reads as a broken harness rather
+    # than as the cleanup that has already happened. Cleared, the second call refuses at the guard
+    # above and says so.
+    $config.ContestScopeFromSeed = $false
     return $record
 }
 
@@ -438,5 +445,165 @@ function Reset-ExperimentQueue {
             throw "Deleting '$($config.QueueName)' also removed '$name', which this reset must not touch."
         }
     }
+    return $record
+}
+
+# --- leftovers from a run that did not finish -------------------------------------------------------
+
+# The run id a seeded row's name encodes, or `$null` when the name is not one of this experiment's.
+#
+# Anchored on both ends and read with a capture group rather than by substring arithmetic: the run id
+# contains underscores of its own, so a length-based slice would have to count them correctly on every
+# call, and one off-by-one there would attribute a leftover to the wrong run and delete the wrong rows.
+# Two spellings exist because the seed writes two shapes - `sbrec_<runId>_contest` and
+# `sbrec_<runId>_user_<n>` - and each function answers for exactly the shape it is named after.
+function Get-RunIdFromContestName {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name)
+
+    if ($Name -match '^sbrec_(?<runId>.+)_contest$') { return $Matches["runId"] }
+    return $null
+}
+
+function Get-RunIdFromUserName {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name)
+
+    if ($Name -match '^sbrec_(?<runId>.+)_user_\d+$') { return $Matches["runId"] }
+    return $null
+}
+
+# Every row in the database that carries this experiment's name prefix, whoever's run it belongs to.
+#
+# The prefix is the only thing that identifies an experiment row, and it is matched loosely here on
+# purpose: a LIKE pattern that tried to carry a run id would have to escape the underscores that run
+# ids legitimately contain, and MySQL's LIKE treats `_` as a single-character wildcard. So the read is
+# broad and the attribution happens above it, in a language that has a real string comparison. The set
+# is at most one contest and one user per run, so reading all of it costs nothing.
+function Get-ExperimentRowsInDatabase {
+    $tUser = '`user`'
+    $contests = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($row in @(Invoke-SqlRows -Sql @"
+SELECT id, name, DATE_FORMAT(start_time, '%Y-%m-%d %H:%i:%s.%f'),
+       DATE_FORMAT(end_time, '%Y-%m-%d %H:%i:%s.%f')
+  FROM contest WHERE name LIKE 'sbrec%';
+"@ -Description "contests that carry the experiment prefix")) {
+        $name = [string]$row[1]
+        $runId = Get-RunIdFromContestName -Name $name
+        if ($null -eq $runId) { continue }
+        $contests.Add([pscustomobject][ordered]@{
+                Id = ConvertTo-RequiredInt64 -Value $row[0] -Description "leftover contest id"
+                Name = $name
+                RunId = $runId
+                StartTimeMysql = [string]$row[2]
+                EndTimeMysql = [string]$row[3]
+            })
+    }
+
+    $users = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($row in @(Invoke-SqlRows -Sql @"
+SELECT id, name FROM $tUser WHERE name LIKE 'sbrec%' ORDER BY id;
+"@ -Description "users that carry the experiment prefix")) {
+        $name = [string]$row[1]
+        $runId = Get-RunIdFromUserName -Name $name
+        if ($null -eq $runId) { continue }
+        $users.Add([pscustomobject][ordered]@{
+                Id = ConvertTo-RequiredInt64 -Value $row[0] -Description "leftover user id"
+                Name = $name
+                RunId = $runId
+            })
+    }
+
+    return [pscustomobject][ordered]@{
+        Contests = $contests.ToArray()
+        Users = $users.ToArray()
+        ContestCount = $contests.Count
+        UserCount = $users.Count
+    }
+}
+
+# Takes back what an *interrupted* attempt at this run id left behind, so a run can be repeated from the
+# same command instead of from hand-written SQL. Without this, one crashed run makes its run id
+# unusable - the seeder refuses to insert users under a prefix that already exists - and the only way
+# forward is a DELETE nobody reviewed.
+#
+# The scope is discovered rather than assumed: the contest's id comes from reading back the exact name
+# this run's seed writes, and adopting it goes through the same Set-ExperimentContestScope the seeder
+# uses. So a leftover cleanup and the cleanup at the end of a completed run delete through one scope
+# with one definition, and nothing here can widen it.
+#
+# Another run's leftovers are reported, never deleted. This run has no evidence about which rows under
+# another run's contest are its own, and "delete everything with the prefix" is precisely the
+# widening the scope exists to prevent. Each is removable by repeating *that* run id, which is how the
+# suite clears all nine before it starts.
+function Remove-ExperimentLeftovers {
+    param([Parameter(Mandatory = $true)][string]$EvidenceDirectory)
+
+    $config = Get-RecoveryConfig
+    $tUser = '`user`'
+    if (-not (Test-Path -LiteralPath $EvidenceDirectory)) {
+        # Created here rather than left to Remove-ExperimentData, which only runs on one of the three
+        # paths below: the record is written on all of them, and the no-op path - the common one, since
+        # most runs start with nothing to take back - would otherwise fail on a directory that only a
+        # completed run had made. The integration test found this by calling it first.
+        [void](New-Item -ItemType Directory -Path $EvidenceDirectory -Force)
+    }
+    $found = Get-ExperimentRowsInDatabase
+    $ours = @($found.Contests | Where-Object { $_.RunId -eq $config.RunId })
+    $theirs = @($found.Contests | Where-Object { $_.RunId -ne $config.RunId })
+
+    $record = [pscustomobject][ordered]@{
+        runId = $config.RunId
+        observedAtUtc = [DateTimeOffset]::UtcNow.UtcDateTime.ToString("o")
+        observedAtMysql = Get-MySqlNow
+        ourContest = @($ours | ForEach-Object { "$($_.Name) (id=$($_.Id))" })
+        otherRunsContests = @($theirs | ForEach-Object { "$($_.Name) (id=$($_.Id))" })
+        ourUsers = @($found.Users | Where-Object { $_.Name.StartsWith("$($config.SeedPrefix)user_") } |
+            ForEach-Object { $_.Name })
+        cleaned = $false
+        removed = $null
+    }
+
+    if ($ours.Count -gt 1) {
+        $record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory "leftovers.json") -Encoding utf8
+        throw "Run id '$($config.RunId)' names $($ours.Count) contests ($(@($ours | ForEach-Object { $_.Id }) -join ', ')). " +
+        "Two rows with one name is a state this harness never creates, so the scope cannot be chosen safely. Evidence: $EvidenceDirectory"
+    }
+
+    if ($ours.Count -eq 1) {
+        [void](Set-ExperimentContestScope -ContestId $ours[0].Id -ProblemIdStart $config.ProblemIdStart `
+                -ProblemIdEnd $config.ProblemIdEnd -ContestStartTimeMysql $ours[0].StartTimeMysql)
+        $record.removed = Remove-ExperimentData -EvidenceDirectory $EvidenceDirectory
+        $record.cleaned = $true
+    }
+    elseif ($record.ourUsers.Count -gt 0) {
+        # The contest is gone but its users are not, which is what a crash between the two deletes
+        # leaves. The prefix is the whole scope here: these names are written by one function from one
+        # run id, and no other row in this schema can match them.
+        $before = Invoke-SqlInt64 -Sql "SELECT COUNT(*) FROM $tUser WHERE name LIKE '$($config.SeedPrefix)%'" `
+            -Description "leftover users of run '$($config.RunId)'"
+        [void](Invoke-SqlScript -Sql "DELETE FROM $tUser WHERE name LIKE '$($config.SeedPrefix)%'" `
+                -Description "delete $before leftover user row(s) of run '$($config.RunId)'")
+        $after = Invoke-SqlInt64 -Sql "SELECT COUNT(*) FROM $tUser WHERE name LIKE '$($config.SeedPrefix)%'" `
+            -Description "leftover users of run '$($config.RunId)' after deletion"
+        if ($after -ne 0) {
+            throw "Deleting run '$($config.RunId)'s users left $after row(s)."
+        }
+        $record.ourUsers = @()
+        $record.cleaned = $true
+        $record.removed = [pscustomobject][ordered]@{
+            runId = $config.RunId
+            scope = "user WHERE name LIKE '$($config.SeedPrefix)%'"
+            totalDeleted = $before
+            note = "users only: the contest row was already gone, so there was nothing left to scope by"
+        }
+    }
+
+    # The scope is cleared on every path out of here. After the branches above, either the contest this
+    # run seeded has just been deleted, or there was none of this run's to begin with - and in both
+    # cases a scope still pointing at an id names nothing. Left armed, the next cleanup would run its
+    # statements against that dead id and fail inside the name check, which is a failure a reader has to
+    # go and diagnose rather than the refusal it should have been.
+    $config.ContestScopeFromSeed = $false
+
+    $record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory "leftovers.json") -Encoding utf8
     return $record
 }
