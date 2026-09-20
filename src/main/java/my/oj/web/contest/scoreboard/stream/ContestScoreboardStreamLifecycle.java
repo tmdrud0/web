@@ -187,13 +187,16 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
                     appliedOffset, storedOffset, strategy.mode().propertyValue());
             ContestScoreboardRecoveryStrategy.LostRange range = new ContestScoreboardRecoveryStrategy.LostRange(
                     storedOffset,
-                    storedOffset + 1L,
+                    appliedOffset,
                     appliedOffset,
                     position.rebuiltThrough()
             );
             if (strategy.rebuildHistory(range)) {
                 // The live path reads this so a range the supervisor already rebuilt is not rebuilt
-                // again by the delivery that anchors past it.
+                // again by the delivery that anchors past it. The watermark is what the rebuild was
+                // marked at, and the live path asks about the offset below its delivery, so a
+                // rebuild that did not reach as far as the current watermark is not taken for one
+                // that did.
                 position.markRebuiltThrough(appliedOffset);
                 log.warn("Rebuilt the scoreboard history through offset {} with the {} basis; the consumer "
                                 + "may now anchor the checkpoint past it",
@@ -203,7 +206,7 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
             log.error("The {} basis could not rebuild the history the rollback took away between offsets {} "
                             + "and {}; the scoreboard stays short there and the checkpoint stays put until "
                             + "something can",
-                    strategy.mode().propertyValue(), storedOffset + 1L, appliedOffset);
+                    strategy.mode().propertyValue(), range.firstLostOffset(), range.lastLostOffset());
             return;
         }
         container.stop();
@@ -224,7 +227,11 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
     }
 
     /**
-     * Starts the consumer and records the position it is resuming from.
+     * Starts the consumer at a fresh position, which is the question it will answer next.
+     *
+     * <p>What the resume does not do is overwrite how far this process applied. That watermark is the
+     * only in-memory trace of a Redis rollback, and the checkpoint a resubscribe resumes from can sit
+     * behind it - which is precisely the rollback the mode still has to be asked about.</p>
      *
      * <p>The position handed to the broker is the checkpoint itself rather than its successor. The
      * offset is the last one the scoreboard applied, so asking for it re-delivers one event the
@@ -244,7 +251,7 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
      */
     private void startAt(long storedOffset, Object requestedOffset) {
         completion.repairPending();
-        position.resumeAt(storedOffset);
+        position.consumerRestarted();
         metrics.initializeOffset(storedOffset);
         container.setConsumerArguments(Map.of("x-stream-offset", requestedOffset));
         container.start();

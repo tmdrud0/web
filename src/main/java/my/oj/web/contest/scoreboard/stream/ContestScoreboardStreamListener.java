@@ -92,9 +92,14 @@ class ContestScoreboardStreamListener implements BatchMessageListener {
         // and does not hand the message back to the running consumer, so the retry comes from
         // ContestScoreboardStreamLifecycle resubscribing at the stored checkpoint. Measured against a
         // real broker in StreamQueueRequeueRabbitIntegrationTests.
-        log.error("Scoreboard stream batch failed and was left unapplied; the scoreboard stays at offset {} "
-                + "and the batch is re-read when the consumer resubscribes",
-                position.highestAppliedOffset(), failure);
+        // The offset the checkpoint may not pass, not the applied watermark: a batch that failed
+        // halfway applied its earlier deliveries, so the watermark sits below the checkpoint and
+        // naming it here would report the scoreboard as shorter than it is.
+        long unappliedFrom = position.unappliedFrom();
+        log.error("Scoreboard stream batch failed and was left unapplied; the checkpoint does not move past "
+                        + "{} until the consumer resubscribes and re-reads the batch",
+                unappliedFrom < 0L ? "the delivery that failed" : "offset " + unappliedFrom,
+                failure);
         LockSupport.parkNanos(retryBackoffNanos);
         if (Thread.interrupted()) {
             Thread.currentThread().interrupt();

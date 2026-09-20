@@ -124,6 +124,39 @@ rollback 이전에 적용된 결과는 rollback **이후에 시작한** replay �
 rollback에 대한 pass는 **관측당 1회**만 실행한다 — 회귀를 관측한 `(storedOffset, appliedOffset)`
 쌍을 기억한다. 없으면 트래픽이 없는 동안 매 초 replay가 돈다.
 
+#### 모드에게 주는 질문은 구간이다 — 그리고 그 구간은 양끝으로 말한다
+
+`rebuildHistory`에 넘기는 것은 checkpoint 한 점이 아니라 **잃어버린 구간**(`LostRange`)이다.
+구간은 호출자 두 곳(supervisor pass, live delivery)이 **관측한 양끝으로** 진술한다 —
+`checkpointOffset`(Redis가 들고 있는 하한)과 `lastLostOffset`(결과가 사라졌을 수 있는 최고 offset).
+`firstLostOffset()`은 `checkpointOffset + 1`로 **파생**된다: offset이 연속 정수가 아니므로 "구간의
+바닥"을 별도 필드로 두면 호출자가 다른 값을 넘겨 임계값을 조용히 옮길 수 있다.
+
+이 구간에 대한 판정은 두 개이고, 둘 다 **구간의 위쪽 끝**을 읽는다.
+
+| 판정 | 뜻 | 참이 되는 조건 |
+|---|---|---|
+| `rebuiltAlready()` | 이번 질문에 답할 필요가 없다 | `rebuiltThrough >= lastLostOffset` — 완료된 재구성이 구간의 **위쪽 끝까지** 덮었다 |
+| `withinAppliedHistory()` | 이 모드의 basis가 구간을 **되찾을 수 있는가** | `lastLostOffset <= highestAppliedOffset` — 구간 전체가 이 JVM이 적용한 이력 안에 있다 |
+
+위쪽 끝을 읽는 것이 핵심이다. 재구성은 자기가 기록한 watermark까지의 모든 offset을 덮으므로,
+그 위로 올라가는 구간은 **아래의 checkpoint가 무엇을 말하든** 덮이지 않았다. checkpoint만 읽던
+판정은 이 경우를 "이미 지나간 일"로 오인했고, 아래 watermark만 읽던 판정은 Redis에 한 번도 적용된
+적이 없는 offset(실패한 batch가 남긴 구간의 끝)을 "이 이력 안"으로 오인했다. 그래서 `redis-seq`는
+이제 그런 구간을 **거부**하고(그 basis는 적용 시점에 기록되므로 적용된 적 없는 offset을 찾을 수
+없다), MySQL을 읽는 `full-replay`는 같은 구간을 **덮는다**(judge가 발행 전에 MySQL을 쓴다, §1).
+
+#### 이 프로세스가 적용한 offset은 watermark이지 정확한 위치가 아니다
+
+`ContestScoreboardStreamPosition.highestAppliedOffset()`은 **이 JVM의 완료된 batch가 적용한 최고
+offset**이다 — 정확한 watermark가 아니라 그 **하한**이다(부분 적용된 batch는 기록되지 않는다).
+**재시작은 이 값을 쓰지 않는다.** `ContestScoreboardStreamLifecycle.startAt...`는
+`position.consumerRestarted()`만 부르고, 저장 checkpoint는 읽어서 consumer 인자로만 쓴다.
+
+이유는 이 값이 **Redis 롤백의 유일한 메모리상 흔적**이기 때문이다. 재구독이 재개하는 checkpoint는
+정의상 이 값보다 뒤에 있으므로, 재시작이 재개 위치를 watermark에 써 넣으면 supervisor가 롤백을
+판정하려고 읽는 바로 그 값을 지우게 된다 — 재개 지점 위로의 복원은 눈에 띄지 않고 아무도 묻지 않는다.
+
 ### 3.2 stream-offset
 
 기준 브랜치의 기전이며 아래를 유지한다.
@@ -189,8 +222,28 @@ full-replay는 Redis를 초기화하지 않아야 한다는 것이었다.
 
 `none`은 잃어버린 결과를 조용히 건너뛰지 않는다. 모드의 basis가 `covered=false`를 돌려주면 batch를
 적용하지 않고 실패시키므로 checkpoint가 전진하지 않고 consumer가 요란하게 계속 실패한다. 원인은
-`contest.scoreboard.stream.offset.gaps` 지표와 `expected offset / first available offset` ERROR 로그로
-확인한다.
+`contest.scoreboard.stream.offset.gaps` 지표와 `checkpoint 다음 offset / 마지막으로 잃은 offset`
+ERROR 로그로 확인한다.
+
+#### 전진 점프의 세 가지 이유는 따로 센다
+
+checkpoint보다 위에서 시작하는 delivery는 **한 가지 뜻이 아니다.** 원인을 구분하지 않으면 브로커가
+retention을 잘 지키고 있는데도 "브로커가 역사를 잃었다"고 보고하게 된다.
+
+| 이유 (`GapReason`) | 뜻 | `offset.gaps` |
+|---|---|---|
+| `RETENTION` | 요청 offset이 더 이상 retention에 없다 | **오른다** |
+| `ROLLBACK` | checkpoint가 **이 프로세스가 적용한 것보다 뒤**다 — offset은 남아 있고 scoreboard가 움직였다 | 오르지 않는다 |
+| `UNAPPLIED` | 실패한 batch가 그 구간을 미적용으로 남겼다 | 오르지 않는다 |
+
+지표의 정의는 "요청한 offset이 retention 밖이었던 횟수"이므로, retention이 아닌 두 이유에 그
+카운터를 빌려 쓰지 않는다. 롤백은 `contest.scoreboard.stream.rollback.observed`, 미적용 구간은
+`contest.scoreboard.stream.unapplied.refusals`와 실패 카운터가 보여준다.
+
+모드에게 넘기는 구간은 **양끝 모두 관측값**이다(`LostRange`, §3.1). 예전에는 위쪽 끝을
+`checkpoint + 1`로 지어내 넘겼는데, 그것은 아무도 본 적 없는 offset이었고 fallback이 "가장 먼저
+보존된 offset"과 "마지막으로 잃은 offset"으로 그 값을 그대로 되돌려 보고했다 — offset이 연속이
+아니므로 정직한 보고는 delivery가 실제로 건너뛴 구간(예: 6~12)이지 6~6이 아니다.
 
 같은 방식으로 `redis-seq`도 **retention gap을 메울 수 없다.** 이 모드의 기준(중복 seq + lost-tail)은
 Redis에 한 번도 적용되지 않은 이벤트를 찾을 수 없기 때문이다. 이때도 checkpoint는 전진하지 않고
@@ -232,8 +285,9 @@ standings에도 없다 — 실패 기록만 남는다).
 - 그 구간 **위에서 시작하는** delivery는:
   - checkpoint가 **없으면** → 거부한다. 아래 구간을 맡길 모드도, 그 구간을 보증할 basis도 없다.
     checkpoint는 `-1`로 남고 `contest.scoreboard.stream.unapplied.refusals`가 오른다.
-  - checkpoint가 **있으면** → anchor 검증을 지우고 기존 retention-gap 질문으로 넘긴다. 모드가
-    덮는다고 답할 때만 전진한다.
+  - checkpoint가 **있으면** → anchor 검증을 지우고 기존 전진 질문으로 넘긴다(이유는
+    `GapReason.UNAPPLIED`로 분류되므로 `offset.gaps`는 오르지 않는다, 위 "전진 점프의 세 가지 이유").
+    모드가 덮는다고 답할 때만 전진한다.
 - 구간은 **적용된 checkpoint가 그 구간에 도달했을 때만** 해제된다(`recordAppliedOffset`). 적용이
   없으면 해제되지 않는다.
 - 재구독은 구간을 **의도적으로 해제하지 않는다.** 재시작은 checkpoint 포함 지점부터 다시 읽으므로
@@ -401,6 +455,15 @@ bounds를 빌리지 않는다 — 그것은 chunk replay의 bounds이고, 여기
   단조 증가뿐이다. Lua는 연속성 검사를 하지 않고 `ARGV[2]`의 **명시적 전진 정책 토큰**
   (`continue`/`anchor`)을 요구하므로, 정책을 빠뜨린 호출자는 조용히 점프하지 못하고 실패한다.
   재구독은 checkpoint **자신**을 포함해서 요청한다(§3.2).
+- **모드에게 묻는 것은 구간이고, 구간은 양끝으로 진술한다.** 구간의 바닥(`firstLostOffset`)은
+  checkpoint에서 **파생**되며 별도 인자가 아니다 — 호출자가 다른 값을 넘기면 임계값이 조용히
+  움직인다. `rebuiltAlready()`와 `withinAppliedHistory()`는 둘 다 구간의 **위쪽 끝**을 읽는다:
+  재구성은 자기가 기록한 watermark까지 덮으므로 그 위로 올라가는 구간은 덮이지 않았고, 적용 이력
+  판정도 적용된 적 없는 offset을 "이력 안"으로 볼 수 없다(§3.1, §3.2).
+- **`highestAppliedOffset`은 이 JVM의 완료된 batch가 적용한 최고 offset이며, 정확한 위치가 아니라
+  하한이다.** 재시작·재구독은 이 값을 **쓰지 않는다**(`consumerRestarted()`만 호출). 이 값은 Redis
+  롤백의 유일한 메모리상 흔적이고 재개 checkpoint는 정의상 그보다 뒤이므로, 재개 위치를 여기 쓰면
+  롤백 판정이 읽는 값을 지우게 된다(§3.1).
 - **Redis 쓰기는 DB 트랜잭션 밖에서 한다.** replay는 조회 → (트랜잭션 밖) Redis apply → 짧은 별도
   트랜잭션으로 marker 순서이고, marker가 먼저 쓰이면 MySQL이 scoreboard가 받지 않은 결과를 받았다고
   주장하게 된다. Redis 쓰기는 DB 롤백으로 되돌아가지 않으므로 이 순서가 유일하게 안전한 순서다(§3.5).
@@ -492,7 +555,7 @@ Interval·timeout·backoff 성격의 Duration은 **0이나 음수를 받지 않�
 | `contest.scoreboard.stream.failures` | 적용되지 못하고 남은 stream batch |
 | `contest.scoreboard.stream.rollback.restarts` / `.failure.restarts` | 롤백 / 실패 batch 때문에 재구독한 횟수 |
 | `contest.scoreboard.stream.rollback.observed` | 롤백을 관측한 횟수(되감지 않는 모드에서는 restart 없이 관측만 된다) |
-| `contest.scoreboard.stream.offset.gaps` | retention gap 감지 횟수 |
+| `contest.scoreboard.stream.offset.gaps` | **retention 밖**이라 요청 offset을 건네줄 수 없었던 횟수. 롤백·미적용 구간은 여기 세지 않는다(§3.2) |
 | `contest.scoreboard.stream.unapplied.refusals` | 실패한 batch가 남긴 구간 위에서 시작한 delivery를, checkpoint조차 없어 거부한 횟수 |
 | `contest.scoreboard.recovery.pass.skipped` (tag `pass`) | 다른 pass가 gate를 쥐고 있어 건너뛴 pass |
 | `contest.scoreboard.recovery.marker.failed` | 적용은 됐으나 applied marker 기록이 bounds 안에 실패한 횟수 |

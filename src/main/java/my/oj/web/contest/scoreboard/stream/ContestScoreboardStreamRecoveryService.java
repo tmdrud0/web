@@ -7,9 +7,9 @@ import org.springframework.stereotype.Component;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 
 /**
- * What happens when the offset the scoreboard needs is no longer in the broker's retention.
+ * What happens when the offsets the scoreboard needs cannot be read from the stream any more.
  *
- * <p>The offsets between the checkpoint and the earliest retained message are gone for good, so the
+ * <p>The offsets between the checkpoint and the offset the consumer was handed are unreachable, so the
  * results they carried exist only in MySQL. Replaying from MySQL is what puts them back, and the
  * replay is deliberately non-destructive: it re-sends every stored judgement through the same apply
  * path the live stream uses and lets the processed set absorb what is already there, rather than
@@ -45,38 +45,48 @@ public class ContestScoreboardStreamRecoveryService {
     }
 
     /**
-     * Handles a gap between the stored checkpoint and the earliest offset still retained.
+     * Handles a range the stream could not serve below the offset the consumer was handed.
      *
-     * @return whether the gap may now be bridged, which is what decides if the event at
-     *         {@code firstAvailableOffset} is allowed to move the checkpoint past the missing range
+     * <p>Both ends of the range are reported as they were observed. Neither is derived by arithmetic:
+     * the offsets a stream holds are whatever was published, so nothing here may describe the gap as
+     * an offset that was never seen - which is what asserting the checkpoint's successor would do.</p>
+     *
+     * @param checkpointOffset the offset Redis holds and the stream could not serve
+     * @param lastLostOffset   the highest offset whose result the standings may be missing, which is
+     *                         the one just below the delivery that jumped the checkpoint
+     * @return whether the gap may now be bridged, which is what decides if the delivery may move the
+     *         checkpoint past the missing range
      */
-    public boolean recoverRetentionGap(long expectedOffset, long firstAvailableOffset) {
+    public boolean recoverRetentionGap(long checkpointOffset, long lastLostOffset) {
         ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback fallback =
                 properties.streamOffset().retentionGapFallback();
         log.error(
-                "Scoreboard stream offset {} is no longer retained; the earliest offset the broker still has is {}",
-                expectedOffset,
-                firstAvailableOffset
+                "Scoreboard stream offset {} could not be served to the consumer; the results carried by "
+                        + "offsets {} to {} are missing from the standings",
+                checkpointOffset,
+                checkpointOffset + 1L,
+                lastLostOffset
         );
 
         if (fallback == ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback.NONE) {
             log.error(
                     "contest.scoreboard.recovery.stream-offset.retention-gap-fallback=none: the results carried by "
-                            + "offsets {} to {} are gone from the broker and will not be replayed from MySQL. The "
-                            + "batch is left unapplied rather than bridging the gap, so the checkpoint does not move "
-                            + "past results the scoreboard never saw. Replay the scoreboard from MySQL or reset it, "
-                            + "or set the fallback to full-replay, before resuming.",
-                    expectedOffset,
-                    firstAvailableOffset - 1L
+                            + "offsets {} to {} will not be replayed from MySQL. The batch is left unapplied rather "
+                            + "than bridging the gap, so the checkpoint does not move past results the scoreboard "
+                            + "never saw. Replay the scoreboard from MySQL or reset it, or set the fallback to "
+                            + "full-replay, before resuming.",
+                    checkpointOffset + 1L,
+                    lastLostOffset
             );
             return false;
         }
 
         int replayed = fullReplayService.replayAllContests();
         log.warn(
-                "Replayed {} stored results from MySQL after the scoreboard stream retention gap; resuming at {}",
+                "Replayed {} stored results from MySQL after the scoreboard stream could not serve offsets {} to {}",
                 replayed,
-                firstAvailableOffset
+                checkpointOffset + 1L,
+                lastLostOffset
         );
         return true;
     }

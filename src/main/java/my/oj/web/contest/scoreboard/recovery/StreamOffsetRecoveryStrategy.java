@@ -22,6 +22,12 @@ import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamRecoveryServic
  * the checkpoint and read the results again - is a decision about the running consumer, which the
  * live path does not own. So the live path refuses in that case and the supervisor's pass rewinds,
  * which is the same recovery reached by the thing that can carry it out.</p>
+ *
+ * <p>A range reaching above what this process applied is a different question and does get the
+ * fallback. Those offsets were published without this process applying them - that is the only way an
+ * offset sits above its own watermark - and the judge writes MySQL before it publishes, so a replay
+ * does cover them. The two ends of the range are handed over as they are, so the report names the range
+ * the delivery actually jumped rather than a successor offset that nothing observed.</p>
  */
 class StreamOffsetRecoveryStrategy implements ContestScoreboardRecoveryStrategy {
 
@@ -51,7 +57,7 @@ class StreamOffsetRecoveryStrategy implements ContestScoreboardRecoveryStrategy 
         }
         return gate.tryRun(PassKind.MYSQL_REPLAY, () -> recoveryService.recoverRetentionGap(
                 range.checkpointOffset(),
-                range.firstLostOffset()
+                range.lastLostOffset()
         )).orElse(Boolean.FALSE);
     }
 }

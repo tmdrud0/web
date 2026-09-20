@@ -112,7 +112,7 @@ class ContestScoreboardStreamProcessorTests {
         when(applier.currentStreamOffset()).thenReturn(5L, 5L, 11L);
         when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         when(strategy.rebuildHistory(any())).thenReturn(true);
-        position.resumeAt(5L);
+        position.recordAppliedOffset(5L);
 
         processor.process(List.of(event(10L, 110L), event(11L, 111L)));
 
@@ -121,6 +121,9 @@ class ContestScoreboardStreamProcessorTests {
         ContestScoreboardRecoveryStrategy.LostRange range = capturedRange();
         assertThat(range.checkpointOffset()).isEqualTo(5L);
         assertThat(range.firstLostOffset()).isEqualTo(6L);
+        // The range is stated by both ends, and this one reaches from the checkpoint to the offset just
+        // below the delivery - which is what a mode's basis has to cover, not the checkpoint alone.
+        assertThat(range.lastLostOffset()).isEqualTo(9L);
         assertThat(range.highestAppliedOffset()).isEqualTo(5L);
         assertThat(counter("contest.scoreboard.stream.offset.gaps")).isEqualTo(1.0);
     }
@@ -134,7 +137,7 @@ class ContestScoreboardStreamProcessorTests {
     void aRetentionGapNoBasisRebuiltLeavesTheBatchUnapplied() {
         when(applier.currentStreamOffset()).thenReturn(5L);
         when(strategy.rebuildHistory(any())).thenReturn(false);
-        position.resumeAt(5L);
+        position.recordAppliedOffset(5L);
 
         assertThatThrownBy(() -> processor.process(List.of(event(10L, 110L), event(11L, 111L))))
                 .isInstanceOf(IllegalStateException.class)
@@ -176,7 +179,7 @@ class ContestScoreboardStreamProcessorTests {
         when(applier.currentStreamOffset()).thenReturn(2L, 2L, 5L);
         when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         when(strategy.rebuildHistory(any())).thenReturn(true);
-        position.resumeAt(4L);
+        position.recordAppliedOffset(4L);
         // The anchor was verified for the position the consumer held before Redis rolled back.
         position.markAnchorVerified();
 
@@ -185,6 +188,9 @@ class ContestScoreboardStreamProcessorTests {
         ContestScoreboardRecoveryStrategy.LostRange range = capturedRange();
         assertThat(range.checkpointOffset()).isEqualTo(2L);
         assertThat(range.firstLostOffset()).isEqualTo(3L);
+        // The rollback took away everything up to what this process applied, so the range a mode is
+        // asked about reaches all the way to it.
+        assertThat(range.lastLostOffset()).isEqualTo(4L);
         assertThat(range.highestAppliedOffset()).isEqualTo(4L);
         assertThat(counter("contest.scoreboard.stream.offset.gaps")).isZero();
         assertThat(requests().get(0).advance()).isEqualTo(CheckpointAdvance.ANCHOR);
@@ -199,12 +205,17 @@ class ContestScoreboardStreamProcessorTests {
         when(applier.currentStreamOffset()).thenReturn(5L, 5L, 10L);
         when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         when(strategy.rebuildHistory(any())).thenReturn(true);
-        position.resumeAt(5L);
+        position.recordAppliedOffset(5L);
         position.markRebuiltThrough(9L);
 
         processor.process(List.of(event(10L, 110L)));
 
-        assertThat(capturedRange().rebuiltThrough()).isEqualTo(9L);
+        ContestScoreboardRecoveryStrategy.LostRange range = capturedRange();
+        assertThat(range.rebuiltThrough()).isEqualTo(9L);
+        // The rebuild reached exactly as far as this delivery asks about, so a real strategy
+        // recognises the earlier work instead of rebuilding the same range twice.
+        assertThat(range.lastLostOffset()).isEqualTo(9L);
+        assertThat(range.rebuiltAlready()).isTrue();
     }
 
     @Test
@@ -287,16 +298,24 @@ class ContestScoreboardStreamProcessorTests {
     void aDeliveryAboveTheRangeAsksTheModeWhenThereIsACheckpoint() {
         when(applier.currentStreamOffset()).thenReturn(5L);
         when(strategy.rebuildHistory(any())).thenReturn(false);
-        position.resumeAt(5L);
+        position.recordAppliedOffset(5L);
         position.markAnchorVerified();
         position.recordUnappliedRange(6L);
 
         assertThatThrownBy(() -> processor.process(List.of(event(7L, 107L))))
                 .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("left unapplied by a failed batch")
                 .hasMessageContaining("checkpoint does not move past results the standings never saw");
 
-        assertThat(capturedRange().firstLostOffset()).isEqualTo(6L);
-        assertThat(counter("contest.scoreboard.stream.offset.gaps")).isEqualTo(1.0);
+        ContestScoreboardRecoveryStrategy.LostRange range = capturedRange();
+        assertThat(range.firstLostOffset()).isEqualTo(6L);
+        // The range reaches the offset the batch failed at, which is what the mode's basis has to cover -
+        // and what a basis written at apply time cannot, because that offset was never applied.
+        assertThat(range.lastLostOffset()).isEqualTo(6L);
+        // Not a retention gap: the broker still holds offset 6 and this consumer is the only thing that
+        // cannot be handed it again, so borrowing the retention counter would report the broker as
+        // having lost history it kept. The refusal is what the failure counter shows.
+        assertThat(counter("contest.scoreboard.stream.offset.gaps")).isZero();
         assertThat(counter("contest.scoreboard.stream.unapplied.refusals")).isZero();
         // Being asked about does not clear it: only the delivery that applies the range does.
         assertThat(position.unappliedFrom()).isEqualTo(6L);

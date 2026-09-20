@@ -624,7 +624,59 @@ JVM-scoped이고 seeding으로 초기화되지 않으므로, 한 메서드가 �
 
 ## 15. 2라운드 검토 (`60d98ec..7af681e`)
 
-읽기 전용 검토자를 별도로 붙여 `60d98ec..HEAD`를 검토시켰다. 관점: 모드 격리, offset 비연속성,
-다중 인스턴스 실행권(그리고 그 부재), 트랜잭션 경계, 테스트 판별력.
+읽기 전용 검토자를 별도로 붙여 `60d98ec..HEAD`(`7af681e`)를 검토시켰다. 관점: 모드 격리, offset
+비연속성, 다중 인스턴스 실행권(그리고 그 부재), 트랜잭션 경계, 테스트 판별력.
 
-(검토 결과는 이 절에 기록한다.)
+**검토자 판정: 다섯 관점 중 넷은 clean, 하나는 불완전.**
+- 모드 격리 — clean. strategy가 주입되는 곳은 정확히 두 곳이고, 그 두 메서드가 유일한 모드 질의다.
+- offset 비연속성 — clean. main 어디에도 `+1` 산술로 checkpoint를 전진시키는 곳이 없다.
+- 다중 인스턴스 실행권과 그 부재 — clean. 문서·gate 해제(`finally`)·owner 기본값의 비대칭이 모두
+  일관되며, 검증은 **안전한 방향으로만** 거부한다.
+- 트랜잭션 경계 — clean. replay의 Redis 쓰기는 트랜잭션 밖이고, 남은 Redis 호출은 의도된 read다.
+- **테스트 판별력 — 불완전.** 지적 5건.
+
+### 15.1 지적과 판정
+
+| # | 지적 | 심각도 | 판정 | 조치 |
+|---|---|---|---|---|
+| 1 | `rebuiltAlready()`가 **아래쪽 끝만 보고** "이미 재구성됨"을 결론낸다. `rebuiltThrough`는 단조 증가하고 `resumeAt`이 지우지 않으므로, stale watermark가 두 번째 롤백(또는 같은 RDB 스냅샷의 재적용)에서 replay를 **건너뛰게** 만든다 | high | **확인** | 두 판정이 모두 **구간의 위쪽 끝**을 읽도록 수정 (`rebuiltAlready()` = `rebuiltThrough >= lastLostOffset`, `withinAppliedHistory()` = `lastLostOffset <= highestAppliedOffset`) |
+| 2 | checkpoint가 있는 미적용 구간 경로가 모드의 답에 전적으로 의존하고, 그 답은 checkpoint **아래** 구간에 대한 것이다. 모드가 true면 미적용 offset 41 위로 anchor되어 영구 미적용 + `offset.gaps` 오집계 | medium | **확인** | `GapReason`으로 이유를 분리(`UNAPPLIED`는 `offset.gaps`를 올리지 않는다). 위쪽 끝 판정과 합쳐져 `redis-seq`는 이제 그 구간을 **거부**한다 |
+| 3 | 롤백 dedup 쌍이 `appliedOffset`이 커질 때마다 재무장되어, 실제 롤백 하나가 batch마다 로그·지표로 반복된다 | medium | **부분 인정** | 재무장 자체는 **더 깊은 롤백**에 대해 정당하다. "replay 없이 재구성됨"을 경고하던 **거짓 WARN은 지적 1의 결함**이며 거기서 고쳐졌다 |
+| 4 | `LostRange` javadoc이 "두 호출자가 다른 `firstLostOffset`을 넘긴다"고 주장하지만 둘 다 `checkpoint + 1`을 넘긴다. 유지보수자가 processor를 "고치면" `rebuiltAlready()`의 임계값이 조용히 바뀐다. 또한 fallback이 존재한 적 없는 offset(`firstAvailableOffset - 1`)을 로깅한다 | medium | **확인** | 바닥을 `checkpointOffset + 1`로 **파생**시켜 우연을 구조로 바꾸고, fallback에는 구간의 실제 위쪽 끝을 넘기며, 로그는 실제 구간(`checkpoint+1` ~ `lastLostOffset`)을 찍는다 |
+| 5 | `resumeAt`이 **consumer 위치와 적용 watermark를 혼동**한다. 모든 기동 경로가 이 메서드를 지나므로 non-rewinding 모드에서 watermark가 되감기고, 롤백이 잠시 가려지며 redis-seq의 `withinAppliedHistory()`가 뒤집히고 롤백이 retention gap으로 재분류된다 | low-medium | **부분 인정** | `resumeAt(long)`을 삭제하고 `consumerRestarted()`로 교체 — 재개는 watermark를 **쓰지 않는다**. 다만 실패 재구독 분기로는 도달하지 않는다(stored ≥ applied이고 그 쓰기는 watermark를 **올린다**). 실질 이득은 두 번째 Redis 복원 경우와, 필드가 문서화한 의미를 실제로 갖게 된 것이다 |
+
+검토자가 지적 1의 판별을 위해 요구한 것은 "mock을 걷어내고 **실제** `FullReplayRecoveryStrategy`로
+롤백 → 복구 → 두 번째 롤백을 구동하는 테스트 한 건"이었고, 그대로 추가했다(§15.2).
+
+### 15.2 지적에 대응해 추가·수정한 테스트
+
+- **`ContestScoreboardRecoveryStrategyTests` (신규, 8건)** — 세 전략을 **실물로** 구동한다. 기존
+  lifecycle 테스트는 strategy를 mock하므로(지적 1·3이 구조적으로 보이지 않던 이유) 그 seam으로는
+  판정의 **의미**를 물을 수 없다. 요구된 "롤백 → 복구 → 두 번째 롤백"(`replayAllContests()` 2회 단언),
+  supervisor→live handoff(1회), 위쪽 끝이 적용 watermark를 넘는 구간을 `redis-seq`이 거부하는지,
+  같은 구간을 MySQL basis는 덮는지, retention fallback이 실제 구간(5~12)을 받는지를 고정한다.
+- **lifecycle** — supervisor가 넘기는 구간의 `lastLostOffset`을 단언하고, 새 테스트
+  `aRestartLeavesWhatThisProcessAppliedWhereItWas`가 "재개 위치는 적용 watermark가 아니다"를 고정한다.
+- **processor** — 다섯 테스트의 seed를 `resumeAt(N)`에서 `recordAppliedOffset(N)`으로 바꾸고(재개는
+  적용이 아니다), 구간의 위쪽 끝을 단언한다. 미적용 구간 테스트는 `offset.gaps`가 **0**임을 함께
+  단언한다.
+- **실물 부분 실패 테스트** — await 조건을 `offset.gaps >= 1`에서 `failures >= 2`로 바꾸고,
+  "retention 밖이었던 것이 없으므로 retention gap도 없다"(`offset.gaps == 0`)를 단언한다.
+
+### 15.3 수정 후 재실행 결과
+
+| tier | 총 | skipped | failed |
+|---|---|---|---|
+| `test` | 408 | 38 | 0 |
+| `test -DredisIntegration=true -DredisPort=16379` | 408 | 13 | 0 |
+| `test -DrabbitIntegration=true` | 408 | 31 | 0 |
+| `test --tests "*ContestScoreboard*" --tests "*Recovery*"` | 192 (41 classes) | 29 | 0 |
+
+§7의 399건에 신규 9건(전략 테스트 8 + lifecycle 테스트 1)이 더해져 408건이다.
+
+### 15.4 검토가 확인하지 못한 것
+
+검토자는 이번에도 **성능·복구 시간·비교 우위를 측정하지 않았고**, 이 보고서도 그 값을 추정하지
+않는다. RDB 스냅샷 rollback 자체의 fault injection과 장시간 부하 테스트는 두 라운드 모두 범위 밖이다.
+지적 1·2의 시나리오는 **단위 수준에서** 재현·고정했으며, 실물 브로커·실물 RDB 롤백으로 그 두 시나리오를
+end-to-end로 구동한 증거는 없다 — 그 재현에는 RDB 복원 주입이 필요하고 그것은 범위 밖이다.

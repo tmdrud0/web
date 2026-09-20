@@ -34,12 +34,15 @@ import java.util.List;
  *   <li>A delivery above the checkpoint, with the anchor already verified - an ordinary forward step.
  *       Only monotonic increase is checked, and that inside the script.</li>
  *   <li>A delivery above the checkpoint, with the anchor not verified - the checkpoint is gone from
- *       retention. {@link ContestScoreboardRecoveryStrategy#rebuildHistory} decides whether the mode's
- *       own basis covers the range below it. Only if it does may the checkpoint move there.</li>
+ *       retention, a batch failed below this delivery, or Redis rolled back behind the position.
+ *       {@link ContestScoreboardRecoveryStrategy#rebuildHistory} decides whether the mode's own basis
+ *       covers the range below it. Only if it does may the checkpoint move there.</li>
  *   <li>A delivery above a range a failed batch left unapplied - never an ordinary step, and never the
  *       first offset of the stream however unset the checkpoint is. That range is a live delivery the
- *       broker will not hand back, so it exists nowhere else and no basis may vouch for it; the
- *       resubscribe re-reads it instead. See {@link ContestScoreboardStreamPosition#unappliedFrom()}.</li>
+ *       broker will not hand back, so the resubscribe that re-reads it is its repair; asking a mode
+ *       about it is asking whether the mode's basis happens to hold the same results, which for a
+ *       basis written at apply time it does not. See
+ *       {@link ContestScoreboardStreamPosition#unappliedFrom()}.</li>
  * </ul>
  *
  * <p>What this cannot see is a broker that skips offsets mid-connection: the position was verified
@@ -56,6 +59,34 @@ import java.util.List;
 @ConditionalOnProperty(prefix = "contest.scoreboard.stream.consumer", name = "enabled", havingValue = "true")
 @Slf4j
 class ContestScoreboardStreamProcessor {
+
+    /**
+     * Why a delivery sat above the range the checkpoint could not reach, so nothing is reported as
+     * something it is not.
+     *
+     * <p>The three are counted apart for a reason: {@code contest.scoreboard.stream.offset.gaps}
+     * counts requested offsets that were outside retained history, and a rollback or a failed batch is
+     * not that. Neither is a lost result either - the first was taken away from the standings and can
+     * be rebuilt, the second was never applied and is re-read by a resubscribe - so each says what it
+     * is in the message instead of borrowing the retention vocabulary.</p>
+     */
+    private enum GapReason {
+
+        /** The checkpoint is no longer retained, so the stream cannot be read from where it stopped. */
+        RETENTION("no longer retained"),
+
+        /** Redis rolled back behind what this process applied. */
+        ROLLBACK("behind what this process applied"),
+
+        /** A failed batch left the offsets below this delivery unapplied. */
+        UNAPPLIED("left unapplied by a failed batch");
+
+        private final String description;
+
+        GapReason(String description) {
+            this.description = description;
+        }
+    }
 
     private final ContestScoreboardApplier applier;
     private final ContestScoreboardAppliedAtCompletion completion;
@@ -111,7 +142,8 @@ class ContestScoreboardStreamProcessor {
         }
         long firstDelivery = batch.get(0).offset();
         long unappliedFrom = position.unappliedFrom();
-        if (unappliedFrom >= 0L && firstDelivery > unappliedFrom) {
+        boolean aboveUnappliedRange = unappliedFrom >= 0L && firstDelivery > unappliedFrom;
+        if (aboveUnappliedRange) {
             // A batch was left unapplied and this delivery begins above it. Between the two lies a
             // range no apply ever wrote, and the delivery's own offset is a claim over it: applying
             // it would move the checkpoint past results the standings never saw, with the failure
@@ -152,7 +184,23 @@ class ContestScoreboardStreamProcessor {
                     firstDelivery, checkpoint);
             return CheckpointAdvance.CONTINUE;
         }
-        return anchorAfterRebuild(checkpoint, firstDelivery, checkpoint < applied);
+        return anchorAfterRebuild(checkpoint, firstDelivery,
+                gapReason(aboveUnappliedRange, checkpoint, applied));
+    }
+
+    /**
+     * Why the delivery could not be an ordinary forward step.
+     *
+     * <p>An outstanding unapplied range wins even when the checkpoint is also behind what this process
+     * applied, because it is what makes <em>this delivery</em> a question - and because what the mode
+     * is asked about the range is then whether its basis holds offsets that were never applied, which
+     * is a different question from the one a rollback asks.</p>
+     */
+    private static GapReason gapReason(boolean aboveUnappliedRange, long checkpoint, long applied) {
+        if (aboveUnappliedRange) {
+            return GapReason.UNAPPLIED;
+        }
+        return checkpoint < applied ? GapReason.ROLLBACK : GapReason.RETENTION;
     }
 
     /**
@@ -160,28 +208,31 @@ class ContestScoreboardStreamProcessor {
      *
      * <p>A delivery above the checkpoint means the offsets between them are not readable from the
      * stream, so the results they carried exist only in whatever the mode treats as its history. The
-     * mode is the only thing that may say whether they are there.</p>
+     * mode is the only thing that may say whether they are there - and its answer covers the range only
+     * if it can find every offset in it, which is what {@code lastLostOffset} tells it and what a mode
+     * whose basis is written at apply time has to refuse.</p>
      *
-     * <p>Two situations produce this jump and they are counted apart. A checkpoint that is no longer
-     * retained is a retention gap: nothing was lost from the standings, but the stream can no longer
-     * be read from where the scoreboard stopped. A checkpoint below what this JVM applied is a
-     * rollback: the standings lost results the stream still has, and the supervisor's pass answers it
-     * per mode. Only the first is what {@code contest.scoreboard.stream.offset.gaps} counts.</p>
+     * <p>The range handed over states both of its ends: the offset just below this delivery, and the
+     * highest offset this process applied. Its answer is read against the same ends, so a
+     * reconstruction that stopped short of them is not taken for one that reached them.</p>
      */
-    private CheckpointAdvance anchorAfterRebuild(long checkpoint, long firstDelivery, boolean rolledBack) {
-        if (!rolledBack) {
+    private CheckpointAdvance anchorAfterRebuild(long checkpoint, long firstDelivery, GapReason reason) {
+        if (reason == GapReason.RETENTION) {
+            // Only a checkpoint that is gone from retention is what this counter counts. A rollback is
+            // the standings moving while the broker kept every offset, and a failed batch is a range
+            // the broker still serves and only this consumer cannot be handed again.
             metrics.recordOffsetGap();
         }
         ContestScoreboardRecoveryStrategy.LostRange range = new ContestScoreboardRecoveryStrategy.LostRange(
                 checkpoint,
-                checkpoint + 1L,
+                firstDelivery - 1L,
                 position.highestAppliedOffset(),
                 position.rebuiltThrough()
         );
         if (!strategy.rebuildHistory(range)) {
             throw new IllegalStateException(
                     "Scoreboard stream checkpoint " + checkpoint + " is "
-                            + (rolledBack ? "behind what this process applied" : "no longer retained")
+                            + reason.description
                             + " and the " + strategy.mode().propertyValue()
                             + " basis did not rebuild the range below " + firstDelivery
                             + "; the batch is left unapplied so the checkpoint does not move past results "
@@ -191,7 +242,7 @@ class ContestScoreboardStreamProcessor {
         log.warn("Scoreboard stream checkpoint {} was {}; the {} basis rebuilt the range below {} "
                         + "and the checkpoint may now move there",
                 checkpoint,
-                rolledBack ? "behind what this process applied" : "not retained",
+                reason.description,
                 strategy.mode().propertyValue(),
                 firstDelivery);
         return CheckpointAdvance.ANCHOR;

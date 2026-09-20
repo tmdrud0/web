@@ -54,7 +54,6 @@ class ContestScoreboardStreamListenerTests {
     void setUp() {
         position = new ContestScoreboardStreamPosition();
         // The position a running consumer holds: verified against the checkpoint it resumed at.
-        position.resumeAt(-1L);
         position.markAnchorVerified();
         registry = new SimpleMeterRegistry();
         listener = new ContestScoreboardStreamListener(

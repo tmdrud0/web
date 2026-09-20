@@ -41,40 +41,71 @@ public interface ContestScoreboardRecoveryStrategy {
      * <p>Idempotent, and expected to run once per lost range: a mode whose basis already covers the
      * range returns immediately rather than rebuilding it twice.</p>
      *
-     * @return whether the range below {@link LostRange#firstLostOffset()} is rebuilt, which is what
-     *         decides if the checkpoint may move to the offset that follows it
+     * @return whether the range is rebuilt, which is what decides if the checkpoint may move to the
+     *         offset above it
      */
     boolean rebuildHistory(LostRange range);
 
     /**
-     * The range whose results may be absent from the standings.
+     * The range whose results may be absent from the standings, stated by both of its ends.
+     *
+     * <p>A range is the offsets between two offsets, and a mode's basis is asked about all of them:
+     * whether a completed reconstruction covered them, and whether they were ever applied here. Both
+     * questions are about the range's top, so the top is a value the caller states rather than
+     * something a predicate infers from the checkpoint. Inferring it was a defect twice over - a
+     * reconstruction that covered an earlier, lower range was read as covering this one, and a range
+     * reaching above what this JVM applied was read as being inside it because the checkpoint below
+     * the range was.</p>
+     *
+     * <p>The bottom is not a component for the same reason: {@link #firstLostOffset()} is derived from
+     * the checkpoint, because a range always begins directly above it. The two callers of this record
+     * describe the same boundary - the offsets the checkpoint cannot reach - from the two things that
+     * observe it, and neither has a different bottom to offer. Leaving it as a field invited a caller
+     * to pass something else, which would have moved the threshold silently.</p>
      *
      * @param checkpointOffset     the offset Redis currently holds, or {@code -1} when it holds none
-     * @param firstLostOffset      the first offset whose result the standings may be missing
-     * @param highestAppliedOffset the highest offset this JVM applied. It survives a Redis rollback in
-     *                             memory, so it is the one record of how far the rollback reached back
-     * @param rebuiltThrough       the highest offset a completed reconstruction in this JVM already
-     *                             covers, or {@code -1} when none has run
+     * @param lastLostOffset       the highest offset whose result the standings may be missing. The
+     *                             supervisor names the highest offset the rollback took away, the live
+     *                             path the offset just below the delivery that jumped the checkpoint
+     * @param highestAppliedOffset the highest offset a completed batch of this JVM applied. It
+     *                             survives a Redis rollback in memory, so it is the one record of how
+     *                             far the rollback reached back
+     * @param rebuiltThrough       the highest offset a completed reconstruction in this JVM covers, or
+     *                             {@code -1} when none has run
      */
     record LostRange(long checkpointOffset,
-                     long firstLostOffset,
+                     long lastLostOffset,
                      long highestAppliedOffset,
                      long rebuiltThrough) {
+
+        /**
+         * The first offset whose result the standings may be missing, derived from the checkpoint.
+         *
+         * <p>Meaningless without a checkpoint, and never asked for in that case: a scoreboard that
+         * holds no checkpoint adopts the first offset it is handed instead of describing a range below
+         * it.</p>
+         */
+        public long firstLostOffset() {
+            return checkpointOffset + 1L;
+        }
 
         /**
          * Whether a reconstruction that already ran covers the whole range, so this call must not
          * start another one.
          *
-         * <p>{@code firstLostOffset - 1} rather than {@code firstLostOffset}: a reconstruction is
-         * claimed to cover the range <em>below</em> the first lost offset. The two callers describe
-         * the same gap from different sides - the supervisor names the checkpoint it rolled back to
-         * and marks the offset it rebuilt through, the live path names the first offset it was handed
-         * and asks about everything before it - so requiring the marked offset to reach the first
-         * <em>lost</em> one would make each caller fail to recognise the other's completed work and
-         * rebuild it twice.</p>
+         * <p>The top of the range, not its bottom. A reconstruction is claimed to cover every offset
+         * up to the watermark it recorded, and a range that reaches above that watermark is not
+         * covered by it - whatever the checkpoint below says. Comparing against the checkpoint was
+         * what let a rollback that reached further back than the last reconstruction be reported as
+         * rebuilt without one running, leaving the results between the two to be stepped over by the
+         * delivery that anchored past them.</p>
+         *
+         * <p>The handoff between the two callers survives: the supervisor marks the range it rebuilt
+         * through at the applied watermark, and the delivery that anchors directly above it asks about
+         * that offset, so the completed work is recognised and not repeated.</p>
          */
         public boolean rebuiltAlready() {
-            return rebuiltThrough >= firstLostOffset - 1L;
+            return rebuiltThrough >= lastLostOffset;
         }
 
         /**
@@ -85,16 +116,15 @@ public interface ContestScoreboardRecoveryStrategy {
          * anything this JVM applied has a record the mode can find. A range reaching past that point
          * was never applied at all, and no amount of replaying what is stored can reconstruct it.</p>
          *
-         * <p>Judged by the checkpoint rather than by {@code firstLostOffset}. The two callers place
-         * the first lost offset differently - the supervisor at {@code checkpointOffset + 1}, the live
-         * path at the offset it was handed - and only the live path's one sits above the highest
-         * applied offset in the ordinary case, so a test on {@code firstLostOffset} would answer false
-         * for the supervisor's range and refuse a recovery that is in fact available. What the
-         * question really asks is whether the checkpoint is below what this JVM applied: only then did
-         * the rollback take away results the mode has a record of.</p>
+         * <p>The top of the range again. Asked of the range rather than of the checkpoint because the
+         * checkpoint being below the applied watermark says only that <em>something</em> was taken away
+         * - not that everything the question is about was ever applied. A delivery above a batch that
+         * failed, or above a range the broker no longer serves, can sit above the applied watermark
+         * with the checkpoint below it, and a mode whose basis is a record written at apply time
+         * cannot find offsets that were never applied.</p>
          */
         public boolean withinAppliedHistory() {
-            return checkpointOffset < highestAppliedOffset;
+            return lastLostOffset <= highestAppliedOffset;
         }
     }
 

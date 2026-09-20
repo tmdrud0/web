@@ -304,8 +304,16 @@ class ContestScoreboardStreamPartialBatchFailureRabbitIntegrationTests {
         // taken on the strength of that position would carry the checkpoint over a result nobody
         // applied, and this delivery is the only thing that can ask for one.
         publish(AFTER_DELIVERY, healthyContest);
-        await("the delivery above the failed offset to be judged rather than stepped over",
-                () -> counter("contest.scoreboard.stream.offset.gaps") >= 1.0);
+        // The second failure is the refusal: the poison failed the batch, and this delivery fails for
+        // starting above the range that batch left unapplied. Deliberately not the gap counter - every
+        // offset here is still in the broker, so counting one as a retention gap would report history
+        // the broker kept as history it lost.
+        await("the delivery above the failed offset to be refused rather than stepped over",
+                () -> counter("contest.scoreboard.stream.failures") >= 2.0);
+
+        assertThat(counter("contest.scoreboard.stream.offset.gaps"))
+                .as("nothing was outside the broker's retention, so nothing is a retention gap")
+                .isZero();
 
         assertThat(checkpoint())
                 .as("a delivery above a failed batch does not license moving over it")

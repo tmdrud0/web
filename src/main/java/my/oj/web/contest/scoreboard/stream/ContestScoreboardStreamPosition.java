@@ -25,7 +25,18 @@ import java.util.concurrent.atomic.AtomicLong;
 )
 class ContestScoreboardStreamPosition {
 
-    /** Highest offset this JVM has applied, or {@code -1} before the first batch. */
+    /**
+     * Highest offset a completed batch of this JVM applied, or {@code -1} before the first one.
+     *
+     * <p>A lower bound on what reached the standings rather than an exact watermark: the applier writes
+     * Redis as it goes and is recorded here only once it has answered for the whole batch, so a batch
+     * that failed halfway applied offsets this never counted. Understating is the safe direction, since
+     * every question that reads it is whether the checkpoint is behind what was applied and an offset
+     * missed here cannot hide a rollback that a lower one still shows.</p>
+     *
+     * <p>It is deliberately not written when the consumer is started. See
+     * {@link #consumerRestarted()}.</p>
+     */
     private final AtomicLong highestAppliedOffset = new AtomicLong(-1L);
 
     private final AtomicLong failedBatches = new AtomicLong();
@@ -108,15 +119,20 @@ class ContestScoreboardStreamPosition {
     }
 
     /**
-     * Records the position a restarted consumer resumes from.
+     * Records that the consumer is being started, which makes its position a fresh question.
      *
-     * <p>Clears the anchor verification with it: a new position is a new question, whatever the old
-     * one had established. A range an earlier batch left unapplied is deliberately left outstanding -
-     * the resume is at or below it, so the re-read either applies it or records it again, and until
-     * then nothing above it may be applied.</p>
+     * <p>Clears the anchor verification and deliberately does nothing else - in particular it does not
+     * touch {@link #highestAppliedOffset}. That watermark is the one record in memory of how far back a
+     * Redis rollback reached, and a resubscribe is exactly when it is needed: the checkpoint the
+     * consumer resumes from may be behind it, so lowering the watermark to the resume position would
+     * hide the rollback from the supervisor and have the live path report it as a retention gap, with
+     * the mode that owns the recovery never asked about it.</p>
+     *
+     * <p>A range an earlier batch left unapplied is left outstanding for the same reason: the resume is
+     * at or below it, so the re-read either applies it or records it again, and until then nothing
+     * above it may be applied.</p>
      */
-    void resumeAt(long offset) {
-        highestAppliedOffset.set(offset);
+    void consumerRestarted() {
         anchorVerified.set(false);
     }
 

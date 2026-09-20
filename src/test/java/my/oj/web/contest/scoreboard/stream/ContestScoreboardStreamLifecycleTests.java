@@ -82,9 +82,10 @@ class ContestScoreboardStreamLifecycleTests {
         lifecycle(StartupOffset.FIRST).start();
 
         assertThat(consumerArguments()).containsEntry("x-stream-offset", "first");
-        // The checkpoint is still the scoreboard's own value: re-reading retention must not rewrite
-        // it, or the first re-delivered message would look like a forward jump to the script.
-        assertThat(position.highestAppliedOffset()).isEqualTo(4L);
+        // Nothing about the scoreboard's own position is rewritten: the checkpoint is read from the
+        // applier and never written here, and starting the consumer does not record the checkpoint as
+        // something this process applied. See ContestScoreboardStreamPosition.consumerRestarted.
+        assertThat(position.highestAppliedOffset()).isEqualTo(-1L);
     }
 
     @Test
@@ -162,6 +163,9 @@ class ContestScoreboardStreamLifecycleTests {
         when(strategy.rewindsOnCheckpointRegression()).thenReturn(true);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
+        // What makes the rollback visible: this process had applied up to 4 when Redis came back
+        // holding 2. Starting the consumer records nothing of the sort - a resume is not an apply.
+        position.recordAppliedOffset(4L);
 
         lifecycle.recoverConsumption();
 
@@ -187,6 +191,7 @@ class ContestScoreboardStreamLifecycleTests {
         when(strategy.rebuildHistory(any())).thenReturn(true);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
+        position.recordAppliedOffset(4L);
 
         lifecycle.recoverConsumption();
 
@@ -207,6 +212,7 @@ class ContestScoreboardStreamLifecycleTests {
         when(strategy.rebuildHistory(any())).thenReturn(true);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
+        position.recordAppliedOffset(4L);
 
         lifecycle.recoverConsumption();
 
@@ -215,8 +221,35 @@ class ContestScoreboardStreamLifecycleTests {
         verify(strategy).rebuildHistory(range.capture());
         assertThat(range.getValue().checkpointOffset()).isEqualTo(2L);
         assertThat(range.getValue().firstLostOffset()).isEqualTo(3L);
+        // Both ends: the rollback took away everything from the checkpoint up to what this process
+        // applied, and a rebuild that stopped short of that top is not one that covered the range.
+        assertThat(range.getValue().lastLostOffset()).isEqualTo(4L);
         assertThat(range.getValue().highestAppliedOffset()).isEqualTo(4L);
         assertThat(position.rebuiltThrough()).isEqualTo(4L);
+    }
+
+    /**
+     * A restart does not write over how far this process applied.
+     *
+     * <p>That watermark is the only trace in memory of a Redis rollback, and the checkpoint a
+     * resubscribe resumes from sits behind it by definition - so a restart that wrote the resume
+     * position into it would erase the very value this pass reads to decide that a rollback happened,
+     * and a later restore to a point above the resume position would go unnoticed and unasked about.</p>
+     */
+    @Test
+    void aRestartLeavesWhatThisProcessAppliedWhereItWas() {
+        when(applier.currentStreamOffset()).thenReturn(9L, 6L);
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(true);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordAppliedOffset(9L);
+
+        lifecycle.recoverConsumption();
+
+        assertThat(consumerArguments()).containsEntry("x-stream-offset", 6L);
+        assertThat(position.highestAppliedOffset())
+                .as("the resume position is not the applied watermark")
+                .isEqualTo(9L);
     }
 
     /**
@@ -231,6 +264,7 @@ class ContestScoreboardStreamLifecycleTests {
         when(strategy.rebuildHistory(any())).thenReturn(false);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
+        position.recordAppliedOffset(4L);
 
         lifecycle.recoverConsumption();
 
@@ -250,6 +284,7 @@ class ContestScoreboardStreamLifecycleTests {
         when(strategy.rebuildHistory(any())).thenReturn(true);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
+        position.recordAppliedOffset(4L);
 
         lifecycle.recoverConsumption();
         lifecycle.recoverConsumption();
@@ -267,6 +302,7 @@ class ContestScoreboardStreamLifecycleTests {
         when(strategy.rebuildHistory(any())).thenReturn(true);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
+        position.recordAppliedOffset(4L);
 
         lifecycle.recoverConsumption();
         position.recordAppliedOffset(2L);
