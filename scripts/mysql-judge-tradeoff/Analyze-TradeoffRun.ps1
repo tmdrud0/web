@@ -601,8 +601,9 @@ if (Test-Path $stagesPath) {
         $latencyByClass = Get-LatencyClassSummary $stageLatencyRows
 
         # The guard-adjusted scrape was added for this experiment. Existing counters retain their
-        # hold-wide start label for backwards compatibility, while these class metrics span the same
-        # 60-second window as the cohort percentiles and throughput rows.
+        # hold-wide start label for backwards compatibility. Timer deltas below are completion-attributed:
+        # an invocation contributes its full duration when its timer is recorded between the two scrapes.
+        # They therefore are not an integral of worker occupancy over the 60-second interval.
         $classMetricStartLabel = if ($stage.prometheusMeasurementStartLabel) {
             [string]$stage.prometheusMeasurementStartLabel
         } else { [string]$stage.prometheusStartLabel }
@@ -615,19 +616,19 @@ if (Test-Path $stagesPath) {
                 "contest_judge_latency_class_duration_seconds_sum" $tag
             $judgeWorkByClass[$latencyClass] = [ordered]@{
                 invocations = $classInvocations
-                actualDurationSeconds = $classDurationSeconds
-                actualDurationMillis = if ($null -eq $classDurationSeconds) { $null } else { [math]::Round(1000.0 * $classDurationSeconds, 3) }
+                completionAttributedDurationSeconds = $classDurationSeconds
+                completionAttributedDurationMillis = if ($null -eq $classDurationSeconds) { $null } else { [math]::Round(1000.0 * $classDurationSeconds, 3) }
             }
         }
-        $classActualJudgeSeconds = if (@($judgeWorkByClass.fast.actualDurationSeconds, $judgeWorkByClass.slow.actualDurationSeconds) -contains $null) {
+        $completionAttributedJudgeSeconds = if (@($judgeWorkByClass.fast.completionAttributedDurationSeconds, $judgeWorkByClass.slow.completionAttributedDurationSeconds) -contains $null) {
             $null
-        } else { [math]::Round($judgeWorkByClass.fast.actualDurationSeconds + $judgeWorkByClass.slow.actualDurationSeconds, 6) }
-        $availableWorkerSeconds = [math]::Round($mSeconds * 2 * [int]$parameters.workerCountPerNode, 3)
+        } else { [math]::Round($judgeWorkByClass.fast.completionAttributedDurationSeconds + $judgeWorkByClass.slow.completionAttributedDurationSeconds, 6) }
+        $nominalWorkerSeconds = [math]::Round($mSeconds * 2 * [int]$parameters.workerCountPerNode, 3)
         $judgeWorkByClass["total"] = [ordered]@{
-            actualDurationSeconds = $classActualJudgeSeconds
-            availableWorkerSeconds = $availableWorkerSeconds
-            actualDurationPerAvailableWorkerSecond = if ($null -eq $classActualJudgeSeconds -or $availableWorkerSeconds -le 0) { $null } else { [math]::Round($classActualJudgeSeconds / $availableWorkerSeconds, 6) }
-            windowBasis = "guard-adjusted measurement window; class counters use the measurement-start and hold-end Prometheus snapshots"
+            completionAttributedDurationSeconds = $completionAttributedJudgeSeconds
+            nominalWorkerSeconds = $nominalWorkerSeconds
+            completionAttributedDurationPerNominalWorkerSecond = if ($null -eq $completionAttributedJudgeSeconds -or $nominalWorkerSeconds -le 0) { $null } else { [math]::Round($completionAttributedJudgeSeconds / $nominalWorkerSeconds, 6) }
+            windowBasis = "timer recordings completed between guard-adjusted measurement-start and hold-end snapshots; each completed invocation contributes its full duration, so invocations crossing either boundary are censored or asymmetrically attributed. This is not a time integral of worker occupancy or exact utilization."
         }
 
         $claimByNode = [ordered]@{}

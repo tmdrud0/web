@@ -335,7 +335,13 @@ foreach ($mif in @($byMif.Keys | Sort-Object)) {
     $lines += "- max-in-flight ${mif}: $(($ordered | ForEach-Object { "$($_.mysqlClaimTimeout) -> duplicate claims $(Format-Value $_.duplicateClaims), duplicate judgements $(Format-Value $_.duplicateJudgeExecutions), result RPS $(Format-Value $_.resultPerSecond), p95 total $(Format-Value $_.p95TotalMs)ms, drain $(Format-Value $_.drainSeconds)s" }) -join ' | ')"
 }
 $lines += @("", "The timeout column is the configured claim timeout, not a measured lease duration: a claim is reclaimed by any later poll once its age passes that value, so the effective lease is the configured timeout plus up to one poll interval.")
-$lines += @("", "Scope of each column, because three different windows are in play and reading them as one is a mistake: `accepted`, `judge invocations`, the duplicate columns and the residual span the run's whole measurement phase (baseline snapshot to end snapshot) - the idle between the warm-up quiescing and the ramp, the 5s ramp, the 63s hold and the drain, about 75s in these runs, not the 63s hold alone; the percentiles span only the 60s steady window inside that hold, with the 5s ramp excluded; the rate columns (`result RPS`, `backlog growth`, the second-half slope) span the same 60s window. The per-10k ratios divide a run-scoped count by a run-scoped denominator, so they are consistent with each other but not with the window-scoped columns beside them.")
+$scopeDurations = @($runs | ForEach-Object {
+    "$($_.runId)=$(Format-Value $_.latencyClassAccounting.total.measurementScopeSeconds)s"
+}) -join ", "
+$lines += @(
+    "",
+    "Scope of each column, because three different windows are in play and reading them as one is a mistake: accepted, judge invocations, the duplicate columns and the residual span the run's whole measurement phase (baseline snapshot to end snapshot) - the idle between the warm-up quiescing and the ramp, the 5s ramp, the 63s hold and the drain, not the 63s hold alone. Recorded baseline-to-end durations: $scopeDurations. The percentiles span only the 60s steady window inside that hold, with the 5s ramp excluded; the rate columns (result RPS, backlog growth, the second-half slope) span the same 60s window. The per-10k ratios divide a run-scoped count by a run-scoped denominator, so they are consistent with each other but not with the window-scoped columns beside them."
+)
 
 $lines | Set-Content $markdownPath -Encoding utf8
 

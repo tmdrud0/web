@@ -155,18 +155,23 @@ measurement contest submission과 그 invocation이 닫히므로 class별 `invoc
 708,714ms로 같은 크기다. 다만 개별 invocation의 first/duplicate tag는 없으므로 708,000ms는
 `354 × 2000ms` 계산값이며 “실측 duplicate duration”으로 부르지 않는다.
 
-### 8.2 정확한 60초 측정창 worker-seconds
+### 8.2 60초 측정창의 completion-attributed timer seconds
 
-guard 이후 별도 Prometheus snapshot과 hold-end snapshot 사이에서 측정했다. 두 노드의 가용량은
-`2 × 16 × 60 = 1,920 worker-seconds`다.
+guard 이후 별도 Prometheus snapshot과 hold-end snapshot 사이의 timer delta다. Micrometer timer는
+invocation이 끝날 때 전체 duration을 기록하므로, 시작 경계를 걸친 invocation은 전체 시간이 들어가고
+종료 경계를 걸친 invocation은 빠진다. 따라서 아래 값은 worker occupancy의 시간 적분이나 정확한
+utilization이 아니라 **두 snapshot 사이에 완료 기록된 invocation에 귀속된 timer seconds**다.
+비율의 명목 분모는 `2 × 16 × 60 = 1,920 worker-seconds`다.
 
-| timeout | fast invocation seconds | slow invocation seconds | total judge-seconds | 가용 worker-seconds 대비 |
+| timeout | fast completion-attributed seconds | slow completion-attributed seconds | total timer seconds | 명목 1,920 worker-seconds 대비 |
 |---|---:|---:|---:|---:|
 | 2500ms | 313.936 | 634.033 | 947.969 | 49.37% |
 | 1s | 238.300 | 1,040.046 | 1,278.346 | **66.58%** |
 
 1s에서는 result 처리량이 떨어졌기 때문에 창 안의 fast invocation 수 자체는 줄었지만, slow
-worker-seconds는 406.013초 증가했다.
+completion-attributed timer seconds는 406.013초 증가했다. 이 차이는 경계 censoring이 있는 보조
+지표이며, clean baseline부터 drain 이후까지 모두 닫힌 run-scope accounting이 실제 총량 비교의
+주 근거다.
 
 ## 9. Duplicate claim / 실제 중복 채점 / republish
 
@@ -238,7 +243,7 @@ unapplied row의 합이다.
 7. **1s backlog는 지속 증가했나?** 그렇다. 전체 +25.295, 후반 +26.966 rows/s다.
 8. **drain은 증가했나?** 1.930s에서 18.145s로 9.4배다.
 9. **무결성은 유지됐나?** 두 조건 모두 유지됐다.
-10. **80 RPS에서 숨겨진 비용이 110 RPS에서 손실로 바뀌었나?** 이 표본에서는 그렇다.
+10. **80 RPS에서 숨겨진 비용이 110 RPS에서 측정창 내 처리용량 부족과 backlog로 바뀌었나?** 이 표본에서는 그렇다.
     이전 80 RPS run은 처리량이 약 78 RPS로 평평하고 1s 비용이 주로 지연으로 보였지만,
     이번 110 RPS에서는 result throughput -23.36%와 지속 backlog가 함께 나타났다.
 
@@ -272,14 +277,14 @@ unapplied row의 합이다.
 
 - synthetic sleep은 실제 채점 sandbox가 아니다.
 - 단일 run이라 작은 percentile/RPS 차이는 일반화하지 않는다.
-- 60초 창 시작 snapshot lag는 2500ms 820ms, 1s 574ms다. worker-second 비율에는 이 경계
-  오차가 남는다.
+- 60초 창 시작 snapshot lag는 2500ms 820ms, 1s 574ms다. completion-attributed timer 비율에는
+  이 경계 오차와 완료 시점 귀속 효과가 남으며, 정확한 worker utilization으로 읽을 수 없다.
 - MySQL CPU는 stock image에서 측정하지 못했다. connection과 InnoDB lock counter만 보존했다.
 - 총 HTTP attempt는 client maxDuration의 in-flight 요청 때문에 unavailable이다. 완료 요청과
   DB accepted를 분리했다.
 - 1s percentile은 overload queueing을 포함하므로 steady service-time percentile이 아니다.
-- run-scope actual judge-seconds의 분모에는 서로 다른 drain 길이가 포함되므로 조건 간 점유율 비교는
-  정확한 60초 창의 49.37%와 66.58%를 사용했다.
+- run-scope actual judge-seconds의 분모에는 서로 다른 drain 길이가 포함된다. 반대로 60초 창의
+  49.37%와 66.58%도 완료 시점 귀속 timer 비율이므로 정확한 점유율 비교는 제공하지 않는다.
 
 ## 15. 다음 장애 복구 실험에 미치는 영향
 
