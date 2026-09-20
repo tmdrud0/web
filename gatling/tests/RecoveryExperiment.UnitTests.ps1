@@ -35,6 +35,30 @@ Test-Case "ConvertTo-RequiredDouble rejects non-finite values" {
     Assert-Throws { ConvertTo-RequiredDouble -Value "+Inf" -Description "test" } "infinity is rejected"
 }
 
+Test-Case "ConvertFrom-SqlCell treats the text NULL as an absent value" {
+    # `mysql -N -B` prints SQL NULL as the four characters NULL, so `MIN(LENGTH(id))` over no rows reaches
+    # a caller as a string that passes both `$null -ne $cell` and an IsNullOrWhiteSpace check. The oracle's
+    # submission-id width guard was written to tolerate an empty contest - it asks for null, the empty
+    # string or whitespace - and was defeated by this third spelling of absence. Hence a function with a
+    # test rather than an inline comparison, so that the next guard can ask once and be answered.
+    Assert-True ($null -eq (ConvertFrom-SqlCell -Value "NULL")) "the text NULL is absent"
+    Assert-Equal "13" (ConvertFrom-SqlCell -Value "13") "a number is passed through"
+    Assert-Equal "ACCEPTED" (ConvertFrom-SqlCell -Value "ACCEPTED") "a word is passed through"
+    Assert-Equal "" (ConvertFrom-SqlCell -Value "") "an empty cell stays an empty string, which is a value and not an absence"
+}
+
+Test-Case "an object[] cast of a string[] is the same array, not a copy" {
+    # This is what makes the reader build its rows explicitly. .NET arrays are covariant, so the cast is a
+    # reference conversion: assigning null into the result writes into the original `string[]`, where a
+    # `[string]` element coerces it to the empty string. The normalization then reports success and the
+    # absence is unreadable again, which is how the oracle's finalized-contest check broke twice.
+    $fields = @("NULL", "x")
+    $cast = [object[]]$fields
+    Assert-True ([object]::ReferenceEquals($cast, $fields)) "the cast hands back the same array"
+    $cast[0] = $null
+    Assert-Equal "" $fields[0] "null assigned through the cast became an empty string in the original"
+}
+
 Test-Case "the pilot stack declares fifteen containers and no mysql" {
     $containers = Get-ExpectedPilotContainers
     Assert-Equal 15 $containers.Count "fifteen services are expected"
@@ -513,6 +537,38 @@ Test-Case "an array wrap is not left to protect a pipeline it has already closed
         }
     }
     Assert-True ($checked -ge 2) "the scan found the harness's array-wrapped pipelines ($checked found)"
+}
+
+Test-Case "every SQL reader normalizes the cell it hands a caller" {
+    # The two readers are the only place MySQL's untyped text becomes a value for this harness, so they are
+    # where a NULL is turned into an absence. A reader that casts its split line straight into string[] puts
+    # the text NULL back on the wire, and the guards above it go on asking a question they cannot answer.
+    #
+    # Scoped to these libraries on purpose: `run-scoreboard-rdb-recovery.ps1` has readers of the same shape,
+    # and it is a pre-existing tool this experiment is not allowed to modify, so its behaviour is left as it
+    # was found rather than quietly changed here. Only the modules this harness owns are held to this.
+    foreach ($name in @("Invoke-SqlRows", "Invoke-SqlScalar")) {
+        $found = $false
+        foreach ($source in @(Get-HarnessSourceFiles)) {
+            if ($source.Name -notlike "RecoveryExperiment.*") { continue }
+            $text = Get-Content -LiteralPath $source.FullName -Raw
+            $start = $text.IndexOf("function $name {")
+            if ($start -lt 0) { continue }
+            $next = $text.IndexOf("`nfunction ", $start + 1)
+            $body = if ($next -lt 0) { $text.Substring($start) } else { $text.Substring($start, $next - $start) }
+            Assert-True ($body -match "ConvertFrom-SqlCell") `
+                "$($source.Name): $name hands a caller an unnormalized cell, so the text NULL arrives as a value"
+            if ($name -eq "Invoke-SqlRows") {
+                # And the normalization only survives in an `object[]` row: PowerShell coerces null into the
+                # empty string on assignment to a `[string]` element, so a `string[]` row would carry the
+                # absence back to being unreadable and the guard would answer wrongly a second time.
+                Assert-True ($body -match "object\[\]") `
+                    "$($source.Name): $name builds rows that cannot hold a null, so the absence it just normalized is coerced to an empty string"
+            }
+            $found = $true
+        }
+        Assert-True $found "the scan found $name"
+    }
 }
 
 # --- report -------------------------------------------------------------------------------------

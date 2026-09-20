@@ -309,9 +309,30 @@ function Invoke-SqlScript {
     return @($output)
 }
 
+# `mysql -N -B` has no types to carry: it prints SQL NULL as the four characters NULL. So an aggregate
+# over no rows - `MIN(user_id)`, `MAX(LENGTH(id))` - arrives as the string 'NULL', which passes both
+# `$null -ne $cell` and `[string]::IsNullOrWhiteSpace($cell)`, and a caller asking "is this aggregate
+# absent?" gets told no. Normalizing here, at the one boundary where MySQL's text becomes values, is what
+# makes that question answerable; nothing this harness asks of MySQL returns the text NULL as data, since
+# every cell is an id, a count, a timestamp or a digest. An empty cell is left alone: it is an empty
+# string, which is a value, and only NULL is the absence of one.
+function ConvertFrom-SqlCell {
+    param([string]$Value)
+
+    if ($Value -eq "NULL") {
+        return $null
+    }
+    return $Value
+}
+
 # Batched, tab separated, no header. Callers are numeric or single-token projections: a value with an
 # embedded tab or newline would be silently ambiguous here, and none of the statements this harness
 # runs can produce one.
+#
+# Rows are `object[]` and not `string[]` so that a normalized NULL survives, and the array is built
+# explicitly rather than cast: `[object[]]$stringArray` is a reference conversion, because .NET arrays
+# are covariant, so the cast hands back the same `string[]` and assigning null into it coerces the
+# absence to an empty string again - the whole normalization undone by a cast that looks like a copy.
 function Invoke-SqlRows {
     param(
         [Parameter(Mandatory = $true)][string]$Sql,
@@ -319,12 +340,17 @@ function Invoke-SqlRows {
     )
 
     $lines = @(Invoke-SqlScript -Sql $Sql -Description $Description)
-    $rows = New-Object 'System.Collections.Generic.List[string[]]'
+    $rows = New-Object 'System.Collections.Generic.List[object[]]'
     foreach ($line in $lines) {
         if ([string]::IsNullOrWhiteSpace([string]$line)) {
             continue
         }
-        $rows.Add([string[]]([string]$line -split "`t", -1))
+        $fields = [string]$line -split "`t", -1
+        $cells = New-Object 'object[]' $fields.Length
+        for ($i = 0; $i -lt $fields.Length; $i++) {
+            $cells[$i] = ConvertFrom-SqlCell -Value $fields[$i]
+        }
+        $rows.Add($cells)
     }
     return $rows.ToArray()
 }
@@ -340,7 +366,9 @@ function Invoke-SqlScalar {
     if ($null -eq $value) {
         throw "MySQL returned no value for $Description."
     }
-    return [string]$value
+    # A scalar is one cell, so it is normalized the same way: callers such as the latency percentiles ask
+    # whether the aggregate is absent, and must not be handed the text NULL and told it is a number.
+    return ConvertFrom-SqlCell -Value ([string]$value)
 }
 
 function Invoke-SqlInt64 {

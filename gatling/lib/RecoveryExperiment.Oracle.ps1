@@ -279,9 +279,9 @@ SELECT MIN(user_id), MAX(user_id), COUNT(DISTINCT user_id) FROM (
 "@ -Description "participant id spread")
     # A contest with nothing applied yet has no participants, and that is the honest state before the
     # load rather than a fault: `MIN` over no rows is NULL, and the injectivity question this check asks
-    # cannot be violated by an empty set. Checked the same way as the submission-id width below, which
-    # is empty at the same moment and was already written to tolerate it. The check still runs for real
-    # at the end of the run, when the participants exist and the answer can be wrong.
+    # cannot be violated by an empty set. This is the same emptiness the submission-id width below has to
+    # tolerate at the same moment. Both still run for real at the end of the run, when the participants
+    # exist and either answer can be wrong.
     $participants = ConvertTo-RequiredInt64 -Value $spread[0][2] -Description "participant count"
     $observed["participantCount"] = $participants
     if ($participants -eq 0) {
@@ -301,10 +301,12 @@ SELECT MIN(user_id), MAX(user_id), COUNT(DISTINCT user_id) FROM (
 
     # The scoreboard's own tie-break compares submission ids as decimal strings, so it orders them the
     # way arithmetic does only while they are all the same length. The oracle compares them as numbers.
+    # Before the load this contest has no submissions at all, and the question is then vacuous rather
+    # than violated: `MIN(LENGTH(id))` over no rows is NULL, which `Invoke-SqlRows` normalizes to `$null`.
     $lengths = @(Invoke-SqlRows -Sql @"
 SELECT MIN(LENGTH(id)), MAX(LENGTH(id)) FROM contest_submission WHERE contest_id = $($config.ContestId);
 "@ -Description "submission id width")
-    if ($null -ne $lengths[0][0] -and -not [string]::IsNullOrWhiteSpace([string]$lengths[0][0])) {
+    if ($null -ne $lengths[0][0]) {
         $minLength = ConvertTo-RequiredInt64 -Value $lengths[0][0] -Description "minimum submission id width"
         $maxLength = ConvertTo-RequiredInt64 -Value $lengths[0][1] -Description "maximum submission id width"
         $observed["submissionIdDigits"] = "$minLength..$maxLength"

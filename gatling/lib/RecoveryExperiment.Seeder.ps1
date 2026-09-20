@@ -270,8 +270,12 @@ function Assert-ExperimentSeedUsable {
 
     $config = Get-RecoveryConfig
     $tUser = '`user`'
+    # A bare `DATE_FORMAT(finalized_at, ...)` and not `IFNULL(..., 'NULL')`: this is a whole cell, so SQL
+    # NULL reaches `Invoke-SqlRows` as `$null` and the question "is it finalized?" is asked directly. The
+    # text sentinel is still needed in the seed report above, where the value sits inside a CONCAT and a
+    # NULL there would null the whole line rather than one field of it.
     $contest = @(Invoke-SqlRows -Sql @"
-SELECT IFNULL(DATE_FORMAT(finalized_at, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'),
+SELECT DATE_FORMAT(finalized_at, '%Y-%m-%d %H:%i:%s.%f'),
        NOW(6) BETWEEN start_time AND end_time,
        TIMESTAMPDIFF(SECOND, NOW(6), end_time)
   FROM contest WHERE id = $($config.ContestId);
@@ -289,13 +293,13 @@ SELECT COUNT(*) FROM $tUser u JOIN submission s ON s.user_id = u.id WHERE u.name
         phase = $Phase
         contestId = $config.ContestId
         observedAtUtc = [DateTimeOffset]::UtcNow.UtcDateTime.ToString("o")
-        finalizedAt = [string]$contest[0][0]
+        finalizedAt = if ($null -eq $contest[0][0]) { "not finalized" } else { [string]$contest[0][0] }
         insideWindow = ([string]$contest[0][1] -eq "1")
         secondsUntilEnd = [long]$contest[0][2]
         submissionsOutsideTheContestPath = $outsideSubmissions
     }
-    if ($record.finalizedAt -ne "NULL") {
-        throw "Contest $($config.ContestId) was finalized during $Phase; every result of this run after that point is invalid."
+    if ($null -ne $contest[0][0]) {
+        throw "Contest $($config.ContestId) was finalized during $Phase ($($record.finalizedAt)); every result of this run after that point is invalid."
     }
     if (-not $record.insideWindow) {
         throw "Contest $($config.ContestId) is outside its window during $Phase (ends in $($record.secondsUntilEnd)s). " +
