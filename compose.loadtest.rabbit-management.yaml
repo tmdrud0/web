@@ -1,0 +1,18 @@
+# Run-scoped overlay: publish the RabbitMQ management API on the host.
+#
+# Passed only by a rabbit fault-recovery run, and only for that run. compose.loadtest.yaml resets
+# rabbitmq's ports to none on purpose - the load-test stack is otherwise reachable only through
+# nginx, and a broker port left open on every run would be an isolation regression for the runs that
+# do not need it. This overlay exists so the one experiment that must read the broker's own counters
+# can, without reopening the port for anything else.
+#
+# The counters are only available over this API. `rabbitmqctl list_queues` rejects message_stats keys
+# on RabbitMQ 4.1, and publish/deliver/ack/redeliver are exactly what a redelivery measurement is
+# made of, so the CLI is not a substitute here.
+#
+# 15672 is the port the user selected for this experiment; the container that otherwise holds it is
+# stopped for the duration of the run and started again afterwards.
+services:
+  rabbitmq:
+    ports: !override
+      - "127.0.0.1:15672:15672"

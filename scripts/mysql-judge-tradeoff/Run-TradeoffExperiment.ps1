@@ -89,6 +89,23 @@ param(
     [int]$FaultMinRunning = 1,
     [int]$FaultMinReserved = 4,
     [int]$FaultFallbackMinReserved = 1,
+    # The rabbit trigger's own thresholds, kept as separate parameters rather than reused from the
+    # pair above. The two dispatch paths read different things: mysql's condition is `running` and
+    # `reserved` from the node's own executor gauges, while rabbit's is the count of that node's
+    # consumer channels the broker reports as holding an unacknowledged message - with prefetch=1 a
+    # channel holding one message is a worker mid-judgement. Sharing one number across both would
+    # make a reader of either run think the other's threshold had been applied to it.
+    #
+    # 4 of 16 is a deliberately low bar: the condition is "this node is serving", and a node that
+    # holds work on a quarter of its channels is serving by any reading. The fallback of 1 accepts a
+    # node that is merely mid-flight somewhere once the window has elapsed.
+    [int]$RabbitFaultMinUnacked = 4,
+    [int]$RabbitFaultFallbackMinUnacked = 1,
+    # The management API the broker sampler and the rabbit trigger both read. The credentials are the
+    # compose stack's own defaults rather than guest, so the API is not loopback-restricted.
+    [string]$RabbitManagementUrl = "http://127.0.0.1:15672",
+    [string]$RabbitManagementUser = "oj",
+    [string]$RabbitManagementPassword = "oj-password",
     # Open-arrival burst. The closed model answers "what does this population sustain"; this answers
     # "what happens when the arrivals keep coming", which is the question a capacity claim has to
     # survive. The arrivals are a clock, not a population: the offered rate is scheduled and pushed
@@ -228,6 +245,13 @@ if ($Staircase) {
 # defines its stage labels and the other two differ in what they do to the cluster mid-hold.
 $phasedLoad = [bool]$NormalTimeout -or [bool]$FaultRecovery
 $stagedLoad = [bool]$Staircase -or $phasedLoad
+# A rabbit fault run is the one experiment that reads the broker's own counters, and those are only
+# on the management API (`rabbitmqctl list_queues` rejects message_stats keys on RabbitMQ 4.1, so the
+# CLI cannot stand in). The overlay that publishes that port is passed for this combination alone, so
+# every other run keeps the stack's ports closed exactly as before.
+if ($FaultRecovery -and $DispatchMode -eq "rabbit") {
+    $composeArgs += @("-f", "compose.loadtest.rabbit-management.yaml")
+}
 # The open-arrival burst is its own model rather than a fourth staged mode: the staged runs are all
 # closed - a population paces itself and the offered rate is whatever that population sustains - and
 # every one of them reads its measurement off a traced hold whose head is the ramp. The burst's offer
@@ -260,12 +284,16 @@ if ($AuthPrepSeconds -gt 0 -and -not $phasedLoad) {
 if ($AuthPrepSeconds -lt 0) { throw "-AuthPrepSeconds must not be negative; 0 is the model that submits as it logs in." }
 if ($IngressPreflight -and -not $phasedLoad) { throw "-IngressPreflight establishes a phased run's session population before its warm-up; it does not apply to this one." }
 if ($phasedLoad) {
-    # The fault-recovery run is still mysql-only: its whole subject is what a killed claim lease
-    # does to the rows it held, and rabbit has no claim lease to lose. The normal-timeout run holds
-    # one rate across two contests and says nothing about the claim protocol, so it is meaningful
-    # for either dispatch path - and a rabbit capacity question is exactly that shape.
-    if ($DispatchMode -ne "mysql" -and -not ($NormalTimeout -and $DispatchMode -eq "rabbit")) {
-        throw "A phased-load run is mysql, or rabbit with -NormalTimeout; -FaultRecovery measures a MySQL claim lease."
+    # Both dispatch paths are measurable here, but they are measured on different evidence. Under
+    # mysql the subject is the claim lease: which rows the killed node held, how long its lease took
+    # to expire, and how the survivors re-claimed them. Under rabbit there is no lease to lose - the
+    # broker redelivers what the dead node held unacknowledged the moment its connection drops - so
+    # the subject is the consumer drop, the first redelivery, and whether the surviving single node
+    # carries the offered rate while the other is down. The trigger, the kill snapshot and the
+    # readiness gate all differ between the two, which is why each reads its own evidence rather
+    # than one path being a reinterpretation of the other.
+    if ($DispatchMode -ne "mysql" -and -not ($NormalTimeout -and $DispatchMode -eq "rabbit") -and -not $FaultRecovery) {
+        throw "A phased-load run is mysql, or rabbit with -NormalTimeout or -FaultRecovery."
     }
     if ($FaultEnabled) { throw "A phased-load run drives the fault from its own trigger, so -FaultEnabled does not apply to it." }
     if (-not $PSBoundParameters.ContainsKey("TargetRps")) { throw "A phased-load run requires an explicit -TargetRps: the offered rate is an input to the comparison, not a default." }
@@ -701,6 +729,10 @@ if ($NormalTimeout) {
     }
 }
 if ($FaultRecovery) {
+    # The trigger, the kill snapshot and the readiness gate all read dispatch-specific evidence, so
+    # the document says which path's rule was applied instead of describing one path's and leaving a
+    # reader to assume it held for the other.
+    $rabbitFault = ($DispatchMode -eq "rabbit")
     $parameters.faultRecovery = [ordered]@{
         enabled = $true
         targetRps = $TargetRps
@@ -717,16 +749,41 @@ if ($FaultRecovery) {
         # it is not a kill deadline, and nothing is killed at it.
         minSteadySecondsBeforeTriggerWindow = $FaultMinSteadySeconds
         triggerWaitSeconds = $FaultTriggerWaitSeconds
-        triggerPrimaryMinRunning = $FaultMinRunning
-        triggerPrimaryMinReserved = $FaultMinReserved
-        triggerFallbackMinReserved = $FaultFallbackMinReserved
-        triggerBasis = "poll the target node's executor gauges once the window is open; inject on the primary condition, else on the fallback when the window elapses, else inject anyway and mark the run faultNotInjectedWithActiveWork"
+        # The mysql condition's thresholds. Kept for mysql runs and marked unavailable for rabbit
+        # ones, because a rabbit run is not judged on a threshold it never read.
+        triggerPrimaryMinRunning = if ($rabbitFault) { $null } else { $FaultMinRunning }
+        triggerPrimaryMinReserved = if ($rabbitFault) { $null } else { $FaultMinReserved }
+        triggerFallbackMinReserved = if ($rabbitFault) { $null } else { $FaultFallbackMinReserved }
+        triggerPrimaryMinUnacked = if ($rabbitFault) { $RabbitFaultMinUnacked } else { $null }
+        triggerFallbackMinUnacked = if ($rabbitFault) { $RabbitFaultFallbackMinUnacked } else { $null }
+        triggerBasis = if ($rabbitFault) {
+            "poll the target node's own consumer channels on the live queue through the broker's management API once the window is open; a channel whose peer address resolves to that node's container and whose messages_unacknowledged is at or above the threshold is a worker mid-judgement, and the reading is corroborated by contest_judge_invocations_total observed to advance. Inject on the primary condition, else on the fallback when the window elapses, else inject anyway and mark the run faultNotInjectedWithActiveWork"
+        } else {
+            "poll the target node's executor gauges once the window is open; inject on the primary condition, else on the fallback when the window elapses, else inject anyway and mark the run faultNotInjectedWithActiveWork"
+        }
         downDurationSeconds = $DownDurationSeconds
         downDurationBasis = "restartRequestedAt - faultInjectedAt; the restart is scheduled at faultInjectedAt + downDurationSeconds, so a slow pre-kill snapshot shifts the window rather than shrinking it"
         restartSettingsIdentical = $true
-        nodeReadyBasis = "container running AND /actuator/health/readiness UP AND /actuator/prometheus scrapable AND contest_judge_claim_calls_total observed to advance; a judge container's own healthcheck is process liveness only and is not used"
-        claimedUnfinishedBasis = "the judge schema has no claimed_by column, so the claimed unfinished row count at kill time is a cluster-wide upper bound, not the killed node's active claims"
-        attemptsAboveOneBasis = "recovery re-claims, not concurrent duplicate CPU execution; the process that held the claim was SIGKILLed, so it did not keep judging"
+        nodeReadyBasis = if ($rabbitFault) {
+            "container running AND /actuator/health/readiness UP AND /actuator/prometheus scrapable AND the live queue's consumer count back at the configured total (workerCount x 2 nodes), which is the same reading the run reports as consumers 16 -> 32; a judge container's own healthcheck is process liveness only and is not used"
+        } else {
+            "container running AND /actuator/health/readiness UP AND /actuator/prometheus scrapable AND contest_judge_claim_calls_total observed to advance; a judge container's own healthcheck is process liveness only and is not used"
+        }
+        claimedUnfinishedBasis = if ($rabbitFault) {
+            "rabbit dispatch has no claim lease and therefore no claimed rows to snapshot; the equivalent kill-time evidence is the broker's own unacknowledged count on the live queue, recorded in kill-snapshot.json"
+        } else {
+            "the judge schema has no claimed_by column, so the claimed unfinished row count at kill time is a cluster-wide upper bound, not the killed node's active claims"
+        }
+        attemptsAboveOneBasis = if ($rabbitFault) {
+            "unavailable under rabbit dispatch: the outbox attempts column is the claim protocol's durable trace, and a redelivery from the broker does not touch it, so attempts > 1 here would describe something other than the kill"
+        } else {
+            "recovery re-claims, not concurrent duplicate CPU execution; the process that held the claim was SIGKILLed, so it did not keep judging"
+        }
+        judgeBacklogBasis = if ($rabbitFault) {
+            "accepted submissions - persisted results, as the experiment defines it. Under rabbit the outbox row is PUBLISHED once the broker confirms it, so a queue full of messages the judges have not reached is neither unfinished nor unapplied and both of those terms read zero; the result-count term is what carries that in-flight work. Rabbit's ready and unacknowledged depths are recorded as explanatory constituents and are never added into this value"
+        } else {
+            "unfinished outbox rows for the measured contest plus unapplied scoreboard rows; the judge backlog term is the MySQL relay's own unfinished count"
+        }
         simulationClass = "my.oj.perf.ContestSubmissionStepLoadSimulation"
         measuredStageLabel = "stage-0"
         measurementWindowBasis = "the hold minus steadyGuardSeconds; the preceding ramp is part of the schedule but outside every measured window"
@@ -957,6 +1014,16 @@ function Save-BacklogSample {
 
 function Observe-FaultRecovery {
     param([string]$Phase)
+    # Dispatch-aware in both of its halves, because both of them are statements about the claim
+    # protocol. The backlog it writes for mysql is the outbox relay's unfinished rows, and under
+    # rabbit that relay's count is near zero while the judges are far behind - written into the same
+    # file it would put two different definitions in one column. The stale-reclaim probe below reads
+    # the attempts column, which a broker redelivery never touches, so on this path it would report
+    # "no re-claim observed" for a run that redelivered hundreds of messages.
+    if ($DispatchMode -eq "rabbit") {
+        Save-RabbitBacklogSample $Phase | Out-Null
+        return
+    }
     Save-BacklogSample $Phase | Out-Null
     if ($null -eq $events.firstStaleReclaimObservedAt -and $events.contestId) {
         $reclaimed = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(o.attempts - 1, 0)), 0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId)"
@@ -990,6 +1057,374 @@ function Save-ClaimSnapshot {
         # The raw rows are handed back so the kill snapshot can report claimed_at ages without a
         # second query against a table that is only frozen after the kill.
         rows = $objects
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Rabbit-side observation, for the fault-recovery run only.
+#
+# Everything under this heading reads the broker's own management API. The CLI is not an option:
+# `rabbitmqctl list_queues` rejects message_stats keys on RabbitMQ 4.1, and publish/deliver/ack/
+# redeliver are exactly what a redelivery measurement is made of. The API is reachable because the
+# rabbit fault path adds the management overlay to $composeArgs, and only that path does.
+#
+# Every reader below follows the rule the rest of this file follows: a value that could not be read
+# is null, never zero. That rule matters more here than anywhere else in the harness, because the
+# two readings this experiment turns on - "this node holds unacknowledged work" and "the queue has
+# this many consumers" - are both counts whose zero is a meaningful finding. A failed HTTP call
+# reported as 0 would read as "the node was idle" and "nobody is consuming", which are conclusions
+# about the system under test drawn from a failure of the observer.
+$script:rabbitAuthHeader = @{
+    Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$RabbitManagementUser`:$RabbitManagementPassword"))
+}
+$script:rabbitLiveQueue = "contest.judge.live"
+$script:rabbitDeadQueue = "contest.judge.dead"
+
+function Get-RabbitApiBody {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $uri = "$RabbitManagementUrl$Path"
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            # The broker's own API over a loopback socket, but the container is under load while this
+            # is read, so one retry is taken before the reading is called unavailable.
+            $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri $uri -Headers $script:rabbitAuthHeader -ErrorAction Stop
+            return (Get-ResponseText -Response $response | ConvertFrom-Json)
+        } catch {
+            if ($attempt -eq 3) { return $null }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    return $null
+}
+
+function Get-RabbitNumber {
+    param($Object, [Parameter(Mandatory = $true)][string]$Name)
+    # One numeric field of a parsed API document, or null. The document is JSON, so a value is already
+    # a number or a string; the parse is invariant-culture and Float-styled for the same reason the
+    # gauge parse above is - a count that arrives as "16.0" must not read as unreadable.
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return ConvertTo-DoubleOrNull $property.Value
+}
+
+function Get-RabbitAddressMap {
+    # Address -> service name for the judge nodes, re-read on every call. It is not cached across the
+    # run because a restarted container can come back on a different address, and a map captured
+    # before the restart would attribute the replacement's channels to the node that was killed -
+    # which is the one attribution this experiment must not get wrong.
+    $map = @{}
+    foreach ($node in @("judge-1", "judge-2")) {
+        try {
+            $lines = @(& docker inspect --format "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}" "oj-loadtest-$node" 2>$null | Where-Object { $_ })
+            if ($lines.Count -eq 0) { continue }
+            $address = ([string]$lines[0]).Trim().Split(" ")[0]
+            if (-not [string]::IsNullOrWhiteSpace($address)) { $map[$address] = $node }
+        } catch { }
+    }
+    return $map
+}
+
+function Get-RabbitChannels {
+    # The live queue's consumer channels. `messages_unacknowledged` per channel is the only per-node
+    # reading the broker offers, because the judge's own actuator gauges are mysql-only - so "does
+    # judge-1 hold work" is answered from here or not at all.
+    $document = Get-RabbitApiBody -Path "/api/queues/%2F/$($script:rabbitLiveQueue)"
+    if ($null -eq $document) { return $null }
+    $channels = $document.PSObject.Properties["consumer_details"]
+    if ($null -eq $channels -or $null -eq $channels.Value) { return @() }
+    $map = Get-RabbitAddressMap
+    $rows = @()
+    foreach ($entry in @($channels.Value)) {
+        $channel = $entry.PSObject.Properties["channel_details"]
+        $peerHost = $null
+        if ($null -ne $channel -and $null -ne $channel.Value) {
+            $peer = $channel.Value.PSObject.Properties["peer_host"]
+            if ($null -ne $peer) { $peerHost = [string]$peer.Value }
+        }
+        $node = $null
+        if (-not [string]::IsNullOrWhiteSpace($peerHost)) {
+            $hostOnly = $peerHost.Split(":")[0]
+            if ($map.ContainsKey($hostOnly)) { $node = $map[$hostOnly] }
+        }
+        $rows += [pscustomobject]@{
+            node = $node
+            peerHost = $peerHost
+            unacked = Get-RabbitNumber -Object $entry -Name "messages_unacknowledged"
+            prefetch = Get-RabbitNumber -Object $entry -Name "prefetch_count"
+        }
+    }
+    return $rows
+}
+
+function Get-RabbitNodeUnacked {
+    param([Parameter(Mandatory = $true)][string]$Node)
+    # Summed over the node's own channels. An empty channel list is a real 0 - the node holds nothing
+    # - while an unreadable API is null, and the two are kept apart by the caller.
+    $channels = Get-RabbitChannels
+    if ($null -eq $channels) { return $null }
+    $total = 0.0
+    $counted = 0
+    foreach ($channel in $channels) {
+        if ($channel.node -ne $Node) { continue }
+        if ($null -eq $channel.unacked) { return $null }
+        $total += $channel.unacked
+        $counted++
+    }
+    return [pscustomobject]@{ unacked = $total; channels = $counted; totalChannels = @($channels).Count }
+}
+
+function Get-RabbitQueueState {
+    # The live queue's own counts, read as one document so the fields cannot come from two different
+    # instants. Consumers is the anchor the readiness gate and the recovery timeline both use.
+    $document = Get-RabbitApiBody -Path "/api/queues/%2F/$($script:rabbitLiveQueue)"
+    if ($null -eq $document) { return $null }
+    $stats = $document.PSObject.Properties["message_stats"]
+    $statsValue = if ($null -eq $stats) { $null } else { $stats.Value }
+    return [pscustomobject]@{
+        ready = Get-RabbitNumber -Object $document -Name "messages_ready"
+        unacked = Get-RabbitNumber -Object $document -Name "messages_unacknowledged"
+        consumers = Get-RabbitNumber -Object $document -Name "consumers"
+        publish = Get-RabbitNumber -Object $statsValue -Name "publish"
+        deliver = Get-RabbitNumber -Object $statsValue -Name "deliver"
+        ack = Get-RabbitNumber -Object $statsValue -Name "ack"
+        redeliver = Get-RabbitNumber -Object $statsValue -Name "redeliver"
+    }
+}
+
+function Get-RabbitDeadQueueState {
+    $document = Get-RabbitApiBody -Path "/api/queues/%2F/$($script:rabbitDeadQueue)"
+    if ($null -eq $document) { return $null }
+    return [pscustomobject]@{
+        ready = Get-RabbitNumber -Object $document -Name "messages_ready"
+        unacked = Get-RabbitNumber -Object $document -Name "messages_unacknowledged"
+        consumers = Get-RabbitNumber -Object $document -Name "consumers"
+    }
+}
+
+function Get-RabbitInvocationsTotal {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    # The rabbit dispatcher's own liveness counter. `contest.judge.invocations` is registered eagerly
+    # when the listener container binds, so it exists at the first scrape as 0 and a strictly larger
+    # later value still proves the dispatcher is serving. `contest.judge.stored_result.republish` is
+    # read as well: a redelivery whose result was already committed republishes instead of judging, so
+    # on its own the invocation counter can stand still while the node is demonstrably consuming.
+    try {
+        $content = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$Port/actuator/prometheus").Content
+        $values = @{}
+        foreach ($metric in @("invocations", "stored_result_republish")) {
+            $match = [regex]::Match($content, "(?m)^contest_judge_$metric(?:_total)?(?:\{[^}]*\})?\s+([^\s]+)$")
+            if ($match.Success) {
+                $values[$metric] = ConvertTo-DoubleOrNull $match.Groups[1].Value
+            } else {
+                $values[$metric] = $null
+            }
+        }
+        return $values
+    } catch { return $null }
+}
+
+function Wait-RabbitStackReady {
+    param([int]$TimeoutSeconds = 180)
+    # The management API only answers once the broker is up. Readiness at the app level is the
+    # existing nine-container gate; this one exists so the sampler and the trigger are not started
+    # against a broker that has not bound its listener yet.
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $overview = Get-RabbitApiBody -Path "/api/overview"
+        if ($null -ne $overview) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
+function Invoke-RabbitQueuePurge {
+    # Both judge queues are emptied before the measured load starts, and the result is recorded rather
+    # than assumed.
+    #
+    # The named volume that backs the broker survives `docker compose down`, so a queue can still hold
+    # messages from an earlier stack - and this experiment's central identity, `accepted - results`,
+    # counts a submission with no result row, which is exactly what a stranded message from a previous
+    # run looks like. Purging removes the messages outright, so the per-message delivery count starts
+    # fresh as well, and the dead-letter queue is emptied for the same reason: a run that begins with
+    # dead letters already in it cannot report its own dead-letter count as a finding.
+    $result = [ordered]@{}
+    foreach ($queue in @($script:rabbitLiveQueue, $script:rabbitDeadQueue)) {
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Method Delete `
+                -Uri "$RabbitManagementUrl/api/queues/%2F/$queue/contents" -Headers $script:rabbitAuthHeader -ErrorAction Stop
+            $result[$queue] = [ordered]@{ purged = $true; status = [int]$response.StatusCode }
+        } catch {
+            $status = $null
+            try { if ($null -ne $_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode } } catch { }
+            # A 404 is not a failure: the queue is declared by the application at startup, so a queue
+            # that does not exist yet is one that holds nothing, which is the state being asked for.
+            $result[$queue] = [ordered]@{
+                purged = ($status -eq 404)
+                status = $status
+                note = if ($status -eq 404) { "queue did not exist, which is already empty" } else { $_.Exception.Message }
+            }
+        }
+    }
+    return $result
+}
+
+function Save-RabbitFaultSnapshot {
+    param($Trigger, $NodeUnacked, $QueueState, $DeadState)
+    # The rabbit kill snapshot. The claimed-rows section of the mysql snapshot has no counterpart
+    # here - rabbit dispatch has no claim lease, so there is nothing to hold a lease - and it is
+    # reported as unavailable with that reason rather than as an empty claim list, because an empty
+    # list would read as "the killed node held no claims", which is a different statement.
+    $startedAt = [datetimeoffset]::UtcNow
+    $unfinishedGlobal = Get-SqlScalar "SELECT COUNT(*) FROM contest_judge_outbox WHERE status <> 'PUBLISHED'"
+    $accepted = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id=$($events.contestId)"
+    $results = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($events.contestId)"
+    $scoreboardPending = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($events.contestId) AND scoreboard_applied_at IS NULL"
+    # The kill-time unacked is the reading the trigger itself took, immediately before the kill: after
+    # the kill the node's connections are gone and its channels with them, so those are the only
+    # kill-time per-node readings that can exist. The queue state is read after, when the kill has
+    # frozen the cluster.
+    $atKill = [ordered]@{
+        killedNodeUnacknowledged = if ($null -eq $NodeUnacked) { $null } else { $NodeUnacked.unacked }
+        killedNodeConsumerChannels = if ($null -eq $NodeUnacked) { $null } else { $NodeUnacked.channels }
+        liveQueueConsumerChannels = if ($null -eq $NodeUnacked) { $null } else { $NodeUnacked.totalChannels }
+        killedNodeUnacknowledgedObservedAt = $Trigger.observedAt
+        queueReady = if ($null -eq $QueueState) { $null } else { $QueueState.ready }
+        queueUnacknowledged = if ($null -eq $QueueState) { $null } else { $QueueState.unacked }
+        queueConsumers = if ($null -eq $QueueState) { $null } else { $QueueState.consumers }
+        deadQueueReady = if ($null -eq $DeadState) { $null } else { $DeadState.ready }
+        deadQueueUnacknowledged = if ($null -eq $DeadState) { $null } else { $DeadState.unacked }
+        accepted = $accepted
+        results = $results
+        judgeBacklogAcceptedMinusResults = if ($null -eq $accepted -or $null -eq $results) { $null } else { [math]::Max(0, $accepted - $results) }
+        scoreboardPending = $scoreboardPending
+        unfinishedOutboxGlobal = $unfinishedGlobal
+        basis = "the per-node unacknowledged count is the trigger's own pre-kill reading of the killed node's consumer channels; the queue and dead-queue depths are read from the management API after the kill, when the cluster is frozen; a reading that failed is null and never 0"
+        readSeconds = [math]::Round(([datetimeoffset]::UtcNow - $startedAt).TotalSeconds, 3)
+    }
+    $document = [ordered]@{
+        capturedAt = [datetimeoffset]::UtcNow.ToString("o")
+        dispatchMode = "rabbit"
+        signal = "SIGKILL"
+        command = "docker compose -p oj-loadtest ... kill $KilledNode"
+        trigger = $Trigger
+        atKill = $atKill
+        claims = [ordered]@{
+            available = $false
+            reason = "rabbit dispatch has no claim lease: a message the killed node held unacknowledged returns to the queue when its connection drops, and no row ever recorded a claim over it. The equivalent kill-time evidence is atKill.killedNodeUnacknowledged."
+            clusterWideClaimedUnfinishedUpperBound = $null
+            exact = $false
+        }
+    }
+    $document | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDirectory "kill-snapshot.json") -Encoding utf8
+    return [pscustomobject]@{ document = $document; seconds = $document.atKill.readSeconds; ages = @() }
+}
+
+function Save-RabbitBacklogSample {
+    param([string]$Phase)
+    # The rabbit backlog series. Same file and same two columns as the mysql path so the readers that
+    # already exist keep working, but the definition is the experiment's: judge backlog is accepted
+    # submissions minus persisted results, because under rabbit the outbox row is PUBLISHED the moment
+    # the broker confirms it and the relay's own unfinished count is therefore near zero while the
+    # judges are still behind. The broker's ready and unacknowledged depths are written to the
+    # fault-backlog-components series as constituents and are never added into this value.
+    $accepted = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id=$($events.contestId)"
+    $results = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($events.contestId)"
+    $unapplied = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($events.contestId) AND scoreboard_applied_at IS NULL"
+    $path = Join-Path $runDirectory "backlog.csv"
+    if (-not (Test-Path $path)) { "timestamp,phase,unfinished,scoreboardUnapplied" | Set-Content $path -Encoding utf8 }
+    $unfinished = $null
+    if ($null -ne $accepted -and $null -ne $results) { $unfinished = [math]::Max(0, $accepted - $results) }
+    $unfinishedText = if ($null -eq $unfinished) { "" } else { [string]$unfinished }
+    $unappliedText = if ($null -eq $unapplied) { "" } else { [string]$unapplied }
+    Add-SampleRow -Path $path -Row "$([datetimeoffset]::UtcNow.ToString('o')),$Phase,$unfinishedText,$unappliedText"
+    if ($null -eq $unfinished -or $null -eq $unapplied) { return $null }
+    return ($unfinished + $unapplied)
+}
+
+function Save-RabbitBacklogComponents {
+    param($Sample)
+    # The identity behind the backlog column, so it can be re-checked against its own counts rather
+    # than trusted. The broker columns are explanatory: ready + unacked is what the queue is holding,
+    # and it is deliberately NOT part of the judge backlog - a message sitting ready has not been
+    # judged, but it is already counted once by `accepted - results`, and adding it again would
+    # double-count the same submission.
+    $path = Join-Path $runDirectory "fault-backlog-components.csv"
+    if (-not (Test-Path $path)) {
+        "timestamp,accepted,results,judgeBacklogAcceptedMinusResults,scoreboardPending," +
+        "brokerReady,brokerUnacked,brokerReadyPlusUnacked,note" |
+            Set-Content $path -Encoding utf8
+    }
+    # The live queue only. The dead-letter queue is read by the background sampler on its own 250ms
+    # clock and carried in rabbit-queue-samples.csv, so reading it a second time here would add a
+    # broker round trip to this tick for a column that already exists four times finer elsewhere.
+    $queue = Get-RabbitQueueState
+    # Read through locals with the null guard applied first: a chain of property accesses on a null
+    # sample is a silent null in this PowerShell, which is the same value an unreadable field
+    # produces, and the two must not be written as the same empty cell without the reason beside it.
+    $accepted = if ($null -eq $Sample) { $null } else { $Sample.accepted }
+    $results = if ($null -eq $Sample) { $null } else { $Sample.results }
+    $unapplied = if ($null -eq $Sample) { $null } else { $Sample.unapplied }
+    $brokerReady = if ($null -eq $queue) { $null } else { $queue.ready }
+    $brokerUnacked = if ($null -eq $queue) { $null } else { $queue.unacked }
+    $readyPlusUnacked = $null
+    if ($null -ne $brokerReady -and $null -ne $brokerUnacked) { $readyPlusUnacked = $brokerReady + $brokerUnacked }
+    $judgeBacklog = $null
+    if ($null -ne $accepted -and $null -ne $results) { $judgeBacklog = [math]::Max(0, $accepted - $results) }
+    $row = "$([datetimeoffset]::UtcNow.ToString('o'))," +
+        "$(Format-CellOrEmpty $accepted),$(Format-CellOrEmpty $results),$(Format-CellOrEmpty $judgeBacklog),$(Format-CellOrEmpty $unapplied)," +
+        "$(Format-CellOrEmpty $brokerReady),$(Format-CellOrEmpty $brokerUnacked),$(Format-CellOrEmpty $readyPlusUnacked)," +
+        "broker ready/unacked are explanatory constituents of the queue's depth and are never added into judgeBacklogAcceptedMinusResults; the dead-letter queue is sampled in rabbit-queue-samples.csv"
+    Add-SampleRow -Path $path -Row $row
+}
+
+function Format-CellOrEmpty {
+    param($Value)
+    # An unavailable reading is an empty cell, never a zero. Written as a function so the rule is
+    # stated once for this file's rabbit side rather than repeated at each column.
+    if ($null -eq $Value) { return "" }
+    return [string]$Value
+}
+
+function Set-RabbitSamplerPhase {
+    param([Parameter(Mandatory = $true)][string]$Phase)
+    # A one-line marker the sampler reads on its own tick. A file rather than a channel because the
+    # two are separate processes and the sampler must not block on the runner to label a sample it
+    # has already taken; a phase the runner never announces is recorded as "unknown" rather than
+    # stamped with the previous phase's name.
+    if ($null -eq $script:rabbitSamplerPhaseFile) { return }
+    try { Set-Content -Path $script:rabbitSamplerPhaseFile -Value $Phase -Encoding utf8 -ErrorAction Stop } catch { }
+}
+
+function Stop-RabbitSampler {
+    param([int]$TimeoutSeconds = 20)
+    # The stop file first, then the wait, then the job. A sampler killed while it is mid-write leaves
+    # a truncated CSV row, and this file's rows are the evidence - so it is asked to stop and given
+    # time to finish the tick it is in, and only removed once it has ended on its own.
+    if ($null -eq $script:rabbitSamplerJob) { return }
+    try {
+        if ($null -ne $script:rabbitSamplerStopFile) {
+            Set-Content -Path $script:rabbitSamplerStopFile -Value "stop" -Encoding utf8 -ErrorAction SilentlyContinue
+        }
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while ($script:rabbitSamplerJob.State -eq "Running" -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 250
+        }
+        if ($script:rabbitSamplerJob.State -eq "Running") {
+            Write-Warning "The rabbit sampler did not stop within ${TimeoutSeconds}s of its stop file; stopping the job."
+            Stop-Job -Job $script:rabbitSamplerJob -ErrorAction SilentlyContinue
+        }
+        # The job's own output is drained rather than ignored: a sampler that threw on its first tick
+        # and exited would otherwise leave an empty CSV and no explanation anywhere.
+        $samplerOutput = @(Receive-Job -Job $script:rabbitSamplerJob -ErrorAction SilentlyContinue)
+        if ($samplerOutput.Count -gt 0) {
+            $samplerOutput | Set-Content (Join-Path $runDirectory "rabbit-sampler-output.log") -Encoding utf8
+        }
+    } catch {
+        Write-Warning "Stopping the rabbit sampler failed: $_"
+    } finally {
+        Remove-Job -Job $script:rabbitSamplerJob -Force -ErrorAction SilentlyContinue
+        $script:rabbitSamplerJob = $null
     }
 }
 
@@ -2150,9 +2585,29 @@ function Wait-JudgeNodeReady {
         [Parameter(Mandatory = $true)][int]$Port,
         [int]$ReadinessTimeoutSeconds = 180,
         [int]$DispatcherTimeoutSeconds = 90,
-        [scriptblock]$OnPoll = $null,
-        $Progress = $null
+        # Gate 4's evidence is dispatch-specific, so both halves of it are passed in. The defaults
+        # reproduce the mysql behaviour exactly: read `contest_judge_claim_calls_total` from the
+        # node's own metrics endpoint and call the dispatcher active once that reading is strictly
+        # larger than the first one. A rabbit run supplies a different reader (the broker's consumer
+        # count on the live queue) and a different rule (the count is back at the configured total),
+        # because on rabbit the node's own endpoints cannot answer the question at all - and because
+        # the invocation counter alone would be the wrong test after a restart: a redelivery whose
+        # result was already committed republishes instead of judging, so a node that is consuming
+        # perfectly well can leave that counter standing still and be declared never-ready.
+        [scriptblock]$DispatcherReading = $null,
+        [scriptblock]$DispatcherSatisfied = $null,
+        [string]$DispatcherCounterName = "contest_judge_claim_calls_total"
     )
+    # Assigned in branches rather than as `$x = if (...) {...} else {...}`: an if used as an
+    # expression unrolls its output in this PowerShell, which is a habit this file keeps everywhere.
+    $readDispatcher = $DispatcherReading
+    if ($null -eq $readDispatcher) {
+        $readDispatcher = { param($probePort) Get-ClaimCallsTotal -Port $probePort }
+    }
+    $dispatcherIsActive = $DispatcherSatisfied
+    if ($null -eq $dispatcherIsActive) {
+        $dispatcherIsActive = { param($first, $last) return ($null -ne $last -and ($null -eq $first -or $last -gt $first)) }
+    }
     # Four gates in order, because each one's evidence only means something once the previous holds.
     # gate 1: the container is running. gate 2: Spring's readiness group is UP. gate 3: the judge's
     # metrics endpoint can be scraped. gate 4: the dispatcher has actually claimed since it started.
@@ -2195,21 +2650,21 @@ function Wait-JudgeNodeReady {
     Wait-JudgeMetrics -Node $Node -OnPoll $OnPoll
     $metricsAt = [datetimeoffset]::UtcNow
     if ($null -ne $Progress) { $Progress.metricsAt = $metricsAt }
-    $claimCallsAtFirstScrape = Get-ClaimCallsTotal -Port $Port
+    $claimCallsAtFirstScrape = & $readDispatcher $Port
     $dispatcherDeadline = (Get-Date).AddSeconds($DispatcherTimeoutSeconds)
     $dispatcherActiveAt = $null
     $claimCallsLast = $claimCallsAtFirstScrape
     while ((Get-Date) -lt $dispatcherDeadline) {
         if ($null -ne $OnPoll) { & $OnPoll }
         Start-Sleep -Milliseconds 500
-        $claimCallsLast = Get-ClaimCallsTotal -Port $Port
-        if ($null -ne $claimCallsLast -and ($null -eq $claimCallsAtFirstScrape -or $claimCallsLast -gt $claimCallsAtFirstScrape)) {
+        $claimCallsLast = & $readDispatcher $Port
+        if (& $dispatcherIsActive $claimCallsAtFirstScrape $claimCallsLast) {
             $dispatcherActiveAt = [datetimeoffset]::UtcNow
             break
         }
     }
     if ($null -eq $dispatcherActiveAt) {
-        throw ("$Node never showed contest_judge_claim_calls_total advancing within " +
+        throw ("$Node never showed $DispatcherCounterName advancing within " +
             "$DispatcherTimeoutSeconds seconds (first scrape $(if ($null -eq $claimCallsAtFirstScrape) { 'unavailable' } else { $claimCallsAtFirstScrape }), " +
             "last $(if ($null -eq $claimCallsLast) { 'unavailable' } else { $claimCallsLast })), so its " +
             "dispatcher is not confirmed active. Readiness was reached at $($readinessAt.ToString('o')).")
@@ -2226,8 +2681,14 @@ function Wait-JudgeNodeReady {
         metricsToDispatcherSeconds = [math]::Round(($dispatcherActiveAt - $metricsAt).TotalSeconds, 3)
         readinessProbeAttempts = $readinessAttempts
         lastReadinessStatus = $lastReadiness
+        # The mysql field names are kept for every run, so a reader of the mysql runs is unaffected;
+        # the generic pair is added beside them and names the counter that was actually read, so a
+        # rabbit run's gate is not reported under a metric it never touched.
         claimCallsAtFirstScrape = $claimCallsAtFirstScrape
         claimCallsWhenActive = $claimCallsLast
+        dispatcherCounterName = $DispatcherCounterName
+        dispatcherAtFirstScrape = $claimCallsAtFirstScrape
+        dispatcherWhenActive = $claimCallsLast
     }
 }
 
@@ -2578,10 +3039,31 @@ function Step-FaultRecoverySample {
     if ($now -lt $state.nextTick) { return }
     Save-StaircaseBoundarySnapshots -Trace $state.trace -NowMillis $now.ToUnixTimeMilliseconds() -Captured $state.captured
     $sample = Save-StaircaseSample -Phase "load" -Trace $state.trace -ContestId $state.contestId
+    # The judge backlog's definition is dispatch-specific, and this is where the two differ.
+    #
+    # MySQL's is the outbox relay's unfinished rows: a claim that was lost is still an unpublished
+    # outbox row, so that count IS the stranded work. Under rabbit it is not: the outbox row is
+    # PUBLISHED the moment the broker confirms it, so a queue full of messages the judges have not
+    # reached yet leaves both `unfinishedOutbox` and `unappliedScoreboard` at zero - the pipeline
+    # would read as drained with a thousand submissions still in it. The experiment's own definition
+    # is accepted submissions minus persisted results, and that is what carries that in-flight work.
+    #
+    # Rabbit's ready and unacknowledged depths are deliberately not a third term. A message sitting
+    # ready has not been judged, but it is already counted once by accepted-minus-results, and adding
+    # the broker's depth would count the same submission twice. They are written to
+    # fault-backlog-components.csv as explanatory constituents instead.
+    $unfinished = $sample.unfinishedContest
+    if ($DispatchMode -eq "rabbit") {
+        $unfinished = $null
+        if ($null -ne $sample.accepted -and $null -ne $sample.results) {
+            $unfinished = [math]::Max(0, $sample.accepted - $sample.results)
+        }
+    }
     $state.samples.Add([pscustomobject]@{
-        at = $now; unfinished = $sample.unfinishedContest
+        at = $now; unfinished = $unfinished
         unapplied = $sample.unappliedContest; accepted = $sample.accepted; results = $sample.results
     })
+    if ($DispatchMode -eq "rabbit") { Save-RabbitBacklogComponents -Sample $sample }
     $state.nextTick = $state.nextTick.AddSeconds(1)
     if (([datetimeoffset]::UtcNow - $state.nextTick).TotalMilliseconds -gt 1000) { $state.nextTick = [datetimeoffset]::UtcNow }
 }
@@ -2640,7 +3122,80 @@ function Invoke-FaultRecoveryPhase {
         $now = [datetimeoffset]::UtcNow
 
         # ---- A. trigger evaluation, before any sampling ----
-        if (-not $injected -and $null -eq $escalation -and $now -ge $windowOpenAt) {
+        #
+        # Two dispatch paths, two pieces of evidence, and neither is a reinterpretation of the other.
+        # MySQL asks the node's own executor gauges what it is holding. Rabbit cannot: those gauges
+        # are registered only when dispatch-mode=mysql, so on a rabbit run Get-JudgeGauges returns
+        # empty strings for all three - the trigger's condition would never be readable and every run
+        # would be marked faultNotInjectedWithActiveWork regardless of what the judge was doing. The
+        # rabbit trigger therefore reads the broker instead, where the same fact is visible: a
+        # consumer channel whose prefetch is 1 and whose messages_unacknowledged is 1 is a worker
+        # holding a message it has not acknowledged, which is precisely "this node is mid-judgement".
+        if ($DispatchMode -eq "rabbit") {
+            if (-not $injected -and $null -eq $escalation -and $now -ge $windowOpenAt) {
+                $gaugeAt = [datetimeoffset]::UtcNow
+                $nodeUnacked = Get-RabbitNodeUnacked -Node $KilledNode
+                # The invocation and republish counters are read as corroboration, not as the
+                # condition. A redelivery whose result was already committed republishes instead of
+                # judging, so the invocation counter alone can stand still on a node that is
+                # demonstrably consuming - which is why it is reported beside the channel reading
+                # rather than used in place of it.
+                $invocationsBefore = Get-RabbitInvocationsTotal -Port $killedPort
+                Start-Sleep -Milliseconds 1000
+                $invocationsAfter = Get-RabbitInvocationsTotal -Port $killedPort
+                $unacked1 = if ($null -eq $nodeUnacked) { $null } else { $nodeUnacked.unacked }
+                $channels1 = if ($null -eq $nodeUnacked) { $null } else { $nodeUnacked.channels }
+                $invocationsAdvanced = $null
+                if ($null -ne $invocationsBefore -and $null -ne $invocationsAfter) {
+                    $before = $invocationsBefore.invocations
+                    $after = $invocationsAfter.invocations
+                    $beforeRepublish = $invocationsBefore.stored_result_republish
+                    $afterRepublish = $invocationsAfter.stored_result_republish
+                    $invocationsAdvanced = $false
+                    if ($null -ne $before -and $null -ne $after -and $after -gt $before) { $invocationsAdvanced = $true }
+                    if ($null -ne $beforeRepublish -and $null -ne $afterRepublish -and $afterRepublish -gt $beforeRepublish) { $invocationsAdvanced = $true }
+                }
+                if ($null -ne $unacked1 -and $unacked1 -ge 1) { $activeWorkSeen = $true }
+                $onTarget = ($null -ne $unacked1 -and $unacked1 -ge $RabbitFaultMinUnacked)
+                $fallback = ($null -ne $unacked1 -and $unacked1 -ge $RabbitFaultFallbackMinUnacked)
+                if ($onTarget) {
+                    $escalation = "unacked>=$RabbitFaultMinUnacked"
+                } elseif ($now -ge $triggerWaitEndsAt) {
+                    $escalation = if ($fallback) { "unacked>=$RabbitFaultFallbackMinUnacked-fallback" }
+                        elseif (-not $activeWorkSeen) { "no-active-work" }
+                        else { "window-elapsed-below-primary-threshold" }
+                }
+                if ($null -ne $escalation) {
+                    $triggerRecord = [ordered]@{
+                        windowOpenedAt = $windowOpenAt.ToString("o")
+                        observedAt = $gaugeAt.ToString("o")
+                        escalation = $escalation
+                        waitedSeconds = [math]::Round(($gaugeAt - $windowOpenAt).TotalSeconds, 3)
+                        primaryCondition = "$KilledNode consumer channels holding an unacknowledged message >= $RabbitFaultMinUnacked"
+                        fallbackCondition = "$KilledNode consumer channels holding an unacknowledged message >= $RabbitFaultFallbackMinUnacked once the window elapses"
+                        primaryMinUnacked = $RabbitFaultMinUnacked
+                        fallbackMinUnacked = $RabbitFaultFallbackMinUnacked
+                        judge1 = @{ unacked = $unacked1; consumerChannels = $channels1 }
+                        thresholdReadings = [ordered]@{
+                            killedNodeUnacknowledged = $unacked1
+                            killedNodeConsumerChannels = $channels1
+                            liveQueueConsumerChannels = if ($null -eq $nodeUnacked) { $null } else { $nodeUnacked.totalChannels }
+                            invocationsBefore = if ($null -eq $invocationsBefore) { $null } else { $invocationsBefore.invocations }
+                            invocationsAfter = if ($null -eq $invocationsAfter) { $null } else { $invocationsAfter.invocations }
+                            republishesBefore = if ($null -eq $invocationsBefore) { $null } else { $invocationsBefore.stored_result_republish }
+                            republishesAfter = if ($null -eq $invocationsAfter) { $null } else { $invocationsAfter.stored_result_republish }
+                            invocationsAdvanced = $invocationsAdvanced
+                            basis = "the per-node unacknowledged count is summed over the live queue's consumer channels whose peer address resolves to the killed node's container address at the moment of the read; the invocation and republish counters are read 1s apart as corroboration, and a counter that could not be read is null, never 0"
+                        }
+                        activeWorkSeen = $activeWorkSeen
+                        faultNotInjectedWithActiveWork = (-not $activeWorkSeen)
+                    }
+                    Write-Host ("[fault] trigger fired at $($gaugeAt.ToString('o')): escalation=$escalation " +
+                        "$KilledNode unacked=$unacked1 on $channels1 channels " +
+                        "(invocations advanced: $(if ($null -eq $invocationsAdvanced) { 'unavailable' } else { $invocationsAdvanced }); waited $($triggerRecord.waitedSeconds)s)")
+                }
+            }
+        } elseif (-not $injected -and $null -eq $escalation -and $now -ge $windowOpenAt) {
             $gaugeAt = [datetimeoffset]::UtcNow
             $judge1 = Get-JudgeGauges -Port 19001
             $judge2 = Get-JudgeGauges -Port 19002
@@ -2700,10 +3255,19 @@ function Invoke-FaultRecoveryPhase {
             $preFaultStartedAt = [datetimeoffset]::UtcNow
             Save-MetricsSnapshot "pre-fault"
             $events.preFaultSnapshotSeconds = [math]::Round(([datetimeoffset]::UtcNow - $preFaultStartedAt).TotalSeconds, 3)
-            $staleBefore = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(o.attempts - 1, 0)), 0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId)"
-            $events.staleAttemptsBeforeFault = if ($null -eq $staleBefore) { 0 } else { $staleBefore }
+            if ($DispatchMode -ne "rabbit") {
+                $staleBefore = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(o.attempts - 1, 0)), 0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId)"
+                $events.staleAttemptsBeforeFault = if ($null -eq $staleBefore) { 0 } else { $staleBefore }
+            } else {
+                # The outbox attempts column is the claim protocol's durable trace. Under rabbit a
+                # redelivery does not touch it, so the same query would report 0 for both ends of a
+                # run that redelivered a great deal - a reading that looks like a measurement and is
+                # not one. It is left unread and reported as unavailable instead.
+                $events.staleAttemptsBeforeFault = $null
+            }
             Invoke-Compose -Arguments @("kill", $KilledNode)
             $events.faultInjectedAt = [datetimeoffset]::UtcNow.ToString("o")
+            Set-RabbitSamplerPhase "fault-down"
             $script:faultWasInjected = $true
             $injected = $true
             # Scheduled from the injection itself, not from the trigger's clock position, so a slow
@@ -2716,17 +3280,55 @@ function Invoke-FaultRecoveryPhase {
             # The last two seconds before the restart belong to the clock alone, so any observation
             # that could cost more than that is kept out of them by construction.
             $downObserveUntil = $restartScheduledAt.AddSeconds(-2)
-            # Taken after the kill: the cluster's state is frozen, so no query here can race the kill,
-            # and the rows that are still PUBLISHING are exactly the ones the dead node was holding
-            # or waiting on - which the schema cannot attribute to a node.
-            $script:claimSnapshot = Save-ClaimSnapshot
-            $killSnapshot = Save-FaultSnapshot -Trigger $triggerRecord -ClaimSnapshot $script:claimSnapshot
+            if ($DispatchMode -eq "rabbit") {
+                # The rabbit path's kill-time evidence. The node's own channels are gone the instant
+                # its connection dropped, so the per-node reading that describes what it was holding
+                # is the trigger's, taken immediately before the kill and carried in the trigger
+                # record; the queue and dead-queue depths are read here, after the kill, when the
+                # cluster is frozen. There is no claim snapshot on this path and none is invented:
+                # rabbit dispatch holds no lease, so an empty claim list would be a statement about
+                # the schema dressed up as a measurement of the run.
+                $queueState = Get-RabbitQueueState
+                $deadState = Get-RabbitDeadQueueState
+                $nodeUnackedAtKill = [pscustomobject]@{
+                    unacked = $triggerRecord.thresholdReadings.killedNodeUnacknowledged
+                    channels = $triggerRecord.thresholdReadings.killedNodeConsumerChannels
+                    totalChannels = $triggerRecord.thresholdReadings.liveQueueConsumerChannels
+                }
+                $script:claimSnapshot = [pscustomobject]@{
+                    exact = $false
+                    ids = @()
+                    observedActiveClaimCount = $null
+                    rows = @()
+                    unavailableReason = "rabbit dispatch has no claim lease; the equivalent kill-time reading is the killed node's unacknowledged message count in kill-snapshot.json"
+                }
+                # Written with its header and no rows, because the analyzer's cohort code reads this
+                # file when it exists. A missing file would leave the claim cohorts with no
+                # explanation; an empty one with the reason in kill-snapshot.json says the schema has
+                # no claim to record here rather than that the collection failed.
+                "submission_id,claim_token,claimed_at,attempts" |
+                    Set-Content (Join-Path $runDirectory "killed-node-claims.csv") -Encoding utf8
+                $killSnapshot = Save-RabbitFaultSnapshot -Trigger $triggerRecord -NodeUnacked $nodeUnackedAtKill `
+                    -QueueState $queueState -DeadState $deadState
+                # The dead queue is read at the kill as well as by the sampler, so a run that begins
+                # with dead letters already in it is visible at the instant the outage starts.
+                $events.deadQueueDepthAtKill = if ($null -eq $deadState) { $null } else { $deadState.ready + $deadState.unacked }
+            } else {
+                # Taken after the kill: the cluster's state is frozen, so no query here can race the kill,
+                # and the rows that are still PUBLISHING are exactly the ones the dead node was holding
+                # or waiting on - which the schema cannot attribute to a node.
+                $script:claimSnapshot = Save-ClaimSnapshot
+                $killSnapshot = Save-FaultSnapshot -Trigger $triggerRecord -ClaimSnapshot $script:claimSnapshot
+            }
             # Positive means the kill snapshot started after the kill, which is the only order the
             # schema allows - the snapshot describes the post-kill cluster. The previous expression
             # subtracted the other way round, so a snapshot that started 0.68s after the kill was
             # reported as -0.68 seconds and read as if it had preceded it.
             $events.killToSnapshotStartSeconds = [math]::Round(
                 (([datetimeoffset]::UtcNow.AddSeconds(-$killSnapshot.seconds)) - [datetimeoffset]::Parse($events.faultInjectedAt)).TotalSeconds, 3)
+            # Observe-FaultRecovery is dispatch-aware: on this path it writes the rabbit backlog
+            # definition and makes no attempts-column observation, because a broker redelivery does
+            # not touch the claim protocol's durable trace.
             Observe-FaultRecovery "fault"
             Write-Host ("[fault] SIGKILL $KilledNode at $($events.faultInjectedAt); kill snapshot started " +
                 "$($events.killToSnapshotStartSeconds)s after the kill and took $($killSnapshot.seconds)s; " +
@@ -2740,7 +3342,12 @@ function Invoke-FaultRecoveryPhase {
                 # the last two seconds belong to the clock alone: past downObserveUntil this branch takes
                 # no sample and no reading, and waits on the deadline with no I/O of any kind.
                 Step-FaultRecoverySample
-                Observe-FaultRecovery "node-down"
+                if ($DispatchMode -eq "rabbit") {
+                    # No attempts-column observation on this path: the claim protocol's recovery
+                    # signal is not what a broker redelivery produces.
+                } else {
+                    Observe-FaultRecovery "node-down"
+                }
                 $downWindowObservationCount++
                 $sliceEnd = $now.AddSeconds(1)
                 if ($sliceEnd -gt $downObserveUntil) { $sliceEnd = $downObserveUntil }
@@ -2753,6 +3360,7 @@ function Invoke-FaultRecoveryPhase {
                 $events.restartRequestedAt = $restartRequestedAt.ToString("o")
                 $events.restartTimingErrorSeconds = [math]::Round(($restartRequestedAt - $restartScheduledAt).TotalSeconds, 3)
                 $restartRequested = $true
+                Set-RabbitSamplerPhase "post-restart"
                 Invoke-Compose -Arguments @("start", $KilledNode)
                 # Kept under the name the shared cohort labels already read.
                 $events.nodeRestartedAt = [datetimeoffset]::UtcNow.ToString("o")
@@ -2772,9 +3380,40 @@ function Invoke-FaultRecoveryPhase {
             Write-Host "[fault] waiting for $KilledNode to reach ready at $([datetimeoffset]::UtcNow.ToString('o'))"
             $gateProgress = [ordered]@{}
             try {
-                $nodeReadyDetail = Wait-JudgeNodeReady -Node $KilledNode -Port $killedPort `
-                    -ReadinessTimeoutSeconds 120 -DispatcherTimeoutSeconds 60 `
-                    -OnPoll { Step-FaultRecoverySample } -Progress $gateProgress
+                if ($DispatchMode -eq "rabbit") {
+                    # Gate 4 on this path asks the broker whether the killed node is consuming again,
+                    # and that is the right question for two reasons.
+                    #
+                    # It is the only question the evidence can answer. The node's own claim-calls
+                    # counter does not exist under rabbit dispatch, and the invocation counter is not
+                    # a substitute: a redelivery whose result was already committed republishes
+                    # instead of judging, so a node that came back and is consuming correctly can
+                    # leave `contest.judge.invocations` standing still - the gate would then time out
+                    # precisely on the runs where failover worked.
+                    #
+                    # And the reading is the same one the rest of this experiment is built on. The
+                    # live queue is consumed by two 16-worker nodes and nothing else, so its consumer
+                    # count returning to the configured total IS the killed node's sixteen channels
+                    # rejoining - the `consumers 16 -> 32` transition the recovery timeline reports.
+                    $expectedConsumers = $WorkerCount * 2
+                    # GetNewClosure, because a bare scriptblock is not a closure: the threshold would
+                    # be resolved in Wait-JudgeNodeReady's scope when the gate invokes it, where this
+                    # function's local does not exist, and the gate would compare against a null.
+                    $consumersRestored = {
+                        param($first, $last)
+                        return ($null -ne $last -and $last -ge $expectedConsumers)
+                    }.GetNewClosure()
+                    $nodeReadyDetail = Wait-JudgeNodeReady -Node $KilledNode -Port $killedPort `
+                        -ReadinessTimeoutSeconds 120 -DispatcherTimeoutSeconds 60 `
+                        -OnPoll { Step-FaultRecoverySample } -Progress $gateProgress `
+                        -DispatcherCounterName "consumers on $($script:rabbitLiveQueue)" `
+                        -DispatcherReading { param($probePort) (Get-RabbitQueueState).consumers } `
+                        -DispatcherSatisfied $consumersRestored
+                } else {
+                    $nodeReadyDetail = Wait-JudgeNodeReady -Node $KilledNode -Port $killedPort `
+                        -ReadinessTimeoutSeconds 120 -DispatcherTimeoutSeconds 60 `
+                        -OnPoll { Step-FaultRecoverySample } -Progress $gateProgress
+                }
                 $events.containerRunningAt = $nodeReadyDetail.containerRunningAt.ToString("o")
                 $events.nodeReadyAt = $nodeReadyDetail.nodeReadyAt.ToString("o")
                 Save-MetricsSnapshot "post-restart"
@@ -3022,6 +3661,65 @@ try {
     Wait-Healthy
     Invoke-Compose -Arguments @("restart", "nginx")
     Wait-Healthy
+    if ($FaultRecovery -and $DispatchMode -eq "rabbit") {
+        # Three things happen here, in this order, and the order is the point.
+        #
+        # The management API must be answering before either the sampler or the trigger reads it: the
+        # overlay publishes the port, but the broker binds its listener on its own clock, and a
+        # sampler started against a broker that has not bound yet would record a run-long stretch of
+        # unavailable readings where the baseline should be.
+        #
+        # The queues are then emptied. The named volume that backs the broker survives
+        # `docker compose down`, so a queue can still hold messages from an earlier stack - and this
+        # experiment's central identity, accepted minus results, counts a submission with no result
+        # row, which is exactly what a stranded message from a previous run looks like. Purging
+        # removes the messages outright, so each one's delivery count starts fresh as well.
+        #
+        # Only then is the sampler started, and it is started before the warm-up rather than before
+        # the measured phase: the broker's publish/deliver/ack/redeliver counters are cumulative for
+        # the broker's lifetime, so the run reports them as baseline-versus-end deltas, and a sampler
+        # that began at the measured window would have no baseline to subtract from.
+        if (-not (Wait-RabbitStackReady -TimeoutSeconds 180)) {
+            throw "The RabbitMQ management API at $RabbitManagementUrl never answered, so this run's broker observation - the queue sampler, the per-node unacknowledged trigger and the dead-letter count - cannot be taken. The management overlay publishes 127.0.0.1:15672; a run without that reading is not a fault-recovery measurement."
+        }
+        $events.rabbitQueuePurge = Invoke-RabbitQueuePurge
+        $events.rabbitQueuePurgeAt = [datetimeoffset]::UtcNow.ToString("o")
+        # The stop file's absence is what keeps the sampler running; the runner creates it after the
+        # drain. Started as a separate process because the fault loop is deadline-first and must not
+        # absorb a broker round trip - least of all in the two seconds before the restart, which are
+        # the outage's own clock.
+        #
+        # The configuration travels as one JSON argument rather than as a positional list. Start-Job
+        # -FilePath binds -ArgumentList positionally, so eleven separate arguments would silently
+        # mis-bind the moment either side's parameter order changed, and the failure would look like
+        # a sampler that read the wrong queue rather than like a binding error.
+        $script:rabbitSamplerStopFile = Join-Path $runDirectory "rabbit-sampler.stop"
+        Remove-Item -Path $script:rabbitSamplerStopFile -Force -ErrorAction SilentlyContinue
+        $script:rabbitSamplerPhaseFile = Join-Path $runDirectory "sampler-phase.txt"
+        "startup" | Set-Content $script:rabbitSamplerPhaseFile -Encoding utf8
+        $samplerConfig = @{
+            RunDirectory = $runDirectory
+            StopFile = $script:rabbitSamplerStopFile
+            ManagementUrl = $RabbitManagementUrl
+            User = $RabbitManagementUser
+            Password = $RabbitManagementPassword
+            LiveQueue = $script:rabbitLiveQueue
+            DeadQueue = $script:rabbitDeadQueue
+            Containers = @("oj-loadtest-nginx", "oj-loadtest-web-1", "oj-loadtest-web-2", "oj-loadtest-batch-1",
+                "oj-loadtest-judge-1", "oj-loadtest-judge-2", "oj-loadtest-mysql", "oj-loadtest-redis",
+                "oj-loadtest-rabbitmq")
+            MaxSeconds = 7200
+        } | ConvertTo-Json -Depth 4 -Compress
+        $script:rabbitSamplerJob = Start-Job -FilePath (Join-Path $PSScriptRoot "Invoke-RabbitFaultSampler.ps1") `
+            -ArgumentList $samplerConfig
+        $script:rabbitSamplerStartedAt = [datetimeoffset]::UtcNow
+        $events.rabbitSamplerStartedAt = $script:rabbitSamplerStartedAt.ToString("o")
+        $events.rabbitSamplerConfigJsonSha256 = [BitConverter]::ToString(
+            [Security.Cryptography.SHA256]::Create().ComputeHash(
+                [Text.Encoding]::UTF8.GetBytes($samplerConfig))).Replace("-", "").ToLowerInvariant()
+        Write-Host ("[fault] rabbit sampler started (job $($script:rabbitSamplerJob.Id)) after purging both judge queues; " +
+            "management API at $RabbitManagementUrl")
+    }
     if ($openBurst) {
         # One contest, and one prefix that no earlier run used. The burst submits into this contest and
         # its preparation logs in as this contest's users, so every count the run reports - the drain,
@@ -3387,6 +4085,7 @@ try {
             # with sampling, and the staged loop's "sleep only up to the next tick" rule has no notion
             # of a deadline that must not be overshot. Both loops write the same timeseries.csv columns
             # through Save-StaircaseSample, so the analyzer's windows and deltas are unaffected.
+            Set-RabbitSamplerPhase "measured"
             $recoveryPhase = Invoke-FaultRecoveryPhase -Process $gatling -Trace $staircaseTrace `
                 -ContestId $contestId -CapturedBoundaries $capturedBoundaries
         } else {
@@ -3438,6 +4137,7 @@ try {
     }
 
     $events.drainStartedAt = [datetimeoffset]::UtcNow.ToString("o")
+    Set-RabbitSamplerPhase "drain"
     $deadline = (Get-Date).AddSeconds($DrainTimeoutSeconds)
     $backlog = $null
     do {
@@ -3474,6 +4174,12 @@ try {
         throw "The drain gate never read the backlog: at least one tick returned no count, so this run's drain is undecided rather than complete."
     }
     if ($backlog -ne 0) { throw "Pipeline did not drain within $DrainTimeoutSeconds seconds." }
+    # The measured load has stopped and the pipeline is quiescent, which is the end of everything the
+    # broker sampler observes: the fault, the outage, the restart and the recovery all happened inside
+    # the window it has been recording. It is stopped here rather than left to the finally block so
+    # its files are complete and closed before the verification and the analyzer read them.
+    Stop-RabbitSampler
+    Set-RabbitSamplerPhase "stopped"
     Save-MetricsSnapshot "end"
     $events.measurementEndSnapshotAt = [datetimeoffset]::UtcNow.ToString("o")
     if ($stagedLoad) {
@@ -3774,8 +4480,20 @@ try {
     $unavailable.Add("duplicate judge time is bounded by the deterministic 50ms/2000ms profile; exact per-claim attribution is unavailable")
     if ($DispatchMode -eq "rabbit") { $unavailable.Add("Rabbit per-node running/local-waiting/reserved gauges are unavailable; worker-count x prefetch is recorded only as the configured normalized ceiling") }
     $unavailable.Add("MySQL CPU is not exposed by the stock mysql:8.0 container; connection and InnoDB lock counters are captured instead")
-    if (-not $claimSnapshot.exact -and $faultWasInjected) { $unavailable.Add("killed-node claim attribution: the outbox has no claimed_by column, so killed-node-claims.csv holds every node's PUBLISHING rows at kill time; the count is a cluster-wide claimed-unfinished upper bound and is never reported as the killed node's active claims") }
-    if ($faultWasInjected) { $unavailable.Add("attempts > 1 counts recovery re-claims after the lease expired, not concurrent duplicate CPU execution: the process holding the claim was SIGKILLed, so it did not keep judging. Testing true concurrent duplicate execution and fencing needs a separate docker pause -> timeout -> unpause experiment, which this round does not run.") }
+    if ($DispatchMode -eq "rabbit") {
+        # The three readings the mysql path reports and the rabbit path cannot. Each is stated as a
+        # reason rather than omitted, so a reader of this run's document can tell "not applicable to
+        # this dispatch path" apart from "the harness failed to collect it".
+        $unavailable.Add("killed-node claim attribution: rabbit dispatch holds no claim lease, so no row ever recorded a claim over a message. The equivalent kill-time evidence is the killed node's unacknowledged message count in kill-snapshot.json, which is exact for that node rather than a cluster-wide bound. killed-node-claims.csv is written with its header and no rows.")
+        if ($faultWasInjected) {
+            $unavailable.Add("attempts > 1 as a recovery signal: the outbox attempts column is the claim protocol's durable trace, and a broker redelivery does not touch it. It is not read on this path, and a value of 0 here would not mean nothing was redelivered.")
+            $unavailable.Add("the killed JVM's in-process counters are lower bounds in a SIGKILL run, exactly as on the mysql path: every increment between the pre-fault scrape and the kill died with the process. On this path the broker's own counters are the durable evidence and they are not affected - a broker counter lives in the broker, not in the node that was killed.")
+        }
+        $unavailable.Add("redelivered-submissions latency cohort: RabbitMQ keeps no per-delivery durable record, so a redelivery cannot be linked to the submission id it carried and that cohort cannot be formed. The aggregate decomposition is reported instead: the broker's redeliver counter against the sum of contest_judge_stored_result_republish_total (redelivered with the result already committed) and the remainder (redelivered and re-judged after the node died mid-execution).")
+        $unavailable.Add("concurrent duplicate execution: not distinguishable from a partial execution followed by a redelivery on this path either, so it is not estimated. A node SIGKILLed mid-judgement leaves a message that was partially processed and then redelivered, and RabbitMQ records no per-delivery outcome that would separate that from two judges running the same submission at once. Testing that needs a separate experiment (docker pause, not kill), which this round does not run.")
+    }
+    if (-not $claimSnapshot.exact -and $faultWasInjected -and $DispatchMode -ne "rabbit") { $unavailable.Add("killed-node claim attribution: the outbox has no claimed_by column, so killed-node-claims.csv holds every node's PUBLISHING rows at kill time; the count is a cluster-wide claimed-unfinished upper bound and is never reported as the killed node's active claims") }
+    if ($faultWasInjected -and $DispatchMode -ne "rabbit") { $unavailable.Add("attempts > 1 counts recovery re-claims after the lease expired, not concurrent duplicate CPU execution: the process holding the claim was SIGKILLed, so it did not keep judging. Testing true concurrent duplicate execution and fencing needs a separate docker pause -> timeout -> unpause experiment, which this round does not run.") }
     if ($null -eq $completedHttpRequests) {
         $unavailable.Add("completed HTTP submission count: Gatling simulation.log was not found")
     }
@@ -3922,8 +4640,8 @@ try {
                 restartScheduledAt = @{ value = $events.restartScheduledAt; gate = "faultInjectedAt + ${DownDurationSeconds}s, computed at the injection" }
                 restartRequestedAt = @{ value = $events.restartRequestedAt; gate = "recorded before docker compose start was invoked" }
                 containerRunningAt = @{ value = $events.containerRunningAt; gate = "docker inspect {{.State.Running}} == true for the single container, not the nine-container health gate" }
-                nodeReadyAt = @{ value = $events.nodeReadyAt; gate = "container running AND /actuator/health/readiness UP AND /actuator/prometheus scrapable AND contest_judge_claim_calls_total observed to advance" }
-                firstStaleObservedAt = @{ value = $events.firstStaleReclaimObservedAt; gate = "durable SUM(attempts - 1) above its pre-fault value, polled at about 1s so the observation error is bounded rather than exact" }
+                nodeReadyAt = @{ value = $events.nodeReadyAt; gate = if ($DispatchMode -eq "rabbit") { "container running AND /actuator/health/readiness UP AND /actuator/prometheus scrapable AND the live queue's consumer count back at the configured total, which is the killed node's sixteen channels rejoining" } else { "container running AND /actuator/health/readiness UP AND /actuator/prometheus scrapable AND contest_judge_claim_calls_total observed to advance" } }
+                firstStaleObservedAt = @{ value = $events.firstStaleReclaimObservedAt; gate = if ($DispatchMode -eq "rabbit") { "unavailable on this path: durable SUM(attempts - 1) is the claim protocol's re-claim signal and a broker redelivery does not touch it, so it is not read" } else { "durable SUM(attempts - 1) above its pre-fault value, polled at about 1s so the observation error is bounded rather than exact" } }
                 firstPostFaultResultAt = @{ value = $null; gate = "analyzer-only: MIN(result_saved_at) at or after faultInjectedAt, read from latency.csv" }
                 throughputRecoveredAt = @{ value = $events.throughputRecoveredAt; gate = "5s rolling result RPS at or above 90% of the pre-fault value for 3 consecutive windows" }
                 # This is the run's own during-run reading, and it is a lower bound on what the series
@@ -3970,6 +4688,12 @@ try {
                     metricsToDispatcherSeconds = $recoveryPhase.nodeReady.metricsToDispatcherSeconds
                     claimCallsAtFirstScrape = $recoveryPhase.nodeReady.claimCallsAtFirstScrape
                     claimCallsWhenActive = $recoveryPhase.nodeReady.claimCallsWhenActive
+                    # The counter this gate actually read. A rabbit run's gate is not reported under
+                    # the mysql counter's name, and the two field names above are kept so a reader of
+                    # the mysql runs is unaffected.
+                    dispatcherCounterName = $recoveryPhase.nodeReady.dispatcherCounterName
+                    dispatcherAtFirstScrape = $recoveryPhase.nodeReady.dispatcherAtFirstScrape
+                    dispatcherWhenActive = $recoveryPhase.nodeReady.dispatcherWhenActive
                     satisfied = $true
                 }
             }
@@ -3980,6 +4704,27 @@ try {
             faultNotInjectedWithActiveWork = $events.faultNotInjectedWithActiveWork
             runValidForRecovery = (-not $events.faultNotInjectedWithActiveWork) -and ($null -ne $events.nodeReadyAt) -and (-not $events.recoveryTimeout)
             killSnapshot = if ($null -eq $recoveryPhase -or $null -eq $recoveryPhase.killSnapshot) { $null } else {
+                if ($DispatchMode -eq "rabbit") {
+                    # The rabbit kill snapshot reads the broker rather than the outbox, so it is
+                    # reported under its own field names: the queue's own depths and the killed node's
+                    # unacknowledged count. Reusing the mysql names would publish a claim-lease
+                    # reading for a run that has no lease.
+                    [ordered]@{
+                        file = "kill-snapshot.json"
+                        killedNodeUnacknowledged = $recoveryPhase.killSnapshot.document.atKill.killedNodeUnacknowledged
+                        killedNodeConsumerChannels = $recoveryPhase.killSnapshot.document.atKill.killedNodeConsumerChannels
+                        liveQueueConsumerChannels = $recoveryPhase.killSnapshot.document.atKill.liveQueueConsumerChannels
+                        queueReady = $recoveryPhase.killSnapshot.document.atKill.queueReady
+                        queueUnacknowledged = $recoveryPhase.killSnapshot.document.atKill.queueUnacknowledged
+                        queueConsumers = $recoveryPhase.killSnapshot.document.atKill.queueConsumers
+                        deadQueueReady = $recoveryPhase.killSnapshot.document.atKill.deadQueueReady
+                        deadQueueUnacknowledged = $recoveryPhase.killSnapshot.document.atKill.deadQueueUnacknowledged
+                        judgeBacklogAcceptedMinusResults = $recoveryPhase.killSnapshot.document.atKill.judgeBacklogAcceptedMinusResults
+                        scoreboardPending = $recoveryPhase.killSnapshot.document.atKill.scoreboardPending
+                        unfinishedOutboxGlobal = $recoveryPhase.killSnapshot.document.atKill.unfinishedOutboxGlobal
+                        basis = "the killed node's unacknowledged count is the trigger's own reading, taken immediately before the kill - after it the node's connections are gone and its channels with them, so no post-kill read of that node can exist; the queue and dead-queue depths are read from the management API after the kill, when the cluster is frozen. Rabbit dispatch holds no claim lease, so there is no claimed-rows bound to report."
+                    }
+                } else {
                 [ordered]@{
                     file = "kill-snapshot.json"
                     unfinishedOutboxGlobal = $recoveryPhase.killSnapshot.document.atKill.unfinishedOutboxGlobal
@@ -3989,10 +4734,31 @@ try {
                     claimedUnfinishedAgeSeconds = $recoveryPhase.killSnapshot.document.claims.ageSeconds
                     basis = "the outbox has no claimed_by column, so this is a cluster-wide upper bound over every node's PUBLISHING rows at kill time"
                 }
+                }
             }
-            # attempts is durable after the fact, unlike claimed_at/updated_at, so the re-claim count is
-            # exact while the instant it was first observed is not.
-            reclaimAccounting = [ordered]@{
+        }
+        # attempts is durable after the fact, unlike claimed_at/updated_at, so the re-claim count is
+        # exact while the instant it was first observed is not. Assigned after the literal rather than
+        # as one of its keys, because the two dispatch paths report different things here and a key
+        # cannot be chosen by a branch inside a hashtable's own braces.
+        if ($DispatchMode -eq "rabbit") {
+            # No re-claim accounting exists on this path, and none is synthesized. The redelivery
+            # decomposition that replaces it is computed by the analyzer from the broker's own
+            # counters against the durable republish counter, and it is aggregate by construction:
+            # RabbitMQ keeps no per-delivery record, so a redelivery cannot be attributed to the
+            # submission it carried.
+            $faultRecoveryVerification.reclaimAccounting = [ordered]@{
+                available = $false
+                reason = "rabbit dispatch has no claim lease and no attempts-column trace of one; the recovery signal on this path is the broker's own redelivery of what the killed node held unacknowledged"
+                reclaimedRowsAfterFault = $null
+                reclaimedRowsInKillSnapshot = $null
+                killedNodeClaimAttributionExact = $null
+                label = "unavailable: a broker redelivery does not increment the outbox attempts column"
+                sigkillCounterLoss = "the killed JVM's in-process counters are lower bounds, exactly as on the mysql path. The broker's own publish/deliver/ack/redeliver counters are not: they live in the broker, which was not killed, so their deltas across this run are complete."
+                followUpCandidate = "not applicable to this path"
+            }
+        } else {
+            $faultRecoveryVerification.reclaimAccounting = [ordered]@{
                 reclaimedRowsAfterFault = $duplicateEstimate
                 reclaimedRowsInKillSnapshot = $script:claimSnapshot.observedActiveClaimCount
                 killedNodeClaimAttributionExact = [bool]$script:claimSnapshot.exact
@@ -4084,6 +4850,11 @@ try {
             }
         } catch { Write-Warning $_ }
     }
+    # The broker sampler is stopped here as well as in the success path, because the failure path
+    # unwinds through this block: a sampler left running would keep polling a broker that is about to
+    # be torn down, and its error log would fill with connection failures that describe the teardown
+    # rather than the run.
+    Stop-RabbitSampler
     if ($started -and -not $KeepStack) {
         try { Invoke-Compose -Arguments @("down") } catch { Write-Warning $_ }
     }
