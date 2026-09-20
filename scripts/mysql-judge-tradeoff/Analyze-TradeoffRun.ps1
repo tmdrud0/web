@@ -2105,52 +2105,136 @@ if (Test-Path $stagesPath) {
             $burstEndMillis = [long]$primaryStage.measurementEndMillis
             $burstWindowSource = "the trace-derived hold, because the recorder was written without its boundary fields"
         }
-        # The last tick at or before each boundary, so the rate is an endpoint delta over the ticks'
-        # own elapsed time. The rows inside the window alone would miss the head of it: the first tick
-        # inside the window is already a second of submissions in.
-        $burstBaselineRow = $null
-        $burstEndRow = $null
+        # What the stack did inside that window is read from the hold stage's own Prometheus snapshots:
+        # they are taken at the window's two boundaries, so the delta between them is the window and
+        # nothing else, and the stage's own measured seconds are its divisor. This is the same
+        # measurement the stage block publishes, read once more, so the two cannot disagree - the
+        # earlier version of this block took its endpoint deltas from the 1s sampler instead and did.
+        #
+        # The sampler cannot answer this question. Its ticks are about a second apart while it samples,
+        # but it is not sampling during the preparation phase, so a window that starts inside that gap
+        # has no tick at or before its start: "the last tick at or before the boundary" then reaches
+        # tens of seconds back, and a rate taken over the pair measures the gap rather than the burst.
+        # On the first real open-arrival run that turned a 10s window holding 3,650 accepted submissions
+        # into "87.3s at 33.5/s". The sampler is kept as a cross-check instead, and it reports its own
+        # slack and calls itself unusable whenever a boundary's nearest tick is further away than the
+        # ticks' own worst interval - which is exactly the hole case.
+        $burstWindowSeconds = $null
+        $burstTicksInWindow = $null
+        $burstCrossCheck = $null
         if ($null -ne $burstStartMillis -and $null -ne $burstEndMillis) {
+            $burstWindowSeconds = [math]::Round(($burstEndMillis - $burstStartMillis) / 1000.0, 3)
+            $burstTicksInWindow = @($timeseries | Where-Object {
+                [long]$_.epochMillis -ge $burstStartMillis -and [long]$_.epochMillis -lt $burstEndMillis }).Count
+            $burstBaselineRow = $null
+            $burstEndRow = $null
             foreach ($row in $timeseries) {
                 $at = [long]$row.epochMillis
                 if ($at -le $burstStartMillis) { $burstBaselineRow = $row }
                 if ($at -le $burstEndMillis) { $burstEndRow = $row }
             }
-        }
-        $burstDelivery = $null
-        if ($null -ne $burstBaselineRow -and $null -ne $burstEndRow) {
-            $burstElapsedSeconds = [math]::Round(([long]$burstEndRow.epochMillis - [long]$burstBaselineRow.epochMillis) / 1000.0, 3)
-            if ($burstElapsedSeconds -gt 0) {
-                $burstDeliveryAvailable = $true
-                $burstRates = [ordered]@{}
-                $burstCounts = [ordered]@{}
+            if ($null -ne $burstBaselineRow -and $null -ne $burstEndRow) {
+                $burstStartSlackMs = $burstStartMillis - [long]$burstBaselineRow.epochMillis
+                $burstEndSlackMs = $burstEndMillis - [long]$burstEndRow.epochMillis
+                $burstSamplerSeconds = [math]::Round(([long]$burstEndRow.epochMillis - [long]$burstBaselineRow.epochMillis) / 1000.0, 3)
+                $burstSamplerRates = [ordered]@{}
+                $burstSamplerCounts = [ordered]@{}
+                $burstSamplerReadable = ($burstSamplerSeconds -gt 0)
                 foreach ($metric in @("acceptedTotal", "resultsTotal", "scoreboardTotal")) {
                     $from = ConvertTo-LongOrNull ([string]$burstBaselineRow.$metric)
                     $to = ConvertTo-LongOrNull ([string]$burstEndRow.$metric)
-                    if ($null -eq $from -or $null -eq $to) {
-                        $burstDeliveryAvailable = $false
-                        $burstRates[$metric] = $null
-                        $burstCounts[$metric] = $null
+                    if ($null -eq $from -or $null -eq $to -or -not $burstSamplerReadable) {
+                        $burstSamplerReadable = $false
+                        $burstSamplerRates[$metric] = $null
+                        $burstSamplerCounts[$metric] = $null
                         continue
                     }
-                    $burstRates[$metric] = [math]::Round(($to - $from) / $burstElapsedSeconds, 3)
-                    $burstCounts[$metric] = $to - $from
+                    $burstSamplerRates[$metric] = [math]::Round(($to - $from) / $burstSamplerSeconds, 3)
+                    $burstSamplerCounts[$metric] = $to - $from
                 }
-                $burstDelivery = [ordered]@{
-                    available = $burstDeliveryAvailable
-                    basis = "the last 1s sample at or before each boundary of the burst's own window, read from timeseries.csv; the rate is the endpoint delta over the two ticks' own elapsed time, not an average of per-tick deltas"
-                    windowSeconds = $burstElapsedSeconds
-                    acceptedInWindow = $burstCounts["acceptedTotal"]
-                    resultsInWindow = $burstCounts["resultsTotal"]
-                    scoreboardAppliedInWindow = $burstCounts["scoreboardTotal"]
-                    acceptedPerSecond = $burstRates["acceptedTotal"]
-                    resultsPerSecond = $burstRates["resultsTotal"]
-                    scoreboardAppliedPerSecond = $burstRates["scoreboardTotal"]
-                    judgeBacklogAtWindowEnd = ConvertTo-LongOrNull ([string]$burstEndRow.unfinishedOutbox)
-                    scoreboardPendingAtWindowEnd = ConvertTo-LongOrNull ([string]$burstEndRow.unappliedScoreboard)
-                    ticksInWindow = @($timeseries | Where-Object {
-                        [long]$_.epochMillis -ge $burstStartMillis -and [long]$_.epochMillis -lt $burstEndMillis }).Count
+                # The bound a tick pair is honest within: the widest interval the sampler itself showed
+                # in this window. A boundary further from its tick than that is a boundary the sampler
+                # did not cover, and no rate may be taken across it. An absent bound is missing evidence
+                # rather than a clean one, so the cross-check stays unusable and says which it is.
+                $burstTickHonesty = if ($null -ne $primaryStage) { $primaryStage.tickHonesty } else { $null }
+                $burstMaxIntervalMs = if ($null -ne $burstTickHonesty) { $burstTickHonesty.maxIntervalMs } else { $null }
+                $burstCrossCheckUsable = $false
+                $burstCrossCheckReason = $null
+                if (-not $burstSamplerReadable) {
+                    $burstCrossCheckReason = "the sampler's bracketing ticks do not carry all three counters, so no cross-check rate can be taken from them"
+                } elseif ($null -eq $burstMaxIntervalMs) {
+                    $burstCrossCheckReason = "the hold stage reported no tick honesty, so the sampler has no bound to be honest within and its pair cannot be certified as bracketing the window"
+                } elseif ([double]$burstStartSlackMs -gt [double]$burstMaxIntervalMs -or [double]$burstEndSlackMs -gt [double]$burstMaxIntervalMs) {
+                    $burstCrossCheckReason = "a boundary's nearest tick is further away ($([long]$burstStartSlackMs)ms before the start, $([long]$burstEndSlackMs)ms before the end) than the sampler's own worst interval ($([math]::Round([double]$burstMaxIntervalMs, 3))ms), so the pair spans a gap the sampler did not cover and its rate measures that gap: it is reported as unusable rather than as a cross-check"
+                } else {
+                    $burstCrossCheckUsable = $true
                 }
+                $burstCrossCheck = [ordered]@{
+                    available = $true
+                    usable = $burstCrossCheckUsable
+                    unusableReason = $burstCrossCheckReason
+                    basis = "the last 1s sample at or before each boundary of the burst's window, read from timeseries.csv; the rate is the endpoint delta over the two ticks' own elapsed time, not an average of per-tick deltas"
+                    windowSeconds = $burstSamplerSeconds
+                    startSlackMs = [long]$burstStartSlackMs
+                    endSlackMs = [long]$burstEndSlackMs
+                    maxIntervalMs = if ($null -eq $burstMaxIntervalMs) { $null } else { [math]::Round([double]$burstMaxIntervalMs, 3) }
+                    acceptedInWindow = $burstSamplerCounts["acceptedTotal"]
+                    resultsInWindow = $burstSamplerCounts["resultsTotal"]
+                    scoreboardAppliedInWindow = $burstSamplerCounts["scoreboardTotal"]
+                    acceptedPerSecond = $burstSamplerRates["acceptedTotal"]
+                    resultsPerSecond = $burstSamplerRates["resultsTotal"]
+                    scoreboardAppliedPerSecond = $burstSamplerRates["scoreboardTotal"]
+                }
+            } else {
+                $burstCrossCheck = [ordered]@{
+                    available = $false
+                    usable = $false
+                    unusableReason = "no 1s sample bracketed the burst's window, so the sampler has no pair to difference and offers no cross-check"
+                    basis = $null
+                    windowSeconds = $null
+                    startSlackMs = $null
+                    endSlackMs = $null
+                    maxIntervalMs = $null
+                    acceptedInWindow = $null
+                    resultsInWindow = $null
+                    scoreboardAppliedInWindow = $null
+                    acceptedPerSecond = $null
+                    resultsPerSecond = $null
+                    scoreboardAppliedPerSecond = $null
+                }
+            }
+        }
+        $burstDelivery = $null
+        $burstDeliveryUnavailableReason = $null
+        if ($null -eq $primaryStage) {
+            $burstDeliveryUnavailableReason = "this run has no measured stage, so the window's accepted/results/scoreboard deltas are unmeasured rather than zero; the offer itself is recorded in openBurst.recorder"
+        } elseif ($null -eq $primaryStage.accepted.delta -or $null -eq $primaryStage.resultsCompleted.delta -or $null -eq $primaryStage.scoreboardApplied.delta) {
+            $burstDeliveryUnavailableReason = "the hold stage's Prometheus snapshot deltas are not all readable, so the window's accepted/results/scoreboard counts are unmeasured rather than zero; the offer itself is recorded in openBurst.recorder"
+        } elseif ($null -eq $burstStartMillis -or $null -eq $burstEndMillis) {
+            $burstDeliveryUnavailableReason = "the burst's window has no recorded boundaries, so there is no window to take the stage's deltas over; the offer itself is recorded in openBurst.recorder"
+        } else {
+            $burstDelivery = [ordered]@{
+                available = $true
+                source = "prometheus-snapshot-deltas"
+                stageIndex = $primaryStage.stageIndex
+                windowSeconds = $primaryStage.measurementSeconds
+                # True when the stage's held window and its measurement window are the same span, which
+                # is what an open burst sets up (no steady guard, because the arrivals are scheduled
+                # rather than carried by a population still delivering its first submissions).
+                windowSecondsIsTheHeldWindow = ($primaryStage.measurementSeconds -eq $burstWindowSeconds)
+                samplerWindowSeconds = $burstWindowSeconds
+                acceptedInWindow = $primaryStage.accepted.delta
+                resultsInWindow = $primaryStage.resultsCompleted.delta
+                scoreboardAppliedInWindow = $primaryStage.scoreboardApplied.delta
+                acceptedPerSecond = $primaryStage.accepted.perSecond
+                resultsPerSecond = $primaryStage.resultsCompleted.perSecond
+                scoreboardAppliedPerSecond = $primaryStage.scoreboardApplied.perSecond
+                judgeBacklogAtWindowEnd = $primaryStage.backlogGrowth.judgeEnd
+                scoreboardPendingAtWindowEnd = $primaryStage.backlogGrowth.scoreboardEnd
+                backlogAtWindowEndBasis = "the stage's backlog at its last sample inside the window, so a row that arrived after the window closed is not counted as if it were still open at the boundary"
+                ticksInWindow = $burstTicksInWindow
+                crossCheck = $burstCrossCheck
+                basis = "the hold stage's own Prometheus snapshots, taken at the two boundaries of the recorder's measured window; the counts are the end-minus-start deltas and the rates divide them by the stage's own measured $($primaryStage.measurementSeconds)s, so this block and staircase.stages[$($primaryStage.stageIndex)] are one measurement read twice. The sampler's own endpoint deltas are reported as crossCheck, with the slack at each boundary"
             }
         }
         $openBurstAnalysis = [ordered]@{
@@ -2161,9 +2245,7 @@ if (Test-Path $stagesPath) {
             # Recomputed here rather than copied from the harness, so the supply verdict's own claim
             # about where its window was can be checked against the stages and the samples.
             delivery = $burstDelivery
-            deliveryUnavailableReason = if ($null -ne $burstDelivery) { $null } else {
-                "no two 1s samples bracketed the burst's window, so no rate could be taken over it; the offer itself is recorded in openBurst.recorder"
-            }
+            deliveryUnavailableReason = if ($null -ne $burstDelivery) { $null } else { $burstDeliveryUnavailableReason }
             # The generator's document and the verdict, kept whole: a reader who disagrees with the
             # verdict has the evidence it was computed from rather than the verdict's account of it.
             recorder = if ($null -ne $stagesDoc.openBurst) { $stagesDoc.openBurst.recorder } else { $null }
@@ -2572,7 +2654,8 @@ if ($null -ne $staircase) {
             $lines += @("- Unavailable: $($burst.deliveryUnavailableReason)")
         } else {
             $lines += @(
-                "- Window: $($burst.windowStartUtc) .. $($burst.windowEndUtc) ($($burst.windowSource)); $($del.windowSeconds)s of sampler time, $($del.ticksInWindow) ticks inside it",
+                "- Window: $($burst.windowStartUtc) .. $($burst.windowEndUtc) ($($burst.windowSource)); $($del.windowSeconds)s, the span between the hold stage's own two Prometheus snapshots (stage $($del.stageIndex), $(if ($del.windowSecondsIsTheHeldWindow) { 'the measured window and the held window are the same span' } else { "the sampler's own window reads $($del.samplerWindowSeconds)s" }))",
+                "- Sampler cross-check: $(if ($null -eq $del.crossCheck) { 'unavailable' } elseif (-not $del.crossCheck.available) { 'unavailable - ' + $del.crossCheck.unusableReason } elseif (-not $del.crossCheck.usable) { 'unusable - ' + $del.crossCheck.unusableReason } else { "$($del.crossCheck.acceptedPerSecond) accepted /s, $($del.crossCheck.resultsPerSecond) results /s, $($del.crossCheck.scoreboardAppliedPerSecond) scoreboard /s over $($del.crossCheck.windowSeconds)s of sampler time ($($del.ticksInWindow) ticks inside the window; the start tick is $($del.crossCheck.startSlackMs)ms before the boundary and the end tick $($del.crossCheck.endSlackMs)ms before it, against a worst interval of $($del.crossCheck.maxIntervalMs)ms)" })",
                 "- Accepted $(if ($null -eq $del.acceptedPerSecond) { 'unavailable' } else { [string]$del.acceptedPerSecond + ' /s' }) ($(if ($null -eq $del.acceptedInWindow) { 'unavailable' } else { $del.acceptedInWindow }) submissions), results $(if ($null -eq $del.resultsPerSecond) { 'unavailable' } else { [string]$del.resultsPerSecond + ' /s' }) ($(if ($null -eq $del.resultsInWindow) { 'unavailable' } else { $del.resultsInWindow })), scoreboard applied $(if ($null -eq $del.scoreboardAppliedPerSecond) { 'unavailable' } else { [string]$del.scoreboardAppliedPerSecond + ' /s' }) ($(if ($null -eq $del.scoreboardAppliedInWindow) { 'unavailable' } else { $del.scoreboardAppliedInWindow }))",
                 "- Backlog at the window's end: judge outbox $(if ($null -eq $del.judgeBacklogAtWindowEnd) { 'unavailable' } else { $del.judgeBacklogAtWindowEnd }) rows, scoreboard pending $(if ($null -eq $del.scoreboardPendingAtWindowEnd) { 'unavailable' } else { $del.scoreboardPendingAtWindowEnd }) rows",
                 "- Basis: $($del.basis)",
