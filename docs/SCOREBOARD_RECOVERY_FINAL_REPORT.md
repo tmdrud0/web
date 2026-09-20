@@ -408,6 +408,10 @@ a2c446b fix: apply the scoreboard replay outside the database transaction
 - **남음**: ① 운영 프로파일에서 세 모드 각각을 실제 배포·기동해 계약 확정, ② 복구 트리거를
   운영자가 재현 가능하게 만드는 절차 정리(장애 주입은 이번 범위 밖), ③ 동일 대회 데이터·동일
   이벤트 순서·동일 MySQL/Redis 형상으로 변수 통제, ④ **부하 조건에서의 성능·복구 시간 측정**.
+- **④는 [`docs/scoreboard-recovery-experiment/`](scoreboard-recovery-experiment/README.md)에서 별도로
+  다룬다**: 측정 전에 고정한 조건은 [EXPERIMENT_PLAN.md](scoreboard-recovery-experiment/EXPERIMENT_PLAN.md),
+  실측 결과는 같은 디렉터리의 `PILOT_REPORT.md`에 있다. 이 보고서는 그 실험의 구현 내역을 다시
+  확장하지 않는다.
 - **이번 범위 밖으로 남긴 판단 3건**(전부 **지표 관측만** 한다): 전역 seq 매핑 해시의 누적 정리
   정책, window 포화 경보 임계, `scoreboard_applied_seq` 인덱스의 live 쓰기 비용.
 
