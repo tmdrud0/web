@@ -12,7 +12,9 @@ RabbitMQ 비교축은 raw prefetch가 아니라 `worker-count × prefetch`, 즉 
 reserved-but-unfinished 상한이다. MySQL의 대응 축은 `max-in-flight`다.
 
 fault 없이 `max-in-flight` 자체가 정상상태 처리 용량을 어떻게 바꾸는지는 별도 문서
-`docs/MYSQL_JUDGE_MAX_IN_FLIGHT_CAPACITY.md`에서 다룬다.
+`docs/MYSQL_JUDGE_MAX_IN_FLIGHT_CAPACITY.md`에서 다룬다. 그 문서가 남긴 "timeout을 짧게 줄이면
+정상상태에서 실제로 무엇이 일어나는가"는 `docs/MYSQL_JUDGE_NORMAL_TIMEOUT_DUPLICATION.md`에서
+`max-in-flight` 16과 64의 timeout별 중복 claim·중복 채점으로 측정한다.
 
 ## 지연과 cohort 정의
 

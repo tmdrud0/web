@@ -327,3 +327,8 @@ run 전체 cohort(`all`)의 p95/p99는 warm-up, 전환 구간, overload stage, d
 - **overload stage의 p95/p99를 timeout 우열의 근거로 쓰지 않는다.** overload 구간의 백분위는
   대기열 크기이고, 이 실험에서 그것은 mif가 정했다.
 
+이 문서가 남긴 "timeout을 짧게 줄이면 정상상태에서 실제로 무엇이 일어나는가"는
+`docs/MYSQL_JUDGE_NORMAL_TIMEOUT_DUPLICATION.md`에서 mif 16과 64의 timeout별 중복 claim·중복
+채점으로 측정했다. 그 라운드는 위에서 권한 100~150 RPS가 아니라 포화의 약 70%(80/100 RPS)에서
+돌았으므로, 두 문서의 부하 구간은 다르다.
+
