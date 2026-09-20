@@ -148,6 +148,21 @@ function Get-ApiScoreboardDigest {
 # results MySQL says were applied, and never a PENDING one - the scoreboard's write path skips a
 # PENDING result entirely, so counting one as a wrong attempt would make the oracle disagree with a
 # correct scoreboard.
+#
+# Who appears at all is part of the rules, not a detail of the query. The scoreboard takes a ZSET entry
+# for every user whose result is not PENDING, and it writes that entry *before* it can know whether the
+# attempt was accepted: `ContestScoreboardRedisScript` creates the member at score `-userId` on the first
+# non-PENDING result and re-writes it at `solved * 1e9 - penalty * 1e3 - userId` on every one after, so a
+# user who has only ever been wrong is a real, last-place member. The API serves every member - ZCARD is
+# the participant count it reports - so a user with no accepted attempt is on the board.
+#
+# So the participant set is "every user with an applied, non-PENDING result", which is what `participants`
+# below is. The earlier version drove the totals off `user_problem`, whose `earliest_accepted` join is an
+# INNER one, so a user with no accepted attempt produced no row at all and was silently absent from the
+# oracle while the product kept them. The two digests then disagreed on every run that had any such user -
+# about one participant in forty at the calibrated rate - and the disagreement was reported as the
+# scoreboard's fault at the K gate, blaming the product for an asymmetry in the harness. Measured against
+# the product's own Lua rather than inferred from the SQL.
 function Get-OracleStandingsSql {
     param([switch]$AllResolvedResults)
 
@@ -187,17 +202,26 @@ user_problem AS (
       JOIN earliest_accepted ea ON ea.user_id = r.user_id AND ea.problem_id = r.problem_id
      GROUP BY r.user_id, r.problem_id, ea.accepted_minutes
 ),
-totals AS (
-    SELECT user_id,
-           COUNT(*) AS solved,
-           SUM(accepted_minutes + wrong_before * 5) AS penalty,
-           COUNT(*) * 1000000000 - SUM(accepted_minutes + wrong_before * 5) * 1000 - user_id AS score
+-- Every user the scoreboard holds a member for, which is every user with an applied non-PENDING result -
+-- solved or not. This is the set the product's `zadd` writes, not the set that solved something.
+participants AS (
+    SELECT DISTINCT user_id FROM resolved
+),
+per_user AS (
+    SELECT user_id, COUNT(*) AS solved,
+           SUM(accepted_minutes + wrong_before * 5) AS penalty
       FROM user_problem
      GROUP BY user_id
 )
-SELECT user_id, solved, penalty
-  FROM totals
- ORDER BY score DESC, user_id ASC;
+SELECT p.user_id AS user_id,
+       COALESCE(pu.solved, 0) AS solved,
+       COALESCE(pu.penalty, 0) AS penalty
+  FROM participants p
+  LEFT JOIN per_user pu ON pu.user_id = p.user_id
+ ORDER BY (COALESCE(pu.solved, 0) * 1000000000
+           - COALESCE(pu.penalty, 0) * 1000
+           - p.user_id) DESC,
+       p.user_id ASC;
 "@
 }
 
@@ -297,6 +321,20 @@ SELECT MIN(user_id), MAX(user_id), COUNT(DISTINCT user_id) FROM (
             "than the penalty weight of 1000. Two participants could then tie on ZSET score and the standings " +
             "order would depend on the member string instead of the data (phase $Phase)."
         }
+    }
+
+    # And the page the digest is read in has to hold the whole board. The API numbers a rank within the
+    # slice it was asked for and does not continue a tie across a page boundary, so a board of 201 makes
+    # page two report ranks the oracle's whole-board ranks cannot equal - a harness precondition failing
+    # in the shape of a product fault, and only when a tie happens to straddle the boundary. Asserted
+    # rather than left to whoever reads `digestPageSize`, because that value only says what was asked
+    # for. The calibrated participant count sits on this limit rather than under it, so the check is
+    # what keeps that a decision instead of a coincidence.
+    if ($participants -gt $observed["digestPageSize"]) {
+        throw "The contest has $participants participants but the digest reads one page of " +
+        "$($observed["digestPageSize"]). The API ranks within the page it was asked for, so a second page " +
+        "would carry ranks the whole-board oracle cannot reproduce. Keep the participant count at or below " +
+        "the page size (phase $Phase)."
     }
 
     # The scoreboard's own tie-break compares submission ids as decimal strings, so it orders them the

@@ -177,7 +177,20 @@ echo "SBRE_PROBE_MISS"
         Assert-Equal $expectedScoreboardKeys $census.ScoreboardKeys "the scoreboard namespace is counted"
         Assert-Equal $expectedDbsize $census.Dbsize "the instance holds the seeded keys and nothing else"
         Assert-Equal 1 $census.OtherKeys "the session key is counted as another namespace"
-        Assert-Equal 1 @($census.PrefixHistogram | Where-Object { [string]$_ -like "spring:*" }).Count "the foreign namespace is named"
+        # The exact bucket, not `-like "spring:*"`. That pattern is satisfied by `spring:` as well as by
+        # `spring:session:`, so it held at either depth and pinned neither - which is how the census came
+        # to bucket at one segment while `Clear-RecoveryRedis` compared against two, refusing to flush on
+        # the instance's own data. The census and the project's namespace list are two halves of one
+        # comparison, so the test that keeps them together has to name the depth they share.
+        $sessionNamespace = @($census.Namespaces | Where-Object { $_.name -eq "spring:session:" })
+        Assert-Equal 1 $sessionNamespace.Count "the session key is named at the depth the known list is written at"
+        Assert-Equal 1 $sessionNamespace[0].count "the one session key is counted under it"
+        # And the property the reset depends on: the census reports nothing outside the project's own
+        # namespaces, so `Clear-RecoveryRedis` would not refuse. The histogram is the thing read, not the
+        # text rendering of it, so this asserts the same field the refusal reads.
+        $known = Get-ProjectRedisNamespaces
+        Assert-Equal 0 @($census.Namespaces | Where-Object { $known -notcontains $_.name }).Count "every namespace in the census is one this project owns"
+        Assert-Equal @($census.Namespaces | ForEach-Object { "$($_.name)=$($_.count)" }) $census.PrefixHistogram "the human-readable histogram is derived from the same data"
     }
 
     Test-Case "the snapshot captures every key with its type, payload and expiry" {

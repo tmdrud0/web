@@ -239,7 +239,22 @@ Test-Case "Get-OracleStandingsSql counts only results the scoreboard has taken" 
     $sql = Get-OracleStandingsSql
     Assert-True ($sql -match 'scoreboard_applied_at IS NOT NULL') "the applied boundary is in the statement"
     Assert-True ($sql -match "<> 'PENDING'") "PENDING results are excluded"
-    Assert-True ($sql -match 'ORDER BY score DESC, user_id ASC') "the order is the scoreboard's own"
+    # Who appears, which is a rule and not a formatting detail: the scoreboard writes a member for every
+    # user with an applied non-PENDING result, before it can know whether the attempt was accepted, so a
+    # user who has only ever been wrong is on the board at `-userId`. The oracle has to keep them too, and
+    # the three assertions below are the shape that keeps them - a participant set taken from `resolved`
+    # rather than from the accepted attempts, a LEFT JOIN so a participant with no solved problem survives
+    # it, and the order computed from the same expression the scoreboard scores with.
+    #
+    # Asserted as this shape rather than as the ORDER BY text, because the text is what a later edit moves
+    # while the rule stays the same; the behavioural half of this is the wrong-only user in the MySQL
+    # fixture, which is the case that catches a change these three lines would let through.
+    Assert-True ($sql -match 'participants AS \(\s*SELECT DISTINCT user_id FROM resolved') `
+        "the participant set is every user with an applied result, not only the ones that solved"
+    Assert-True ($sql -match 'LEFT JOIN per_user') `
+        "a participant with no accepted attempt is kept rather than dropped by the join"
+    Assert-True ($sql -match 'COALESCE\(pu\.solved, 0\) \* 1000000000') `
+        "the order is the scoreboard's own score expression, applied to the same defaulted totals"
 
     $all = Get-OracleStandingsSql -AllResolvedResults
     Assert-True (-not ($all -match 'scoreboard_applied_at IS NOT NULL')) "the boundary is absent when every resolved result is asked for"
@@ -505,6 +520,56 @@ Test-Case "a leftover row's name is attributed to the run id that wrote it" {
     Assert-Equal $null (Get-RunIdFromUserName -Name "sbrec_fullreplay_1_contest") "a contest name is not a user name"
     Assert-Equal $null (Get-RunIdFromUserName -Name "sbrec_fullreplay_1_user_") "a user name with no index is not a seeded user"
     Assert-Equal $null (Get-RunIdFromUserName -Name "sbrec_fullreplay_1_user_7x") "a trailing character in the index is not a seeded user"
+}
+
+Test-Case "the redis census names a namespace at the depth the project's list is written at" {
+    # The census and the list of namespaces this project owns are two halves of one comparison: the census
+    # produces a name for each key, `Clear-RecoveryRedis` asks whether that name is in the list. They were
+    # written at different depths - the census bucketed at the *first* colon, the list named two segments -
+    # so `spring:session:s1` came out as `spring:` and was tested against `spring:session:`. The reset then
+    # refused to flush the instance's own app-tier sessions, as "namespaces this experiment does not own",
+    # permanently, from the first run that had ever started an app tier onward.
+    #
+    # The live instance at the time held 200 keys, every one of them `spring:session:` written by this
+    # project's own web tier. The integration test that looked like it covered this read
+    # `-like "spring:*"`, which is satisfied at either depth - which is why the drift outlived it.
+    #
+    # So the depth is pinned here as the literal names it produces, and then the relation itself is
+    # checked: every key the product writes has to name something in the list.
+    Assert-Equal "spring:session:" (Get-RedisKeyNamespace -Key "spring:session:s1") "a session key names two segments"
+    Assert-Equal "spring:session:" (Get-RedisKeyNamespace -Key "spring:session:sessions:abc") "a deeper session key names the same two"
+    Assert-Equal "contest:submission:" (Get-RedisKeyNamespace -Key "contest:submission:dedup:abc") "dedup names the submission namespace"
+    Assert-Equal "contest:submission:" (Get-RedisKeyNamespace -Key "contest:submission:rate-limit:u1") "and so does the rate limiter, which one segment could not tell from dedup"
+    Assert-Equal "contest:scoreboard:" (Get-RedisKeyNamespace -Key "contest:scoreboard:1:ranking") "a standings key names the scoreboard namespace"
+    Assert-Equal "contest:scoreboard:" (Get-RedisKeyNamespace -Key "contest:scoreboard:stream:offset") "including the checkpoint key this experiment reads"
+    Assert-Equal "(no prefix)" (Get-RedisKeyNamespace -Key "standalone") "a key with no colon has no namespace"
+    Assert-Equal "foobar:" (Get-RedisKeyNamespace -Key "foobar:x") "a single segment is named as far as it goes"
+
+    $known = Get-ProjectRedisNamespaces
+    $productKeys = @(
+        "contest:scoreboard:1:ranking",
+        "contest:scoreboard:1:u:10",
+        "contest:scoreboard:stream:offset",
+        "contest:scoreboard:stream:db-pending",
+        "contest:scoreboard:seq:1",
+        "contest:submission:dedup:abc",
+        "contest:submission:rate-limit:u1",
+        "spring:session:sessions:abc"
+    )
+    foreach ($key in $productKeys) {
+        $namespace = Get-RedisKeyNamespace -Key $key
+        Assert-True ($known -contains $namespace) `
+            "the project's own key '$key' names '$namespace', which is not in the project's list, so every reset would refuse it"
+    }
+
+    # The refusal exists for a namespace this project does not own, so the same relation has to come out the
+    # other way for a foreign key - otherwise a list that contained everything would satisfy the check above
+    # while guarding nothing at all.
+    foreach ($key in @("myapp:cache:1", "someoneelse:thing:2", "foobar:x")) {
+        $namespace = Get-RedisKeyNamespace -Key $key
+        Assert-True (-not ($known -contains $namespace)) `
+            "a foreign key '$key' names '$namespace', which is in the project's list, so the intruder check would pass it"
+    }
 }
 
 Test-Case "the login feeder's prefix builds the name the seeder inserted" {

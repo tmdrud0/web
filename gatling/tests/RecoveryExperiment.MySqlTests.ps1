@@ -85,7 +85,7 @@ try {
 
     [void](Assert-ExperimentDataAbsent -Phase "before the integration test")
 
-    $seed = New-ExperimentSeed -UserCount 4 -ProblemCount 2 -ContestDurationMinutes 30 `
+    $seed = New-ExperimentSeed -UserCount 5 -ProblemCount 2 -ContestDurationMinutes 30 `
         -EvidenceDirectory $artifacts
     $script:seed = $seed
     Write-Output ("  seeded contest {0} '{1}' {2}..{3}, problems {4}..{5}, users {6}..{7}" -f `
@@ -99,19 +99,26 @@ try {
 
     # --- the fixture -------------------------------------------------------------------------------
     #
-    # Ten submissions by four users on two problems. Minutes are counted from the contest's own start
+    # Eleven submissions by five users on two problems. Minutes are counted from the contest's own start
     # time read out of the database, not from the host clock, because that is what the application and
     # the oracle both count from.
+    #
+    # u5 is the case worth keeping. They submit once and are wrong, so they solve nothing - and the
+    # scoreboard still holds a member for them at `-userId`, because it writes the entry on the first
+    # non-PENDING result without waiting to learn whether the attempt was accepted. An oracle that builds
+    # its standings from the accepted attempts alone leaves u5 out and disagrees with a correct
+    # scoreboard, which is what it did until this row was added to the fixture.
     $u1 = $seed.UserIdStart
     $u2 = $seed.UserIdStart + 1
     $u3 = $seed.UserIdStart + 2
     $u4 = $seed.UserIdStart + 3
+    $u5 = $seed.UserIdStart + 4
     $p1 = $seed.ProblemIdStart
     $p2 = $seed.ProblemIdStart + 1
     # The ids are derived from the contest id so that a leftover row from another run cannot collide, and
     # they are the same width as each other so that both tie-breaks agree.
     $submissionBase = 7000000000000L + ($seed.ContestId * 100)
-    $script:submissionIds = @(1..10 | ForEach-Object { $submissionBase + $_ })
+    $script:submissionIds = @(1..11 | ForEach-Object { $submissionBase + $_ })
 
     $insertSql = @"
 SET @contest = $($seed.ContestId);
@@ -128,7 +135,8 @@ INSERT INTO contest_submission (id, contest_id, problem_id, user_id, submitted_t
   (@base + 7,  @contest, $p1, $u3, @start + INTERVAL 2 MINUTE,  'inttest-7',  'sbrec_inttest_07'),
   (@base + 8,  @contest, $p1, $u3, @start + INTERVAL 30 MINUTE, 'inttest-8',  'sbrec_inttest_08'),
   (@base + 9,  @contest, $p1, $u4, @start,                      'inttest-9',  'sbrec_inttest_09'),
-  (@base + 10, @contest, $p2, $u4, @start,                      'inttest-10', 'sbrec_inttest_10');
+  (@base + 10, @contest, $p2, $u4, @start,                      'inttest-10', 'sbrec_inttest_10'),
+  (@base + 11, @contest, $p1, $u5, @start + INTERVAL 7 MINUTE,  'inttest-11', 'sbrec_inttest_11');
 
 INSERT INTO contest_submission_result
   (submission_id, contest_id, provisional_result, provisional_judged_at, final_result, final_judged_at, result_saved_at, scoreboard_applied_at)
@@ -142,7 +150,8 @@ VALUES
   (@base + 7,  @contest, 'PARTIAL_ACCEPTED', @start + INTERVAL 2 MINUTE + INTERVAL 1 SECOND,  NULL,           NULL,                    @start + INTERVAL 2 MINUTE + INTERVAL 2 SECOND,  @start + INTERVAL 2 MINUTE + INTERVAL 3 SECOND),
   (@base + 8,  @contest, 'ACCEPTED',         @start + INTERVAL 30 MINUTE + INTERVAL 1 SECOND, NULL,           NULL,                    @start + INTERVAL 30 MINUTE + INTERVAL 2 SECOND, @start + INTERVAL 30 MINUTE + INTERVAL 3 SECOND),
   (@base + 9,  @contest, 'ACCEPTED',         @start + INTERVAL 1 SECOND,                      NULL,           NULL,                    @start + INTERVAL 2 SECOND,                      @start + INTERVAL 3 SECOND),
-  (@base + 10, @contest, 'ACCEPTED',         @start + INTERVAL 1 SECOND,                      NULL,           NULL,                    @start + INTERVAL 2 SECOND,                      NULL);
+  (@base + 10, @contest, 'ACCEPTED',         @start + INTERVAL 1 SECOND,                      NULL,           NULL,                    @start + INTERVAL 2 SECOND,                      NULL),
+  (@base + 11, @contest, 'WRONG_ANSWER',     @start + INTERVAL 7 MINUTE + INTERVAL 1 SECOND,  NULL,           NULL,                    @start + INTERVAL 7 MINUTE + INTERVAL 2 SECOND,  @start + INTERVAL 7 MINUTE + INTERVAL 3 SECOND);
 
 SELECT CONCAT('SBRE_SQLTEST_INSERTED=', (SELECT COUNT(*) FROM contest_submission WHERE contest_id = @contest), '|', (SELECT COUNT(*) FROM contest_submission_result WHERE contest_id = @contest));
 "@
@@ -151,56 +160,64 @@ SELECT CONCAT('SBRE_SQLTEST_INSERTED=', (SELECT COUNT(*) FROM contest_submission
     if ($inserted.Count -ne 1) {
         throw "Inserting the fixture reported nothing readable: $($insertLines -join ' | ')"
     }
-    Assert-Equal "SBRE_SQLTEST_INSERTED=10|10" ([string]$inserted[0]).Trim() "ten submissions and ten results are in the database"
+    Assert-Equal "SBRE_SQLTEST_INSERTED=11|11" ([string]$inserted[0]).Trim() "eleven submissions and eleven results are in the database"
 
     # The standings the contest rules predict, written out by hand. Competition rank over (solved,
-    # penalty): u1 and u2 tie on (2, 25) and share rank 1, rank 2 is skipped, u4 is 3rd and u3 is 4th.
+    # penalty): u1 and u2 tie on (2, 25) and share rank 1, rank 2 is skipped, then u4, u3 and u5.
     #
     #   u1  p1 accepted at 5, p2 accepted at 20                        -> 2 solved, 5 + 20        = 25
     #   u2  p1 accepted at 3, p2 wrong at 4 and 10, accepted at 12     -> 2 solved, 3 + 12 + 2*5  = 25
     #   u4  p1 accepted at 0 (p2 is judged but not applied)           -> 1 solved, 0             = 0
     #   u3  p1 partial-accepted at 2, accepted at 30                   -> 1 solved, 30 + 1*5     = 35
+    #   u5  p1 wrong at 7, never accepted                             -> 0 solved, 0             = 0
+    #
+    # u5 is last and is present. The score is `solved * 1e9 - penalty * 1e3 - userId`, so a participant
+    # who has solved nothing scores `-userId` and sorts below everyone; on the scoreboard that is a real
+    # member, not an absence.
     $expectedApplied = @(
         [pscustomobject]@{ Rank = 1L; UserId = $u1; Solved = 2; Penalty = 25L },
         [pscustomobject]@{ Rank = 1L; UserId = $u2; Solved = 2; Penalty = 25L },
         [pscustomobject]@{ Rank = 3L; UserId = $u4; Solved = 1; Penalty = 0L },
-        [pscustomobject]@{ Rank = 4L; UserId = $u3; Solved = 1; Penalty = 35L }
+        [pscustomobject]@{ Rank = 4L; UserId = $u3; Solved = 1; Penalty = 35L },
+        [pscustomobject]@{ Rank = 5L; UserId = $u5; Solved = 0; Penalty = 0L }
     )
     # With every resolved result counted, u4's second problem arrives: 2 solved and 0 penalty beats the
-    # tied pair, so u4 leads and the pair becomes 2nd with rank 3 skipped.
+    # tied pair, so u4 leads and the pair becomes 2nd with rank 3 skipped. u5 is unaffected - their one
+    # attempt was wrong, and no boundary makes it accepted.
     $expectedAllResolved = @(
         [pscustomobject]@{ Rank = 1L; UserId = $u4; Solved = 2; Penalty = 0L },
         [pscustomobject]@{ Rank = 2L; UserId = $u1; Solved = 2; Penalty = 25L },
         [pscustomobject]@{ Rank = 2L; UserId = $u2; Solved = 2; Penalty = 25L },
-        [pscustomobject]@{ Rank = 4L; UserId = $u3; Solved = 1; Penalty = 35L }
+        [pscustomobject]@{ Rank = 4L; UserId = $u3; Solved = 1; Penalty = 35L },
+        [pscustomobject]@{ Rank = 5L; UserId = $u5; Solved = 0; Penalty = 0L }
     )
 
     $oracle = Get-OracleDigest
     $oracleAll = Get-OracleDigest -AllResolvedResults
     $script:oracle = $oracle
     $script:oracleAll = $oracleAll
-    $expectedDigest = New-StandingsDigest -ContestId $seed.ContestId -Participants 4 -Standings $expectedApplied
-    $expectedDigestAll = New-StandingsDigest -ContestId $seed.ContestId -Participants 4 -Standings $expectedAllResolved
+    $expectedDigest = New-StandingsDigest -ContestId $seed.ContestId -Participants 5 -Standings $expectedApplied
+    $expectedDigestAll = New-StandingsDigest -ContestId $seed.ContestId -Participants 5 -Standings $expectedAllResolved
 
     $script:preconditions = Assert-OraclePreconditions -Phase "on the fixture"
 
     # --- the cases ---------------------------------------------------------------------------------
 
     Test-Case "the seeded contest is usable and the seeded rows are the ones that were read back" {
-        Assert-Equal 4 $script:seed.UserCount "four users were seeded"
+        Assert-Equal 5 $script:seed.UserCount "five users were seeded"
         Assert-Equal 2 $script:seed.ProblemCount "two problems were seeded"
         Assert-True ($script:seed.UserIdStart -ge 1) "the users have real ids"
-        Assert-Equal ($script:seed.UserIdStart + 3) $script:seed.UserIdEnd "the seeded users are contiguous, so the fixture can name them"
+        Assert-Equal ($script:seed.UserIdStart + 4) $script:seed.UserIdEnd "the seeded users are contiguous, so the fixture can name them"
         $usability = Assert-ExperimentSeedUsable -Phase "during the cases"
         Assert-True $usability.insideWindow "the contest window is still open"
         Assert-Equal 0 $usability.submissionsOutsideTheContestPath "no submission of this run went to the plain submission table"
     }
 
     Test-Case "the oracle ranks the applied results the way the contest rules do" {
-        Assert-Equal 4 $script:oracle.Participants "four users have an accepted result and so appear"
-        Assert-SequenceEqual @("1|$u1|2|25", "1|$u2|2|25", "3|$u4|1|0", "4|$u3|1|35") `
+        Assert-Equal 5 $script:oracle.Participants "every user with an applied result appears, including the one that never solved"
+        Assert-SequenceEqual @("1|$u1|2|25", "1|$u2|2|25", "3|$u4|1|0", "4|$u3|1|35", "5|$u5|0|0") `
             @($script:oracle.Standings | ForEach-Object { "$($_.Rank)|$($_.UserId)|$($_.Solved)|$($_.Penalty)" }) `
-            "the standings are the hand-computed ones, tie included"
+            "the standings are the hand-computed ones, tie and wrong-only participant included"
     }
 
     Test-Case "the oracle's digest equals the digest of the hand-computed standings" {
@@ -209,7 +226,7 @@ SELECT CONCAT('SBRE_SQLTEST_INSERTED=', (SELECT COUNT(*) FROM contest_submission
     }
 
     Test-Case "a result MySQL has judged but the scoreboard has not applied is outside the default standings" {
-        Assert-SequenceEqual @("1|$u4|2|0", "2|$u1|2|25", "2|$u2|2|25", "4|$u3|1|35") `
+        Assert-SequenceEqual @("1|$u4|2|0", "2|$u1|2|25", "2|$u2|2|25", "4|$u3|1|35", "5|$u5|0|0") `
             @($script:oracleAll.Standings | ForEach-Object { "$($_.Rank)|$($_.UserId)|$($_.Solved)|$($_.Penalty)" }) `
             "the unapplied result appears only when every resolved result is asked for"
         Assert-Equal $expectedDigestAll.Digest $script:oracleAll.Digest "the all-resolved digest is the expected one"
@@ -229,26 +246,26 @@ SELECT CONCAT('SBRE_SQLTEST_INSERTED=', (SELECT COUNT(*) FROM contest_submission
     Test-Case "the oracle's preconditions hold over this fixture" {
         Assert-Equal 0 $script:preconditions.appliedPendingResults "no result is both applied and PENDING"
         Assert-Equal 1 $script:preconditions.contestsWithResults "only this contest has stored results"
-        Assert-Equal 3 ($script:preconditions.participantIdMax - $script:preconditions.participantIdMin) "the participant ids span less than the penalty weight"
+        Assert-Equal 4 ($script:preconditions.participantIdMax - $script:preconditions.participantIdMin) "the participant ids span less than the penalty weight"
         Assert-Equal "13..13" $script:preconditions.submissionIdDigits "every submission id is the same width, so both tie-breaks order them alike"
     }
 
     Test-Case "the result counts separate judged from applied" {
         $counts = Get-ResultCounts
-        Assert-Equal 10 $counts.Submissions "ten submissions"
-        Assert-Equal 10 $counts.ResolvedResults "ten resolved results"
-        Assert-Equal 9 $counts.AppliedResults "nine of them applied"
+        Assert-Equal 11 $counts.Submissions "eleven submissions"
+        Assert-Equal 11 $counts.ResolvedResults "eleven resolved results"
+        Assert-Equal 10 $counts.AppliedResults "ten of them applied"
         Assert-Equal 6 $counts.AppliedAcceptedResults "six applied accepted results"
-        Assert-Equal 4 $counts.SubmittingUsers "four users submitted"
+        Assert-Equal 5 $counts.SubmittingUsers "five users submitted"
     }
 
     Test-Case "the reflection latency is measured from the judgement to the applied mark" {
         $stats = Get-ReflectLatencyStats -AppliedAtOrAfter $script:seed.StartTimeMysql -Description "integration test fixture"
-        Assert-Equal 9 $stats.Samples "nine applied results carry a latency"
+        Assert-Equal 10 $stats.Samples "ten applied results carry a latency"
         Assert-Equal "1000" $stats.MinMs "the result judged two seconds after submission reflects in one"
         Assert-Equal "2000" $stats.MaxMs "the rest reflect two seconds after their judgement"
         Assert-Equal "2000" $stats.P50Ms "the median is two seconds"
-        Assert-Equal "1889" $stats.MeanMs "the mean carries the one shorter sample"
+        Assert-Equal "1900" $stats.MeanMs "the mean carries the one shorter sample"
     }
 
     Test-Case "a window that contains nothing reports unavailable rather than zero" {
@@ -264,8 +281,8 @@ SELECT CONCAT('SBRE_SQLTEST_INSERTED=', (SELECT COUNT(*) FROM contest_submission
     Test-Case "the clock-frame guard reads a JVM clock against a MySQL clock, and refuses a drifted one" {
         # Both columns are on the same inserted row: `provisional_judged_at` is the value the judging JVM
         # passes, `result_saved_at` is MySQL's `CURRENT_TIMESTAMP(6)` from the same INSERT. The fixture
-        # writes the two a second apart, so the guard reads 1s over the nine rows that carry both - row 5
-        # has no provisional judgement, which is why nine of ten are compared.
+        # writes the two a second apart, so the guard reads 1s over the ten rows that carry both - row 5
+        # has no provisional judgement, which is why ten of eleven are compared.
         #
         # The case that matters is the second half. The guard used to compare `scoreboard_applied_at`
         # against MySQL's `NOW(6)`, and MySQL writes both of those, so it could not have failed for the
@@ -273,7 +290,7 @@ SELECT CONCAT('SBRE_SQLTEST_INSERTED=', (SELECT COUNT(*) FROM contest_submission
         # error between the JVM and the database - and it is caught here, through the real query, against
         # real rows, and then put back.
         $aligned = Assert-ClockFramesAligned
-        Assert-Equal "the JVM's and MySQL's clocks are 1s apart over 9 result(s)" $aligned "the fixture's two clocks differ by the second the fixture wrote"
+        Assert-Equal "the JVM's and MySQL's clocks are 1s apart over 10 result(s)" $aligned "the fixture's two clocks differ by the second the fixture wrote"
 
         $driftedId = $script:submissionIds[0]
         $driftSql = @"
@@ -367,15 +384,15 @@ SELECT CONCAT('SBRE_SQLTEST_RESTORED=', ROW_COUNT());
         $steps = @($script:removal.steps)
         Assert-True ($steps.Count -ge 10) "the cleanup reports a count for every scoped table, not just the ones it deleted from"
 
-        # The composition, not a total: the ten submissions and their ten results are the fixture, the
-        # two problems and the contest are the seed, and the four users are the seed's. Asserting a bare
-        # sum would pass just as well if the scope had reached a row this run did not create.
+        # The composition, not a total: the eleven submissions and their eleven results are the fixture,
+        # the two problems and the contest are the seed, and the five users are the seed's. Asserting a
+        # bare sum would pass just as well if the scope had reached a row this run did not create.
         $expectedDeleted = [ordered]@{
-            "contest_submission_result" = 10
-            "contest_submission" = 10
+            "contest_submission_result" = 11
+            "contest_submission" = 11
             "problem" = 2
             "contest" = 1
-            '`user`' = 4
+            '`user`' = 5
         }
         foreach ($step in $steps) {
             $expected = if ($expectedDeleted.Contains($step.table)) { $expectedDeleted[$step.table] } else { 0 }
@@ -384,7 +401,7 @@ SELECT CONCAT('SBRE_SQLTEST_RESTORED=', ROW_COUNT());
             Assert-True (-not [string]::IsNullOrWhiteSpace([string]$step.sql)) "the statement run against '$($step.table)' is recorded"
             Assert-True (-not [string]::IsNullOrWhiteSpace([string]$step.note)) "why '$($step.table)' is in scope is recorded"
         }
-        Assert-Equal 27 $script:removal.totalDeleted "the total is the fixture, the seed and the seeded users, and nothing else"
+        Assert-Equal 30 $script:removal.totalDeleted "the total is the fixture, the seed and the seeded users, and nothing else"
     }
 
     Test-Case "the cleanup left the rows the experiment does not own exactly as they were" {

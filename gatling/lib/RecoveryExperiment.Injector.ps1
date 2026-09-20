@@ -171,6 +171,62 @@ function Assert-RedisIsDedicated {
     }
 }
 
+# The namespace a key belongs to, as this experiment names it: the text through the *second* colon, or
+# through the first when there is only one, or `(no prefix)` when there is none at all.
+#
+# Two segments, not one, because two is the depth at which this application's namespaces are distinct
+# from each other. At one segment `contest:submission:dedup:` and `contest:submission:rate-limit:` both
+# name `contest:`, and `spring:session:` names `spring:` - neither of which is a name that the set of
+# namespaces this project owns can be compared against. The census and that set are two halves of one
+# decision and have to be written at one depth; they were written at two, and the consequence was that
+# the census reported the instance as an intruder on itself: a `spring:` bucket tested against a
+# `spring:session:` expectation, so `Clear-RecoveryRedis` refused to flush, permanently, from the second
+# run onward. Measured on the dedicated instance at the time: 200 keys, every one of them
+# `spring:session:`, produced by this project's own app tier.
+function Get-RedisKeyNamespace {
+    param([Parameter(Mandatory = $true)][string]$Key)
+
+    $text = $Key.Trim()
+    $first = $text.IndexOf(":")
+    if ($first -le 0) { return "(no prefix)" }
+    $second = $text.IndexOf(":", $first + 1)
+    if ($second -lt 0) { return $text.Substring(0, $first + 1) }
+    return $text.Substring(0, $second + 1)
+}
+
+# Every namespace this application creates, written at the depth above and read off the product's own
+# key definitions rather than guessed:
+#
+#   * `contest:scoreboard:`  the standings, the per-user and per-problem hashes, the `processed` set,
+#                            and the repository's own `seq`, `stream:offset` and `stream:db-pending` keys
+#   * `contest:submission:`  the duplicate registry and the submission rate limiter
+#   * `spring:session:`      app-tier HTTP sessions (spring.session.store-type=redis)
+#   * `(no prefix)`          a key with no colon carries no namespace to compare against, so it is
+#                            allowed rather than refused. This is the list's one weak spot and it is
+#                            deliberate: nothing in this application writes such a key - checked
+#                            against the product's key definitions and against the census of the live
+#                            instance, which held only `spring:session:` - but a colon-less key also
+#                            cannot be attributed to an owner, so its presence is not evidence that the
+#                            instance is someone else's. Stated here rather than left for a reader of
+#                            the refusal message to discover.
+#
+# `contest:scoreboard:` is listed even though `Get-RedisCensus` counts those keys separately and never
+# puts them in the histogram: the point of the list is to be the complete set of namespaces the
+# application owns, not just the reachable part of it.
+#
+# This list is not what makes the instance safe to flush - that is `Assert-RedisIsDedicated`, which
+# reads Compose's own project label and so cannot be satisfied by a shared instance. What the list adds
+# is the second question, which the label cannot answer: an instance that is ours may still have been
+# used for something else.
+function Get-ProjectRedisNamespaces {
+    return @(
+        "contest:scoreboard:",
+        "contest:submission:",
+        "spring:session:",
+        "(no prefix)"
+    )
+}
+
 # What is in the instance before anything writes to it, in the form the decision needs: how many keys,
 # which namespaces, and whether any of them is outside the scoreboard. A namespace this experiment does
 # not own appearing here would mean the instance is carrying someone else's data.
@@ -181,6 +237,11 @@ function Get-RedisCensus {
         Dbsize = 0
         ScoreboardKeys = 0
         OtherKeys = 0
+        # Two views of one computation rather than two computations: `Namespaces` is what the decision
+        # reads (a name to compare, not a string to parse), `PrefixHistogram` is the same data as
+        # `name=count` for whoever reads the evidence file. Derived from `Namespaces` below, so the two
+        # cannot disagree.
+        Namespaces = @()
         PrefixHistogram = @()
     }
     $census["Dbsize"] = Get-RedisInt64 -RedisArguments @("DBSIZE")
@@ -190,7 +251,7 @@ function Get-RedisCensus {
     # instance is the *successful* reset, so the unguarded version failed the run it had just cleared.
     $keys = @(@(Invoke-RedisText -RedisArguments @("--scan")) |
         Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-    $histogram = @{}
+    $histogram = [ordered]@{}
     $scoreboard = 0
     foreach ($key in $keys) {
         $text = ([string]$key).Trim()
@@ -198,14 +259,16 @@ function Get-RedisCensus {
             $scoreboard++
             continue
         }
-        $separator = $text.IndexOf(":")
-        $prefix = if ($separator -gt 0) { $text.Substring(0, $separator + 1) } else { "(no prefix)" }
-        if (-not $histogram.ContainsKey($prefix)) { $histogram[$prefix] = 0 }
+        $prefix = Get-RedisKeyNamespace -Key $text
+        if (-not $histogram.Contains($prefix)) { $histogram[$prefix] = 0 }
         $histogram[$prefix] = $histogram[$prefix] + 1
     }
     $census["ScoreboardKeys"] = $scoreboard
     $census["OtherKeys"] = $keys.Count - $scoreboard
-    $census["PrefixHistogram"] = @($histogram.Keys | Sort-Object | ForEach-Object { "$_=$($histogram[$_])" })
+    $census["Namespaces"] = @($histogram.Keys | Sort-Object | ForEach-Object {
+            [pscustomobject][ordered]@{ name = $_; count = $histogram[$_] }
+        })
+    $census["PrefixHistogram"] = @($census["Namespaces"] | ForEach-Object { "$($_.name)=$($_.count)" })
     return $census
 }
 
@@ -384,35 +447,32 @@ function Get-BatchPaused {
 #
 #   * the container is this project's `redis` service. That is what "dedicated" means, and it is read
 #     from Compose's own labels, so it cannot be true of a shared instance.
-#   * the namespaces found are ones this application creates. The four below are the whole of them
-#     (scoreboard, submission dedup, submission rate limit, Spring Session), so a fifth is evidence
-#     that something else is using the instance - a reason to stop rather than to reason about.
+#   * the namespaces found are ones this application creates. The whole of them is
+#     `Get-ProjectRedisNamespaces`, so a namespace outside it is evidence that something else is using
+#     the instance - a reason to stop rather than to reason about.
+#
+# The comparison is by name and not by pattern. The names come from `Get-RedisKeyNamespace`, so there
+# is nothing to escape and no depth for the two sides to disagree about; the earlier version built
+# regexes by interpolating the scoreboard prefix and hand-writing the rest, which is how a one-segment
+# census came to be tested against two-segment patterns.
 function Clear-RecoveryRedis {
     param([Parameter(Mandatory = $true)][string]$EvidencePath)
 
     $identity = Assert-RedisIsDedicated
     $before = Get-RedisCensus
-    $known = @(
-        "^$([regex]::Escape((Get-RecoveryConfig).ScoreboardKeyPrefix))=",
-        "^contest:submission:=",
-        "^spring:session:=",
-        "^\(no prefix\)="
-    )
-    $unexpected = @($before.PrefixHistogram | Where-Object {
-            $prefix = $_
-            -not ($known | Where-Object { $prefix -match $_ })
-        })
+    $known = Get-ProjectRedisNamespaces
+    $unexpected = @($before.Namespaces | Where-Object { $known -notcontains $_.name })
     $record = [pscustomobject][ordered]@{
         identity = $identity
         before = $before
-        unexpectedPrefixes = @($unexpected)
+        unexpectedNamespaces = @($unexpected | ForEach-Object { "$($_.name)=$($_.count)" })
         flushed = $false
         after = $null
     }
     if ($unexpected.Count -gt 0) {
         $record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $EvidencePath -Encoding utf8
         throw "The pilot redis instance holds namespaces this experiment does not own " +
-        "($($unexpected -join ', ')). It is not a dedicated instance; refusing to flush. Evidence: $EvidencePath"
+        "($($record.unexpectedNamespaces -join ', ')). It is not a dedicated instance; refusing to flush. Evidence: $EvidencePath"
     }
 
     [void](Invoke-RedisText -RedisArguments @("FLUSHALL"))
