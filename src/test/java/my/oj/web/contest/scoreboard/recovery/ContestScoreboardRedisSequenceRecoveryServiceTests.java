@@ -350,7 +350,7 @@ class ContestScoreboardRedisSequenceRecoveryServiceTests {
                         ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback.FULL_REPLAY,
                         ContestScoreboardRecoveryProperties.StreamOffset.StartupOffset.STORED
                 )
-        );
+        , new ContestScoreboardRecoveryProperties.RecoveryOwner(true));
     }
 
     /** A pass with the documented defaults except for the two sizes each test is about. */

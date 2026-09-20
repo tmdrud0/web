@@ -48,6 +48,7 @@ class ContestScoreboardRecoverySummaryTests {
                     assertThat(summary)
                             .contains("mode=redis-seq")
                             .contains("store=redis")
+                            .contains("recovery-owner=true")
                             .contains("duplicate-check-interval=30s")
                             .contains("lost-tail-check-interval=30s")
                             .contains("check-window-size=250")
@@ -103,6 +104,50 @@ class ContestScoreboardRecoverySummaryTests {
                 .hasMessageContaining("must be written as full-replay");
     }
 
+    /**
+     * The owner declaration is checked because everything that enforces "one recovery pass" is
+     * JVM-local, so a role that contradicts what it runs is a silent second owner. A consumer runs the
+     * supervisor pass whether or not it says so, and the declaration must not be able to deny it.
+     */
+    @Test
+    void refusesAConsumerThatDeclaresItselfNoOwner() {
+        MockEnvironment environment = environment("stream-offset", "redis");
+        environment.setProperty(ContestScoreboardRecoveryValidator.STREAM_CONSUMER_PROPERTY, "true");
+
+        assertThatThrownBy(() -> new ContestScoreboardRecoveryValidator(
+                properties("stream-offset", false), environment).afterSingletonsInstantiated())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(ContestScoreboardRecoveryValidator.OWNER_PROPERTY)
+                .hasMessageContaining("recovery owner whether it declares itself one or not");
+    }
+
+    /**
+     * The other direction: {@code stream-offset} has no trigger but the consumer's supervisor pass, so
+     * an owner with the consumer off owns nothing while reporting that it recovers.
+     */
+    @Test
+    void refusesAnOwnerWithNoTriggerInTheModeThatNeedsTheConsumer() {
+        assertThatThrownBy(() -> validator("stream-offset", "stream-offset", "memory", true, false)
+                .afterSingletonsInstantiated())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(ContestScoreboardRecoveryValidator.OWNER_PROPERTY)
+                .hasMessageContaining("would own nothing");
+    }
+
+    /**
+     * The other two modes trigger without the consumer, so an owner with the consumer off is a real
+     * configuration there rather than an empty declaration.
+     */
+    @Test
+    void allowsAnOwnerWithNoConsumerInTheModesThatDoNotNeedOne() {
+        assertThatCode(() -> validator("full-replay", "full-replay", "memory", true, false)
+                .afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validator("redis-seq", "redis-seq", "redis", true, false)
+                .afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+    }
+
     @Test
     void allowsTheCanonicalModeSpellingAndAnAbsentMode() {
         assertThatCode(() -> validator("full-replay", "full-replay", "memory").afterSingletonsInstantiated())
@@ -122,7 +167,7 @@ class ContestScoreboardRecoverySummaryTests {
                     String summary = ContestScoreboardRecoverySummary.describe(properties.mode(), store, properties);
 
                     assertThat(summary)
-                            .startsWith("mode=" + mode + " store=" + store + " ")
+                            .startsWith("mode=" + mode + " store=" + store + " recovery-owner=true ")
                             .doesNotContain("null");
                 });
     }
@@ -138,15 +183,34 @@ class ContestScoreboardRecoverySummaryTests {
     private static ContestScoreboardRecoveryValidator validator(String configuredMode,
                                                                 String mode,
                                                                 String store) {
+        return validator(configuredMode, mode, store, true, true);
+    }
+
+    private static ContestScoreboardRecoveryValidator validator(String configuredMode,
+                                                                String mode,
+                                                                String store,
+                                                                boolean ownerEnabled,
+                                                                boolean consumerEnabled) {
+        MockEnvironment environment = environment(configuredMode, store);
+        environment.setProperty(ContestScoreboardRecoveryValidator.STREAM_CONSUMER_PROPERTY,
+                Boolean.toString(consumerEnabled));
+        return new ContestScoreboardRecoveryValidator(properties(mode, ownerEnabled), environment);
+    }
+
+    private static MockEnvironment environment(String configuredMode, String store) {
         MockEnvironment environment = new MockEnvironment();
         if (configuredMode != null) {
             environment.setProperty(ContestScoreboardRecoveryValidator.MODE_PROPERTY, configuredMode);
         }
         environment.setProperty(ContestScoreboardStoreProperty.NAME, store);
-        return new ContestScoreboardRecoveryValidator(properties(mode), environment);
+        return environment;
     }
 
     private static ContestScoreboardRecoveryProperties properties(String mode) {
+        return properties(mode, true);
+    }
+
+    private static ContestScoreboardRecoveryProperties properties(String mode, boolean ownerEnabled) {
         return new ContestScoreboardRecoveryProperties(
                 Arrays.stream(ContestScoreboardRecoveryMode.values())
                         .filter(candidate -> candidate.propertyValue().equals(mode))
@@ -167,7 +231,8 @@ class ContestScoreboardRecoverySummaryTests {
                 new ContestScoreboardRecoveryProperties.StreamOffset(
                         ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback.FULL_REPLAY,
                         ContestScoreboardRecoveryProperties.StreamOffset.StartupOffset.STORED
-                )
+                ),
+                new ContestScoreboardRecoveryProperties.RecoveryOwner(ownerEnabled)
         );
     }
 

@@ -323,6 +323,6 @@ class ContestScoreboardStreamLifecycleTests {
                         ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback.FULL_REPLAY,
                         startupOffset
                 )
-        );
+        , new ContestScoreboardRecoveryProperties.RecoveryOwner(true));
     }
 }

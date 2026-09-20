@@ -6,6 +6,7 @@ import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.ContestScoreboardSequenceSource;
+import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamRecoveryService;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
 import org.junit.jupiter.api.Test;
@@ -30,22 +31,63 @@ import static org.mockito.Mockito.mock;
  * <p>Unlike the replay service, the sequence recovery is conditional on the mode. Nothing else runs
  * a sequence check, and the sequence state it reads lives only beside a Redis scoreboard, so an
  * unconditional service would leave the default {@code store=memory} configuration unable to start.</p>
+ *
+ * <p>The strategy is the mode made into an object, and there is exactly one of it. Its bean is
+ * selected by an exhaustive switch over the bound mode rather than by {@code @ConditionalOnProperty}
+ * on the raw string, so a mode added to the enum without a branch fails the build instead of quietly
+ * selecting no strategy - which is what the relaxed-spelling test below is about, seen from the other
+ * side.</p>
  */
 class ContestScoreboardRecoveryModeWiringTests {
 
     private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
+            // The strategy is the live path's decision-maker as well as the supervisor's, so it exists
+            // where the consumer does - and only there. Both are gated on this one property.
+            .withPropertyValues("contest.scoreboard.stream.consumer.enabled=true")
             .withUserConfiguration(
                     Dependencies.class,
-                    // The production class, not a mock: this runner's job is to decide whether the
-                    // service comes up in every mode, and a bean the test itself registers would
-                    // answer that whichever way the service were annotated.
+                    // The production classes, not mocks: this runner's job is to decide whether a bean
+                    // comes up in every mode, and a bean the test itself registers would answer that
+                    // whichever way the service were annotated.
                     ContestScoreboardFullReplayService.class,
+                    ContestScoreboardStreamRecoveryService.class,
+                    ContestScoreboardRecoveryStrategyConfig.class,
                     ContestScoreboardFullReplayStartupRunner.class,
                     ContestScoreboardRedisSequenceConfig.class,
                     ContestScoreboardRedisSequenceRecoveryService.class,
                     ContestScoreboardRedisSequenceScheduler.class,
                     ContestScoreboardRedisSequenceStartupCheck.class
             );
+
+    /**
+     * Every mode gets a strategy, each mode gets its own, and the one thing the supervisor reads from
+     * it - whether that mode repairs a rollback by re-reading the stream - is what the mode chose.
+     * A single strategy shared by all three, or a mode falling through to another's, would make the
+     * modes indistinguishable at the one place they are supposed to differ.
+     */
+    @Test
+    void eachModeBringsUpItsOwnRecoveryStrategy() {
+        assertStrategy("stream-offset", ContestScoreboardRecoveryMode.STREAM_OFFSET, true);
+        assertStrategy("full-replay", ContestScoreboardRecoveryMode.FULL_REPLAY, false);
+        assertStrategy("redis-seq", ContestScoreboardRecoveryMode.REDIS_SEQ, false);
+    }
+
+    /**
+     * The strategy is not created where nothing could use it. A mode with no consumer has no live
+     * path and no supervisor, so a strategy there would be a bean that decides nothing - and the
+     * point of gating it is that the same {@code enabled} property governs both.
+     */
+    @Test
+    void noStrategyComesUpWithoutTheConsumer() {
+        new ApplicationContextRunner()
+                .withPropertyValues("contest.scoreboard.stream.consumer.enabled=false")
+                .withUserConfiguration(
+                        Dependencies.class,
+                        ContestScoreboardFullReplayService.class,
+                        ContestScoreboardRecoveryStrategyConfig.class
+                )
+                .run(context -> assertThat(context).doesNotHaveBean(ContestScoreboardRecoveryStrategy.class));
+    }
 
     /**
      * The service is unconditional - the retention-gap fallback replays through it in every mode, so
@@ -144,6 +186,22 @@ class ContestScoreboardRecoveryModeWiringTests {
                 });
     }
 
+    private void assertStrategy(String mode,
+                                ContestScoreboardRecoveryMode expected,
+                                boolean rewindsOnCheckpointRegression) {
+        contextRunner
+                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                .run(context -> {
+                    assertThat(context).hasSingleBean(ContestScoreboardRecoveryStrategy.class);
+                    ContestScoreboardRecoveryStrategy strategy =
+                            context.getBean(ContestScoreboardRecoveryStrategy.class);
+                    assertThat(strategy.mode()).as("mode=%s", mode).isEqualTo(expected);
+                    assertThat(strategy.rewindsOnCheckpointRegression())
+                            .as("mode=%s", mode)
+                            .isEqualTo(rewindsOnCheckpointRegression);
+                });
+    }
+
     @Configuration
     @EnableConfigurationProperties(ContestScoreboardRecoveryProperties.class)
     static class Dependencies {
@@ -181,6 +239,11 @@ class ContestScoreboardRecoveryModeWiringTests {
         @Bean
         MeterRegistry meterRegistry() {
             return new SimpleMeterRegistry();
+        }
+
+        @Bean
+        ContestScoreboardRecoveryPassGate recoveryPassGate(MeterRegistry meterRegistry) {
+            return new ContestScoreboardRecoveryPassGate(meterRegistry);
         }
     }
 }

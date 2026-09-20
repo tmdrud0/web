@@ -22,7 +22,8 @@ public final class ContestScoreboardRecoverySummary {
                                   ContestScoreboardRecoveryProperties properties) {
         StringBuilder summary = new StringBuilder()
                 .append("mode=").append(mode.propertyValue())
-                .append(" store=").append(store);
+                .append(" store=").append(store)
+                .append(" recovery-owner=").append(properties.owner().enabled());
         switch (mode) {
             case STREAM_OFFSET -> {
                 ContestScoreboardRecoveryProperties.StreamOffset streamOffset = properties.streamOffset();

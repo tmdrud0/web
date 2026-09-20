@@ -24,8 +24,21 @@ public record ContestScoreboardRecoveryProperties(
         @DefaultValue("stream-offset") ContestScoreboardRecoveryMode mode,
         @Valid @DefaultValue FullReplay fullReplay,
         @Valid @DefaultValue RedisSequence redisSeq,
-        @Valid @DefaultValue StreamOffset streamOffset
+        @Valid @DefaultValue StreamOffset streamOffset,
+        @Valid @DefaultValue RecoveryOwner owner
 ) {
+
+    /**
+     * Whether this instance is the one that runs recovery passes.
+     *
+     * <p>Nothing enforces this across instances, and nothing can: the gates and locks in this package
+     * are JVM-local, so two instances that both run a pass will both run it. What the setting does is
+     * make the deployment's assumption explicit and checkable at startup, so a role that silently
+     * became a second recovery owner is stopped rather than discovered later - see
+     * {@link ContestScoreboardRecoveryValidator}.</p>
+     */
+    public record RecoveryOwner(@DefaultValue("true") boolean enabled) {
+    }
 
     /** Replaying the whole contest from MySQL. */
     public record FullReplay(

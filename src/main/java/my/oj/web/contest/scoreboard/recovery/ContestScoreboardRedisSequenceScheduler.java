@@ -2,13 +2,12 @@ package my.oj.web.contest.scoreboard.recovery;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy.PassKind;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.SchedulingConfigurer;
 import org.springframework.scheduling.config.IntervalTask;
 import org.springframework.scheduling.config.ScheduledTaskRegistrar;
 import org.springframework.stereotype.Component;
-
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Runs the {@code redis-seq} check on the configured periods.
@@ -32,8 +31,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <h2>Why the pass is guarded</h2>
  *
  * <p>Two passes reading the allocator at overlapping moments would each judge the other's in-flight
- * results as lost, and the two triggers are independent schedules. A pass that is already running
+ * results as lost, and the triggers are independent schedules. A pass that is already running
  * makes the later trigger a no-op rather than a second reader.</p>
+ *
+ * <p>The guard is {@link ContestScoreboardRecoveryPassGate} rather than a flag of this class's own,
+ * because the scheduler is not the only thing that runs this check: the live path asks the sequence
+ * strategy for the same pass when a delivery arrives above a checkpoint that was not retained, and a
+ * scheduler-local flag would not see it. That gate is JVM-local, so it holds within one instance and
+ * says nothing about two - see {@code ARCHITECTURE.md} §3.5.</p>
  */
 @Component
 @ConditionalOnProperty(
@@ -48,8 +53,7 @@ class ContestScoreboardRedisSequenceScheduler implements SchedulingConfigurer {
     private final ContestScoreboardRedisSequenceRecoveryService recoveryService;
     private final ContestScoreboardRedisSequenceMetrics metrics;
     private final ContestScoreboardRecoveryProperties properties;
-
-    private final AtomicBoolean running = new AtomicBoolean();
+    private final ContestScoreboardRecoveryPassGate gate;
 
     @Override
     public void configureTasks(ScheduledTaskRegistrar taskRegistrar) {
@@ -63,30 +67,24 @@ class ContestScoreboardRedisSequenceScheduler implements SchedulingConfigurer {
     }
 
     /**
-     * One check pass, or nothing at all when a pass is already running.
+     * One check pass, or nothing at all when a pass already holds the gate.
      *
      * <p>Exposed because the startup check is a third trigger: it runs the same pass through the same
-     * guard, so a JVM starting up cannot end up with two readers.</p>
+     * gate, so a JVM starting up cannot end up with two readers.</p>
      */
     void runCheck(String trigger) {
-        if (!running.compareAndSet(false, true)) {
-            log.debug("A contest scoreboard sequence check is already running; skipping the {} trigger",
-                    trigger);
-            return;
-        }
-        try {
-            ContestScoreboardRedisSequenceRecoveryService.SequenceCheckReport report =
-                    recoveryService.check();
-            report(trigger, report);
-        } catch (RuntimeException failure) {
-            // Caught rather than propagated: a fixed-delay task that throws is cancelled, which would
-            // leave the mode silently not checking anything - the exact failure this mode exists to
-            // make visible.
-            metrics.recordFailedRound();
-            log.error("Contest scoreboard sequence check ({}) failed", trigger, failure);
-        } finally {
-            running.set(false);
-        }
+        gate.tryRun(PassKind.SEQUENCE_CHECK, () -> {
+            try {
+                report(trigger, recoveryService.check());
+            } catch (RuntimeException failure) {
+                // Caught rather than propagated: a fixed-delay task that throws is cancelled, which
+                // would leave the mode silently not checking anything - the exact failure this mode
+                // exists to make visible.
+                metrics.recordFailedRound();
+                log.error("Contest scoreboard sequence check ({}) failed", trigger, failure);
+            }
+            return Boolean.TRUE;
+        });
     }
 
     private void report(String trigger,

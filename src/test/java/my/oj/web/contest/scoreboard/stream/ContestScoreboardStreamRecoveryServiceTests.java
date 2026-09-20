@@ -69,6 +69,6 @@ class ContestScoreboardStreamRecoveryServiceTests {
                         fallback,
                         ContestScoreboardRecoveryProperties.StreamOffset.StartupOffset.STORED
                 )
-        );
+        , new ContestScoreboardRecoveryProperties.RecoveryOwner(true));
     }
 }

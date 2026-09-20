@@ -225,7 +225,7 @@ class ContestScoreboardFullReplayServiceTests {
                 new ContestScoreboardRecoveryProperties.StreamOffset(
                         ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback.FULL_REPLAY,
                         ContestScoreboardRecoveryProperties.StreamOffset.StartupOffset.STORED)
-        );
+        , new ContestScoreboardRecoveryProperties.RecoveryOwner(true));
     }
 
     private static ContestScoreboardReplayRow row(long submissionId, SubmissionResult result) {
