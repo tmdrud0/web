@@ -119,9 +119,13 @@ public class ContestScoreboardRebuildService {
         if (result == null) {
             return null;
         }
-        if (result.getFinalResult() != null) {
-            return result.getFinalResult();
-        }
-        return result.getProvisionalResult();
+        SubmissionResult effective = result.getFinalResult() != null
+                ? result.getFinalResult()
+                : result.getProvisionalResult();
+        // PENDING is what the row holds before any judge has decided, and the column is not
+        // nullable, so the check above does not catch it. Replaying it would still mark the
+        // submission as processed - the Redis script adds to that set outside its PENDING branch -
+        // and the real judgement would then be skipped for good.
+        return effective == SubmissionResult.PENDING ? null : effective;
     }
 }

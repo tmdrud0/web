@@ -133,7 +133,7 @@ class ContestScoreboardRebuildServiceTests {
     @Test
     void rebuildFromContestResults_skipsSubmissionsThatHaveNotBeenJudged() {
         stubBatches(Map.of(
-                3L, ContestSubmissionResult.pending(submission3),
+                3L, unjudged(submission3),
                 5L, judged(submission5, SubmissionResult.ACCEPTED)
         ));
         when(scoreboardApplier.applyAll(anyList())).thenAnswer(invocation -> succeed(invocation.getArgument(0)));
@@ -145,6 +145,26 @@ class ContestScoreboardRebuildServiceTests {
         assertThat(captor.getValue())
                 .extracting(request -> request.update().contestSubmissionId())
                 .containsExactly(5L);
+        verify(appliedAtWriter).markApplied(List.of(5L));
+    }
+
+    /**
+     * Applying a PENDING row would record the submission as handled, and the Redis script adds to
+     * its processed set outside the PENDING branch, so the real judgement would be skipped for
+     * good. A batch of nothing but unjudged rows therefore has to replay nothing at all.
+     */
+    @Test
+    void rebuildFromContestResults_replaysNothingWhenNoSubmissionHasBeenJudged() {
+        stubBatches(Map.of(
+                3L, unjudged(submission3),
+                5L, unjudged(submission5)
+        ));
+
+        rebuildService.rebuildFromContestResults(CONTEST_ID);
+
+        verify(scoreboardApplier).reset(CONTEST_ID);
+        verify(scoreboardApplier, never()).applyAll(anyList());
+        verify(appliedAtWriter, never()).markApplied(anyList());
     }
 
     @Test
@@ -197,11 +217,23 @@ class ContestScoreboardRebuildServiceTests {
     }
 
     private static ContestSubmissionResult judged(ContestSubmission submission, SubmissionResult result) {
-        ContestSubmissionResult judged = ContestSubmissionResult.pending(submission);
-        ReflectionTestUtils.setField(judged, "id", submission.getId());
+        ContestSubmissionResult judged = unjudged(submission);
         judged.recordProvisional(result, LocalDateTime.of(2024, 1, 1, 10, 30));
         judged.recordFinal(result, LocalDateTime.of(2024, 1, 1, 10, 30));
         return judged;
+    }
+
+    /**
+     * A row that exists but has not been judged yet.
+     *
+     * <p>The id has to be set here: the service indexes these rows by id, exactly as JPA does for a
+     * persisted row, so a fixture without one would be looked up as "no row" and the test would
+     * never reach the PENDING handling it exists to cover.</p>
+     */
+    private static ContestSubmissionResult unjudged(ContestSubmission submission) {
+        ContestSubmissionResult unjudged = ContestSubmissionResult.pending(submission);
+        ReflectionTestUtils.setField(unjudged, "id", submission.getId());
+        return unjudged;
     }
 
     private static List<ContestScoreboardApplier.ApplyResult> succeed(
