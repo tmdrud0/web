@@ -12,6 +12,19 @@ gatling {
   logLevel = 'INFO'
 }
 
+dependencies {
+  // The load model's arithmetic - the arrival plan, the per-second bucket rule, the record of what
+  // was started - is checked rather than only measured. The tests live in the simulations' own source
+  // set (see `loadModelTest` below) rather than in a `test` source set of their own, because the
+  // gatling plugin loads the test source set into the simulations' classpath: a test source set that
+  // depends back on the compiled simulations closes the loop
+  // `compileGatlingJava -> compileTestJava -> compileGatlingJava` and gradle refuses to build it.
+  // Running them over the simulations' own output is also the more honest wiring - the classes under
+  // test are the classes that measure the run, not a second compilation of the same text.
+  gatlingImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+  gatlingRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
 tasks.register('prepareStandaloneGatling') {
   group = 'Gatling'
   description = 'Compiles Gatling simulations and writes a standalone classpath file for direct java execution.'
@@ -29,6 +42,22 @@ tasks.register('prepareStandaloneGatling') {
     def classpathFile = new File(root, 'classpath.txt')
     classpathFile.text = classpathEntries.join(File.pathSeparator)
   }
+}
+
+/** JUnit 5 over the simulations' compiled output. Wired into `check`, so `./gradlew build` runs it. */
+tasks.register('loadModelTest', Test) {
+  group = 'verification'
+  description = 'Runs the load model tests (arrival plan, per-second buckets, request-start record).'
+  testClassesDirs = sourceSets.gatling.output.classesDirs
+  classpath = sourceSets.gatling.runtimeClasspath
+  useJUnitPlatform()
+  testLogging {
+    events 'passed', 'failed', 'skipped'
+  }
+}
+
+tasks.named('check') {
+  dependsOn tasks.named('loadModelTest')
 }
 
 def registerSimulationTask = { String taskName, String simulationPattern, String taskDescription ->
@@ -71,4 +100,3 @@ registerSimulationTask(
     '**/OjGoalLoadSimulation.scala',
     'Runs only OjGoalLoadSimulation.'
 )
-

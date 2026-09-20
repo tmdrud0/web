@@ -121,13 +121,32 @@ object ApiLoad {
   /**
    * 202 is the accept; 503 is the admission limiter refusing work it cannot queue, which is
    * backpressure rather than a fault and is counted separately by the harness.
+   *
+   * The request is built once and the checks are added per caller, so the open-arrival model's
+   * variant cannot drift from the closed model's submission: same method, same path, same body.
    */
-  val submit: HttpRequestBuilder = http("api-contest-submit")
+  private val submitRequest: HttpRequestBuilder = http("api-contest-submit")
     .post("/api/problems/#{problemId}/submissions")
     .body(StringBody("""{"code":"#{code}"}"""))
     .asJson
+
+  val submit: HttpRequestBuilder = submitRequest
     .check(status.is(202))
     .check(jsonPath("$.submissionId").exists)
+
+  /**
+   * The same submission, additionally writing what the response carried into the session.
+   *
+   * The open-arrival recorder keeps one row per attempted submission whether or not the response
+   * ever arrived, and a row for an accepted attempt that does not say which submission was accepted
+   * cannot be joined against the server's own row for it. `saveAs` runs only for a check that
+   * passed, so the accept status is what makes the identifier recorded: an attempt refused with 503
+   * is left `unavailable` and is read from the client log, which is where the refused request's
+   * status code is written.
+   */
+  val submitCapturingOutcome: HttpRequestBuilder = submitRequest
+    .check(status.is(202).saveAs("responseCode"))
+    .check(jsonPath("$.submissionId").ofType[Long].saveAs("submissionId"))
 
   /**
    * How many rows a scoreboard page must carry, from the two numbers the server itself used: the
