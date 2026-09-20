@@ -3,6 +3,9 @@ package my.oj.perf
 import io.gatling.core.Predef._
 import io.gatling.core.controller.inject.closed.ClosedInjectionStep
 
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Paths, StandardOpenOption}
+
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.duration._
 
@@ -25,6 +28,19 @@ import scala.concurrent.duration._
  * Session authentication is the reason it had to move: this drove `/perf/contest/submit`, which
  * took a user id in the body. Against `POST /api/problems/{id}/submissions` an open model would
  * log in once per submission and the staircase would measure logins.
+ *
+ * `perf.stageRps` replaces the arithmetic walk with an explicit list, which the walk cannot
+ * express: a measured capacity sweep needs a warm-up stage that repeats the first plateau's rate,
+ * so the ladder is not an arithmetic progression. Everything else - the ramp-then-hold shape, the
+ * closed populations, the seeding - is the same, and with the property absent the arithmetic path
+ * below is untouched.
+ *
+ * `perf.stageTraceFile` writes the whole schedule up front, at the instant the injection profile
+ * is about to start. The harness otherwise has to infer stage boundaries from the traffic itself,
+ * and the only available anchor - the first persisted submission - is spread over one full
+ * `submitIntervalMillis` by `initialJitter`, which is a third of a 30 second stage. Predicting the
+ * boundaries from a single anchor costs whatever delay sits between `before()` and the injector
+ * start (a constant, recorded alongside the run), and it removes the sampling error.
  */
 class ContestSubmissionStepLoadSimulation extends Simulation {
 
@@ -46,8 +62,20 @@ class ContestSubmissionStepLoadSimulation extends Simulation {
   private val stepHoldSeconds = propInt("perf.stepHoldSeconds", 10)
   private val intervalMs      = propLong("perf.submitIntervalMillis", 5_000L)
 
+  /**
+   * Explicit staircase, e.g. `50,50,100,150,200,230`. Absent means the arithmetic walk, so no
+   * existing invocation changes behaviour.
+   */
+  private val explicitStageRps = Option(System.getProperty("perf.stageRps"))
+    .map(_.split(',').iterator.map(_.trim).filter(_.nonEmpty).map(_.toDouble).toVector)
+  private val warmupStageCount = propInt("perf.warmupStageCount", 0)
+  private val stageTraceFile   = Option(System.getProperty("perf.stageTraceFile")).filter(_.nonEmpty)
+
   private val availableUsers = userIndexEnd - userIndexStart + 1
-  private val peakConcurrentUsers = ApiLoad.concurrentUsers(maxRps, intervalMs)
+  private val arithmeticTargets = staircaseTargets()
+  private val targets = explicitStageRps.getOrElse(arithmeticTargets)
+  private val peakConcurrentUsers =
+    if (targets.isEmpty) 0 else targets.map(ApiLoad.concurrentUsers(_, intervalMs)).max
 
   require(userIndexEnd >= userIndexStart, "perf.userIndex.end must be greater than or equal to perf.userIndex.start")
   require(problemIdEnd >= problemIdStart, "perf.problemId.end must be greater than or equal to perf.problemId.start")
@@ -58,6 +86,12 @@ class ContestSubmissionStepLoadSimulation extends Simulation {
   require(peakConcurrentUsers <= availableUsers,
     s"the top step needs $peakConcurrentUsers seeded users at a ${intervalMs}ms pace but only $availableUsers are " +
       "available - raise -UserCount, lower perf.maxRps, or shorten perf.submitIntervalMillis")
+  require(explicitStageRps.forall(_.nonEmpty), "perf.stageRps must list at least one target rate")
+  require(explicitStageRps.forall(_.forall(_ > 0d)), "every perf.stageRps entry must be greater than 0")
+  require(warmupStageCount >= 0 && warmupStageCount < targets.size,
+    s"perf.warmupStageCount must leave at least one measured stage (got $warmupStageCount of ${targets.size})")
+  require(stageTraceFile.isEmpty || explicitStageRps.isDefined,
+    "perf.stageTraceFile describes the explicit stage list, so it requires perf.stageRps")
 
   private val httpProtocol = ApiLoad.jsonProtocol(baseUrl)
 
@@ -72,17 +106,105 @@ class ContestSubmissionStepLoadSimulation extends Simulation {
         .exec(ApiLoad.submit)
     }
 
-  private val targets = staircaseTargets()
-  private val totalDuration = (targets.size * (rampSeconds + stepHoldSeconds)).seconds
+  private val totalDuration =
+    if (explicitStageRps.isDefined) explicitPlan().map(_.seconds).sum.seconds
+    else (arithmeticTargets.size * (rampSeconds + stepHoldSeconds)).seconds
+
+  private val injectionProfile =
+    if (explicitStageRps.isDefined) buildExplicitInjectionProfile() else buildInjectionProfile()
 
   setUp(
-    submitScenario.inject(buildInjectionProfile())
+    submitScenario.inject(injectionProfile)
   ).protocols(httpProtocol)
     .maxDuration(totalDuration)
     .assertions(LoadTestAssertions.globalAssertions: _*)
 
+  /**
+   * Written at construction, because the runner instantiates the simulation immediately before it
+   * starts the injector and no `Simulation` hook fires reliably at that point - Gatling's
+   * `before`/`after` are `ScenarioBuilder`/`PopulationBuilder` statements, and nothing in
+   * gatling-core 3.10.5 calls the `Simulation` ones. The harness reads the boundaries while the
+   * run is in flight, so the file is complete before the first request is sent rather than
+   * appended to as the schedule advances.
+   */
+  stageTraceFile.foreach(writeStageTrace)
+
+  private case class PlannedStep(
+      kind: String,
+      population: Int,
+      fromPopulation: Int,
+      stageIndex: Int,
+      targetRps: Double,
+      seconds: Int)
+
+  private def explicitPlan(): List[PlannedStep] = {
+    val rates = explicitStageRps.get
+    val populations = rates.map(ApiLoad.concurrentUsers(_, intervalMs))
+    val steps = ListBuffer.empty[PlannedStep]
+
+    steps += PlannedStep("initialRamp", populations.head, 1, -1, rates.head, rampSeconds)
+    populations.zip(rates).zipWithIndex.foreach {
+      case ((population, target), index) =>
+        if (index > 0) {
+          steps += PlannedStep("transition", population, populations(index - 1), index, target, rampSeconds)
+        }
+        steps += PlannedStep("hold", population, population, index, target, stepHoldSeconds)
+    }
+    steps.toList
+  }
+
+  /**
+   * `rampConcurrentUsers(x).to(x)` is not a step this file has ever exercised, and a transition
+   * that does not change the population is a plateau, not a ramp. Two consecutive constants say
+   * the same thing using only steps the arithmetic path already relies on.
+   */
+  private def buildExplicitInjectionProfile(): List[ClosedInjectionStep] = {
+    val steps = ListBuffer.empty[ClosedInjectionStep]
+    explicitPlan().foreach { step =>
+      step.kind match {
+        case "initialRamp" =>
+          steps += rampConcurrentUsers(1).to(step.population).during(step.seconds.seconds)
+        case "transition" if step.fromPopulation == step.population =>
+          steps += constantConcurrentUsers(step.population).during(step.seconds.seconds)
+        case "transition" =>
+          steps += rampConcurrentUsers(step.fromPopulation).to(step.population).during(step.seconds.seconds)
+        case _ =>
+          steps += constantConcurrentUsers(step.population).during(step.seconds.seconds)
+      }
+    }
+    steps.toList
+  }
+
+  private def writeStageTrace(path: String): Unit = {
+    val steps = explicitPlan()
+    val anchorMillis = System.currentTimeMillis()
+    val lines = ListBuffer.empty[String]
+
+    def boundary(event: String, index: Int, step: PlannedStep, offsetMillis: Long): String = {
+      val stageIndex = if (step.kind == "hold") step.stageIndex else -1
+      val isWarmup = if (step.kind == "hold" && step.stageIndex < warmupStageCount) 1 else 0
+      s"${anchorMillis + offsetMillis},$event,$index,${step.kind},$stageIndex,$isWarmup," +
+        s"${step.population},${step.targetRps}"
+    }
+
+    lines += s"$anchorMillis,anchor,-1,none,-1,0,0,0"
+    var offsetMillis = 0L
+    steps.zipWithIndex.foreach {
+      case (step, index) =>
+        lines += boundary("segmentStart", index, step, offsetMillis)
+        offsetMillis += step.seconds * 1000L
+        lines += boundary("segmentEnd", index, step, offsetMillis)
+    }
+    lines += s"${anchorMillis + offsetMillis},planDone,-1,none,-1,0,0,0"
+
+    Files.write(
+      Paths.get(path),
+      (lines.mkString("\n") + "\n").getBytes(StandardCharsets.UTF_8),
+      StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)
+  }
+
   private def buildInjectionProfile(): List[ClosedInjectionStep] = {
-    val populations = targets.map(ApiLoad.concurrentUsers(_, intervalMs))
+    val populations = arithmeticTargets.map(ApiLoad.concurrentUsers(_, intervalMs))
     val steps = ListBuffer.empty[ClosedInjectionStep]
 
     steps += rampConcurrentUsers(1).to(populations.head).during(rampSeconds.seconds)
