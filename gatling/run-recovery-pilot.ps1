@@ -424,7 +424,7 @@ try {
             "$($beforeLoad.ApiParticipants) vs $($beforeLoad.OracleParticipants) participants). " +
             "Stopping: no figure from this run would be about a recovery.")
     }
-    Write-Output "  pre-load: scoreboard and oracle agree, clock skew ${clockSkew}s, pipeline quiescent"
+    Write-Output "  pre-load: scoreboard and oracle agree, clock frame: $clockSkew, pipeline quiescent"
     Write-Output ""
 
     # --- 5. load ----------------------------------------------------------------------------------

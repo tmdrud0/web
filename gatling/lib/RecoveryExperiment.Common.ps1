@@ -829,9 +829,24 @@ SELECT @@global.time_zone, @@session.time_zone, NOW(6), UTC_TIMESTAMP(6),
     }
 }
 
-# Decisive rather than inferred: the newest applied-at stamp was written moments ago, so if it is not
-# within a minute of the database's own clock reading then the writer and the database are not in the
-# same frame and no latency figure from these columns means anything.
+# The two clocks the latency columns are built from, compared on rows that carry one value from each.
+#
+# `provisional_judged_at` is written by the judging JVM - the batch passes the instant it judged at, and
+# the driver formats it in the session's zone - while `result_saved_at` on the same row is MySQL's
+# `CURRENT_TIMESTAMP(6)`. One INSERT writes both, milliseconds apart, so a difference between them past
+# the tolerance is not a delay: it is the two clocks disagreeing, and the disagreement worth catching is
+# a zone offset of hours. The tolerance sits orders of magnitude from both - well above the sub-second
+# gap the write leaves, well below any frame error - so it is not a threshold anything normal drifts to.
+#
+# This is the comparison the applied-at column cannot make, which is what it was previously asked to do.
+# `scoreboard_applied_at` is written by MySQL as well (`COALESCE(scoreboard_applied_at,
+# CURRENT_TIMESTAMP(6))`), so reading it against MySQL's own clock compares MySQL with itself and
+# measures pipeline staleness under a message about clock frames. Those two need opposite responses: a
+# stale pipeline drains on its own, a wrong frame stays wrong and every latency figure computed across it
+# is offset by the difference.
+#
+# Nothing to compare yet is a state and not a zero. Before the load no result has been judged, so the
+# guard reports `unavailable` rather than a 0 that would read as a measured agreement.
 function Assert-ClockFramesAligned {
     # Not `Mandatory`: the default is the intended tolerance, and PowerShell treats a mandatory parameter
     # as one the caller must supply even when it declares a default, so `Mandatory` here made both call
@@ -839,16 +854,30 @@ function Assert-ClockFramesAligned {
     param([int]$ToleranceSeconds = 60)
 
     $row = @(Invoke-SqlRows -Sql @"
-SELECT IFNULL(TIMESTAMPDIFF(SECOND, MAX(scoreboard_applied_at), NOW(6)), 0)
+SELECT MAX(ABS(TIMESTAMPDIFF(SECOND, provisional_judged_at, result_saved_at))), COUNT(*)
   FROM contest_submission_result
- WHERE contest_id = $((Get-RecoveryConfig).ContestId);
-"@ -Description "applied-at clock skew")[0]
-    $skew = ConvertTo-RequiredInt64 -Value $row[0] -Description "applied-at clock skew"
-    if ($skew -gt $ToleranceSeconds) {
-        throw "The newest scoreboard_applied_at is ${skew}s behind MySQL's clock. The app's timestamp frame " +
-        "and the database's are not the same, so reflect latencies computed across the two would be wrong."
+ WHERE contest_id = $((Get-RecoveryConfig).ContestId)
+   AND provisional_judged_at IS NOT NULL
+   AND result_saved_at IS NOT NULL;
+"@ -Description "judged-at against saved-at")[0]
+    $compared = ConvertTo-RequiredInt64 -Value $row[1] -Description "results carrying both timestamps"
+    if ($compared -eq 0L) {
+        return "unavailable (no judged result carries both timestamps yet)"
     }
-    return $skew
+    $skew = ConvertTo-RequiredInt64 -Value $row[0] -Description "judged-at against saved-at skew"
+    if ($skew -gt $ToleranceSeconds) {
+        # The zones are what a reader needs to act on this, and they are one query away rather than
+        # something to reconstruct from the number: which zone the session is in against which one the
+        # server is in is the whole difference when the two clocks are this far apart.
+        $frame = Get-ClockFrameDiagnostic
+        throw ("The judging JVM's clock and MySQL's are ${skew}s apart over $compared result(s), which is " +
+            "a frame error and not a delay: every reflect latency computed across the two would be off by " +
+            "that difference. MySQL reports global time_zone '$($frame.globalTimeZone)' and session " +
+            "time_zone '$($frame.sessionTimeZone)'; the server reads $($frame.now) and " +
+            "$($frame.utcNow) as UTC, against the applied-at column's newest value of " +
+            "'$($frame.latestAppliedAt)'.")
+    }
+    return "the JVM's and MySQL's clocks are ${skew}s apart over $compared result(s)"
 }
 
 function Assert-NonInterferenceIntact {

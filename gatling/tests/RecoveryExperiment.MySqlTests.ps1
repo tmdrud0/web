@@ -261,6 +261,62 @@ SELECT CONCAT('SBRE_SQLTEST_INSERTED=', (SELECT COUNT(*) FROM contest_submission
         Assert-Equal "unavailable" $stats.MaxMs "an empty window reports unavailable"
     }
 
+    Test-Case "the clock-frame guard reads a JVM clock against a MySQL clock, and refuses a drifted one" {
+        # Both columns are on the same inserted row: `provisional_judged_at` is the value the judging JVM
+        # passes, `result_saved_at` is MySQL's `CURRENT_TIMESTAMP(6)` from the same INSERT. The fixture
+        # writes the two a second apart, so the guard reads 1s over the nine rows that carry both - row 5
+        # has no provisional judgement, which is why nine of ten are compared.
+        #
+        # The case that matters is the second half. The guard used to compare `scoreboard_applied_at`
+        # against MySQL's `NOW(6)`, and MySQL writes both of those, so it could not have failed for the
+        # reason it named. Drifting one row by nine hours is the fault it is supposed to catch - a zone
+        # error between the JVM and the database - and it is caught here, through the real query, against
+        # real rows, and then put back.
+        $aligned = Assert-ClockFramesAligned
+        Assert-Equal "the JVM's and MySQL's clocks are 1s apart over 9 result(s)" $aligned "the fixture's two clocks differ by the second the fixture wrote"
+
+        $driftedId = $script:submissionIds[0]
+        $driftSql = @"
+UPDATE contest_submission_result
+   SET provisional_judged_at = provisional_judged_at - INTERVAL 9 HOUR
+ WHERE submission_id = $driftedId AND contest_id = $($seed.ContestId);
+SELECT CONCAT('SBRE_SQLTEST_DRIFTED=', ROW_COUNT());
+"@
+        $driftLines = @(Invoke-SqlScript -Sql $driftSql -Description "drift one fixture row's judged-at by nine hours")
+        $drifted = @($driftLines | Where-Object { ([string]$_).Trim().StartsWith("SBRE_SQLTEST_DRIFTED=") })
+        Assert-Equal "SBRE_SQLTEST_DRIFTED=1" ([string]$drifted[0]).Trim() "exactly one fixture row was drifted"
+        try {
+            Assert-Throws { [void](Assert-ClockFramesAligned) } "a nine-hour frame error is refused rather than averaged into the latencies"
+        }
+        finally {
+            $restoreSql = @"
+UPDATE contest_submission_result
+   SET provisional_judged_at = provisional_judged_at + INTERVAL 9 HOUR
+ WHERE submission_id = $driftedId AND contest_id = $($seed.ContestId);
+SELECT CONCAT('SBRE_SQLTEST_RESTORED=', ROW_COUNT());
+"@
+            [void](Invoke-SqlScript -Sql $restoreSql -Description "put the drifted row back")
+        }
+        Assert-Equal $aligned (Assert-ClockFramesAligned) "the guard reads the fixture as it did before the drift"
+    }
+
+    Test-Case "the clock-frame guard reports unavailable before anything has been judged" {
+        # The guard runs before the load, when no result has been judged at all. Nothing to compare is a
+        # state and not an agreement, and a zero here would read as one - the same distinction the empty
+        # latency window above draws. Scoped to a contest with no rows rather than to the fixture, since
+        # the fixture's rows are the ones that must not be disturbed.
+        $config = Get-RecoveryConfig
+        $fixtureContest = $config.ContestId
+        try {
+            $config.ContestId = 0
+            Assert-Equal "unavailable (no judged result carries both timestamps yet)" (Assert-ClockFramesAligned) `
+                "a contest with no judged results reports an absent comparison"
+        }
+        finally {
+            $config.ContestId = $fixtureContest
+        }
+    }
+
     Test-Case "a cleanup without a seed refuses to run" {
         # The failure this guards against is a cleanup that runs before the seed set the scope and
         # therefore scopes its statements to the default contest id, which belongs to somebody else.
