@@ -17,8 +17,10 @@
 | 새 브랜치 | `codex/scoreboard-recovery-tradeoff` |
 | 기준 commit | `0d36f26481df6e75f2b22edd44b6f787ce6c7bc6` (`codex/contest-judge-stream-publish`, 계획의 예상값과 일치) |
 | 1라운드 HEAD | `60d98ec` (기준 + 11 commit) |
-| 2라운드 HEAD | `535855d` (기준 + 19 commit, 101 files, +10171 / −281) |
-| 작업 트리 | **clean (미추적 파일 없음)** — 이 보고서를 커밋한 `535855d`에서 측정. §1.1 |
+| 2라운드 HEAD | `535855d` (기준 + 19 commit) |
+| 검토 기준 HEAD | `7af681e` (기준 + 20 commit) — 읽기 전용 검토자가 본 지점 |
+| **최종 HEAD** | **`b98c83f`** (기준 + 21 commit, 102 files, +10679 / −283) |
+| 작업 트리 | **clean (미추적 파일 없음)** — 최종 HEAD에서 측정. §1.1 |
 | 원본 checkout | 건드리지 않음. `reset`/`clean`/강제 checkout 사용 안 함 |
 
 공개 API 변경 없음. **신규 의존성 없음**(`build.gradle` 무변경).
@@ -31,14 +33,15 @@
 참이지만, 변경 파일 수를 보고하면서 보고서 자신을 빠뜨리면 그 수가 틀린다.
 
 이 절의 값은 **이 보고서가 커밋된 뒤에** 다시 측정해 기록했다(요구사항: clean 상태와 변경 파일 수는
-보고서를 커밋한 다음에만 다시 기록한다). 이 보고서를 커밋한 `535855d`에서 측정한 값이며, 그 측정
-자체는 이 절을 채우는 커밋에 들어간다.
+보고서를 커밋한 다음에만 다시 기록한다). 아래 첫 측정은 보고서를 커밋한 `535855d`에서, 최종 값은
+검토 지적을 수정한 `b98c83f`에서 측정했고 그 측정 자체는 이 절을 채우는 커밋에 들어간다.
 
-| 측정 | 값 (`535855d` 기준) |
-|---|---|
-| 작업 트리 | **clean — `git status --short`가 아무것도 출력하지 않는다** (미추적 파일 없음) |
-| `60d98ec..HEAD` (2라운드) | 59 files changed, 4664 insertions(+), 456 deletions(−) |
-| `0d36f26..HEAD` (전체) | 101 files changed, 10171 insertions(+), 281 deletions(−) |
+| 측정 | 값 (`535855d` 기준) | 값 (**`b98c83f` = 최종 HEAD** 기준) |
+|---|---|---|
+| 작업 트리 | clean (미추적 파일 없음) | **clean — `git status --short`가 아무것도 출력하지 않는다** (미추적 파일 없음) |
+| `7af681e..HEAD` (검토 이후) | — | 17 files changed, 1485 insertions(+), 124 deletions(−) |
+| `60d98ec..HEAD` (2라운드) | 59 files, 4664 insertions(+), 456 deletions(−) | 60 files changed, 5190 insertions(+), 476 deletions(−) |
+| `0d36f26..HEAD` (전체) | 101 files, 10171 insertions(+), 281 deletions(−) | 102 files changed, 10679 insertions(+), 283 deletions(−) |
 
 세 수치 모두 **보고서 자신을 포함한다** — 그것이 1라운드의 "clean"이 틀렸던 바로 그 지점이다.
 
@@ -134,7 +137,7 @@ checkpoint에서의 재구독**으로 구현하고(`recoverConsumption`이 롤�
   unit/MySQL, lifecycle, batch-failure Rabbit, requeue 실측 probe, 모드 기동 2종 등
 - **docs 2**: `ARCHITECTURE.md`, `PORTFOLIO_SCOREBOARD_RECOVERY.md`
 
-### 5.2 [정정] 2라운드 (`60d98ec..HEAD`) — 59 files, +4664 / −456
+### 5.2 [정정] 2라운드 (`60d98ec..HEAD`) — 60 files, +5190 / −476
 
 - **main 신규 11**: `recovery/` 7 (`ContestScoreboardRecoveryStrategy`,
   `StreamOffsetRecoveryStrategy`, `FullReplayRecoveryStrategy`, `RedisSequenceRecoveryStrategy`,
@@ -158,6 +161,16 @@ checkpoint에서의 재구독**으로 구현하고(`recoverConsumption`이 롤�
   mode wiring, full-replay 계열, redis-seq service, batch-failure Rabbit(confirm 동기화),
   stream Redis·Rabbit 통합
 - **docs 3**: `ARCHITECTURE.md`(§3.1–3.5, §4, §5.1), `ENVIRONMENT.md`(§8, §8.1), 이 보고서
+
+**검토 이후 추가분 (`7af681e..b98c83f`, 17 files, +1485 / −124)**
+
+- main 수정 6: `ContestScoreboardRecoveryStrategy`(구간 양끝·파생 바닥), `StreamOffsetRecoveryStrategy`
+  (fallback에 구간의 실제 위쪽 끝), `ContestScoreboardStreamProcessor`(`GapReason`), 
+  `ContestScoreboardStreamLifecycle`, `ContestScoreboardStreamPosition`(`consumerRestarted`),
+  `ContestScoreboardStreamListener`·`ContestScoreboardStreamRecoveryService`(로그가 실제 구간을 보고)
+- test 신규 1: `ContestScoreboardRecoveryStrategyTests`(§15.2)
+- test 수정 5: lifecycle·processor·listener·부분 실패 Rabbit 통합
+- docs 2: `ARCHITECTURE.md`(§3.1 구간 계약·§3.2 `GapReason`·§4 불변식), 이 보고서(§15)
 
 ## 6. 주요 설정과 effective 기본값
 
@@ -199,22 +212,30 @@ override를 준 이유는 그 테스트가 세 모드를 **실제 ApplicationCon
 
 ## 7. 실행한 테스트와 결과
 
-**2라운드 HEAD(`7af681e`) 기준으로 다시 측정한 값이다.**
+**2라운드 최종 HEAD(`b98c83f`) 기준으로 다시 측정한 값이다.** 검토 지적을 수정한 뒤 재실행한
+결과이며, 4개 tier 모두 초록이다.
 
 | tier | 명령 | 결과 |
 |---|---|---|
-| 기본 (실물 MySQL) | `.\gradlew.bat test` | 99 class / **399 tests / skipped 38 / failures 0 / errors 0** (43s) |
-| Redis (실물 Redis) | `... -DredisIntegration=true -DredisPort=16379` | 399 tests / skipped 13 / **failures 0** (56s) |
-| RabbitMQ (실물 브로커) | `... -DrabbitIntegration=true` | 399 tests / skipped 31 / **failures 0** (1m6s) |
-| Rabbit+Redis 동시 | `... -DrabbitIntegration=true -DredisIntegration=true` | 399 tests / skipped 6 / **failures 0** (1m19s) |
+| 기본 (실물 MySQL) | `.\gradlew.bat test` | 100 class / **408 tests / skipped 38 / failures 0 / errors 0** (45s) |
+| Redis (실물 Redis) | `... -DredisIntegration=true -DredisPort=16379` | 408 tests / skipped 13 / **failures 0** (56s) |
+| RabbitMQ (실물 브로커) | `... -DrabbitIntegration=true` | 408 tests / skipped 31 / **failures 0** (1m18s) |
+| 스코어보드·복구 한정 | `... --tests "*ContestScoreboard*" --tests "*Recovery*"` | 41 class / 192 tests / skipped 29 / **failures 0** (20s) |
 
 skip은 전부 **시스템 프로퍼티로 gate된 클래스**다: ① `-DredisIntegration`가 필요한 실물 Redis
 클래스(25), ② `-DrabbitIntegration`가 필요한 실물 브로커 클래스(7), ③
 `ContestSubmissionMySqlBatchRewriteIntegrationTests`(6, 별도 환경변수 — 이번 작업과 무관한 기존 상태).
-25+7+6=38이 기본 tier의 skip이고, 두 플래그를 함께 주면 ③만 남아 6이 된다.
+25+7+6=38이 기본 tier의 skip이고, Redis tier는 25가, Rabbit tier는 7이 풀린다.
 
-**1라운드 대비 증가** — 354 → 399 tests. 늘어난 45건은 2라운드가 추가한 것으로, 새 계약(anchor,
-미적용 구간, pass gate, 트랜잭션 경계, Duration 거부, 실물 부분 실패)을 각각 고정한다.
+**1라운드 대비 증가** — 354 → 408 tests. 늘어난 54건은 2라운드가 추가한 것으로, 새 계약(anchor,
+미적용 구간, pass gate, 트랜잭션 경계, Duration 거부, 실물 부분 실패, 구간 양끝)을 각각 고정한다.
+그중 9건(전략 테스트 8 + lifecycle 테스트 1)은 §15의 검토 지적에 대응해 **검토 이후에** 추가했다.
+같은 이유로 기본 tier의 class 수는 99 → 100이다.
+
+이전 라운드에 있던 `-DrabbitIntegration=true -DredisIntegration=true` 동시 tier는 **수정 후 다시
+돌리지 않았다**. 그 두 플래그는 위 2·3행에서 각각 따로 실행했고, 동시 실행이 덮는 교차 구간
+(실물 Redis + 실물 브로커를 함께 쓰는 클래스)은 Rabbit tier가 이미 포함한다 — 다만 "다시 돌려
+같은 수치를 얻었다"고는 적지 않는다.
 
 **실물 인프라로 검증한 것**
 - MySQL: 기본 tier 전체가 `spring.datasource.url=jdbc:mysql://localhost:3306/oj_test` +
@@ -265,9 +286,11 @@ c307ceb refactor: lift the scoreboard processing lock out of the stream package
 0f7bb14 feat: select the contest scoreboard recovery mode from configuration
 ```
 
-### 8.2 2라운드 (`60d98ec` → `535855d`)
+### 8.2 2라운드 (`60d98ec` → `b98c83f`)
 
 ```
+b98c83f fix: read the scoreboard recovery range from both of its ends
+136440e docs: record the tree state the report describes
 535855d docs: correct the scoreboard recovery report against the implementation
 7af681e test: fail a scoreboard batch halfway through real Redis
 dc008cc fix: declare the recovery owner in the two stream consumer tests
@@ -278,8 +301,10 @@ a2c446b fix: apply the scoreboard replay outside the database transaction
 274b389 refactor: decide scoreboard history recovery per mode
 ```
 
-(`535855d` 뒤에 이 보고서의 §1.1을 측정값으로 채우는 커밋이 하나 더 온다 — 그 커밋은 위 diff에
-포함되지 않는다. 보고서를 커밋한 다음에만 그 값을 기록하라는 요구사항 때문에 순서가 이렇게 된다.)
+순서에 이유가 있다. 읽기 전용 검토자를 `7af681e`에 붙였으므로 보고서 정정(`535855d`)과 그 측정
+기록(`136440e`)은 **검토 대상 밖**이고, 검토 지적 수정(`b98c83f`)은 검토 **뒤**에 온다. 이 보고서
+§1.1의 최종 값은 그 `b98c83f`에서 측정했으며, 그 측정을 적는 커밋이 하나 더 뒤따른다(보고서를
+커밋한 다음에만 clean 상태와 변경 파일 수를 기록하라는 요구사항).
 
 ## 9. 독립 검토 결과
 
@@ -511,6 +536,12 @@ anchor 검증 여부보다 **먼저** 실행되므로, anchor를 지워도 그 �
 기존 retention-gap 질문으로 넘긴다. 구간은 **적용된 checkpoint가 그 구간에 도달했을 때만** 해제되고,
 재구독은 의도적으로 해제하지 않는다.
 
+**§15에서 정정된 부분.** ②의 "모드가 덮는다고 답할 때만 전진한다"는 그대로지만, 그때 모드에게 가는
+구간의 **위쪽 끝**이 미적용 offset이 되면서 답이 달라진다 — 적용 시점에 기록되는 basis(`redis-seq`)는
+**적용된 적 없는 offset을 찾을 수 없으므로 거부**하고, MySQL을 읽는 `full-replay`만 덮는다. 또 이
+경우는 retention이 아니므로 `offset.gaps`를 올리지 않는다(`GapReason.UNAPPLIED`). 즉 이 절의 ②는
+"질문으로 넘긴다"까지가 이 라운드의 내용이고, 질문의 **내용과 답**은 §15가 고정한다.
+
 **판별력(실측).** 되돌려서 실측했다.
 
 | 되돌린 구현 | 실패한 테스트 |
@@ -618,9 +649,24 @@ JVM-scoped이고 seeding으로 초기화되지 않으므로, 한 메서드가 �
 | `@PositiveDuration` | `ContestScoreboardRecoveryPropertiesTests` Duration 거부 | 단위 |
 | pass gate | `ContestScoreboardRecoveryPassGateTests` | 단위 |
 | 미채점 필터 | 실물 MySQL redis-seq 테스트 | 실물 |
+| 구간 위쪽 끝 판정 `rebuiltAlready()` + `withinAppliedHistory()` (§15 지적 1·2) | `ContestScoreboardRecoveryStrategyTests` 4건 | 단위(실물 strategy) |
+| `GapReason` 분류 (§15 지적 2) | `aDeliveryAboveTheRangeAsksTheModeWhenThereIsACheckpoint` | 단위 |
+| 재개가 watermark를 쓰지 않음 (§15 지적 5) | `aRestartLeavesWhatThisProcessAppliedWhereItWas`, `theFirstRetainedOffsetIsUsedWhenTheCheckpointIsTheThingInDoubt` | 단위 |
 
 되돌리기 실측은 각 항목을 **단독으로** 되돌려 해당 테스트만 실패하고 나머지가 통과하는지 확인하는
 방식으로 했다. 유일하게 그 조건을 만족하지 못한 것이 §14-3에 적은 gate의 통합 수준 판별력이다.
+
+**검토 지적에 대응해 추가한 3개 항목도 같은 방식으로 실측했다** (§15.1의 지적 1·2·5). 각각을 단독으로
+되돌리고 `--tests "*ContestScoreboard*" --tests "*Recovery*"`(192건)를 돌린 결과다.
+
+| 되돌린 구현 | 되돌린 내용 | 실패한 테스트 | 나머지 |
+|---|---|---|---|
+| 두 판정의 위쪽 끝 | `rebuiltAlready()` ← `rebuiltThrough >= firstLostOffset() - 1L`, `withinAppliedHistory()` ← `checkpointOffset < highestAppliedOffset` | 전략 테스트 4건 (요구된 "롤백 → 복구 → 두 번째 롤백" 포함) | 188/192 통과 |
+| 재개가 watermark를 쓰지 않음 | `position.consumerRestarted()` ← `position.recordAppliedOffset(storedOffset)` | lifecycle 2건 | 190/192 통과 |
+| `GapReason` 분류 | `UNAPPLIED` 분기 제거(미적용 구간이 `RETENTION`으로 분류되어 `offset.gaps`가 오른다) | processor 1건 | 191/192 통과 |
+
+세 경우 모두 **되돌린 항목에 대응하는 테스트만** 실패했고, 실패 목록은 위 표의 것과 정확히
+일치했다.
 
 ## 15. 2라운드 검토 (`60d98ec..7af681e`)
 
