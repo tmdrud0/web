@@ -26,8 +26,8 @@ import java.util.List;
  * inclusive when there is one and at the beginning of retention when there is not, so:</p>
  *
  * <ul>
- *   <li>No checkpoint at all - the first delivery becomes the checkpoint, whatever number it carries.
- *       Nothing requires a stream to begin at zero or one.</li>
+ *   <li>No checkpoint at all, and nothing outstanding - the first delivery becomes the checkpoint,
+ *       whatever number it carries. Nothing requires a stream to begin at zero or one.</li>
  *   <li>A delivery at or below the checkpoint - the consumer is reading from at or behind where the
  *       scoreboard already is, so it will walk forward through everything retained in between and
  *       nothing was skipped. The anchor is verified, and the script absorbs the duplicate.</li>
@@ -36,6 +36,10 @@ import java.util.List;
  *   <li>A delivery above the checkpoint, with the anchor not verified - the checkpoint is gone from
  *       retention. {@link ContestScoreboardRecoveryStrategy#rebuildHistory} decides whether the mode's
  *       own basis covers the range below it. Only if it does may the checkpoint move there.</li>
+ *   <li>A delivery above a range a failed batch left unapplied - never an ordinary step, and never the
+ *       first offset of the stream however unset the checkpoint is. That range is a live delivery the
+ *       broker will not hand back, so it exists nowhere else and no basis may vouch for it; the
+ *       resubscribe re-reads it instead. See {@link ContestScoreboardStreamPosition#unappliedFrom()}.</li>
  * </ul>
  *
  * <p>What this cannot see is a broker that skips offsets mid-connection: the position was verified
@@ -106,6 +110,27 @@ class ContestScoreboardStreamProcessor {
             position.clearAnchorVerified();
         }
         long firstDelivery = batch.get(0).offset();
+        long unappliedFrom = position.unappliedFrom();
+        if (unappliedFrom >= 0L && firstDelivery > unappliedFrom) {
+            // A batch was left unapplied and this delivery begins above it. Between the two lies a
+            // range no apply ever wrote, and the delivery's own offset is a claim over it: applying
+            // it would move the checkpoint past results the standings never saw, with the failure
+            // the only record that anything was skipped.
+            if (checkpoint < 0L) {
+                // There is no checkpoint, so there is no range below the delivery to hand a mode and
+                // no basis that could vouch for the offsets between. The delivery is refused and the
+                // checkpoint stays unset - the loud failure every mode owes for an unbuilt range.
+                metrics.recordUnappliedRefusal();
+                throw new IllegalStateException("Scoreboard stream delivery at offset " + firstDelivery
+                        + " starts above offset " + unappliedFrom + ", which a failed batch left "
+                        + "unapplied and nothing rebuilt; the delivery is refused so the checkpoint "
+                        + "does not move past results the standings never saw");
+            }
+            // With a checkpoint there is a range and a mode that owns it, so the question is asked of
+            // it rather than answered here - which means the anchor must not be trusted to carry the
+            // delivery forward as an ordinary step.
+            position.clearAnchorVerified();
+        }
         if (checkpoint < 0L) {
             // Nothing to be discontinuous with, so the first offset that exists becomes the
             // checkpoint. It is not required to be 0 or 1.
@@ -202,16 +227,41 @@ class ContestScoreboardStreamProcessor {
                 .findFirst()
                 .orElse(null);
         if (failed != null || results.size() != requests.size()) {
-            String detail = failed == null ? "batch stopped before every event was applied" : failed.errorMessage();
+            // The batch is unapplied from the first request the applier did not answer for: the one it
+            // reported, or - when it reported none - the first one it left unanswered. Recorded before
+            // the failure is thrown, because what the broker does with a requeueing rejection is
+            // nothing at all, so this range is only ever re-read by a resubscribe, and until it is, no
+            // delivery above it may be applied. A stream request's correlation id is the offset the
+            // delivery carried - see ApplyRequest.stream.
+            String detail = failed == null
+                    ? "batch stopped before every event was applied"
+                    : failed.errorMessage();
+            long unappliedFrom = failed != null
+                    ? failed.correlationId()
+                    : offsetOf(requests, results.size());
+            position.recordUnappliedRange(unappliedFrom);
             throw new IllegalStateException("Failed to apply scoreboard stream batch: " + detail);
         }
 
         completion.complete(batch.stream().map(event -> event.message().submissionId()).toList());
         long appliedOffset = applier.currentStreamOffset();
+        // The checkpoint is recorded here rather than by the listener, because this is where it was
+        // read back from the applier: the position and the checkpoint have to be the same claim, and
+        // recording the range that was applied is what releases any range a failure left outstanding.
+        position.recordAppliedOffset(appliedOffset);
         // Count offsets only after MySQL completion. The metric's own watermark deliberately
         // lags Redis when a batch fails halfway, so the successful retry counts those earlier
         // Lua writes once; a delivery repeated after ACK loss counts zero.
         metrics.recordApplied(batch.stream().map(ContestScoreboardStreamEvent::offset).toList(), appliedOffset);
         return appliedOffset;
+    }
+
+    /** The stream offset a request carried, or {@code -1} when it carried none. */
+    private static long offsetOf(List<ContestScoreboardApplier.ApplyRequest> requests, int index) {
+        if (index >= requests.size()) {
+            return -1L;
+        }
+        Long offset = requests.get(index).streamOffset();
+        return offset == null ? -1L : offset;
     }
 }

@@ -30,6 +30,7 @@ public class ContestScoreboardStreamMetrics {
     private volatile Counter rollbackRestarts;
     private volatile Counter rollbackObserved;
     private volatile Counter failureRestarts;
+    private volatile Counter unappliedRefusals;
     private volatile Counter tailProbeFailures;
 
     public ContestScoreboardStreamMetrics(MeterRegistry registry) {
@@ -67,6 +68,10 @@ public class ContestScoreboardStreamMetrics {
                 .register(registry);
         this.failureRestarts = Counter.builder("contest.scoreboard.stream.failure.restarts")
                 .description("Consumer restarts to re-read a failed stream batch the broker does not redeliver")
+                .register(registry);
+        this.unappliedRefusals = Counter.builder("contest.scoreboard.stream.unapplied.refusals")
+                .description("Deliveries refused because they began above an offset a failed batch left"
+                        + " unapplied, with no checkpoint to hand a recovery mode")
                 .register(registry);
         this.tailProbeFailures = Counter.builder("contest.scoreboard.stream.tail.probe.failures")
                 .description("AMQP 0.9.1 probes that failed to observe the latest stream offset")
@@ -122,6 +127,10 @@ public class ContestScoreboardStreamMetrics {
 
     void recordFailureRestart() {
         failureRestarts.increment();
+    }
+
+    void recordUnappliedRefusal() {
+        unappliedRefusals.increment();
     }
 
     void recordTailProbeFailure() {

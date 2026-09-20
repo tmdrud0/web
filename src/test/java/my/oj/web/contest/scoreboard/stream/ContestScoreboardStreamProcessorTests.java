@@ -222,6 +222,87 @@ class ContestScoreboardStreamProcessorTests {
         assertThat(counter("contest.scoreboard.applied")).isZero();
     }
 
+    /**
+     * What a failed apply leaves behind is a range, and it starts at the offset the applier stopped at -
+     * the events before it in the batch were applied, so the standings end below that one.
+     */
+    @Test
+    void aFailedApplyIsRecordedAsTheRangeTheCheckpointMayNotPass() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        when(applier.applyAll(anyList())).thenReturn(List.of(
+                ContestScoreboardApplier.ApplyResult.success(4L, 4L),
+                ContestScoreboardApplier.ApplyResult.failure(5L, "Redis unavailable")
+        ));
+
+        assertThatThrownBy(() -> processor.process(List.of(event(4L, 104L), event(5L, 105L))))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(position.unappliedFrom()).isEqualTo(5L);
+    }
+
+    /**
+     * The delivery after a failed batch, with nothing in Redis to ask about: the scoreboard holds no
+     * checkpoint, so there is no range below the delivery to hand a mode. "Nothing to be discontinuous
+     * with" was read as licence to adopt this offset as the checkpoint - and the offset the batch failed
+     * at, which the stream will not serve again, was stepped over: the standings lost it with the
+     * failure as the only record.
+     */
+    @Test
+    void aDeliveryAboveARangeAFailedBatchLeftUnappliedIsRefusedWhenThereIsNoCheckpoint() {
+        when(applier.currentStreamOffset()).thenReturn(-1L);
+        position.recordUnappliedRange(0L);
+
+        assertThatThrownBy(() -> processor.process(List.of(event(1L, 101L))))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("starts above offset 0")
+                .hasMessageContaining("nothing rebuilt")
+                .hasMessageContaining("does not move past results the standings never saw");
+
+        verify(applier, never()).applyAll(anyList());
+        verify(completion, never()).complete(anyList());
+        verify(strategy, never()).rebuildHistory(any());
+        assertThat(counter("contest.scoreboard.stream.unapplied.refusals")).isEqualTo(1.0);
+    }
+
+    /** The way out is the delivery that starts at the range, and applying it is what releases it. */
+    @Test
+    void aDeliveryThatStartsAtTheUnappliedRangeIsAppliedAndReleasesIt() {
+        when(applier.currentStreamOffset()).thenReturn(-1L, -1L, 2L);
+        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        position.recordUnappliedRange(0L);
+
+        long applied = processor.process(List.of(event(0L, 100L), event(2L, 102L)));
+
+        assertThat(applied).isEqualTo(2L);
+        assertThat(position.unappliedFrom()).isEqualTo(-1L);
+        assertThat(counter("contest.scoreboard.stream.unapplied.refusals")).isZero();
+    }
+
+    /**
+     * With a checkpoint there is a range below the delivery and a mode that owns it, so the range is not
+     * refused here but asked about - which means the delivery must not be carried forward as an ordinary
+     * step, whatever the anchor had established.
+     */
+    @Test
+    void aDeliveryAboveTheRangeAsksTheModeWhenThereIsACheckpoint() {
+        when(applier.currentStreamOffset()).thenReturn(5L);
+        when(strategy.rebuildHistory(any())).thenReturn(false);
+        position.resumeAt(5L);
+        position.markAnchorVerified();
+        position.recordUnappliedRange(6L);
+
+        assertThatThrownBy(() -> processor.process(List.of(event(7L, 107L))))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("checkpoint does not move past results the standings never saw");
+
+        assertThat(capturedRange().firstLostOffset()).isEqualTo(6L);
+        assertThat(counter("contest.scoreboard.stream.offset.gaps")).isEqualTo(1.0);
+        assertThat(counter("contest.scoreboard.stream.unapplied.refusals")).isZero();
+        // Being asked about does not clear it: only the delivery that applies the range does.
+        assertThat(position.unappliedFrom()).isEqualTo(6L);
+        verify(applier, never()).applyAll(anyList());
+    }
+
     @Test
     void successfulRetryCountsPartiallyAppliedOffsetsButAckRedeliveryDoesNotCountTwice() {
         when(applier.currentStreamOffset()).thenReturn(5L, 5L, 6L, 5L, 5L, 6L);

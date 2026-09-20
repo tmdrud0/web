@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -27,6 +28,7 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -136,18 +138,16 @@ class ContestScoreboardStreamBatchFailureRabbitIntegrationTests {
 
     @Test
     void aFailedBatchLeavesTheCheckpointBehindItAndIsRetriedFromThere() {
-        rabbitTemplate.convertAndSend(
-                ContestJudgeRabbitTopology.EXCHANGE,
-                ContestJudgeRabbitTopology.RESULT_STREAM_ROUTING_KEY,
-                poisonMessage()
-        );
-        rabbitTemplate.convertAndSend(
-                ContestJudgeRabbitTopology.EXCHANGE,
-                ContestJudgeRabbitTopology.RESULT_STREAM_ROUTING_KEY,
-                validMessage()
-        );
-
+        // Each publication waits for its broker confirm, because the offsets this test reasons about
+        // are the ones the broker issues and a publication that does not wait can be given a lower
+        // offset than the one before it - measured in StreamPublishConfirmOrderRabbitIntegrationTests.
+        publishAndConfirm(poisonMessage());
         await("the batch to fail", () -> counter("contest.scoreboard.stream.failures") >= 1.0);
+        // The valid result goes in only once the poison has failed the batch it was in, which puts the
+        // consumer's position past the offset that failed. That is the arrangement this test is for: a
+        // delivery above a range a failed batch left unapplied, which the broker will never hand back
+        // and the checkpoint must therefore never step over.
+        publishAndConfirm(validMessage());
         // The recovery the design rests on: the supervisor resubscribes at the stored checkpoint,
         // because the broker will not hand the rejected batch back on its own.
         await("the consumer to resubscribe", () -> counter("contest.scoreboard.stream.failure.restarts") >= 1.0);
@@ -159,6 +159,27 @@ class ContestScoreboardStreamBatchFailureRabbitIntegrationTests {
         assertThat(appliedRows()).isZero();
         assertThat(processedScoreboardRows()).isZero();
         assertThat(counter("contest.scoreboard.applied")).isZero();
+    }
+
+    private void publishAndConfirm(ContestJudgeResultStreamMessage message) {
+        CorrelationData correlationData = new CorrelationData();
+        rabbitTemplate.convertAndSend(
+                ContestJudgeRabbitTopology.EXCHANGE,
+                ContestJudgeRabbitTopology.RESULT_STREAM_ROUTING_KEY,
+                message,
+                correlationData
+        );
+        try {
+            CorrelationData.Confirm confirm = correlationData.getFuture().get(10L, TimeUnit.SECONDS);
+            if (!confirm.isAck()) {
+                throw new IllegalStateException("Broker nacked scoreboard delivery: " + confirm.getReason());
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while publishing a scoreboard delivery", interrupted);
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException failed) {
+            throw new IllegalStateException("Failed to publish a scoreboard delivery", failed);
+        }
     }
 
     private ContestJudgeResultStreamMessage poisonMessage() {

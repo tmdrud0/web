@@ -43,31 +43,82 @@ class ContestScoreboardStreamListener implements BatchMessageListener {
 
     @Override
     public void onMessageBatch(List<Message> messages) {
+        List<ContestScoreboardStreamEvent> events;
         try {
-            List<ContestScoreboardStreamEvent> events = decode(messages);
-            if (events.isEmpty()) {
-                return;
-            }
+            events = decode(messages);
+        } catch (RuntimeException undecodable) {
+            // Nothing in this delivery reached the applier, so the standings end below its first
+            // offset. Recorded before the failure is answered, because what the broker does with a
+            // requeueing rejection is nothing at all: this delivery is only ever re-read by a
+            // resubscribe, and until it is, no delivery above it may be applied.
+            position.recordUnappliedRange(firstOffsetOrNone(messages));
+            throw failBatch(undecodable);
+        }
+        if (events.isEmpty()) {
+            return;
+        }
+        try {
             metrics.recordBatchStarted(events.stream()
                     .map(event -> event.message().judgedAt())
                     .min(java.time.LocalDateTime::compareTo)
                     .orElse(null));
-            position.recordAppliedOffset(processor.process(events));
+            processor.process(events);
         } catch (RuntimeException failure) {
-            metrics.recordFailure();
-            position.recordFailedBatch();
-            // Not "at the head for retry": a stream queue accepts a requeueing rejection without
-            // complaint and does not hand the message back to the running consumer, so the retry comes
-            // from ContestScoreboardStreamLifecycle resubscribing at the stored checkpoint. Measured
-            // against a real broker in StreamQueueRequeueRabbitIntegrationTests.
-            log.error("Scoreboard stream batch failed and was left unapplied; the scoreboard stays at offset {} "
-                    + "and the batch is re-read when the consumer resubscribes",
-                    position.highestAppliedOffset(), failure);
-            LockSupport.parkNanos(retryBackoffNanos);
-            if (Thread.interrupted()) {
-                Thread.currentThread().interrupt();
-            }
-            throw new ImmediateRequeueAmqpException("Retry scoreboard stream batch", failure);
+            // The processor recorded the offset this batch stopped at before throwing; what is left is
+            // to count the failure and put it behind a position that has to be established again.
+            throw failBatch(failure);
+        }
+    }
+
+    /**
+     * Answers a batch that was not applied, and returns the exception for the caller to throw.
+     *
+     * <p>Counted, marked and un-verified in one place: the supervisor reads the count to decide the
+     * batch needs a resubscribe, and the un-verified anchor is what makes the next delivery a question
+     * about the range that was skipped instead of an ordinary step over it.</p>
+     */
+    private ImmediateRequeueAmqpException failBatch(RuntimeException failure) {
+        metrics.recordFailure();
+        position.recordFailedBatch();
+        // The position is no longer verified, and the failure is what un-verifies it: this batch moved
+        // the consumer past results the scoreboard did not account for. Without this the next delivery
+        // above the checkpoint would be applied as an ordinary forward step - which is how a delivery
+        // arriving after a failed batch used to move the checkpoint over the offset that failed,
+        // leaving that result unreachable from the stream and from the checkpoint alike. Dropping the
+        // verification makes the next forward step a gap question, and a gap is answered by the
+        // recovery mode's own basis or refused, never stepped over silently.
+        position.clearAnchorVerified();
+        // Not "at the head for retry": a stream queue accepts a requeueing rejection without complaint
+        // and does not hand the message back to the running consumer, so the retry comes from
+        // ContestScoreboardStreamLifecycle resubscribing at the stored checkpoint. Measured against a
+        // real broker in StreamQueueRequeueRabbitIntegrationTests.
+        log.error("Scoreboard stream batch failed and was left unapplied; the scoreboard stays at offset {} "
+                + "and the batch is re-read when the consumer resubscribes",
+                position.highestAppliedOffset(), failure);
+        LockSupport.parkNanos(retryBackoffNanos);
+        if (Thread.interrupted()) {
+            Thread.currentThread().interrupt();
+        }
+        return new ImmediateRequeueAmqpException("Retry scoreboard stream batch", failure);
+    }
+
+    /**
+     * The first offset a delivery carried, or {@code -1} when it carried none this method can read.
+     *
+     * <p>A delivery whose offsets cannot be read cannot be described as a range, so there is nothing to
+     * hold back; the un-verified anchor still makes the next delivery a question about the range below
+     * it. Logged rather than thrown, because this runs while a failure is already being answered.</p>
+     */
+    private static long firstOffsetOrNone(List<Message> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return -1L;
+        }
+        try {
+            return streamOffset(messages.get(0));
+        } catch (RuntimeException unreadable) {
+            log.warn("A failed scoreboard stream batch carried no readable offset; the range it left "
+                    + "unapplied is not held back", unreadable);
+            return -1L;
         }
     }
 
