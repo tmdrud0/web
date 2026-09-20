@@ -2,6 +2,7 @@ package my.oj.web.contest.scoreboard.stream;
 
 import lombok.extern.slf4j.Slf4j;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryCutover;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryProperties;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy;
 import org.springframework.amqp.rabbit.listener.SimpleMessageListenerContainer;
@@ -28,7 +29,17 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
     private final ContestScoreboardStreamMetrics metrics;
     private final ContestScoreboardRecoveryProperties properties;
     private final ContestScoreboardRecoveryStrategy strategy;
+    private final ContestScoreboardRecoveryCutover cutover;
     private volatile boolean running;
+    /**
+     * Whether the context is going down, so a consumer released by the history-recovery boundary after
+     * this point is not started into a closing context.
+     *
+     * <p>The boundary is reported by a startup pass, and the pass is allowed to run long - a full
+     * replay of every contest does. A shutdown that arrives while it runs must not be followed by the
+     * listener container starting underneath it.</p>
+     */
+    private volatile boolean stopping;
     /**
      * The failure count already answered by a resubscribe, so one failure is not retried forever.
      *
@@ -45,10 +56,19 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
      * on every pass. Answering it once and comparing the pair is what keeps a scheduled interval from
      * turning into a rebuild per interval.</p>
      *
-     * <p>Answered once even when the rebuild failed. Retrying a failed rebuild on this cadence would
-     * be a full MySQL replay per interval; the live path asks again on its next delivery, and the
-     * mode's own triggers keep their own cadence, so a failure is not left unretried - only not
-     * retried here and now.</p>
+     * <p>Recorded only once the range has been answered: the rewind was performed, or the mode's basis
+     * covered the range, or it refused the range outright. A pass that never ran because another held
+     * the gate, and a pass that ran and failed, are not answers - nothing was learned about the range,
+     * a later attempt may reach a different answer, and with no new stream delivery arriving nothing
+     * else on this cadence would ask. Recording the pair before the outcome was known was what lost
+     * those retries: a rollback that could not be rebuilt at that moment was taken for one that had
+     * been, and with the checkpoint unable to move past it the pair never changed, so the history
+     * stayed missing for as long as the JVM ran.</p>
+     *
+     * <p>Retrying is the deliberate cost. A rebuild that keeps failing is a full pass per supervisor
+     * cycle, which is more work than the earlier behaviour did - and that behaviour is what left the
+     * scoreboard short, so the work is the point. The retry is counted where it is decided, so an
+     * interval spent retrying is visible rather than inferred from a log.</p>
      */
     private volatile long answeredRollbackStoredOffset = Long.MIN_VALUE;
     private volatile long answeredRollbackAppliedOffset = Long.MIN_VALUE;
@@ -60,7 +80,8 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
             ContestScoreboardStreamPosition position,
             ContestScoreboardStreamMetrics metrics,
             ContestScoreboardRecoveryProperties properties,
-            ContestScoreboardRecoveryStrategy strategy
+            ContestScoreboardRecoveryStrategy strategy,
+            ContestScoreboardRecoveryCutover cutover
     ) {
         this.container = container;
         this.applier = applier;
@@ -69,11 +90,52 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
         this.metrics = metrics;
         this.properties = properties;
         this.strategy = strategy;
+        this.cutover = cutover;
     }
 
+    /**
+     * Brings the consumer up, or holds it until the mode's own history recovery has run.
+     *
+     * <h2>Why the start is not unconditional</h2>
+     *
+     * <p>What this method asks the broker for is the stored checkpoint, and a consumer reading from
+     * there re-reads every offset above it. On a JVM whose Redis was restored from a snapshot that is a
+     * history recovery, and it is only {@code stream-offset} that means it as one - the other two
+     * rebuild from MySQL and from the sequence, and a consumer that went first would put the restored
+     * history back through the stream before either had a chance to. The container's own ordering is
+     * the opposite of what they need: this lifecycle starts at the end of the context refresh, and the
+     * passes that own their recovery are {@code ApplicationRunner}s, which run after it.</p>
+     *
+     * <p>So the wait is on {@link ContestScoreboardRecoveryCutover}, which the pass itself reports. The
+     * consumer is not started at a different offset and nothing is skipped while it waits - the hold
+     * changes when consumption begins, not where it begins.</p>
+     */
     @Override
     public synchronized void start() {
         if (running) {
+            return;
+        }
+        stopping = false;
+        if (strategy.recoversHistoryBeforeConsuming()) {
+            log.info("Holding the scoreboard stream consumer until the {} history recovery has run; the "
+                            + "consumer will resume at the stored checkpoint, which the recovery does not move",
+                    strategy.mode().propertyValue());
+            cutover.whenCovered(this::startAfterHistoryRecovery);
+            return;
+        }
+        startAtStoredOffset();
+        running = true;
+    }
+
+    /**
+     * The other half of a held start, run when the mode's history recovery reports the history covered.
+     *
+     * <p>Idempotent against the two ways it can be reached more than once: a lifecycle already running
+     * (a shutdown and restart inside one context), and a context that is going down. Neither may leave
+     * a listener container starting behind it.</p>
+     */
+    private synchronized void startAfterHistoryRecovery() {
+        if (running || stopping) {
             return;
         }
         startAtStoredOffset();
@@ -82,6 +144,7 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
 
     @Override
     public synchronized void stop() {
+        stopping = true;
         if (!running) {
             return;
         }
@@ -92,6 +155,7 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
     @Override
     public void stop(Runnable callback) {
         synchronized (this) {
+            stopping = true;
             if (!running) {
                 callback.run();
                 return;
@@ -127,7 +191,10 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
      * basis is MySQL and the sequence, neither of which is the stream position, so restarting the
      * consumer would replace their own recovery with a mechanism they do not own - and would stop the
      * one thing that guarantees no result published during the rebuild is missed. What this pass does
-     * instead is give their rebuild a trigger that does not depend on traffic arriving.</p>
+     * instead is give their rebuild a trigger that does not depend on traffic arriving - and go on
+     * giving it, cycle after cycle, until the range has been answered. A rebuild another pass held the
+     * gate out of, or one that failed, is not an answer: it is retried here, because nothing else on
+     * this deployment will ask again while the checkpoint cannot move past the range.</p>
      *
      * <p>A failed batch is the other way round and belongs to no mode in particular: the checkpoint is
      * right and the batch is not applied. Getting past it needs a resubscribe in every mode, because
@@ -137,6 +204,14 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
      * history recovery: what it resumes from is the consumer's own position, not a claim about which
      * results the standings are missing, so it does not put the stream back in the role of a recovery
      * basis for the modes that do not use it.</p>
+     *
+     * <p>Because the two are independent, this pass asks about them independently rather than treating
+     * one as the other's alternative. A rollback whose rebuild has already been reported still leaves a
+     * failed batch to re-read in the modes that answered it without touching the consumer, and the
+     * checkpoint cannot move past that batch on its own - so the answer to the rollback is not a reason
+     * to stop asking about the batch. In the rewinding mode the two coincide, because that mode's answer
+     * <em>is</em> a restart at the checkpoint: it re-reads the failed batch on the way past, and this pass
+     * counts the batch as handled rather than restarting a second time for it.</p>
      */
     void recoverConsumption() {
         if (!running) {
@@ -147,22 +222,42 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
             long appliedOffset = position.highestAppliedOffset();
             long failures = position.failedBatches();
             boolean rolledBack = storedOffset < appliedOffset;
-            if (rolledBack) {
-                if (storedOffset == answeredRollbackStoredOffset
-                        && appliedOffset == answeredRollbackAppliedOffset) {
-                    return;
-                }
-            } else if (failures <= handledFailures) {
+            boolean rollbackUnanswered = rolledBack
+                    && !(storedOffset == answeredRollbackStoredOffset
+                            && appliedOffset == answeredRollbackAppliedOffset);
+            // Two things are asked about here and they are not alternatives: a rollback the mode has
+            // not answered, and a failed batch. A mode that answers a rollback without touching the
+            // consumer - the two whose basis is not the stream position - does not re-read the failed
+            // batch on the way past, and the checkpoint cannot move past the batch on its own, so this
+            // interval is the only thing that will ever ask about it. Treating the answered rollback as
+            // a reason to stop asking would leave the standings short there for the life of the JVM.
+            if (!rollbackUnanswered && failures <= handledFailures) {
                 return;
             }
             synchronized (this) {
                 if (!running) {
                     return;
                 }
-                if (rolledBack) {
+                boolean answeredNow = false;
+                if (rollbackUnanswered) {
+                    // Remembered only if this pass answered it. A rollback another pass is already
+                    // rebuilding, or one whose rebuild failed, has to be asked about again - and with
+                    // no new delivery arriving, this interval is the only thing that will ask.
+                    if (!handleRollback(storedOffset, appliedOffset)) {
+                        return;
+                    }
                     answeredRollbackStoredOffset = storedOffset;
                     answeredRollbackAppliedOffset = appliedOffset;
-                    handleRollback(storedOffset, appliedOffset);
+                    answeredNow = true;
+                }
+                if (failures <= handledFailures) {
+                    return;
+                }
+                if (answeredNow && strategy.rewindsOnCheckpointRegression()) {
+                    // The rewind in this pass's answer was itself a restart at the checkpoint, which
+                    // re-reads the failed batch on the way past. Restarting again would re-read the
+                    // same range for the same batch.
+                    handledFailures = failures;
                     return;
                 }
                 container.stop();
@@ -177,7 +272,17 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
         }
     }
 
-    private void handleRollback(long storedOffset, long appliedOffset) {
+    /**
+     * Answers one observed rollback, and says whether the answer is complete.
+     *
+     * <p>The caller records the offsets as answered on true, so the return value is the whole of what
+     * decides whether this range is ever looked at again. It is false for the two outcomes that are not
+     * answers: a pass another pass held the gate out of, and one that ran and failed. Both leave the
+     * range exactly as recoverable as they found it.</p>
+     *
+     * @return whether this pass answered the observed pair
+     */
+    private boolean handleRollback(long storedOffset, long appliedOffset) {
         if (!strategy.rewindsOnCheckpointRegression()) {
             position.clearAnchorVerified();
             metrics.recordRollbackObserved();
@@ -191,7 +296,8 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
                     appliedOffset,
                     position.rebuiltThrough()
             );
-            if (strategy.rebuildHistory(range)) {
+            ContestScoreboardRecoveryStrategy.Outcome outcome = strategy.rebuildHistory(range);
+            if (outcome.covers()) {
                 // The live path reads this so a range the supervisor already rebuilt is not rebuilt
                 // again by the delivery that anchors past it. The watermark is what the rebuild was
                 // marked at, and the live path asks about the offset below its delivery, so a
@@ -201,19 +307,39 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
                 log.warn("Rebuilt the scoreboard history through offset {} with the {} basis; the consumer "
                                 + "may now anchor the checkpoint past it",
                         appliedOffset, strategy.mode().propertyValue());
-                return;
+                return true;
             }
-            log.error("The {} basis could not rebuild the history the rollback took away between offsets {} "
-                            + "and {}; the scoreboard stays short there and the checkpoint stays put until "
-                            + "something can",
-                    strategy.mode().propertyValue(), range.firstLostOffset(), range.lastLostOffset());
-            return;
+            if (outcome == ContestScoreboardRecoveryStrategy.Outcome.UNRECOVERABLE) {
+                metrics.recordRollbackUnrecoverable();
+                log.error("The {} basis cannot rebuild the history the rollback took away between offsets {} "
+                                + "and {}; the scoreboard stays short there and the checkpoint stays put until "
+                                + "someone replays from MySQL or changes the mode. The range is not asked "
+                                + "about again until the observed offsets change, and not then either unless "
+                                + "something can rebuild it - the refusal is remembered in this JVM only, so "
+                                + "a restart asks again",
+                        strategy.mode().propertyValue(), range.firstLostOffset(), range.lastLostOffset());
+                return true;
+            }
+            metrics.recordRollbackRetry(outcome);
+            log.warn("The {} basis did not rebuild the history the rollback took away between offsets {} and {} "
+                            + "({}); the range is unanswered and is asked about again on the next supervisor "
+                            + "cycle",
+                    strategy.mode().propertyValue(),
+                    range.firstLostOffset(),
+                    range.lastLostOffset(),
+                    outcome.label());
+            return false;
         }
         container.stop();
         metrics.recordRollbackRestart();
         log.warn("Redis scoreboard offset rolled back from {} to {}; resubscribing from the stored offset",
                 appliedOffset, storedOffset);
         startAt(storedOffset, offsetValue(storedOffset));
+        // Rewinding is this mode's answer to a rollback and it has been carried out, so the observed
+        // pair is answered even though the checkpoint has not moved yet: the resubscribe brings back
+        // the results that move it. Without that, a checkpoint the broker no longer serves would mean
+        // a stop and a start of the consumer on every pass.
+        return true;
     }
 
     private void startAtStoredOffset() {

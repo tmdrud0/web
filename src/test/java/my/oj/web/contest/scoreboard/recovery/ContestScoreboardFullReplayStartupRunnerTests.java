@@ -7,6 +7,8 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -20,9 +22,11 @@ class ContestScoreboardFullReplayStartupRunnerTests {
     @Mock
     private ContestScoreboardFullReplayService fullReplayService;
 
+    private final ContestScoreboardRecoveryCutover cutover = new ContestScoreboardRecoveryCutover();
+
     @Test
     void replaysEveryContestWhenStartupReplayIsEnabled() {
-        new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(true), gate())
+        new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(true), gate(), cutover)
                 .run(null);
 
         verify(fullReplayService).replayAllContests();
@@ -30,7 +34,7 @@ class ContestScoreboardFullReplayStartupRunnerTests {
 
     @Test
     void leavesTheRestoredScoreboardAloneWhenStartupReplayIsDisabled() {
-        new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(false), gate())
+        new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(false), gate(), cutover)
                 .run(null);
 
         verify(fullReplayService, never()).replayAllContests();
@@ -46,7 +50,7 @@ class ContestScoreboardFullReplayStartupRunnerTests {
         ContestScoreboardRecoveryPassGate gate = gate();
 
         gate.tryRun(ContestScoreboardRecoveryStrategy.PassKind.MYSQL_REPLAY, () -> {
-            new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(true), gate)
+            new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(true), gate, cutover)
                     .run(null);
             return Boolean.TRUE;
         });
@@ -63,7 +67,7 @@ class ContestScoreboardFullReplayStartupRunnerTests {
                 .thenThrow(new IllegalStateException("MySQL unavailable"));
 
         assertThatThrownBy(() ->
-                        new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(true), gate)
+                        new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(true), gate, cutover)
                                 .run(null))
                 .isInstanceOf(IllegalStateException.class);
 
@@ -74,6 +78,51 @@ class ContestScoreboardFullReplayStartupRunnerTests {
         return new ContestScoreboardRecoveryPassGate(new SimpleMeterRegistry());
     }
 
+    /**
+     * The replay is what releases the held stream consumer, and it does so only after it has returned:
+     * this mode's basis is the thing that may rebuild the restored history, and a consumer reading from
+     * the stored checkpoint would otherwise have done it first.
+     */
+    @Test
+    void theReplayReleasesTheHeldConsumerOnceItHasRun() {
+        List<String> released = new ArrayList<>();
+        cutover.whenCovered(() -> released.add("consumer"));
+
+        new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(true), gate(), cutover)
+                .run(null);
+
+        assertThat(released).containsExactly("consumer");
+        assertThat(cutover.isCovered()).isTrue();
+    }
+
+    /**
+     * Nothing is released when the replay did not run, in either of the two ways that happens.
+     *
+     * <p>A disabled replay is refused outright when the consumer is on - see
+     * {@code ContestScoreboardRecoveryValidator} - so the configuration below only exists on a role that
+     * does not consume the stream, and what this pins is that the runner does not claim the boundary on
+     * behalf of a pass it did not run. A pass another replay held the gate out of is the same claim: the
+     * range it would have covered is untouched, so nothing may be told that it is covered.</p>
+     */
+    @Test
+    void nothingIsReleasedWhenTheReplayDidNotRun() {
+        List<String> released = new ArrayList<>();
+        cutover.whenCovered(() -> released.add("consumer"));
+
+        new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(false), gate(), cutover)
+                .run(null);
+        assertThat(cutover.isCovered()).isFalse();
+
+        ContestScoreboardRecoveryPassGate gate = gate();
+        gate.tryRun(ContestScoreboardRecoveryStrategy.PassKind.MYSQL_REPLAY, () -> {
+            new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(true), gate, cutover)
+                    .run(null);
+            return Boolean.TRUE;
+        });
+
+        assertThat(released).isEmpty();
+        assertThat(cutover.isCovered()).isFalse();
+    }
     private static ContestScoreboardRecoveryProperties properties(boolean startupReplayEnabled) {
         return new ContestScoreboardRecoveryProperties(
                 ContestScoreboardRecoveryMode.FULL_REPLAY,

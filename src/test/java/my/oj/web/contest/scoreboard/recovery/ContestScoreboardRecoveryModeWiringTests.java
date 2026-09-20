@@ -12,6 +12,7 @@ import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -34,9 +35,18 @@ import static org.mockito.Mockito.mock;
  *
  * <p>The strategy is the mode made into an object, and there is exactly one of it. Its bean is
  * selected by an exhaustive switch over the bound mode rather than by {@code @ConditionalOnProperty}
- * on the raw string, so a mode added to the enum without a branch fails the build instead of quietly
- * selecting no strategy - which is what the relaxed-spelling test below is about, seen from the other
- * side.</p>
+ * on the raw string, so a mode added to the enum without a strategy branch fails the build instead of
+ * quietly selecting no strategy - which is what the relaxed-spelling test below is about, seen from
+ * the other side.</p>
+ *
+ * <h2>The second axis</h2>
+ *
+ * <p>{@code contest.scoreboard.recovery.owner.enabled} is a bean condition, so which instance brings
+ * up a mode's <em>triggers</em> is decided here as well as in the role files. Both axes are asserted
+ * in this class because they are decided at the same seam, and because a mode trigger that is present
+ * on a role that is not the owner is the defect the owner condition was added to remove: the bean
+ * would be registered, appear in {@code /actuator/beans}, and be indistinguishable in the startup log
+ * from one that fires.</p>
  */
 class ContestScoreboardRecoveryModeWiringTests {
 
@@ -44,21 +54,28 @@ class ContestScoreboardRecoveryModeWiringTests {
             // The strategy is the live path's decision-maker as well as the supervisor's, so it exists
             // where the consumer does - and only there. Both are gated on this one property.
             .withPropertyValues("contest.scoreboard.stream.consumer.enabled=true")
-            .withUserConfiguration(
-                    Dependencies.class,
-                    // The production classes, not mocks: this runner's job is to decide whether a bean
-                    // comes up in every mode, and a bean the test itself registers would answer that
-                    // whichever way the service were annotated.
-                    ContestScoreboardFullReplayService.class,
-                    ContestScoreboardReplayApplication.class,
-                    ContestScoreboardStreamRecoveryService.class,
-                    ContestScoreboardRecoveryStrategyConfig.class,
-                    ContestScoreboardFullReplayStartupRunner.class,
-                    ContestScoreboardRedisSequenceConfig.class,
-                    ContestScoreboardRedisSequenceRecoveryService.class,
-                    ContestScoreboardRedisSequenceScheduler.class,
-                    ContestScoreboardRedisSequenceStartupCheck.class
-            );
+            .withUserConfiguration(productionBeans());
+
+    /**
+     * The production classes as beans, not mocks: this runner's job is to decide whether a bean comes
+     * up in every mode, and a bean the test itself registers would answer that whichever way the
+     * service were annotated.
+     */
+    private static Class<?>[] productionBeans() {
+        return new Class<?>[]{
+                Dependencies.class,
+                ContestScoreboardFullReplayService.class,
+                ContestScoreboardReplayApplication.class,
+                ContestScoreboardStreamRecoveryService.class,
+                ContestScoreboardRecoveryCutover.class,
+                ContestScoreboardRecoveryStrategyConfig.class,
+                ContestScoreboardFullReplayStartupRunner.class,
+                ContestScoreboardRedisSequenceConfig.class,
+                ContestScoreboardRedisSequenceRecoveryService.class,
+                ContestScoreboardRedisSequenceScheduler.class,
+                ContestScoreboardRedisSequenceStartupCheck.class
+        };
+    }
 
     /**
      * Every mode gets a strategy, each mode gets its own, and the one thing the supervisor reads from
@@ -156,6 +173,121 @@ class ContestScoreboardRecoveryModeWiringTests {
                                 .doesNotHaveBean(ContestScoreboardRedisSequenceMetrics.class);
                     });
         }
+    }
+
+    /**
+     * Which instance brings up a mode's triggers, asked of the same three modes twice.
+     *
+     * <p>The consumer is off in both halves, so {@code owner.enabled} is the only difference between
+     * them. That matters for reading the result: every trigger in this package is gated on the mode
+     * alone, so if the owner condition were dropped the second half would bring up exactly what the
+     * first does - which is what the pair is here to catch. Turning the consumer on instead would
+     * test nothing extra and would be a state the validator refuses outright.</p>
+     *
+     * <p>{@code stream-offset} has no trigger bean of its own - its pass is a method on the stream
+     * lifecycle, which is gated on the consumer - so for that mode the first half asserts only that
+     * the context came up, and what it contributes is the control: the mode with the least wiring
+     * still starts cleanly with the owner declaration on.</p>
+     */
+    @Test
+    void eachModeBringsUpItsTriggersOnlyOnTheInstanceThatOwnsRecovery() {
+        assertTriggerSurface("stream-offset", false, false);
+        assertTriggerSurface("full-replay", true, false);
+        assertTriggerSurface("redis-seq", false, true);
+    }
+
+    /**
+     * The sequence check on a role that is not the owner: no startup pass and no intervals.
+     *
+     * <p>Both halves of the mode are gone rather than one. A scheduler that came up and skipped every
+     * run would leave two intervals firing on a role whose whole point is not to run recovery, and a
+     * startup check that came up would run once regardless of any interval. The mode's service and its
+     * meters stay, because the gate removes the triggers and not the mode.</p>
+     */
+    @Test
+    void anInstanceThatIsNotTheOwnerRegistersNoSequenceCheck() {
+        ownerRunner(false)
+                .withPropertyValues("contest.scoreboard.recovery.mode=redis-seq")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).doesNotHaveBean(ContestScoreboardRedisSequenceScheduler.class);
+                    assertThat(context).doesNotHaveBean(ContestScoreboardRedisSequenceStartupCheck.class);
+                    assertThat(context)
+                            .hasSingleBean(ContestScoreboardRedisSequenceRecoveryService.class);
+                });
+    }
+
+    /**
+     * The replay on a role that is not the owner: no startup replay, and the service still there.
+     *
+     * <p>{@link #theReplayServiceIsAvailableInEveryMode} is the other half of this. The service is
+     * unconditional on purpose - the retention-gap fallback replays through it from a stream delivery -
+     * so the owner condition must not have been put on it. What is refused at startup is the pair
+     * "consume the stream and declare no ownership", not the service.</p>
+     */
+    @Test
+    void anInstanceThatIsNotTheOwnerDoesNotReplayAtStartup() {
+        ownerRunner(false)
+                .withPropertyValues("contest.scoreboard.recovery.mode=full-replay")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).doesNotHaveBean(ContestScoreboardFullReplayStartupRunner.class);
+                    assertThat(context).hasSingleBean(ContestScoreboardFullReplayService.class);
+                });
+    }
+
+    private void assertTriggerSurface(String mode, boolean replaysAtStartup, boolean checksTheSequence) {
+        ownerRunner(true)
+                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertTriggerSurface(context, mode, replaysAtStartup, checksTheSequence);
+                });
+        ownerRunner(false)
+                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertTriggerSurface(context, mode, false, false);
+                });
+    }
+
+    private static void assertTriggerSurface(AssertableApplicationContext context,
+                                             String mode,
+                                             boolean replaysAtStartup,
+                                             boolean checksTheSequence) {
+        assertTrigger(context, ContestScoreboardFullReplayStartupRunner.class, replaysAtStartup, mode);
+        assertTrigger(context, ContestScoreboardRedisSequenceScheduler.class, checksTheSequence, mode);
+        assertTrigger(context, ContestScoreboardRedisSequenceStartupCheck.class, checksTheSequence, mode);
+    }
+
+    private static void assertTrigger(AssertableApplicationContext context,
+                                      Class<?> trigger,
+                                      boolean present,
+                                      String mode) {
+        if (present) {
+            assertThat(context)
+                    .as("%s in mode=%s should be registered on the owner", trigger.getSimpleName(), mode)
+                    .hasSingleBean(trigger);
+            return;
+        }
+        assertThat(context)
+                .as("%s in mode=%s should not be registered", trigger.getSimpleName(), mode)
+                .doesNotHaveBean(trigger);
+    }
+
+    /**
+     * The same context the mode tests use, with the owner axis moved and the consumer off.
+     *
+     * <p>The consumer is off because a role that is not the owner does not consume the stream: a
+     * consumer runs the supervisor pass whatever the declaration says, so the two halves of this
+     * configuration would contradict each other and the validator refuses both combinations that say
+     * otherwise.</p>
+     */
+    private ApplicationContextRunner ownerRunner(boolean owner) {
+        return new ApplicationContextRunner()
+                .withPropertyValues("contest.scoreboard.stream.consumer.enabled=false")
+                .withPropertyValues("contest.scoreboard.recovery.owner.enabled=" + owner)
+                .withUserConfiguration(productionBeans());
     }
 
     /**

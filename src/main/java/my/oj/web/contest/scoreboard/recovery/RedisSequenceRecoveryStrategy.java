@@ -44,15 +44,34 @@ class RedisSequenceRecoveryStrategy implements ContestScoreboardRecoveryStrategy
         return ContestScoreboardRecoveryMode.REDIS_SEQ;
     }
 
+    /**
+     * True: the consumer waits for the startup check.
+     *
+     * <p>This mode's check judges every stored sequence against the allocator it read, and the contract
+     * that makes that reading correct is that every database read comes before the allocator read. A
+     * consumer applying results while the check runs would be issuing sequences into the middle of that
+     * window - the one thing the mode's own check cannot survive, since each side would judge the
+     * other's in-flight results as lost.</p>
+     *
+     * <p>The cold start is also where the mode's isolation is easiest to lose. A consumer that started
+     * first would re-read the stream from the stored checkpoint and put the restored history back
+     * through the stream, after which the check would find nothing to repair and the mode would look
+     * like it had recovered a scoreboard it never touched.</p>
+     */
+    @Override
+    public boolean recoversHistoryBeforeConsuming() {
+        return true;
+    }
+
     @Override
     public boolean rewindsOnCheckpointRegression() {
         return false;
     }
 
     @Override
-    public boolean rebuildHistory(LostRange range) {
+    public Outcome rebuildHistory(LostRange range) {
         if (range.rebuiltAlready()) {
-            return true;
+            return Outcome.COVERED;
         }
         if (!range.withinAppliedHistory()) {
             log.error("Scoreboard stream offsets below {} include ones this process never applied, so the "
@@ -60,16 +79,40 @@ class RedisSequenceRecoveryStrategy implements ContestScoreboardRecoveryStrategy
                             + "to compare against the allocator, and neither the duplicate scan nor the "
                             + "sequenced-tail walk can see a result that was never applied. The batch is left "
                             + "unapplied rather than moving the checkpoint past results the standings never "
-                            + "saw. Replay from MySQL, or switch to the full-replay mode, to rebuild them.",
+                            + "saw, and this range is not asked about again until the observed offsets "
+                            + "change. Replay from MySQL to rebuild them; this refusal is remembered in this "
+                            + "JVM only, so a restart re-asks, and a restart is also what changing the mode "
+                            + "to full-replay takes - that mode's own pass is what would rebuild them.",
                     range.firstLostOffset());
-            return false;
+            // Unrecoverable, and the only refusal in this mode that is: it is a property of what the
+            // basis records, so a second attempt reaches the same answer. Remembering it is what keeps
+            // a range nobody can rebuild from becoming a sequence check per supervisor cycle.
+            return Outcome.UNRECOVERABLE;
         }
-        return gate.tryRun(PassKind.SEQUENCE_CHECK, () -> {
-            ContestScoreboardRedisSequenceRecoveryService.SequenceCheckReport report = recoveryService.check();
-            // A pass that spent every round, or every window in a round, has not seen the whole set.
-            // Reporting the range as rebuilt on either would let the checkpoint move over candidates
-            // the check never reached.
-            return !report.unresolved() && !report.saturated();
-        }).orElse(Boolean.FALSE);
+        try {
+            return gate.tryRun(PassKind.SEQUENCE_CHECK, () -> {
+                ContestScoreboardRedisSequenceRecoveryService.SequenceCheckReport report = recoveryService.check();
+                // A pass that spent every round, or every window in a round, has not seen the whole
+                // set. Reporting the range as rebuilt on either would let the checkpoint move over
+                // candidates the check never reached.
+                if (report.coveredTheWholeSet()) {
+                    return Outcome.COVERED;
+                }
+                if (report.unresolved()) {
+                    // Rounds were spent and results are still to be replayed: replaying a result the
+                    // scoreboard already applied cannot take the sequence back off it, so the next
+                    // round finds the same group. Another round is not the repair.
+                    return Outcome.UNRECOVERABLE;
+                }
+                // The window budget ran out before the tail was walked to its end. Rounds replay what
+                // they find, so the next pass has less to look at - this one is worth taking again.
+                return Outcome.RETRYABLE_FAILURE;
+            }).orElse(Outcome.BUSY_RETRY_LATER);
+        } catch (RuntimeException failure) {
+            log.error("The sequence check could not rebuild the scoreboard history the rollback took away "
+                            + "between offsets {} and {}; the check is retried on the next supervisor cycle",
+                    range.firstLostOffset(), range.lastLostOffset(), failure);
+            return Outcome.RETRYABLE_FAILURE;
+        }
     }
 }

@@ -2,10 +2,12 @@ package my.oj.web.contest.scoreboard.stream;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryCutover;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryMode;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryProperties;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryProperties.StreamOffset.StartupOffset;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy.Outcome;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -52,6 +54,7 @@ class ContestScoreboardStreamLifecycleTests {
     private ContestScoreboardApplier applier;
     private ContestScoreboardStreamPosition position;
     private ContestScoreboardRecoveryStrategy strategy;
+    private ContestScoreboardRecoveryCutover cutover;
     private SimpleMeterRegistry registry;
 
     @BeforeEach
@@ -60,6 +63,7 @@ class ContestScoreboardStreamLifecycleTests {
         applier = mock(ContestScoreboardApplier.class);
         position = new ContestScoreboardStreamPosition();
         strategy = mock(ContestScoreboardRecoveryStrategy.class);
+        cutover = new ContestScoreboardRecoveryCutover();
         registry = new SimpleMeterRegistry();
         lenient().when(strategy.mode()).thenReturn(ContestScoreboardRecoveryMode.STREAM_OFFSET);
     }
@@ -137,7 +141,114 @@ class ContestScoreboardStreamLifecycleTests {
         assertThat(consumerArguments()).containsEntry("x-stream-offset", 4L);
     }
 
-    /** A failure already answered by a resubscribe must not restart the consumer on every pass. */
+    /**
+     * The cold start a mode that does not own the stream is allowed to have: nothing is read until that
+     * mode's own history recovery has run.
+     *
+     * <p>The defect this pins is an ordering one and it is invisible from the outside. {@code full-replay}
+     * and {@code redis-seq} rebuild history from MySQL and from the sequence, while a consumer resuming
+     * at the stored checkpoint re-reads the history from the stream - and this lifecycle starts at the
+     * end of the context refresh, ahead of the {@code ApplicationRunner}s that run those modes' passes.
+     * Without a boundary the stream would have repaired the restored scoreboard before the mode the
+     * operator selected had done anything, leaving the mode to replay over results that were already
+     * back.</p>
+     */
+    @Test
+    void aModeThatRebuildsHistoryFromItsOwnBasisConsumesNothingUntilItsPassHasRun() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        when(strategy.recoversHistoryBeforeConsuming()).thenReturn(true);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+
+        lifecycle.start();
+
+        verify(container, never()).start();
+        assertThat(lifecycle.isRunning()).isFalse();
+
+        cutover.markCovered("the mode's startup pass");
+
+        assertThat(consumerArguments()).containsEntry("x-stream-offset", 4L);
+        assertThat(lifecycle.isRunning()).isTrue();
+    }
+
+    /**
+     * The stream's own mode is not held, and that is not a detail of this test: its history recovery
+     * <em>is</em> the consumer reading from the stored checkpoint, so holding it until a pass that does
+     * not exist would leave the scoreboard consuming nothing for good.
+     */
+    @Test
+    void theModeThatRecoversByReadingTheStreamIsNotHeld() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        when(strategy.recoversHistoryBeforeConsuming()).thenReturn(false);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+
+        lifecycle.start();
+
+        assertThat(consumerArguments()).containsEntry("x-stream-offset", 4L);
+        assertThat(lifecycle.isRunning()).isTrue();
+        assertThat(cutover.isCovered()).isFalse();
+    }
+
+    /**
+     * Where a held consumer resumes is where it would have resumed anyway, which is the whole of the
+     * claim that the hold costs no result: the pass that releases it writes no stream offset - a rebuild
+     * request carries none - so the checkpoint the consumer asks for is the one it was held at.
+     */
+    @Test
+    void aHeldConsumerResumesAtTheCheckpointTheHoldBeganAt() {
+        when(applier.currentStreamOffset()).thenReturn(7L, 7L);
+        when(strategy.recoversHistoryBeforeConsuming()).thenReturn(true);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+
+        verify(container, never()).setConsumerArguments(any());
+
+        cutover.markCovered("the mode's startup pass");
+
+        assertThat(consumerArguments())
+                .as("the stored checkpoint itself, never its successor and never a broker tail")
+                .containsEntry("x-stream-offset", 7L);
+    }
+
+    /**
+     * A release that arrives while the context is going down must not start a listener container behind
+     * it. The pass that releases it is allowed to run long - a full replay of every contest does - so the
+     * two can meet.
+     */
+    @Test
+    void aConsumerReleasedAfterShutdownIsNotStarted() {
+        when(strategy.recoversHistoryBeforeConsuming()).thenReturn(true);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+
+        lifecycle.stop();
+        cutover.markCovered("the mode's startup pass");
+
+        verify(container, never()).start();
+        assertThat(lifecycle.isRunning()).isFalse();
+    }
+
+    /**
+     * The supervisor is the one thing that must not start a held consumer on a timer: it runs on an
+     * interval and it restarts the consumer for reasons of its own, so a pass that ignored the boundary
+     * would begin consuming within a second of the JVM coming up - ahead of the recovery the wait exists
+     * for.
+     */
+    @Test
+    void theSupervisorDoesNotStartAHeldConsumer() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        when(strategy.recoversHistoryBeforeConsuming()).thenReturn(true);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordFailedBatch();
+
+        lifecycle.recoverConsumption();
+
+        verify(container, never()).start();
+    }
+
+    /**
+     * A failure already answered by a resubscribe must not restart the consumer on every pass.
+     */
     @Test
     void aFailureIsAnsweredOnce() {
         when(applier.currentStreamOffset()).thenReturn(4L);
@@ -188,7 +299,7 @@ class ContestScoreboardStreamLifecycleTests {
     void aRollbackLeavesTheConsumerRunningWhenTheModeDoesNotOwnTheStream() {
         when(applier.currentStreamOffset()).thenReturn(4L, 2L);
         when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
-        when(strategy.rebuildHistory(any())).thenReturn(true);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
         position.recordAppliedOffset(4L);
@@ -209,7 +320,7 @@ class ContestScoreboardStreamLifecycleTests {
     void aRollbackTheModeRebuiltIsRecordedForTheLivePath() {
         when(applier.currentStreamOffset()).thenReturn(4L, 2L);
         when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
-        when(strategy.rebuildHistory(any())).thenReturn(true);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
         position.recordAppliedOffset(4L);
@@ -253,15 +364,19 @@ class ContestScoreboardStreamLifecycleTests {
     }
 
     /**
-     * A rebuild that failed must not be recorded as done: the live path reads that record to decide
-     * whether it may anchor past the range, and a false record there would move the checkpoint over
-     * results nobody put back.
+     * A rebuild that did not cover the range must not be recorded as done: the live path reads that
+     * record to decide whether it may anchor past the range, and a false record there would move the
+     * checkpoint over results nobody put back.
+     *
+     * <p>The refusal is also not an answer that can be filed away - see
+     * {@link #aRollbackTheBasisCouldNotAnswerIsAskedAboutAgain()}, which is the same range a cycle
+     * later.</p>
      */
     @Test
     void aRollbackTheModeCouldNotRebuildIsNotRecordedAsDone() {
         when(applier.currentStreamOffset()).thenReturn(4L, 2L);
         when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
-        when(strategy.rebuildHistory(any())).thenReturn(false);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.RETRYABLE_FAILURE);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
         position.recordAppliedOffset(4L);
@@ -273,6 +388,96 @@ class ContestScoreboardStreamLifecycleTests {
     }
 
     /**
+     * The defect this pins: a rollback the mode could not answer at that moment was recorded as
+     * answered and never looked at again.
+     *
+     * <p>The first cycle's attempt is refused the gate - another pass is rebuilding - so nothing was
+     * learned about the range. The second cycle asks again at the same observed offsets, which is the
+     * point: nothing new arrived from the stream, the checkpoint cannot move past the range, and the
+     * scheduled pass is the only thing left that could ask. Only the third cycle's success is the
+     * answer, and only then is the pair remembered.</p>
+     */
+    @Test
+    void aRollbackTheBasisCouldNotAnswerIsAskedAboutAgain() {
+        when(applier.currentStreamOffset()).thenReturn(4L, 2L, 2L, 2L, 2L);
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
+        when(strategy.rebuildHistory(any()))
+                .thenReturn(Outcome.BUSY_RETRY_LATER, Outcome.COVERED, Outcome.COVERED);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordAppliedOffset(4L);
+
+        lifecycle.recoverConsumption();
+        assertThat(retryCount("busy-retry-later"))
+                .as("a pass another pass held the gate out of is not an answer")
+                .isEqualTo(1.0);
+        assertThat(position.rebuiltThrough())
+                .as("a range that was never rebuilt must not be recorded as rebuilt")
+                .isEqualTo(-1L);
+
+        lifecycle.recoverConsumption();
+        assertThat(position.rebuiltThrough())
+                .as("only the attempt that covered the range is the answer")
+                .isEqualTo(4L);
+
+        // Answered now, so the interval stops asking - three calls of the basis for two cycles that
+        // did not answer it and one that did.
+        lifecycle.recoverConsumption();
+        verify(strategy, times(2)).rebuildHistory(any());
+    }
+
+    /**
+     * A failure is retried as well, and counted apart from a busy gate: one says another pass is
+     * running, the other says this one could not finish, and an operator needs to tell them apart.
+     */
+    @Test
+    void aFailedRebuildIsRetriedAndCountedApartFromABusyGate() {
+        when(applier.currentStreamOffset()).thenReturn(4L, 2L, 2L);
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
+        when(strategy.rebuildHistory(any()))
+                .thenReturn(Outcome.RETRYABLE_FAILURE, Outcome.RETRYABLE_FAILURE, Outcome.RETRYABLE_FAILURE);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordAppliedOffset(4L);
+
+        lifecycle.recoverConsumption();
+        lifecycle.recoverConsumption();
+
+        verify(strategy, times(2)).rebuildHistory(any());
+        assertThat(retryCount("retryable-failure")).isEqualTo(2.0);
+        assertThat(retryCount("busy-retry-later")).isZero();
+    }
+
+    /**
+     * A range the mode refuses outright is an answer, so it is remembered - and that is what keeps a
+     * range nobody can rebuild from becoming a rebuild per interval.
+     *
+     * <p>It is an ERROR state and stays one: the range is not rebuilt, the checkpoint cannot move past
+     * it, and the metric says so. What the memory buys is that the state is reported once rather than
+     * driven into the log every second, which is not the same as it being repaired.</p>
+     */
+    @Test
+    void anUnrecoverableRollbackIsRememberedAndLeftAsAnError() {
+        when(applier.currentStreamOffset()).thenReturn(4L, 2L, 2L);
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.UNRECOVERABLE);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordAppliedOffset(4L);
+
+        lifecycle.recoverConsumption();
+        lifecycle.recoverConsumption();
+
+        verify(strategy, times(1)).rebuildHistory(any());
+        assertThat(position.rebuiltThrough()).isEqualTo(-1L);
+        assertThat(counter("contest.scoreboard.stream.rollback.unrecoverable")).isEqualTo(1.0);
+        assertThat(retryCount("busy-retry-later")).isZero();
+        assertThat(retryCount("retryable-failure"))
+                .as("a refusal is not a retry")
+                .isZero();
+    }
+
+    /**
      * A mode that does not rewind leaves the checkpoint behind for as long as it takes the live path to
      * anchor past it, so the same rollback is visible on every pass. Answering it once per observed
      * pair is what keeps the interval from turning into a rebuild per interval.
@@ -281,7 +486,7 @@ class ContestScoreboardStreamLifecycleTests {
     void aRollbackIsAnsweredOncePerObservedPair() {
         when(applier.currentStreamOffset()).thenReturn(4L, 2L, 2L, 2L);
         when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
-        when(strategy.rebuildHistory(any())).thenReturn(true);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
         position.recordAppliedOffset(4L);
@@ -294,12 +499,14 @@ class ContestScoreboardStreamLifecycleTests {
         assertThat(counter("contest.scoreboard.stream.rollback.observed")).isEqualTo(1.0);
     }
 
-    /** A consumer that was restarted is a new position, so the rollback must be judged again. */
+    /**
+     * A consumer that was restarted is a new position, so the rollback must be judged again.
+     */
     @Test
     void aFurtherRollbackIsAnsweredEvenAfterAnEarlierOne() {
         when(applier.currentStreamOffset()).thenReturn(4L, 2L, 1L);
         when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
-        when(strategy.rebuildHistory(any())).thenReturn(true);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
         lifecycle.start();
         position.recordAppliedOffset(4L);
@@ -309,6 +516,63 @@ class ContestScoreboardStreamLifecycleTests {
         lifecycle.recoverConsumption();
 
         verify(strategy, times(2)).rebuildHistory(any());
+    }
+
+    /**
+     * The two causes are independent, and answering one is not answering the other.
+     *
+     * <p>This is the state the failure leaves behind in a mode that does not rewind: the rebuild has
+     * reported the rollback handled, so the pair is remembered - and a batch is still unapplied below
+     * the checkpoint the consumer's own position cannot pass. Nothing at the broker brings that batch
+     * back, so if the answered rollback were taken as a reason to stop asking, the standings would stay
+     * short there for the life of the JVM. The resubscribe is what re-reads it, in this mode as in every
+     * other.</p>
+     */
+    @Test
+    void aRollbackTheModeAnsweredStillLeavesTheFailedBatchToReRead() {
+        when(applier.currentStreamOffset()).thenReturn(4L, 2L, 2L);
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordAppliedOffset(4L);
+        position.recordFailedBatch();
+
+        lifecycle.recoverConsumption();
+        lifecycle.recoverConsumption();
+
+        assertThat(counter("contest.scoreboard.stream.rollback.restarts"))
+                .as("a mode that does not own the stream does not restart the consumer for a rollback")
+                .isZero();
+        assertThat(counter("contest.scoreboard.stream.failure.restarts"))
+                .as("the batch is re-read by a resubscribe at the checkpoint")
+                .isEqualTo(1.0);
+        assertThat(consumerArguments()).containsEntry("x-stream-offset", 2L);
+        verify(strategy, times(1)).rebuildHistory(any());
+    }
+
+    /**
+     * The rewinding mode is the one case the two causes coincide in, and it must not be restarted twice
+     * for one batch: that mode's answer to the rollback <em>is</em> a restart at the checkpoint, and the
+     * failed batch lies at or above that checkpoint, so the rewind re-reads it on the way past.
+     */
+    @Test
+    void aRewindThatAnsweredTheRollbackDoesNotRestartAgainForTheFailedBatch() {
+        when(applier.currentStreamOffset()).thenReturn(4L, 2L, 2L);
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(true);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordAppliedOffset(4L);
+        position.recordFailedBatch();
+
+        lifecycle.recoverConsumption();
+        lifecycle.recoverConsumption();
+
+        // One start for the service coming up, one for the rewind that re-read the batch.
+        verify(container, times(2)).start();
+        assertThat(counter("contest.scoreboard.stream.rollback.restarts")).isEqualTo(1.0);
+        assertThat(counter("contest.scoreboard.stream.failure.restarts")).isZero();
+        assertThat(consumerArguments()).containsEntry("x-stream-offset", 2L);
     }
 
     /** A healthy consumer must be left alone: this pass runs on an interval, all day. */
@@ -332,12 +596,25 @@ class ContestScoreboardStreamLifecycleTests {
                 position,
                 new ContestScoreboardStreamMetrics(registry),
                 properties(startupOffset),
-                strategy
+                strategy,
+                cutover
         );
     }
 
     private double counter(String name) {
         return registry.get(name).counter().count();
+    }
+
+    /**
+     * The retry counter for one outcome. A pass that did not answer the range is counted under the
+     * outcome that stopped it, so "another pass is running" and "the attempt failed" are told apart
+     * here as well as in the pass itself.
+     */
+    private double retryCount(String outcome) {
+        return registry.get("contest.scoreboard.stream.rollback.retry")
+                .tag("outcome", outcome)
+                .counter()
+                .count();
     }
 
     /** The last consumer argument set, which is where the consumer most recently asked to begin. */

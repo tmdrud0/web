@@ -32,11 +32,17 @@ public record ContestScoreboardRecoveryProperties(
     /**
      * Whether this instance is the one that runs recovery passes.
      *
-     * <p>Nothing enforces this across instances, and nothing can: the gates and locks in this package
-     * are JVM-local, so two instances that both run a pass will both run it. What the setting does is
-     * make the deployment's assumption explicit and checkable at startup, so a role that silently
-     * became a second recovery owner is stopped rather than discovered later - see
-     * {@link ContestScoreboardRecoveryValidator}.</p>
+     * <p>This is an execution boundary, not a declaration. Each of the three mode triggers carries
+     * {@link ContestScoreboardRecoveryOwnerCondition}, so an instance with {@code owner.enabled=false}
+     * has no startup replay, no startup sequence check and no sequence-check intervals registered at
+     * all - they are absent as beans rather than present and declining. Nothing else in the
+     * application needs to read the setting to make that true.</p>
+     *
+     * <p>What the setting does not do is coordinate instances. The gates and locks in this package are
+     * JVM-local, so two instances that both declare themselves owners both run, and the deployment's
+     * single {@code batch-role} instance remains the only thing that prevents it. The setting narrows
+     * who may recover; it cannot detect a second owner. {@link ContestScoreboardRecoveryValidator}
+     * stops the configurations that would make the declaration false in the other direction.</p>
      */
     public record RecoveryOwner(@DefaultValue("true") boolean enabled) {
     }

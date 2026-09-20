@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import lombok.extern.slf4j.Slf4j;
 import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamRecoveryService;
 
 /**
@@ -23,12 +24,20 @@ import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamRecoveryServic
  * live path does not own. So the live path refuses in that case and the supervisor's pass rewinds,
  * which is the same recovery reached by the thing that can carry it out.</p>
  *
+ * <p>That refusal is a {@link Outcome#RETRYABLE_FAILURE} rather than an {@code UNRECOVERABLE} one, and
+ * the name is the point: this basis did not rebuild the range, but nothing has been decided about it
+ * either. The rewind that owns it restarts the consumer at the checkpoint, the batch is delivered
+ * again, and the question does not come back - which is a retry, not a repair this call performed.</p>
+ *
  * <p>A range reaching above what this process applied is a different question and does get the
  * fallback. Those offsets were published without this process applying them - that is the only way an
  * offset sits above its own watermark - and the judge writes MySQL before it publishes, so a replay
  * does cover them. The two ends of the range are handed over as they are, so the report names the range
- * the delivery actually jumped rather than a successor offset that nothing observed.</p>
+ * the delivery actually jumped rather than a successor offset that nothing observed. A fallback
+ * configured as {@code none} refuses instead, and that refusal is the one this mode reports as
+ * {@code UNRECOVERABLE}: it is a decision about the configuration, and asking again reaches it again.</p>
  */
+@Slf4j
 class StreamOffsetRecoveryStrategy implements ContestScoreboardRecoveryStrategy {
 
     private final ContestScoreboardStreamRecoveryService recoveryService;
@@ -45,19 +54,46 @@ class StreamOffsetRecoveryStrategy implements ContestScoreboardRecoveryStrategy 
         return ContestScoreboardRecoveryMode.STREAM_OFFSET;
     }
 
+    /**
+     * False, and this is the mode that makes the question worth asking.
+     *
+     * <p>Resuming at the stored checkpoint re-reads every offset above it, which is a history recovery
+     * for any mode. Here it is the intended one: the checkpoint and the standings were written in the
+     * same Lua invocation and rolled back together, so the offsets the rollback took away are still in
+     * retention and reading them again is what puts the results back. Waiting for a pass that does not
+     * exist would leave the consumer held for good.</p>
+     */
+    @Override
+    public boolean recoversHistoryBeforeConsuming() {
+        return false;
+    }
+
     @Override
     public boolean rewindsOnCheckpointRegression() {
         return true;
     }
 
     @Override
-    public boolean rebuildHistory(LostRange range) {
+    public Outcome rebuildHistory(LostRange range) {
         if (range.withinAppliedHistory()) {
-            return false;
+            // Everything in the range was applied here before the rollback, so it is the supervisor's
+            // rewind that repairs it and this call has nothing to rebuild. Retryable, not
+            // unrecoverable: the range is not missing anything a later attempt could not reach, and
+            // nothing here may be remembered as answered - the supervisor's pass is the answer, and it
+            // has not run yet.
+            return Outcome.RETRYABLE_FAILURE;
         }
-        return gate.tryRun(PassKind.MYSQL_REPLAY, () -> recoveryService.recoverRetentionGap(
-                range.checkpointOffset(),
-                range.lastLostOffset()
-        )).orElse(Boolean.FALSE);
+        try {
+            return gate.tryRun(PassKind.MYSQL_REPLAY, () -> recoveryService.recoverRetentionGap(
+                    range.checkpointOffset(),
+                    range.lastLostOffset()
+            ) ? Outcome.COVERED : Outcome.UNRECOVERABLE).orElse(Outcome.BUSY_RETRY_LATER);
+        } catch (RuntimeException failure) {
+            log.error("The MySQL fallback could not replay the offsets {} to {} the stream no longer "
+                            + "serves; the batch is left unapplied and the replay is retried on the next "
+                            + "supervisor cycle",
+                    range.firstLostOffset(), range.lastLostOffset(), failure);
+            return Outcome.RETRYABLE_FAILURE;
+        }
     }
 }

@@ -22,12 +22,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>{@code startup-replay-enabled=false} keeps this from replaying every contest in the shared test
  * schema. What is asserted is that the mode boots and reports itself, not what the replay does - the
  * replay's own tests seed and assert a single contest.</p>
+ *
+ * <p>{@code owner.enabled=true} is declared because the test profile declares the opposite -
+ * {@code application-test.properties} sets no context as the owner, so that a test which starts a
+ * recovery pass has to say so. This one does: the whole assertion is that the mode's startup runner
+ * comes up in a real boot, and the runner is absent from a context that is not the owner.</p>
  */
 @SpringBootTest
 @ActiveProfiles("test")
 @TestPropertySource(properties = {
         "contest.scoreboard.recovery.mode=full-replay",
         "contest.scoreboard.recovery.full-replay.startup-replay-enabled=false",
+        "contest.scoreboard.recovery.owner.enabled=true",
         "rank.streak.batch.enabled=false"
 })
 class ContestScoreboardRecoveryModeStartupTests {

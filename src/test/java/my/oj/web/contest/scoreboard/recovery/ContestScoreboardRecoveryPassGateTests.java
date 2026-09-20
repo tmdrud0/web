@@ -38,12 +38,25 @@ class ContestScoreboardRecoveryPassGateTests {
     }
 
     /**
-     * A pass that returns nothing is not a completed pass. Reporting empty for it is what keeps a
-     * caller from reading its own {@code null} as a pass that ran.
+     * A pass that returns nothing is refused rather than reported as empty, and the reason is the one
+     * mistake this gate can make quietly.
+     *
+     * <p>Empty already means "another pass held the gate", which every caller treats as "nothing was
+     * done, ask again on my own cadence". A supplier that returned nothing would be handed back under
+     * that same value, so a caller could not tell a pass that ran and answered nothing from a pass
+     * that never ran at all - and the first of those is a range nobody has looked at, reported as one
+     * that is being looked at.</p>
      */
     @Test
-    void reportsAPassThatReturnedNothingAsEmpty() {
-        assertThat(gate.tryRun(PassKind.SEQUENCE_CHECK, () -> null)).isEmpty();
+    void refusesAPassThatReturnedNothing() {
+        assertThatThrownBy(() -> gate.tryRun(PassKind.SEQUENCE_CHECK, () -> null))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("completed without returning a value")
+                .hasMessageContaining("empty result means another pass held the gate");
+
+        // The refusal is about the pass, not the gate: whatever went wrong, the next pass runs.
+        assertThat(gate.held()).isFalse();
+        assertThat(gate.tryRun(PassKind.SEQUENCE_CHECK, () -> 1)).contains(1);
     }
 
     @Test

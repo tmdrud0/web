@@ -6,6 +6,7 @@ import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryMode;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy.Outcome;
 import my.oj.web.contest.submission.messaging.ContestJudgeResultStreamMessage;
 import my.oj.web.submission.SubmissionResult;
 import org.junit.jupiter.api.BeforeEach;
@@ -111,7 +112,7 @@ class ContestScoreboardStreamProcessorTests {
     void aDeliveryAboveAnUnretainedCheckpointIsAnchoredOnlyAfterTheBasisRebuiltIt() {
         when(applier.currentStreamOffset()).thenReturn(5L, 5L, 11L);
         when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
-        when(strategy.rebuildHistory(any())).thenReturn(true);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         position.recordAppliedOffset(5L);
 
         processor.process(List.of(event(10L, 110L), event(11L, 111L)));
@@ -136,7 +137,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void aRetentionGapNoBasisRebuiltLeavesTheBatchUnapplied() {
         when(applier.currentStreamOffset()).thenReturn(5L);
-        when(strategy.rebuildHistory(any())).thenReturn(false);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.RETRYABLE_FAILURE);
         position.recordAppliedOffset(5L);
 
         assertThatThrownBy(() -> processor.process(List.of(event(10L, 110L), event(11L, 111L))))
@@ -178,7 +179,7 @@ class ContestScoreboardStreamProcessorTests {
     void aRollbackIsCountedApartFromARetentionGapAndJudgedAfresh() {
         when(applier.currentStreamOffset()).thenReturn(2L, 2L, 5L);
         when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
-        when(strategy.rebuildHistory(any())).thenReturn(true);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         position.recordAppliedOffset(4L);
         // The anchor was verified for the position the consumer held before Redis rolled back.
         position.markAnchorVerified();
@@ -204,7 +205,7 @@ class ContestScoreboardStreamProcessorTests {
     void theRangeCarriesHowFarACompletedRebuildAlreadyReached() {
         when(applier.currentStreamOffset()).thenReturn(5L, 5L, 10L);
         when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
-        when(strategy.rebuildHistory(any())).thenReturn(true);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         position.recordAppliedOffset(5L);
         position.markRebuiltThrough(9L);
 
@@ -297,7 +298,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void aDeliveryAboveTheRangeAsksTheModeWhenThereIsACheckpoint() {
         when(applier.currentStreamOffset()).thenReturn(5L);
-        when(strategy.rebuildHistory(any())).thenReturn(false);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.RETRYABLE_FAILURE);
         position.recordAppliedOffset(5L);
         position.markAnchorVerified();
         position.recordUnappliedRange(6L);

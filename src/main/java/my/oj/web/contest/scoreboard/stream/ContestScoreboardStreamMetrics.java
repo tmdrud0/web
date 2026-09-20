@@ -3,12 +3,16 @@ package my.oj.web.contest.scoreboard.stream;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.Arrays;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Component
@@ -29,6 +33,17 @@ public class ContestScoreboardStreamMetrics {
     private volatile Counter offsetGaps;
     private volatile Counter rollbackRestarts;
     private volatile Counter rollbackObserved;
+    private volatile Counter rollbackUnrecoverable;
+    /**
+     * One counter per outcome that leaves a range unanswered, so an interval spent retrying is
+     * counted where it is decided rather than inferred from a repeated log line.
+     *
+     * <p>Only the retryable outcomes are registered, and {@link #recordRollbackRetry} refuses the
+     * others rather than ignoring them: a covered or refused range is not a retry, and counting it as
+     * one would report a hot loop where there is none.</p>
+     */
+    private final Map<ContestScoreboardRecoveryStrategy.Outcome, Counter> rollbackRetries =
+            new EnumMap<>(ContestScoreboardRecoveryStrategy.Outcome.class);
     private volatile Counter failureRestarts;
     private volatile Counter unappliedRefusals;
     private volatile Counter tailProbeFailures;
@@ -66,6 +81,19 @@ public class ContestScoreboardStreamMetrics {
                 .description("Redis offset rollbacks a mode rebuilt from its own history basis instead"
                         + " of by rewinding the stream")
                 .register(registry);
+        this.rollbackUnrecoverable = Counter.builder("contest.scoreboard.stream.rollback.unrecoverable")
+                .description("Rollback ranges a mode's basis reported it cannot rebuild in its current"
+                        + " configuration, which are left missing and not asked about again")
+                .register(registry);
+        for (ContestScoreboardRecoveryStrategy.Outcome outcome : ContestScoreboardRecoveryStrategy.Outcome.values()) {
+            if (outcome.retryable()) {
+                rollbackRetries.put(outcome, Counter.builder("contest.scoreboard.stream.rollback.retry")
+                        .tag("outcome", outcome.label())
+                        .description("Rollback ranges a supervisor pass asked a mode's basis about again,"
+                                + " because the earlier attempt left the range unanswered")
+                        .register(registry));
+            }
+        }
         this.failureRestarts = Counter.builder("contest.scoreboard.stream.failure.restarts")
                 .description("Consumer restarts to re-read a failed stream batch the broker does not redeliver")
                 .register(registry);
@@ -123,6 +151,32 @@ public class ContestScoreboardStreamMetrics {
 
     void recordRollbackObserved() {
         rollbackObserved.increment();
+    }
+
+    void recordRollbackUnrecoverable() {
+        rollbackUnrecoverable.increment();
+    }
+
+    /**
+     * Counts a pass that asked a mode's basis about a rollback the earlier attempt left unanswered.
+     *
+     * @throws IllegalArgumentException for an outcome that answers the range, which is not a retry -
+     *         a silent no-op here would read as one for whichever caller passed the wrong value
+     */
+    void recordRollbackRetry(ContestScoreboardRecoveryStrategy.Outcome outcome) {
+        Counter counter = rollbackRetries.get(outcome);
+        if (counter == null) {
+            throw new IllegalArgumentException("A rollback whose outcome is " + outcome
+                    + " has been answered and is not retried; only " + retryableLabels() + " are");
+        }
+        counter.increment();
+    }
+
+    private static List<String> retryableLabels() {
+        return Arrays.stream(ContestScoreboardRecoveryStrategy.Outcome.values())
+                .filter(ContestScoreboardRecoveryStrategy.Outcome::retryable)
+                .map(ContestScoreboardRecoveryStrategy.Outcome::label)
+                .toList();
     }
 
     void recordFailureRestart() {

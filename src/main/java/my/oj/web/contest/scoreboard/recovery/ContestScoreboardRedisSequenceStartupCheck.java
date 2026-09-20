@@ -5,6 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.stereotype.Component;
 
 /**
@@ -16,7 +17,11 @@ import org.springframework.stereotype.Component;
  * first check here and lets {@code startup-check-enabled} turn it off.</p>
  *
  * <p>It goes through the scheduler rather than the service so that it shares the scheduler's guard:
- * a periodic pass that has already started must not be joined by a second reader of the allocator.</p>
+ * a periodic pass that has already started must not be joined by a second reader of the allocator.
+ * That coupling is also why this runner carries the owner condition separately rather than relying on
+ * the scheduler's: it is registered as an {@code ApplicationRunner} in its own right, so a JVM that
+ * somehow had one without the other would still check at startup. The two conditions are the same
+ * condition, so in practice both are present or neither is.</p>
  */
 @Component
 @ConditionalOnProperty(
@@ -24,6 +29,7 @@ import org.springframework.stereotype.Component;
         name = "mode",
         havingValue = "redis-seq"
 )
+@Conditional(ContestScoreboardRecoveryOwnerCondition.class)
 @RequiredArgsConstructor
 @Slf4j
 class ContestScoreboardRedisSequenceStartupCheck implements ApplicationRunner {

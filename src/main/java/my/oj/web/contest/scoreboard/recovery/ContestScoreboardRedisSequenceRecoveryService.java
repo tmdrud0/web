@@ -321,6 +321,21 @@ public class ContestScoreboardRedisSequenceRecoveryService {
                                       int replayed,
                                       boolean saturated,
                                       boolean unresolved) {
+
+        /**
+         * Whether the pass saw the whole set, which is the only thing that lets a range be called
+         * rebuilt.
+         *
+         * <p>Stated as one question because the two flags below are both ways of <em>not</em> having
+         * seen it, and a caller that asked them separately would have to remember that - which is how
+         * the two came to be collapsed into a single boolean whose meaning then had to cover a spent
+         * round budget and a spent window budget as well. They are not the same failure: a spent round
+         * budget means results are still to be replayed that replaying cannot repair, while a spent
+         * window budget means the pass stopped before it had looked everywhere it was allowed to.</p>
+         */
+        public boolean coveredTheWholeSet() {
+            return !unresolved && !saturated;
+        }
     }
 
     private record Round(long duplicateGroups, int replayed, boolean saturated, int candidates) {

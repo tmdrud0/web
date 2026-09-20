@@ -229,12 +229,14 @@ class ContestScoreboardStreamProcessor {
                 position.highestAppliedOffset(),
                 position.rebuiltThrough()
         );
-        if (!strategy.rebuildHistory(range)) {
+        ContestScoreboardRecoveryStrategy.Outcome outcome = strategy.rebuildHistory(range);
+        if (!outcome.covers()) {
             throw new IllegalStateException(
                     "Scoreboard stream checkpoint " + checkpoint + " is "
                             + reason.description
                             + " and the " + strategy.mode().propertyValue()
                             + " basis did not rebuild the range below " + firstDelivery
+                            + " (" + outcome.label() + ")"
                             + "; the batch is left unapplied so the checkpoint does not move past results "
                             + "the standings never saw");
         }

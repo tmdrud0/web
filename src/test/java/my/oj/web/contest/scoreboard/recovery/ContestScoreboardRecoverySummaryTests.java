@@ -158,6 +158,82 @@ class ContestScoreboardRecoverySummaryTests {
                 .doesNotThrowAnyException();
     }
 
+    /**
+     * A consumer whose mode's only release of the history-recovery hold is off is refused, because the
+     * hold is what keeps the mode's own basis as the thing that rebuilds the history a restored Redis is
+     * missing. {@code full-replay} is that mode: its startup runner is the one thing that reports the
+     * boundary, and the retention-gap fallback - the only other caller of the replay - is reached through
+     * the consumer that is waiting. Nothing would report it, so the instance would consume nothing.
+     */
+    @Test
+    void refusesAConsumerWhoseModesOnlyReleaseIsOff() {
+        assertThatThrownBy(() -> consumerWith("full-replay", false, true).afterSingletonsInstantiated())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(ContestScoreboardRecoveryValidator.STARTUP_REPLAY_PROPERTY)
+                .hasMessageContaining("the consumer is held until that replay has run")
+                .hasMessageContaining("mode=full-replay");
+    }
+
+    /**
+     * {@code redis-seq} is deliberately not refused for the same setting, because the property removes
+     * the first check rather than the mechanism: the scheduler registers both periodic checks whether or
+     * not it is set, and the first period releases the hold one interval later. The mode loses the head
+     * start the startup check exists to give it, and nothing more - so refusing here would make
+     * {@code startup-check-enabled=false} unusable on every role that consumes, while asserting a
+     * substitution that the scheduler itself prevents.
+     */
+    @Test
+    void allowsAConsumerWhoseRedisSeqStartupCheckIsOffBecauseThePeriodicChecksReleaseTheHold() {
+        assertThatCode(() -> consumerWith("redis-seq", true, false).afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+    }
+
+    /**
+     * The consumer's flag is read as {@code @ConditionalOnProperty} reads it, not through a lenient
+     * {@code Boolean.class} binding. A spelling the condition turns down registers no consumer at all, so
+     * refusing it would be a false refusal caused only by the spelling - here on a role that declares
+     * itself no recovery owner, which is exactly the shape a web or judge role has.
+     */
+    @Test
+    void doesNotRefuseASpellingTheConsumerConditionItselfTurnsDown() {
+        MockEnvironment environment = environment("full-replay", "memory");
+        environment.setProperty(ContestScoreboardRecoveryValidator.STREAM_CONSUMER_PROPERTY, "yes");
+        ContestScoreboardRecoveryValidator validator = new ContestScoreboardRecoveryValidator(
+                properties("full-replay", false, false, true), environment);
+
+        assertThatCode(validator::afterSingletonsInstantiated).doesNotThrowAnyException();
+    }
+
+    /**
+     * The other half of that refusal: turning the startup pass off is an ordinary setting on a role that
+     * does not consume the stream, because there the pass is not what anything is waiting behind.
+     * {@code stream-offset} is unaffected either way - its history recovery is the consumer's own
+     * re-read, so it has no startup pass to turn off and nothing to hold it.
+     */
+    @Test
+    void allowsAStartupPassTurnedOffOnARoleThatDoesNotConsume() {
+        assertThatCode(() -> validator("full-replay", "full-replay", "memory", true, false, false, true)
+                .afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validator("redis-seq", "redis-seq", "redis", true, false, true, false)
+                .afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validator("stream-offset", "stream-offset", "memory", true, true, false, false)
+                .afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+    }
+
+    /** Every mode may consume the stream with its own startup pass on, which is the shipped default. */
+    @Test
+    void allowsEveryModeToConsumeBehindItsOwnStartupPass() {
+        assertThatCode(() -> consumerWith("stream-offset", true, true).afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+        assertThatCode(() -> consumerWith("full-replay", true, true).afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+        assertThatCode(() -> consumerWith("redis-seq", true, true).afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+    }
+
     private void assertSummary(String mode, String store) {
         contextRunner
                 .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
@@ -191,10 +267,29 @@ class ContestScoreboardRecoverySummaryTests {
                                                                 String store,
                                                                 boolean ownerEnabled,
                                                                 boolean consumerEnabled) {
+        return validator(configuredMode, mode, store, ownerEnabled, consumerEnabled, true, true);
+    }
+
+    /** A context that consumes the stream in the named mode, with the startup pass on unless said not to. */
+    private static ContestScoreboardRecoveryValidator consumerWith(String mode,
+                                                                  boolean startupReplayEnabled,
+                                                                  boolean startupCheckEnabled) {
+        String store = "redis-seq".equals(mode) ? "redis" : "memory";
+        return validator(mode, mode, store, true, true, startupReplayEnabled, startupCheckEnabled);
+    }
+
+    private static ContestScoreboardRecoveryValidator validator(String configuredMode,
+                                                                String mode,
+                                                                String store,
+                                                                boolean ownerEnabled,
+                                                                boolean consumerEnabled,
+                                                                boolean startupReplayEnabled,
+                                                                boolean startupCheckEnabled) {
         MockEnvironment environment = environment(configuredMode, store);
         environment.setProperty(ContestScoreboardRecoveryValidator.STREAM_CONSUMER_PROPERTY,
                 Boolean.toString(consumerEnabled));
-        return new ContestScoreboardRecoveryValidator(properties(mode, ownerEnabled), environment);
+        return new ContestScoreboardRecoveryValidator(
+                properties(mode, ownerEnabled, startupReplayEnabled, startupCheckEnabled), environment);
     }
 
     private static MockEnvironment environment(String configuredMode, String store) {
@@ -211,12 +306,19 @@ class ContestScoreboardRecoverySummaryTests {
     }
 
     private static ContestScoreboardRecoveryProperties properties(String mode, boolean ownerEnabled) {
+        return properties(mode, ownerEnabled, true, true);
+    }
+
+    private static ContestScoreboardRecoveryProperties properties(String mode,
+                                                                 boolean ownerEnabled,
+                                                                 boolean startupReplayEnabled,
+                                                                 boolean startupCheckEnabled) {
         return new ContestScoreboardRecoveryProperties(
                 Arrays.stream(ContestScoreboardRecoveryMode.values())
                         .filter(candidate -> candidate.propertyValue().equals(mode))
                         .findFirst()
                         .orElseThrow(),
-                new ContestScoreboardRecoveryProperties.FullReplay(1000, 500, true),
+                new ContestScoreboardRecoveryProperties.FullReplay(1000, 500, startupReplayEnabled),
                 new ContestScoreboardRecoveryProperties.RedisSequence(
                         Duration.ofSeconds(30),
                         Duration.ofSeconds(30),
@@ -226,7 +328,7 @@ class ContestScoreboardRecoverySummaryTests {
                         500,
                         3,
                         Duration.ofMillis(50),
-                        true
+                        startupCheckEnabled
                 ),
                 new ContestScoreboardRecoveryProperties.StreamOffset(
                         ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback.FULL_REPLAY,

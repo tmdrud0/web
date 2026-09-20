@@ -57,8 +57,18 @@ public class ContestScoreboardRecoveryPassGate {
      * schedule, a supervisor interval, a batch that will be re-read - so the next tick is the retry,
      * and a caller that reported success for a pass it did not run would be the one real mistake.</p>
      *
-     * @return the pass's value, or empty when another pass held the gate. A {@code null} value is
-     *         reported as empty for the same reason: neither is a completed pass
+     * <p>An empty result therefore means one thing only: {@link #held} was already taken, so this call
+     * ran nothing. A pass that completes without a value is refused rather than reported as empty,
+     * because empty is what the callers read as "another pass is running" - and the callers of this
+     * gate act on that: the recovery strategies turn it into a retry-later outcome, which is a
+     * statement about another pass rather than about this one. A {@code null}-returning pass reported
+     * that way would say another pass was running when none was, and the range it did not cover would
+     * be retried on that false premise for as long as the bug survived.</p>
+     *
+     * @return the pass's value, or empty when another pass held the gate. Never a value that is absent
+     *         for any other reason
+     * @throws IllegalStateException when the pass completed without returning a value, which cannot be
+     *         told apart from a pass that never ran
      */
     public <T> Optional<T> tryRun(PassKind kind, Supplier<T> pass) {
         if (!held.compareAndSet(false, true)) {
@@ -67,7 +77,13 @@ public class ContestScoreboardRecoveryPassGate {
             return Optional.empty();
         }
         try {
-            return Optional.ofNullable(pass.get());
+            T value = pass.get();
+            if (value == null) {
+                throw new IllegalStateException("A " + kind.label() + " pass completed without returning a"
+                        + " value; an empty result means another pass held the gate, so this pass could"
+                        + " not be told apart from one that never ran");
+            }
+            return Optional.of(value);
         } finally {
             held.set(false);
         }

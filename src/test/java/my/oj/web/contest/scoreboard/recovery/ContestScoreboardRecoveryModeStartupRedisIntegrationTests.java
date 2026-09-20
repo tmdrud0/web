@@ -31,6 +31,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>Both periodic checks are pushed an hour out and the startup check is turned off: this asserts
  * what the mode brings up, and a pass that ran here would be reading and replaying against whatever
  * the shared Redis happens to hold.</p>
+ *
+ * <p>{@code owner.enabled=true} is declared because the test profile declares the opposite - the
+ * triggers this mode's beans <em>are</em> are registered only on the recovery owner, so a context
+ * that is not the owner would bring up neither the scheduler nor the startup check this asserts.</p>
  */
 @SpringBootTest
 @ActiveProfiles("test")
@@ -40,6 +44,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         "contest.scoreboard.recovery.redis-seq.startup-check-enabled=false",
         "contest.scoreboard.recovery.redis-seq.duplicate-check-interval=1h",
         "contest.scoreboard.recovery.redis-seq.lost-tail-check-interval=1h",
+        "contest.scoreboard.recovery.owner.enabled=true",
         "contest.scoreboard.stream.consumer.enabled=false",
         "rank.streak.batch.enabled=false"
 })
