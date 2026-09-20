@@ -153,6 +153,20 @@ function Get-PromDelta {
     return [math]::Round($total, 3)
 }
 
+function Get-PromNodeDelta {
+    param([string]$StartLabel, [string]$EndLabel, [string]$Metric,
+          [string]$Node, [string]$RequiredTag = "")
+    $end = Get-PromMetricSum $EndLabel $Metric $RequiredTag $Node
+    $start = Get-PromMetricSum $StartLabel $Metric $RequiredTag $Node
+    if ($null -eq $start -and $null -eq $end) { return $null }
+    if ($null -eq $start) {
+        if (-not (Test-SnapshotReadable $StartLabel)) { return $null }
+        $start = 0.0
+    }
+    if ($null -eq $end) { return $null }
+    return [math]::Round($end - $start, 3)
+}
+
 function Get-ColumnStats {
     param([object[]]$Rows, [string]$Column)
     $values = @($Rows | ForEach-Object {
@@ -616,6 +630,31 @@ if (Test-Path $stagesPath) {
             windowBasis = "guard-adjusted measurement window; class counters use the measurement-start and hold-end Prometheus snapshots"
         }
 
+        $claimByNode = [ordered]@{}
+        foreach ($node in @("judge-1", "judge-2")) {
+            $nodeClasses = [ordered]@{}
+            foreach ($latencyClass in @("fast", "slow")) {
+                $tag = 'latency_class="' + $latencyClass + '"'
+                $nodeClasses[$latencyClass] = [ordered]@{
+                    invocations = Get-PromNodeDelta $stage.prometheusStartLabel $stage.prometheusEndLabel `
+                        "contest_judge_latency_class_invocations_total" $node $tag
+                    durationSeconds = Get-PromNodeDelta $stage.prometheusStartLabel $stage.prometheusEndLabel `
+                        "contest_judge_latency_class_duration_seconds_sum" $node $tag
+                }
+            }
+            $claimByNode[$node] = [ordered]@{
+                claimCalls = Get-PromNodeDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_claim_calls_total" $node
+                claimedRows = Get-PromNodeDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_claim_rows_total" $node
+                staleClaims = Get-PromNodeDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_claim_stale_total" $node
+                staleTokenCompletions = Get-PromNodeDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_completion_total" $node 'outcome="stale"'
+                storedResultRepublishes = Get-PromNodeDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_stored_result_republish_total" $node
+                failedExecutions = Get-PromNodeDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_completion_total" $node 'outcome="failure"'
+                executorRejected = Get-PromNodeDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_executor_rejections_total" $node
+                actualJudgeInvocations = Get-PromNodeDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_invocations_total" $node
+                latencyClasses = $nodeClasses
+            }
+        }
+
         $reclaimInStage = @($reclaimMillis | Where-Object { $_ -ge $mStart -and $_ -lt $mEnd }).Count
         $staleCompletions = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_completion_total" 'outcome="stale"'
         # Priced on the duplicate count, not on stale: a reclaimed row's original execution is fenced
@@ -845,6 +884,7 @@ if (Test-Path $stagesPath) {
                 duplicateJudgementMillisLowerBound = $duplicateLowerMs
                 duplicateJudgementMillisUpperBound = $duplicateUpperMs
                 duplicateJudgementBasis = "duplicate judge executions in this window priced at the deterministic profile's 50ms floor and 2000ms ceiling; the lease cannot say how long a discarded attempt actually ran"
+                nodes = $claimByNode
             }
             # Drain happens once, after every stage, so there is no per-stage drain to report.
             drain = [ordered]@{ available = $false; reason = "the pipeline is drained once per run after the last stage, so drain is only defined at run level" }
@@ -1032,12 +1072,12 @@ if (Test-Path $stagesPath) {
         $attemptHistogram = [ordered]@{}
         $rowsAboveOne = $null
         if (Test-Path $attemptRowsPath) {
+            $rowsAboveOne = 0L
             foreach ($line in @(Get-Content $attemptRowsPath | Select-Object -Skip 1)) {
                 $parts = $line -split "`t"
                 if ($parts.Count -lt 2) { continue }
                 $attemptHistogram[$parts[0]] = [long]$parts[1]
                 if ([int]$parts[0] -gt 1) {
-                    if ($null -eq $rowsAboveOne) { $rowsAboveOne = 0L }
                     $rowsAboveOne = $rowsAboveOne + [long]$parts[1]
                 }
             }
