@@ -16,27 +16,32 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
  * resetting the standings the RDB snapshot restored.</p>
  *
  * <p>The fallback is switchable because replaying every contest is a large operation and an operator
- * may want to look before it runs. {@code none} does not silently skip the lost results: it leaves
- * the gap unbridged, so the offset continuity check refuses the batch and the consumer keeps failing
- * loudly until someone acts.</p>
+ * may want to look before it runs. {@code none} does not silently skip the lost results: it reports
+ * the gap as unbridged, so the live path refuses the batch and the consumer keeps failing loudly
+ * until someone acts.</p>
+ *
+ * <p>Reached only through {@code StreamOffsetRecoveryStrategy}. The other two modes rebuild their
+ * history from MySQL or from the sequence, and giving them this service would be exactly the
+ * blurring that keeps the three from being comparable.</p>
+ *
+ * <p>The gap itself is counted where it is observed - by {@code ContestScoreboardStreamProcessor},
+ * which is the only thing that sees a delivery jump past the checkpoint - rather than here, so the
+ * counter does not depend on which mode was asked to bridge it.</p>
  */
 @Component
 @ConditionalOnProperty(prefix = "contest.scoreboard.stream.consumer", name = "enabled", havingValue = "true")
 @Slf4j
-class ContestScoreboardStreamRecoveryService {
+public class ContestScoreboardStreamRecoveryService {
 
     private final ContestScoreboardFullReplayService fullReplayService;
     private final ContestScoreboardRecoveryProperties properties;
-    private final ContestScoreboardStreamMetrics metrics;
 
     ContestScoreboardStreamRecoveryService(
             ContestScoreboardFullReplayService fullReplayService,
-            ContestScoreboardRecoveryProperties properties,
-            ContestScoreboardStreamMetrics metrics
+            ContestScoreboardRecoveryProperties properties
     ) {
         this.fullReplayService = fullReplayService;
         this.properties = properties;
-        this.metrics = metrics;
     }
 
     /**
@@ -45,8 +50,7 @@ class ContestScoreboardStreamRecoveryService {
      * @return whether the gap may now be bridged, which is what decides if the event at
      *         {@code firstAvailableOffset} is allowed to move the checkpoint past the missing range
      */
-    boolean recoverRetentionGap(long expectedOffset, long firstAvailableOffset) {
-        metrics.recordOffsetGap();
+    public boolean recoverRetentionGap(long expectedOffset, long firstAvailableOffset) {
         ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback fallback =
                 properties.streamOffset().retentionGapFallback();
         log.error(
