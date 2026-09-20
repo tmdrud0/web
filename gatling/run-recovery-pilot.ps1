@@ -361,6 +361,10 @@ try {
     #   - the application tier is stopped before either reset, so that deleting the stream queue and
     #     emptying Redis is not itself the cause of anything the next poll observes.
     [void](Invoke-Compose -Arguments @("up", "-d", "redis", "rabbitmq"))
+    # `up -d` returns when the containers exist, not when the services answer, and the resets below read
+    # both of them. On a cold start - a reader's first run, or any run after the stack has been taken
+    # down - the broker is still booting here, and the first `list_queues` exits 64.
+    Wait-ResetTargetsReady
     [void](Invoke-Compose -Arguments (@("stop") + @("web-1", "web-2", "batch-1", "judge-1", "judge-2")))
     [void](Reset-ExperimentQueue -EvidencePath (Join-Path $artifacts "queue-reset.json"))
     [void](Clear-RecoveryRedis -EvidencePath (Join-Path $artifacts "redis-reset.json"))

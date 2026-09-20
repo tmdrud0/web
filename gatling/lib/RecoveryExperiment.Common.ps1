@@ -581,6 +581,37 @@ function Wait-PilotStackHealthy {
     throw "The pilot stack did not become healthy within $($config.ReadyTimeoutSeconds) seconds: $lastError"
 }
 
+# The broker and Redis are started before the resets, and `docker compose up -d` returns when the
+# containers exist rather than when the services inside them answer. On a cold start that gap is real:
+# `rabbitmqctl list_queues` inside it exits 64 with "this command requires the 'rabbit' app to be
+# running", which stopped a calibration run at step 1 - after the stack had been brought down and back
+# up, which is exactly what a reader following the README from a clean machine will do.
+#
+# Waiting here cannot hide anything being measured: no load is running and no scoreboard exists yet, so
+# this waits for the reset's target to exist and not for a recovery to finish. Readiness is tested with
+# the reset's own calls rather than a proxy - a `list_queues` that succeeds is the precondition
+# `Reset-ExperimentQueue` needs, and `PING` is the one `Clear-RecoveryRedis` needs.
+function Wait-ResetTargetsReady {
+    $config = Get-RecoveryConfig
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($config.ReadyTimeoutSeconds)
+    $lastError = $null
+    while ([DateTimeOffset]::UtcNow -lt $deadline) {
+        try {
+            [void](Get-RabbitQueueState)
+            $reply = @(Invoke-RedisText -RedisArguments @("PING"))
+            if ($reply.Count -eq 0 -or [string]$reply[0] -notmatch "PONG") {
+                throw "The dedicated redis instance did not answer PING (got '$($reply -join ' ')')."
+            }
+            return
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "The reset's targets did not become ready within $($config.ReadyTimeoutSeconds) seconds: $lastError"
+}
+
 function Get-ContainerIdentity {
     param([Parameter(Mandatory = $true)][string]$Name)
 
