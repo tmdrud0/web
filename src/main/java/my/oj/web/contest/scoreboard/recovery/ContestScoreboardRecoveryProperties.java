@@ -2,6 +2,7 @@ package my.oj.web.contest.scoreboard.recovery;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Min;
+import my.oj.web.contest.scoreboard.PositiveDuration;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
@@ -48,16 +49,23 @@ public record ContestScoreboardRecoveryProperties(
     ) {
     }
 
-    /** Detecting a reused sequence number and a lost tail. */
+    /**
+     * Detecting a reused sequence number and a lost tail.
+     *
+     * <p>The two check intervals are handed to the scheduler as they are, with no clamp, and the
+     * retry backoff bounds how long a failed replay waits before offering the same chunk again. A
+     * non-positive value in any of them is a cadence that cannot be delivered, so it is refused at
+     * startup rather than normalised into something the operator did not ask for.</p>
+     */
     public record RedisSequence(
-            @DefaultValue("30s") Duration duplicateCheckInterval,
-            @DefaultValue("30s") Duration lostTailCheckInterval,
+            @DefaultValue("30s") @PositiveDuration Duration duplicateCheckInterval,
+            @DefaultValue("30s") @PositiveDuration Duration lostTailCheckInterval,
             @DefaultValue("1000") @Min(1) int checkWindowSize,
             @DefaultValue("10") @Min(1) int maxWindowsPerPass,
             @DefaultValue("5") @Min(1) int maxIterations,
             @DefaultValue("500") @Min(1) int replayBatchSize,
             @DefaultValue("3") @Min(1) int retryMaxAttempts,
-            @DefaultValue("50ms") Duration retryBackoff,
+            @DefaultValue("50ms") @PositiveDuration Duration retryBackoff,
             @DefaultValue("true") boolean startupCheckEnabled
     ) {
     }

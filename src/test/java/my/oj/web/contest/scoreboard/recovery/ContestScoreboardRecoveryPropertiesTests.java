@@ -86,6 +86,32 @@ class ContestScoreboardRecoveryPropertiesTests {
         assertRejected("contest.scoreboard.recovery.redis-seq.retry-max-attempts=0");
     }
 
+    /**
+     * The durations, which the integer bounds above say nothing about. A zero or negative period is
+     * not a weaker check but an undeliverable cadence - the scheduler would be handed it as it is -
+     * and a negative backoff is a sleep the caller never meant to ask for. None of them has a safe
+     * reading the way a small batch size does, so none of them is clamped.
+     */
+    @Test
+    void rejectsRecoveryDurationsThatAreNotPositive() {
+        assertRejected("contest.scoreboard.recovery.redis-seq.duplicate-check-interval=0s");
+        assertRejected("contest.scoreboard.recovery.redis-seq.duplicate-check-interval=-1s");
+        assertRejected("contest.scoreboard.recovery.redis-seq.lost-tail-check-interval=0s");
+        assertRejected("contest.scoreboard.recovery.redis-seq.retry-backoff=0ms");
+    }
+
+    /** The floor is a millisecond rather than a second, because this default is {@code 50ms}. */
+    @Test
+    void acceptsASubSecondRecoveryDuration() {
+        contextRunner
+                .withPropertyValues("contest.scoreboard.recovery.redis-seq.retry-backoff=10ms")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context.getBean(ContestScoreboardRecoveryProperties.class)
+                            .redisSeq().retryBackoff()).isEqualTo(Duration.ofMillis(10));
+                });
+    }
+
     private void assertRejected(String property) {
         contextRunner.withPropertyValues(property).run(context -> {
             assertThat(context).hasFailed();

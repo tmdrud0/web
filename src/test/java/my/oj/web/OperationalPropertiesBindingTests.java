@@ -122,6 +122,38 @@ class OperationalPropertiesBindingTests {
                 });
     }
 
+    /**
+     * The consumer's periods and timeouts are validated for the same reason the recovery mode's are:
+     * zero is not a small value here but an undeliverable one, and the consumer that ran on a
+     * different cadence from the one configured would be a schedule nobody could read back.
+     */
+    @Test
+    void rejectsConsumerDurationsThatAreNotPositive() {
+        for (String property : new String[]{
+                "contest.scoreboard.stream.consumer.receive-timeout=0ms",
+                "contest.scoreboard.stream.consumer.retry-backoff=0s",
+                "contest.scoreboard.stream.consumer.offset-check-interval=0s",
+                "contest.scoreboard.stream.consumer.tail-probe-interval=0s",
+                "contest.scoreboard.stream.consumer.tail-probe-quiet-period=-1ms",
+                "contest.scoreboard.stream.consumer.tail-probe-timeout=0s"
+        }) {
+            contextRunner.withPropertyValues(property).run(context -> assertThat(context)
+                    .as("property=%s", property)
+                    .hasFailed());
+        }
+    }
+
+    /** And the sub-second values the integration tests use are still accepted. */
+    @Test
+    void acceptsSubSecondConsumerDurations() {
+        contextRunner
+                .withPropertyValues(
+                        "contest.scoreboard.stream.consumer.receive-timeout=20ms",
+                        "contest.scoreboard.stream.consumer.retry-backoff=10ms"
+                )
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
     @Configuration(proxyBeanMethods = false)
     @EnableConfigurationProperties({
             ContestSubmissionExecutorProperties.class,
