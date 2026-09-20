@@ -1,0 +1,133 @@
+# Recovery-pilot overlay. Stacked on top of the load-test and observability overlays:
+#
+#   docker compose -p oj-loadtest \
+#     -f compose.yaml -f compose.loadtest.yaml -f compose.observability.yaml \
+#     -f compose.recovery-pilot.yaml up -d nginx web-1 web-2 batch-1 judge-1 judge-2 \
+#       redis rabbitmq prometheus grafana cadvisor mysqld-exporter redis-exporter nginx-exporter
+#
+# Every difference from the documented load-test stack is a fixed condition of the recovery
+# experiment, so all three recovery modes are measured against the same stack. Nothing here is a
+# tuning knob for one mode.
+
+x-pilot-database: &pilot-database
+  # The experiment uses the MySQL instance the project is already configured against, on the host,
+  # instead of a container this overlay would create and own. That is the deliberate part: the
+  # instance already carries the project's schema, and a container of our own would be a second,
+  # differently provisioned one. It also means the `mysql` service is never created - see the
+  # depends_on overrides below, which exist to keep Compose from starting it as a dependency.
+  DB_HOST: host.docker.internal
+  DB_PORT: ${DB_PORT:-3306}
+  DB_NAME: ${RECOVERY_PILOT_DB_NAME:-oj_test}
+  DB_USER: ${DB_USER:-root}
+  # No default. A missing password must stop the stack with this message rather than start five JVMs
+  # that cannot reach the database and report it as a load failure.
+  DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set for the recovery pilot stack}
+
+# host.docker.internal is built in on Docker Desktop and needs host-gateway elsewhere. Declaring it
+# is what lets the same file work on both, and it costs nothing where it is already defined.
+x-pilot-host-gateway: &pilot-host-gateway
+  - "host.docker.internal:host-gateway"
+
+services:
+  web-1:
+    # redis stays a health gate; mysql does not, because it is not part of this stack. The whole
+    # mapping is restated rather than filtered, because an override merges mappings key-wise and a
+    # merge could only ever add the mysql entry back.
+    depends_on: !override
+      redis:
+        condition: service_healthy
+    extra_hosts: *pilot-host-gateway
+    environment:
+      <<: *pilot-database
+      JUDGE_DETERMINISTIC_ENABLED: ${JUDGE_DETERMINISTIC_ENABLED:-true}
+      JUDGE_ACCEPT_PERMILLE: ${JUDGE_ACCEPT_PERMILLE:-400}
+
+  web-2:
+    depends_on: !override
+      redis:
+        condition: service_healthy
+    extra_hosts: *pilot-host-gateway
+    environment:
+      <<: *pilot-database
+      JUDGE_DETERMINISTIC_ENABLED: ${JUDGE_DETERMINISTIC_ENABLED:-true}
+      JUDGE_ACCEPT_PERMILLE: ${JUDGE_ACCEPT_PERMILLE:-400}
+
+  # batch-1 is the scoreboard stream's consumer and the declared recovery owner, so the recovery
+  # mode is the one setting this overlay exists to vary. It is passed to every application service
+  # rather than to batch-1 alone so that the value in the startup report is the same on all five and
+  # a wrong mode cannot be a per-role accident.
+  batch-1:
+    depends_on: !override
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    extra_hosts: *pilot-host-gateway
+    environment:
+      <<: *pilot-database
+      CONTEST_SCOREBOARD_RECOVERY_MODE: ${CONTEST_SCOREBOARD_RECOVERY_MODE:-stream-offset}
+      JUDGE_DETERMINISTIC_ENABLED: ${JUDGE_DETERMINISTIC_ENABLED:-true}
+      JUDGE_ACCEPT_PERMILLE: ${JUDGE_ACCEPT_PERMILLE:-400}
+
+  judge-1:
+    depends_on: !override
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    extra_hosts: *pilot-host-gateway
+    environment:
+      <<: *pilot-database
+      CONTEST_SCOREBOARD_RECOVERY_MODE: ${CONTEST_SCOREBOARD_RECOVERY_MODE:-stream-offset}
+      JUDGE_DETERMINISTIC_ENABLED: ${JUDGE_DETERMINISTIC_ENABLED:-true}
+      JUDGE_ACCEPT_PERMILLE: ${JUDGE_ACCEPT_PERMILLE:-400}
+
+  judge-2:
+    depends_on: !override
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    extra_hosts: *pilot-host-gateway
+    environment:
+      <<: *pilot-database
+      CONTEST_SCOREBOARD_RECOVERY_MODE: ${CONTEST_SCOREBOARD_RECOVERY_MODE:-stream-offset}
+      JUDGE_DETERMINISTIC_ENABLED: ${JUDGE_DETERMINISTIC_ENABLED:-true}
+      JUDGE_ACCEPT_PERMILLE: ${JUDGE_ACCEPT_PERMILLE:-400}
+
+  # The observability containers are load-test-scoped here for a reason the overlay cannot avoid:
+  # their names in compose.observability.yaml are not, so a normal stack started from another
+  # checkout would collide with them. Renaming them changes no scrape config - every Prometheus
+  # target is a service name, so all twelve stay exactly as the environment documents them.
+  prometheus:
+    container_name: oj-loadtest-prometheus
+
+  grafana:
+    container_name: oj-loadtest-grafana
+
+  alertmanager:
+    container_name: oj-loadtest-alertmanager
+
+  cadvisor:
+    container_name: oj-loadtest-cadvisor
+
+  # Keeps the mysql scrape target in the twelve the environment documents. It has to point at
+  # host.docker.internal now that there is no mysql service in this stack, and it reads the same
+  # instance the applications do - so the metrics and the load describe one server.
+  mysqld-exporter:
+    container_name: oj-loadtest-mysqld-exporter
+    depends_on: !reset null
+    extra_hosts: *pilot-host-gateway
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set for the recovery pilot stack}
+    command:
+      - --mysqld.address=host.docker.internal:${DB_PORT:-3306}
+      - --mysqld.username=${DB_USER:-root}
+      - --collect.info_schema.innodb_metrics
+      - --collect.info_schema.processlist
+
+  redis-exporter:
+    container_name: oj-loadtest-redis-exporter
+
+  nginx-exporter:
+    container_name: oj-loadtest-nginx-exporter
