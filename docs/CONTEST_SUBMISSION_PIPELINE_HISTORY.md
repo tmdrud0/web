@@ -570,6 +570,13 @@ retention은 `max-age=7D`, `max-length-bytes=10 GiB`로 시작한다.
 
 ### 4.9.2 B단계: scoreboard consumer와 checkpoint를 Stream으로 전환
 
+> **이 절은 `codex/contest-judge-stream-publish` 시점의 스냅샷이다.** 그 뒤
+> `codex/scoreboard-recovery-tradeoff`에서 **offset 연속성 가정이 제거**되었으므로 아래 세 서술은
+> 더 이상 현재 코드가 아니다 — ① 재구독 인자는 `storedOffset + 1`이 아니라 **checkpoint 자신**이고,
+> ② gap 판정은 `firstDeliveredOffset > storedOffset + 1` 산술이 아니라 **anchor 검증 여부**이며,
+> ③ Lua에는 연속성 검사가 없고 `ARGV[2]`의 **명시적 전진 정책 토큰**이 그 자리를 대신한다. 현재
+> 계약은 [`ARCHITECTURE.md`](ARCHITECTURE.md) §3.2를 본다.
+
 B단계에서는 `contest_submission_outbox` write/worker/recovery를 제거하고 batch-1이
 `contest.judge.result.stream`을 직접 소비한다. 테이블 자체는 롤백 호환을 위해 아직 schema에
 남지만 현재 코드에는 INSERT, claim, recovery 경로가 없다. `contest_judge_outbox`는 제출 DB

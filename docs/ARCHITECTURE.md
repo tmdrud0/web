@@ -65,7 +65,7 @@ stream delivery
 | `contest/scoreboard/redis` | commutative Lua와 Redis key 계약 | `ContestScoreboardRedisScript`, `RedisContestScoreboardApplier` |
 | `contest/scoreboard/stream` | AMQP 0.9.1 stream 소비, offset 복구·tail 관측, 적용 완료 batch | `ContestScoreboardStreamListener`, `ContestScoreboardStreamProcessor`, `ContestScoreboardStreamLifecycle`, `ContestScoreboardStreamTailOffsetMonitor` |
 | `contest/scoreboard/rebuild` | MySQL 결과에서 contest scoreboard 재구성 | `ContestScoreboardRebuildService` |
-| `contest/scoreboard/recovery` | 복구 모드 선택·검증·기동 보고, full-replay와 redis-seq 기전 | `ContestScoreboardRecoveryProperties`, `ContestScoreboardFullReplayService`, `ContestScoreboardRedisSequenceRecoveryService` |
+| `contest/scoreboard/recovery` | 복구 모드 선택·검증·기동 보고, 모드별 역사 복구 기전, JVM 내부 pass gate, 두 replay 모드가 공유하는 적용기 | `ContestScoreboardRecoveryProperties`, `ContestScoreboardRecoveryStrategy`, `ContestScoreboardRecoveryPassGate`, `ContestScoreboardReplayApplication`, `ContestScoreboardFullReplayService`, `ContestScoreboardRedisSequenceRecoveryService` |
 | `contest/finalization` | 대회 종료, 최종 점수, rejudge | `ContestFinalizationService` |
 | `observability` | 중립 지표와 남은 judge outbox 진단 | `ContestOutboxBacklogMetrics`, `ContestOutboxDrainMetrics` |
 
@@ -98,13 +98,39 @@ script(`ContestScoreboardRedisScript.APPLY`), 같은 `ContestScoreboardApplier.a
 INFO 1회로 남긴다. 값 조합은 순수 정적 `ContestScoreboardRecoverySummary.describe(...)`에 있어
 로그를 읽지 않고도 단위 테스트로 고정된다.
 
+#### 모드는 "복구 결정"을 소유한다
+
+모드가 전송만 바꾸지 않는다는 §3.1의 주장은 **코드로 강제된다.** live 경로가 스스로 답할 수 없는
+질문 — checkpoint가 브로커가 건네려는 offset보다 뒤에 있으니, 빠진 결과는 무엇이고 무엇이 그것을
+되돌리는가 — 이 두 곳에서 발생하고, 둘 다 `ContestScoreboardRecoveryStrategy`를 지난다.
+
+| 질문 | 발생 지점 | `stream-offset` | `full-replay` | `redis-seq` |
+|---|---|---|---|---|
+| checkpoint가 이 JVM이 적용한 것보다 뒤로 갔다 (RDB 롤백) | supervisor pass | `rewindsOnCheckpointRegression()=true` → 저장 checkpoint에서 **되감아 재구독** | `false` → 되감지 않음, MySQL 기준으로 rebuild | `false` → 되감지 않음, seq 기준으로 검사 |
+| 건네받은 offset 아래 구간을 이 모드의 기준이 덮는가 | live delivery | 저장 offset이 기준 → 재구독 자체가 복구 | MySQL replay 후 `covered` | Redis에 한 번도 적용되지 않은 이벤트는 **찾을 수 없다** → `covered=false`, checkpoint 전진 금지·요란한 실패 |
+
+모드별 빈은 `ContestScoreboardRecoveryStrategyConfig`가 `properties.mode()`에 대한 **exhaustive
+switch**로 정확히 하나 만든다. `@ConditionalOnProperty`의 원시 문자열 비교와 달리 **모드를 추가하면
+컴파일이 깨진다.**
+
+되감지 않는 두 모드가 **rollback에서 consumer를 정지시키지 않는다**는 점이 cutover의 근거다. live
+연결 위치가 유지되고, MySQL은 stream 발행보다 먼저 쓰이므로(judge listener의 완료 순서, §1)
+rollback 이전에 적용된 결과는 rollback **이후에 시작한** replay 읽기에 반드시 보인다. 즉 복구 중
+발행된 신규 결과는 replay에 흡수되지 않고 live 경로로 그대로 적용된다.
+`ContestScoreboardStreamLifecycle.handleRollback`은 `rewindsOnCheckpointRegression()`이 참일 때만
+`container.stop()`을 한다. (실패한 batch의 재구독은 모든 모드에서 stop/start를 한다 — 그것은 역사
+복구가 아니라 live 전달의 수리이고, `stream-offset`을 복구 기준으로 되돌리는 것이 아니다. §3.2.)
+
+rollback에 대한 pass는 **관측당 1회**만 실행한다 — 회귀를 관측한 `(storedOffset, appliedOffset)`
+쌍을 기억한다. 없으면 트래픽이 없는 동안 매 초 replay가 돈다.
+
 ### 3.2 stream-offset
 
 기준 브랜치의 기전이며 아래를 유지한다.
 
 - RabbitMQ가 stream offset을 발급하고 Redis Lua가 scoreboard 상태와 그 offset을 함께 저장한다.
 - Redis가 과거 RDB로 롤백되면 상태와 offset이 함께 롤백된다. lifecycle이 이를 감지해
-  `x-stream-offset=storedOffset+1`로 consumer를 다시 시작한다.
+  **저장된 offset 자체를 포함해서** consumer를 다시 시작한다.
 - per-contest processed set은 정확성 checkpoint가 아니다. commutative 규칙이 정확성을 보장하고,
   set은 중복 replay의 계산만 줄인다. contest rebuild 때는 해당 set도 지운다.
 - Redis 적용 후 MySQL batch 전에 죽는 구간은 Redis `contest:scoreboard:stream:db-pending` set으로
@@ -123,18 +149,52 @@ INFO 1회로 남긴다. 값 조합은 순수 정적 `ContestScoreboardRecoverySu
 - `stream-offset.retention-gap-fallback`(`full-replay` 기본 | `none`) —
   `ContestScoreboardStreamRecoveryService`가 읽는다.
 
+#### offset은 연속 정수가 아니다 — anchor 계약
+
+**어떤 곳에서도 "다음 offset은 이전 offset + 1"이라고 가정하지 않는다.** stream은 존재하는 offset을
+그대로 건네주고, 존재하는 offset은 발행된 것이다. 따라서 checkpoint는 **산술로 전진하지 않고**,
+delivery가 실제로 실어온 offset으로만 움직인다.
+
+consumer가 되감길 때 요청하는 값은 checkpoint **자신**이지 그 successor가 아니다
+(`offsetValue(storedOffset)` → `storedOffset`, checkpoint가 없으면 `"first"`).
+
+| 상황 | 판정 |
+|---|---|
+| checkpoint 없음(`-1`), 미적용 구간도 없음 | 첫 delivery가 **그 숫자 그대로** checkpoint가 된다. stream이 0이나 1에서 시작해야 할 이유는 없다 |
+| delivery ≤ checkpoint | consumer가 이미 도달한 지점 이하를 읽고 있으므로 그 사이 모든 것을 걸어 올라간다. anchor 검증됨, 중복은 script가 흡수 |
+| delivery > checkpoint, anchor 검증됨 | 평범한 전진. 확인하는 것은 **단조 증가뿐**이고 그마저 script 안에서 |
+| delivery > checkpoint, anchor 미검증 | checkpoint가 retention 밖이다. `rebuildHistory`가 그 아래 구간을 덮는지 판정하고, 덮을 때만 전진 |
+| delivery > **실패한 batch가 남긴 미적용 구간** | 평범한 전진이 **아니다.** §"실패한 batch는 requeue로 돌아오지 않는다" |
+
+Lua는 `streamOffset ~= currentOffset + 1` 검사를 **삭제**했다. 대신 `ARGV[2]`를 **명시적 전진 정책
+토큰**(`"continue"` / `"anchor"`)으로 요구한다. 전진 eligibility 판정이 Java gate로 옮겨갔으므로,
+정책을 빠뜨린 호출자가 조용히 점프하는 대신 `error_reply`로 실패하게 만드는 것이다.
+`InMemoryContestScoreboardApplier`도 같은 규칙을 따른다.
+
+**남는 위험(문서화).** 연결이 살아 있는 동안 브로커가 offset을 건너뛰는 경우는 이 계약으로 탐지하지
+못한다 — position은 consumer가 시작점을 건네받는 경계에서 한 번 검증되고, 그 뒤 checkpoint 위의
+delivery는 평범한 것으로 취급된다. `contest.scoreboard.applied.offset`과 tail monitor의
+`contest.scoreboard.pending`을 맞춰 보는 것이 그 경우의 유일한 관측 수단이며, 방어하지 않고 남은
+위험으로 기록한다.
+
 #### retention gap fallback은 비파괴다
 
-요청 offset이 retention 밖이면 RabbitMQ가 첫 보존 offset으로 맞춘다. consumer는 `firstNew.offset() >
-startingOffset + 1`로 gap을 감지한다. 그 구간의 결과는 브로커에 없고 MySQL에만 있으므로 replay가
-필요한데, 이 fallback은 **`ContestScoreboardFullReplayService`를 호출한다** — 이전에 호출하던
+요청 offset이 retention 밖이면 RabbitMQ가 첫 보존 offset으로 맞춘다. consumer는 첫 delivery가
+checkpoint보다 **위**인 것으로(그리고 그 아래 구간이 미적용 구간이 아닌 것으로) gap을 감지한다. 그
+구간의 결과는 브로커에 없고 MySQL에만 있으므로 replay가 필요한데, 이 fallback은
+**`ContestScoreboardFullReplayService`를 호출한다** — 이전에 호출하던
 `ContestScoreboardRebuildService.rebuildAllFromContestResults()`는 reset을 포함해 **모든 대회의 Redis
 상태를 지웠다.** 요구는 "retention 범위에서 offset이 사라진 경우에만 full-replay fallback"이고
 full-replay는 Redis를 초기화하지 않아야 한다는 것이었다.
 
-`none`은 잃어버린 결과를 조용히 건너뛰지 않는다. gap을 연결하지 않은 채로 두므로 Lua의 연속성
-검사가 batch를 거부하고 consumer가 요란하게 계속 실패한다. 원인은 `contest.scoreboard.stream.offset.gaps`
-지표와 `expected offset / first available offset` ERROR 로그로 확인한다.
+`none`은 잃어버린 결과를 조용히 건너뛰지 않는다. 모드의 basis가 `covered=false`를 돌려주면 batch를
+적용하지 않고 실패시키므로 checkpoint가 전진하지 않고 consumer가 요란하게 계속 실패한다. 원인은
+`contest.scoreboard.stream.offset.gaps` 지표와 `expected offset / first available offset` ERROR 로그로
+확인한다.
+
+같은 방식으로 `redis-seq`도 **retention gap을 메울 수 없다.** 이 모드의 기준(중복 seq + lost-tail)은
+Redis에 한 번도 적용되지 않은 이벤트를 찾을 수 없기 때문이다. 이때도 checkpoint는 전진하지 않고
+요란하게 실패한다 — 메운 척하지 않는다.
 
 #### 실패한 batch는 requeue로 돌아오지 않는다
 
@@ -152,11 +212,36 @@ head에 남아 재시도된다"고 적혀 있었다. **실물 브로커로 측�
 
 | 원인 | checkpoint | 조치 | 지표 |
 |---|---|---|---|
-| Redis 롤백 | 이 프로세스가 적용한 offset보다 **뒤** | 저장된 offset에서 재구독 (재읽기) | `contest.scoreboard.stream.rollback.restarts` |
-| 실패한 batch | 그대로 (전진하지 않음) | `storedOffset + 1`에서 재구독 (재읽기) | `contest.scoreboard.stream.failure.restarts` |
+| Redis 롤백 | 이 프로세스가 적용한 offset보다 **뒤** | 저장된 offset **자신**에서 재구독 (재읽기) | `contest.scoreboard.stream.rollback.restarts` |
+| 실패한 batch | 그대로 (전진하지 않음) | 저장된 offset **자신**에서 재구독 (재읽기) | `contest.scoreboard.stream.failure.restarts` |
 
 실패한 batch는 checkpoint를 움직이지 않으므로 롤백 guard만으로는 "정상"으로 보인다. 그래서
 `ContestScoreboardStreamListener.failedBatches()`를 함께 보고, 이미 답한 실패는 재시작하지 않는다.
+
+#### 실패한 batch가 남긴 구간은 checkpoint가 넘어갈 수 없다
+
+재구독이 오기 전에 **그 위의 delivery가 먼저 도착할 수 있다.** 이때 평범한 전진으로 처리하면
+checkpoint가 실패한 offset을 넘어가고, 그 결과를 어디서도 찾을 수 없게 된다(stream에도 없고
+standings에도 없다 — 실패 기록만 남는다).
+
+`ContestScoreboardStreamPosition`이 **미적용 구간**(`unappliedFrom`)을 들고, gate가 그것을 막는다.
+
+- 실패한 batch는 자기가 멈춘 **가장 낮은 offset**을 기록한다(디코딩 실패면 batch의 첫 offset,
+  적용 실패면 applier가 처음 답하지 못한 요청의 offset — stream 요청의 correlation id가 곧 그
+  delivery의 offset이다). 여러 번 실패해도 더 낮은 쪽이 이긴다.
+- 그 구간 **위에서 시작하는** delivery는:
+  - checkpoint가 **없으면** → 거부한다. 아래 구간을 맡길 모드도, 그 구간을 보증할 basis도 없다.
+    checkpoint는 `-1`로 남고 `contest.scoreboard.stream.unapplied.refusals`가 오른다.
+  - checkpoint가 **있으면** → anchor 검증을 지우고 기존 retention-gap 질문으로 넘긴다. 모드가
+    덮는다고 답할 때만 전진한다.
+- 구간은 **적용된 checkpoint가 그 구간에 도달했을 때만** 해제된다(`recordAppliedOffset`). 적용이
+  없으면 해제되지 않는다.
+- 재구독은 구간을 **의도적으로 해제하지 않는다.** 재시작은 checkpoint 포함 지점부터 다시 읽으므로
+  그 구간을 다시 덮고, 다시 실패하면 다시 기록된다. 따라서 "anchor를 재검증했으니 안전하다"는
+  이유로 구간이 가려지는 일이 없다.
+
+이 구간은 **JVM 안에만** 있다. durable하지 않아도 되는 이유는 재시작한 consumer가 checkpoint
+포함 지점에서 재개하고 그것이 구간 이하이므로 다시 읽히기 때문이다.
 
 ### 3.3 full-replay
 
@@ -239,6 +324,65 @@ chunk 단위로만 잡고** `retry-max-attempts`/`retry-backoff`를 적용한다
 (`ContestScoreboardSequenceRecoveryMySqlIntegrationTests.anUnjudgedResultIsNeverOfferedToTheScoreboard`
 가 이 두 가지를 함께 고정한다).
 
+### 3.5 복구 실행권과 적용 경계
+
+#### 실행권은 JVM 안에만 있다 — 그리고 그것이 전제다
+
+`ContestScoreboardApplyLock`도 `ContestScoreboardRecoveryPassGate`도 **JVM 내부 전용**이다. 이것들은
+**전체 시스템 lock이 아니며, 두 인스턴스를 조정하지 않는다.** 분산 실행권(Redis lock, lease, DB
+advisory lock 등)은 **도입하지 않았다.**
+
+**전제: 복구 역할을 실행하는 인스턴스는 하나다.** 배포 토폴로지가 이를 정하고, 코드가 그것을
+명시적으로 요구한다.
+
+- `contest.scoreboard.recovery.owner.enabled` — 기본 `true`. `application-batch-role.properties`는
+  명시적으로 `true`, web·judge 역할은 `false`다.
+- `ContestScoreboardRecoveryValidator`가 기동 시 두 방향 모두를 **거부**한다.
+  - `stream.consumer.enabled=true`인데 `owner.enabled=false` → **기동 실패**. stream을 소비하며
+    supervisor pass를 도는 JVM은 선언 여부와 무관하게 복구 owner이므로, 아니라고 선언하면 **실제로
+    복구하는 인스턴스가 선언 밖에 남는다** — 두 번째 batch 인스턴스가 아무도 모르게 뜨는 경로다.
+  - `owner.enabled=true` + `stream.consumer.enabled=false` + `mode=stream-offset` → **기동 실패**.
+    트리거가 하나도 없는 owner 선언은 기동 로그에서 "복구 중인 인스턴스"와 똑같이 읽힌다.
+- `ContestScoreboardRecoverySummary`가 기동 로그에 `recovery-owner=`를 함께 남긴다.
+
+`ContestScoreboardRecoveryPassGate`는 **이 JVM 안에서** 모든 pass 트리거(startup runner, scheduler,
+supervisor, retention-gap fallback)가 공유하는 single-flight다. 겹치면 `tryRun`이 건너뛰고
+`contest.scoreboard.recovery.pass.skipped`(tag `pass`)를 남긴다 — 겹치는 두 pass는 낭비가 아니라
+**틀린 결과**이기 때문이다(`redis-seq`는 한 시점에 읽은 할당자로 모든 행을 판정하므로, 두 번째 pass가
+첫 pass의 in-flight 결과를 유실로 본다). live 단건 Lua 적용은 이 gate를 **타지 않는다** — 전역 차단은
+금지다.
+
+**남은 위험.** cross-JVM 중복 실행은 런타임 방어가 **없다.** `batch-role` 인스턴스가 둘 뜨면 두
+인스턴스가 각자 pass를 돌리고, `redis-seq`의 "모든 DB 읽기가 할당자 읽기보다 먼저" 계약이 깨진다.
+위 기동 검증은 **한 인스턴스가 자기 역할을 잘못 선언하는 것**을 막을 뿐, 두 인스턴스가 모두 올바르게
+선언하는 것은 막지 못한다.
+
+#### replay는 DB 트랜잭션 밖에서 Redis에 쓴다
+
+full-replay와 redis-seq의 replay는 `ContestScoreboardReplayApplication` 하나를 지나고, 세 단계로
+나뉜다.
+
+1. chunk 조회 — 짧은 read-only DB 작업.
+2. **DB 트랜잭션 밖에서** `ContestScoreboardApplyLock` 아래 Redis `applyAll`. `EVAL`이 도는 동안 DB
+   connection을 점유하지 않는다.
+3. 적용 결과를 **전부** 검사한 뒤, applied marker를 **자기만의 짧은 트랜잭션**으로 쓴다
+   (`ContestSubmissionBatchExecutor.inNewTransaction`).
+
+순서가 핵심이다. **Redis 쓰기는 DB 롤백으로 되돌아가지 않으므로**, marker를 먼저 쓰면 MySQL이
+scoreboard가 받지 않은 결과를 받았다고 주장하고, 그 marker를 믿는 pass가 그 위를 건너뛴다. 나중에
+쓰면 틀릴 수 있는 방향은 "marker가 도착하지 않음"뿐이고 그쪽은 스스로 복구된다 — 결과가 미적용으로
+보여 다음 pass가 다시 제안하고, scoreboard가 흡수한 뒤 marker가 그때 쓰인다.
+
+marker 쓰기는 **자체 bounds(`MARKER_ATTEMPTS`=3, 50ms backoff)로 재시도**한다. 호출자의 chunk 재시도
+bounds를 빌리지 않는다 — 그것은 chunk replay의 bounds이고, 여기서 필요한 것은 DB이지 또 한 번의
+`EVAL`이 아니다(그 `EVAL`은 live stream 경로가 필요로 하는 apply lock을 잡는다). 최종 실패는 던지지
+않고 `contest.scoreboard.recovery.marker.failed` + 로그로 남긴다. chunk는 이미 scoreboard 위에 있고,
+던지면 다음 pass가 어차피 쓰는 timestamp 하나 때문에 batch의 나머지를 버리게 된다.
+
+`ContestSubmissionBatchExecutor.processBatchesOf`가 batch consumer 전체를 `REQUIRES_NEW`로 감싸던
+것도 이 때문에 제거했다 — 그 안에서 Redis I/O가 DB 트랜잭션·connection 안에서 수행되고 있었다.
+`processBatches`/`processBatchesNonTransactional`은 그대로다(rebuild service·rejudge가 사용).
+
 ## 4. 중요한 불변식
 
 - scoreboard 결과는 event 순서와 중복 횟수에 무관해야 한다. Redis Lua와
@@ -248,11 +392,18 @@ chunk 단위로만 잡고** `retry-max-attempts`/`retry-backoff`를 적용한다
 - poison event를 건너뛰지 않는다. batch 전체를 적용하지 않고 실패시키고, Redis 복구 또는 payload 수정
   후 **같은 offset부터** 다시 처리한다. 재시도 자체는 requeue가 아니라 저장된 checkpoint에서의
   재구독이 만든다(§3.2). checkpoint는 실패한 batch를 넘어 전진하지 않으므로 그 사이 결과가 조용히
-  사라지지 않는다.
-- offset을 **gapless 연속 정수라고 가정하지 않는다.** Lua가 `streamOffset ~= currentOffset + 1`을
-  검사해 `error_reply`로 거부하고, `ARGV[2]=allowOffsetGap`일 때만 통과시킨다. 그 예외를 쓰는 유일한
-  통로는 retention gap fallback이며, fallback이 MySQL replay를 마친 뒤에만 열린다. 즉 "gap이 없다고
-  가정"하는 대신 **gap을 검사하고, gap이면 복구한 뒤에만 연결**한다.
+  사라지지 않는다. **재구독이 오기 전에 그 위의 delivery가 먼저 도착해도 마찬가지다** — 실패한
+  batch가 남긴 미적용 구간(`ContestScoreboardStreamPosition.unappliedFrom`)이 checkpoint의 상한이
+  되어, checkpoint가 없으면 delivery를 거부하고 있으면 모드의 basis에 묻는다. 그 구간은 **적용된
+  checkpoint가 그 구간에 도달했을 때만** 해제된다(§3.2).
+- offset을 **gapless 연속 정수라고 가정하지 않는다.** 어떤 곳에서도 `+1` 산술로 checkpoint를
+  전진시키지 않는다 — checkpoint는 delivery가 실제로 실어온 offset으로만 움직이고, 확인하는 것은
+  단조 증가뿐이다. Lua는 연속성 검사를 하지 않고 `ARGV[2]`의 **명시적 전진 정책 토큰**
+  (`continue`/`anchor`)을 요구하므로, 정책을 빠뜨린 호출자는 조용히 점프하지 못하고 실패한다.
+  재구독은 checkpoint **자신**을 포함해서 요청한다(§3.2).
+- **Redis 쓰기는 DB 트랜잭션 밖에서 한다.** replay는 조회 → (트랜잭션 밖) Redis apply → 짧은 별도
+  트랜잭션으로 marker 순서이고, marker가 먼저 쓰이면 MySQL이 scoreboard가 받지 않은 결과를 받았다고
+  주장하게 된다. Redis 쓰기는 DB 롤백으로 되돌아가지 않으므로 이 순서가 유일하게 안전한 순서다(§3.5).
 - **미채점(PENDING) 결과를 scoreboard에 적용하지 않는다.** Lua는 `ARGV[4] == 'PENDING'`일 때
   standings 변형만 건너뛰고 `sadd processed submissionId`는 그 블록 **바깥**에서 무조건 실행한다.
   PENDING을 한 번 적용하면 그 제출이 `processed` set에 들어가 이후 `alreadyProcessed == 1` 분기가
@@ -261,6 +412,10 @@ chunk 단위로만 잡고** `retry-max-attempts`/`retry-backoff`를 적용한다
   `ContestScoreboardRedisSequenceRecoveryService`는 후보를 모을 때(§3.4) 제외한다.
 - `scoreboard_applied_at`은 `COALESCE`로 최초 적용 시각을 보존하고, `scoreboard_applied_seq`는
   덮어쓴다(§3.4).
+- **모든 lock·gate는 JVM 내부 전용이며 전체 시스템 lock이 아니다.** `ContestScoreboardApplyLock`,
+  `ContestScoreboardRecoveryPassGate` 모두 두 인스턴스를 조정하지 않는다. 복구 역할의 단일 인스턴스
+  전제는 선언(`owner.enabled`)과 기동 검증으로 강제되지만, **cross-JVM 중복 실행에 대한 런타임 방어는
+  없다**(§3.5).
 - AMQP 0.9.1 stream consumer에는 명시적 prefetch가 필요하다. 현재 구성은 consumer 1개,
   `prefetch=500`, consumer batch 500이다.
 - AMQP 0.9.1에는 stream single-active-consumer 조정이 없으므로 scoreboard consumer 역할은 현재
@@ -285,14 +440,15 @@ chunk 단위로만 잡고** `retry-max-attempts`/`retry-backoff`를 적용한다
 
 ### 5.1 복구 모드 설정과 effective 기본값
 
-값은 **클램핑하지 않고 검증**한다(`@Validated` + `@Min`). 다른 scoreboard 프로퍼티는 `Math.max`
-헬퍼로 정규화하지만, 복구 설정이 잘못된 것은 운영자의 실수이므로 **기동을 실패**시킨다. 아래는
-`ContestScoreboardRecoveryProperties`의 `@DefaultValue`이며, 기동 로그의 `mode=... ` 한 줄이 실제
-적용값이다.
+값은 **클램핑하지 않고 검증**한다(`@Validated` + `@Min` / `@PositiveDuration`). 다른 scoreboard
+프로퍼티는 `Math.max` 헬퍼로 정규화하지만, 복구 설정이 잘못된 것은 운영자의 실수이므로 **기동을
+실패**시킨다. 아래는 `ContestScoreboardRecoveryProperties`의 `@DefaultValue`이며, 기동 로그의
+`mode=... ` 한 줄이 실제 적용값이다.
 
 | 프로퍼티 | 기본값 |
 |---|---|
 | `contest.scoreboard.recovery.mode` | `stream-offset` |
+| `contest.scoreboard.recovery.owner.enabled` | `true` (web·judge 역할은 `false`) |
 | `...recovery.stream-offset.startup-offset` | `stored` |
 | `...recovery.stream-offset.retention-gap-fallback` | `full-replay` |
 | `...recovery.full-replay.db-batch-size` | `1000` |
@@ -311,15 +467,35 @@ chunk 단위로만 잡고** `retry-max-attempts`/`retry-backoff`를 적용한다
 모드가 무엇을 실행하는지는 **배타적이다.** `full-replay`는 기동 시 1회 replay하는
 `ContestScoreboardFullReplayStartupRunner`를 켜고(끄려면 `startup-replay-enabled=false`), `redis-seq`는
 `duplicate-check-interval`·`lost-tail-check-interval` 주기의 scheduler와 기동 1회 검사를 켠다.
-`redis-seq`의 검사 scheduler와 기동 검사는 같은 guard를 공유하므로 서로 겹쳐 돌지 않는다.
+`redis-seq`의 검사 scheduler와 기동 검사는 같은 pass gate를 공유하므로 서로 겹쳐 돌지 않는다.
 
-복구 상태 지표는 세 갈래다.
+#### Duration은 양수여야 한다
+
+Interval·timeout·backoff 성격의 Duration은 **0이나 음수를 받지 않는다.**
+`ContestScoreboardRecoveryProperties.RedisSequence`의 `duplicateCheckInterval`·`lostTailCheckInterval`·
+`retryBackoff`와 `ContestScoreboardStreamConsumerProperties`의 Duration 전부에 `@PositiveDuration`이
+붙어 있고(`ContestScoreboardStreamConsumerProperties`는 `@Validated`다), 위반은 **ApplicationContext
+기동 단계에서** 거부된다 — binding 이후 조용히 clamp되지 않는다. Jakarta Bean Validation에 Duration용
+제약이 없고 Spring Boot의 `@DurationMin`이 이 classpath에 없어서 `PositiveDuration` 제약을 직접
+두었다(`math.max` 정규화는 period에 대해 틀린 선택이다 — check interval 0은 "그 주기로는 못 돈다"는
+운영자의 요청이고, 다른 주기로 조용히 도는 것은 그것을 숨기는 일이다).
+
+하한은 **1ms**다 — `receive-timeout`·`tail-probe-quiet-period`의 기본값이 `50ms`이고 실물 테스트가
+`retry-backoff=10ms`·`receive-timeout=20ms`를 쓰므로 초 단위 하한은 기존 테스트를 깨뜨린다.
+`offsetCheckInterval`·`tailProbeInterval`도 함께 검증되므로, 예전처럼 0이 그대로
+`addFixedDelayTask`로 흘러가지 않는다.
+
+복구 상태 지표는 네 갈래다.
 
 | 지표 | 의미 |
 |---|---|
 | `contest.scoreboard.stream.failures` | 적용되지 못하고 남은 stream batch |
 | `contest.scoreboard.stream.rollback.restarts` / `.failure.restarts` | 롤백 / 실패 batch 때문에 재구독한 횟수 |
+| `contest.scoreboard.stream.rollback.observed` | 롤백을 관측한 횟수(되감지 않는 모드에서는 restart 없이 관측만 된다) |
 | `contest.scoreboard.stream.offset.gaps` | retention gap 감지 횟수 |
+| `contest.scoreboard.stream.unapplied.refusals` | 실패한 batch가 남긴 구간 위에서 시작한 delivery를, checkpoint조차 없어 거부한 횟수 |
+| `contest.scoreboard.recovery.pass.skipped` (tag `pass`) | 다른 pass가 gate를 쥐고 있어 건너뛴 pass |
+| `contest.scoreboard.recovery.marker.failed` | 적용은 됐으나 applied marker 기록이 bounds 안에 실패한 횟수 |
 | `contest.scoreboard.redis.sequence.duplicates` / `.replayed` | 중복 seq 그룹 수 / 재적용 건수 |
 | `contest.scoreboard.redis.sequence.rounds` / `.windows.saturated` / `.unresolved` | 회차 수 / window 예산 포화 / 수렴 실패 |
 | `contest.scoreboard.redis.sequence.mapping.size` | 전역 seq 매핑 hash 크기(관측만, 정리는 비목표) |
@@ -327,10 +503,15 @@ chunk 단위로만 잡고** `retry-max-attempts`/`retry-backoff`를 적용한다
 핵심 회귀 테스트는 `RedisContestScoreboardApplierRedisIntegrationTests`,
 `ContestScoreboardLiveVersusRebuildRedisIntegrationTests`, `ContestScoreboardStreamProcessorTests`다.
 복구 모드는 `ContestScoreboardRecoveryModeWiringTests`(모드별 빈 선택),
-`ContestScoreboardRedisSequenceRecoveryServiceTests`,
+`ContestScoreboardRecoveryPassGateTests`, `ContestScoreboardRedisSequenceRecoveryServiceTests`,
 `ContestScoreboardSequenceRecoveryMySqlIntegrationTests`(실물 MySQL),
 `ContestScoreboardStreamLifecycleTests`가 덮는다. 실물 인프라가 있어야 도는 것은
 `-DredisIntegration=true`의 `ContestScoreboardFullReplayRedisIntegrationTests`, 그리고
 `-DrabbitIntegration=true`의 `ContestScoreboardStreamRedisRabbitIntegrationTests`(저장 offset 이후
 재소비), `ContestScoreboardStreamBatchFailureRabbitIntegrationTests`(중간 실패 시 checkpoint 미전진),
-`StreamQueueRequeueRabbitIntegrationTests`(stream 큐의 reject 동작 측정)다.
+`ContestScoreboardStreamPartialBatchFailureRabbitIntegrationTests`(실물 Redis에서 **batch 중간** 실패 —
+타입이 오염된 키를 Lua가 거부, 미적용 구간과 그 위 delivery 거부, 오염 제거 후 수렴),
+`StreamPublishConfirmOrderRabbitIntegrationTests`(confirm을 기다리지 않은 연속 발행의 **순서 보존
+여부 측정**), `StreamQueueRequeueRabbitIntegrationTests`(stream 큐의 reject 동작 측정)다.
+`ContestScoreboardStreamListenerTests`는 컨텍스트 없이 실패한 delivery가 남기는 것(미적용 구간,
+un-verified position)을 고정한다.

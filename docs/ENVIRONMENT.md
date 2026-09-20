@@ -146,10 +146,47 @@ Gatling은 Windows의 저장소 루트 `C:\Users\Home\spring\web\web`에서 실�
 
 ## 8. 실행 구성 검증
 
-`test` profile은 `jdbc:mysql://localhost:3306/oj_test`(root/1234)를 사용하고 Flyway가 schema를
-만든다. 이 MySQL이 없으면 `@DataJpaTest`와 `@SpringBootTest` 클래스가 ApplicationContext 로딩
-단계에서 실패한다. compose의 `oj-mysql`은 호스트 포트를 열지 않으므로 테스트용 인스턴스는
-별도로 준비한다.
+`test` profile은 `jdbc:mysql://localhost:3306/oj_test`를 기본값으로 쓰고 Flyway가 schema를 만든다.
+이 MySQL이 없으면 `@DataJpaTest`와 `@SpringBootTest` 클래스가 ApplicationContext 로딩 단계에서
+실패한다. compose의 `oj-mysql`은 호스트 포트를 열지 않으므로 테스트용 인스턴스는 별도로 준비한다.
+
+`application-test.properties`는 자격 증명을 커밋하지 않고 **env override를 우선**한다 —
+`TEST_DB_URL` / `TEST_DB_USERNAME` / `TEST_DB_PASSWORD`가 있으면 그 값을 쓰고, 없으면 위 기본값이다.
+기본값을 그대로 둔 이유는 이 저장소가 지금 그 인스턴스를 쓰고 있기 때문이며, **권장 구성이
+아니다.** 새 환경을 만든다면 아래 §8.1대로 env override로 안전한 인스턴스를 가리켜라.
+
+### 8.1 테스트 DB는 이렇게 띄운다
+
+> **경고 — 현재 떠 있는 `oj-test-mysql`은 침해된 legacy 컨테이너다.** 작업 중 모든 비시스템 DB가
+> 삭제되고 `RECOVER_YOUR_DATA` 스키마와 랜섬 노트가 남는 사고가 두 번 있었다. 원인은 이 절의
+> 예전 구성 그대로다 — `root` 원격 계정(`root@%`)에 약한 비밀번호 `1234`, 그리고 `-p 3306:3306`로
+> **모든 외부 인터페이스에 공개된 포트**. 이 컨테이너를 새 작업의 기준으로 삼지 말고, 아래 구성으로
+> 다시 만들어라. 기존 컨테이너와 volume은 **소유자가 판단할 때까지 삭제하지 않는다.**
+
+```powershell
+# 1) loopback에만 바인딩한다. 호스트의 다른 인터페이스로는 열리지 않는다.
+# 2) root를 쓰지 않고, 비밀번호를 비기본값으로 두고, root 원격 접속을 만들지 않는다.
+#    (MYSQL_ROOT_HOST를 주지 않으면 root는 localhost 전용이다.)
+$pw = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 24 | ForEach-Object {[char]$_})
+
+docker run -d --name oj-test-mysql `
+  -p 127.0.0.1:3307:3306 `
+  -e MYSQL_ROOT_PASSWORD=$pw `
+  -e MYSQL_DATABASE=oj_test `
+  -e MYSQL_USER=oj_test `
+  -e MYSQL_PASSWORD=$pw `
+  -v oj-test-mysql-data:/var/lib/mysql `
+  mysql:8.0
+
+# 실제 자격 증명은 파일에 쓰지 않는다. 테스트는 env override로만 가리킨다.
+$env:TEST_DB_URL      = "jdbc:mysql://127.0.0.1:3307/oj_test"
+$env:TEST_DB_USERNAME = "oj_test"
+$env:TEST_DB_PASSWORD = $pw
+```
+
+Docker 내부 network로만 붙이는 편이 더 낫다면 `-p`를 아예 빼고 컨테이너를 같은 network에 넣은 뒤
+서비스 이름으로 접속해도 된다. 어느 쪽이든 **외부 인터페이스 전체에 포트를 열지 않는다**는 점이
+핵심이다. Redis도 같은 이유로 loopback에 묶는다.
 
 Redis가 필요한 테스트는 기본적으로 skip이고 `-DredisIntegration=true`로 켠다. 포트는
 `-DredisPort`이며 기본값은 16379다. 부하 테스트는 `load-test` 태그로 제외되어 있고
@@ -157,8 +194,8 @@ Redis가 필요한 테스트는 기본적으로 skip이고 `-DredisIntegration=t
 `INCLUDE_MYSQL_LOAD_TEST`, `INCLUDE_MYSQL_BATCH_VERIFICATION`)를 함께 지정해야 실행된다.
 
 ```powershell
-docker run -d --name oj-test-mysql -p 3306:3306 -e MYSQL_ROOT_PASSWORD=1234 -e MYSQL_DATABASE=oj_test mysql:8.0
-docker run -d --name oj-test-redis -p 16379:6379 redis:7-alpine
+# MySQL은 §8.1의 안전한 구성을 쓴다. 아래는 그 구성이 이미 떠 있다는 전제의 후속 명령이다.
+docker run -d --name oj-test-redis -p 127.0.0.1:16379:6379 redis:7-alpine
 
 .\gradlew.bat bootJar
 .\gradlew.bat test -DredisIntegration=true
@@ -168,6 +205,8 @@ docker compose ps
 docker stats --no-stream
 
 docker exec oj-web-1 cat /sys/fs/cgroup/cpu.max
+# compose.yaml의 oj-mysql은 비밀번호가 파일에 박혀 있고(1234) 호스트에 포트를 열지 않는다.
+# 컨테이너 안에서만 접속한다. 이 비밀번호도 교체 대상이다.
 docker exec oj-mysql mysql -uroot -p1234 -Nse "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';"
 docker exec oj-redis redis-cli CONFIG GET maxmemory maxmemory-policy
 
