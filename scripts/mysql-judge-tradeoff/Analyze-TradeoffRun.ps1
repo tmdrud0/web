@@ -1,6 +1,11 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$RunDirectory
+    [Parameter(Mandatory = $true)][string]$RunDirectory,
+    # A stage where the API refused a share of submissions is measuring the rate limiter, not judge
+    # capacity, so it is reported but kept out of the knee. The share is a parameter because the
+    # line between "a few KOs" and "the limiter is the story" is a judgement, and it is worth being
+    # able to move it without editing the script.
+    [double]$ApiRateLimitShare = 0.01
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +41,293 @@ function Get-LatencySummary {
         }
     }
     return $result
+}
+
+# --- staircase helpers, used only when stages.json exists -----------------------------------------
+
+function Get-EpochMillis {
+    param([string]$UtcNaive)
+    if ([string]::IsNullOrWhiteSpace($UtcNaive)) { return $null }
+    $parsed = [datetimeoffset]::MinValue
+    # Submitted timestamps are UTC without an offset, the same convention Export-Latencies uses.
+    if (-not [datetimeoffset]::TryParse($UtcNaive + "Z", [ref]$parsed)) { return $null }
+    return $parsed.ToUnixTimeMilliseconds()
+}
+
+# A snapshot the sampler could not take is written as a one-line marker rather than an empty file.
+# Reading it as an empty scrape would turn the next delta into the counter's lifetime total, so the
+# two endpoints are checked before any subtraction happens.
+function Test-SnapshotReadable {
+    param([string]$Label)
+    foreach ($node in @("judge-1", "judge-2")) {
+        $path = Join-Path $runPath "metrics\$Label-$node.prom"
+        if (-not (Test-Path $path)) { return $false }
+        $firstLine = Get-Content $path -TotalCount 1 -ErrorAction SilentlyContinue
+        if ($null -eq $firstLine -or $firstLine -like "# unavailable*") { return $false }
+    }
+    return $true
+}
+
+function Get-PromMetricSum {
+    param([string]$Label, [string]$Metric, [string]$RequiredTag = "", [string]$OnlyNode = "")
+    $sum = 0.0; $found = $false
+    foreach ($node in @("judge-1", "judge-2")) {
+        if ($OnlyNode -and $node -ne $OnlyNode) { continue }
+        $path = Join-Path $runPath "metrics\$Label-$node.prom"
+        if (-not (Test-Path $path)) { continue }
+        foreach ($line in @(Get-Content $path)) {
+            if ($line -match ("^" + [regex]::Escape($Metric) + '(?:\{([^}]*)\})?\s+([^\s]+)$')) {
+                # Save the captures before another -match overwrites $Matches.
+                $tags = $Matches[1]
+                $rawValue = $Matches[2]
+                if ($RequiredTag -and $tags -notmatch [regex]::Escape($RequiredTag)) { continue }
+                $value = 0.0
+                if ([double]::TryParse($rawValue, [Globalization.NumberStyles]::Float,
+                        [Globalization.CultureInfo]::InvariantCulture, [ref]$value)) {
+                    $sum += $value; $found = $true
+                }
+            }
+        }
+    }
+    # A missing or unreadable snapshot stays unavailable, never zero.
+    if (-not $found) { return $null }
+    return $sum
+}
+
+function Get-PromDelta {
+    param([string]$StartLabel, [string]$EndLabel, [string]$Metric, [string]$RequiredTag = "")
+    # Subtracted per node, not over the pooled scrape. The pooled form cannot tell a node whose
+    # series is missing from a node whose value is zero, so one lost scrape would quietly turn a
+    # two-node delta into a one-node one with no marker on it. Doing the arithmetic inside each node
+    # makes Micrometer's late meter creation exact (absent at that node means 0 there), and leaves
+    # the two genuinely undecided cases - an unreadable snapshot, and a series that was present at
+    # the start but missing at the end - reported as unavailable instead of guessed.
+    $total = 0.0; $found = $false
+    foreach ($node in @("judge-1", "judge-2")) {
+        $end = Get-PromMetricSum $EndLabel $Metric $RequiredTag $node
+        $start = Get-PromMetricSum $StartLabel $Metric $RequiredTag $node
+        if ($null -eq $start -and $null -eq $end) { continue }
+        if ($null -eq $start) {
+            # Micrometer creates the meter on first use, so it can be absent from the earlier scrape
+            # *of a snapshot that was taken*. An absent snapshot is a different thing: subtracting
+            # from zero there would report the counter's lifetime total as this stage's work.
+            if (-not (Test-SnapshotReadable $StartLabel)) { return $null }
+            $start = 0.0
+        } elseif ($null -eq $end) {
+            # A counter does not disappear, so a series present at the start and missing at the end
+            # is a lost line, not a zero.
+            return $null
+        }
+        $total += ($end - $start); $found = $true
+    }
+    if (-not $found) { return $null }
+    return [math]::Round($total, 3)
+}
+
+function Get-ColumnStats {
+    param([object[]]$Rows, [string]$Column)
+    $values = @($Rows | ForEach-Object {
+        $value = 0.0
+        if ([double]::TryParse([string]$_.$Column, [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$value)) { $value }
+    })
+    if ($values.Count -eq 0) {
+        return [ordered]@{ samples=0; first=$null; last=$null; min=$null; max=$null; average=$null; delta=$null }
+    }
+    return [ordered]@{
+        samples = $values.Count
+        first = $values[0]
+        last = $values[-1]
+        min = ($values | Measure-Object -Minimum).Minimum
+        max = ($values | Measure-Object -Maximum).Maximum
+        average = [math]::Round(($values | Measure-Object -Average).Average, 3)
+        delta = [math]::Round($values[-1] - $values[0], 3)
+    }
+}
+
+function Get-GrowthRate {
+    param([object[]]$Series, [string]$Field)
+    if ($null -eq $Series -or $Series.Count -lt 2) {
+        return [ordered]@{ samples=if ($null -eq $Series) { 0 } else { $Series.Count }; seconds=$null; start=$null; end=$null; rowsPerSec=$null }
+    }
+    $seconds = [math]::Round(([long]$Series[-1].epochMillis - [long]$Series[0].epochMillis) / 1000.0, 3)
+    $start = [double]$Series[0].$Field
+    $end = [double]$Series[-1].$Field
+    return [ordered]@{
+        samples = $Series.Count
+        seconds = $seconds
+        start = $start
+        end = $end
+        rowsPerSec = if ($seconds -gt 0) { [math]::Round(($end - $start) / $seconds, 4) } else { $null }
+    }
+}
+
+function Get-EndpointGrowthRate {
+    param([object[]]$Subset, [string]$Field)
+    if ($null -eq $Subset -or $Subset.Count -lt 2) { return $null }
+    $seconds = ([long]$Subset[-1].epochMillis - [long]$Subset[0].epochMillis) / 1000.0
+    if ($seconds -le 0) { return $null }
+    return ([double]$Subset[-1].$Field - [double]$Subset[0].$Field) / $seconds
+}
+
+function Get-GrowthVerdict {
+    param($Rate, [double]$Threshold)
+    if ($null -eq $Rate) { return $null }
+    if ($Rate -gt $Threshold) { return "overloaded" }
+    return "steady"
+}
+
+# The endpoint difference is the planned decision rule, but over a 27-tick window one late sample can
+# move it further than a whole stage's real drift. These companions say whether the verdict would
+# survive that: a least-squares slope that uses every sample rather than two, the spread of the
+# tick-to-tick differences, the largest single swing, and the same rule recomputed at half and double
+# the threshold and with the first and with the last sample dropped. `stable` is the answer to "would
+# a small change in the window have flipped this".
+function Get-GrowthRobustness {
+    param([object[]]$Series, [string]$Field, [double]$Threshold)
+    $blank = [ordered]@{
+        available = $false
+        leastSquaresRowsPerSec = $null
+        perTickStdevRows = $null
+        maxSingleTickSwingRows = $null
+        netRows = $null
+        netRowsThatWouldExceedThreshold = $null
+        thresholdUsed = $Threshold
+        classificationAtHalfThreshold = $null
+        classificationAtDoubleThreshold = $null
+        classificationWithoutFirstSample = $null
+        classificationWithoutLastSample = $null
+        stable = $null
+    }
+    if ($null -eq $Series -or $Series.Count -lt 3) {
+        $blank.reason = "fewer than 3 samples cannot separate a trend from tick noise"
+        return $blank
+    }
+    $values = @($Series | ForEach-Object { [double]$_.$Field })
+    $times = @($Series | ForEach-Object { ([long]$_.epochMillis - [long]$Series[0].epochMillis) / 1000.0 })
+    $n = $values.Count
+    $meanT = ($times | Measure-Object -Average).Average
+    $meanY = ($values | Measure-Object -Average).Average
+    $covariance = 0.0; $timeVariance = 0.0
+    for ($i = 0; $i -lt $n; $i++) {
+        $covariance += ($times[$i] - $meanT) * ($values[$i] - $meanY)
+        $timeVariance += ($times[$i] - $meanT) * ($times[$i] - $meanT)
+    }
+    $diffs = @(for ($i = 1; $i -lt $n; $i++) { $values[$i] - $values[$i - 1] })
+    # Measure-Object has no -StandardDeviation before PowerShell 6, so the sample deviation is
+    # computed here rather than taken from a cmdlet that would silently return nothing on 5.1.
+    $stdev = $null; $maxSwing = $null
+    if ($diffs.Count -gt 0) {
+        $maxSwing = [math]::Round((($diffs | ForEach-Object { [math]::Abs($_) }) | Measure-Object -Maximum).Maximum, 4)
+        if ($diffs.Count -gt 1) {
+            $meanDiff = ($diffs | Measure-Object -Average).Average
+            $sumSquares = 0.0
+            foreach ($diff in $diffs) { $sumSquares += ($diff - $meanDiff) * ($diff - $meanDiff) }
+            $stdev = [math]::Round([math]::Sqrt($sumSquares / ($diffs.Count - 1)), 4)
+        }
+    }
+    $spanSeconds = ([long]$Series[-1].epochMillis - [long]$Series[0].epochMillis) / 1000.0
+    $variants = @(
+        (Get-GrowthVerdict (Get-EndpointGrowthRate $Series $Field) ($Threshold / 2.0))
+        (Get-GrowthVerdict (Get-EndpointGrowthRate $Series $Field) ($Threshold * 2.0))
+        (Get-GrowthVerdict (Get-EndpointGrowthRate @($Series | Select-Object -Skip 1) $Field) $Threshold)
+        (Get-GrowthVerdict (Get-EndpointGrowthRate @($Series | Select-Object -First ($n - 1)) $Field) $Threshold)
+    )
+    $distinct = @($variants | Where-Object { $null -ne $_ } | Sort-Object -Unique)
+    return [ordered]@{
+        available = $true
+        leastSquaresRowsPerSec = if ($timeVariance -gt 0) { [math]::Round($covariance / $timeVariance, 4) } else { $null }
+        perTickStdevRows = $stdev
+        maxSingleTickSwingRows = $maxSwing
+        netRows = [math]::Round($values[$n - 1] - $values[0], 3)
+        netRowsThatWouldExceedThreshold = [math]::Round($Threshold * $spanSeconds, 3)
+        thresholdUsed = $Threshold
+        classificationAtHalfThreshold = $variants[0]
+        classificationAtDoubleThreshold = $variants[1]
+        classificationWithoutFirstSample = $variants[2]
+        classificationWithoutLastSample = $variants[3]
+        stable = ($distinct.Count -le 1)
+    }
+}
+
+function Get-BucketCount {
+    param($Counts, [string]$Key)
+    if ($Counts.ContainsKey($Key)) { return [int]$Counts[$Key] }
+    return 0
+}
+
+# Reads the submit requests out of a Gatling simulation.log. The HTTP outcome lives nowhere else:
+# the stock MySQL image exposes no status counter, and the assertion report is a summary rather
+# than a per-request record. Timestamps are epoch millis, so a stage window can be applied to them
+# directly, and a request that never returned carries an empty end timestamp - it is still counted
+# as offered, because the client did send it.
+function Get-SubmitHttpRows {
+    param([string]$Path)
+    $rows = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-Path $Path)) { return $rows }
+    foreach ($line in [System.IO.File]::ReadLines($Path)) {
+        if (-not $line.StartsWith("REQUEST`t")) { continue }
+        $p = $line.Split([char]9)
+        if ($p.Count -lt 6 -or $p[2] -ne "api-contest-submit") { continue }
+        $started = 0L
+        if (-not [long]::TryParse($p[3], [ref]$started)) { continue }
+        $status = "ok"
+        if ($p[5] -ne "OK") {
+            $message = if ($p.Count -ge 7) { $p[6] } else { "" }
+            $code = ""
+            if ($message -match "actually found (\d{3})") { $code = $Matches[1] }
+            if ($code) { $status = "ko$code" }
+            elseif ($message -match "ConnectException|Connection refused|connect timed out|UnknownHost|No route to host") { $status = "ko-connect" }
+            else { $status = "ko-other" }
+        }
+        $rows.Add([pscustomobject]@{ startMillis = $started; status = $status })
+    }
+    return $rows
+}
+
+function Get-HttpWindowSummary {
+    param([object[]]$HttpRows, [long]$FromMillis, [long]$ToMillis, [double]$WindowSeconds)
+    $counts = @{}
+    foreach ($row in @($HttpRows | Where-Object { $_.startMillis -ge $FromMillis -and $_.startMillis -lt $ToMillis })) {
+        $counts[$row.status] = 1 + (Get-BucketCount $counts $row.status)
+    }
+    $otherKo = 0
+    foreach ($key in @($counts.Keys)) {
+        if ($key -like "ko*" -and @("ko429", "ko503", "ko500", "ko-connect") -notcontains $key) {
+            $otherKo += (Get-BucketCount $counts $key)
+        }
+    }
+    $ok = Get-BucketCount $counts "ok"
+    $ko429 = Get-BucketCount $counts "ko429"
+    $ko503 = Get-BucketCount $counts "ko503"
+    $ko500 = Get-BucketCount $counts "ko500"
+    $koConnect = Get-BucketCount $counts "ko-connect"
+    $offered = $ok + $ko429 + $ko503 + $ko500 + $koConnect + $otherKo
+    return [ordered]@{
+        offered = $offered
+        ok = $ok
+        ko429 = $ko429
+        ko503 = $ko503
+        ko500 = $ko500
+        koConnect = $koConnect
+        koOther = $otherKo
+        successPercent = if ($offered -gt 0) { [math]::Round(100.0 * $ok / $offered, 3) } else { $null }
+        achievedOkRps = if ($WindowSeconds -gt 0) { [math]::Round($ok / $WindowSeconds, 3) } else { $null }
+        offeredRps = if ($WindowSeconds -gt 0) { [math]::Round($offered / $WindowSeconds, 3) } else { $null }
+    }
+}
+
+function Resolve-StageLabelAt {
+    param([object[]]$Segments, [long]$AtMillis)
+    foreach ($segment in $Segments) {
+        if ($AtMillis -ge [long]$segment.startMillis -and $AtMillis -lt [long]$segment.endMillis) {
+            if ($segment.kind -eq "hold") {
+                return $(if ($segment.isWarmup) { "warmup" } else { "stage-$($segment.stageIndex)" })
+            }
+            return "transition-$($segment.stageIndex)"
+        }
+    }
+    return "outside-plan"
 }
 
 $parameters = Get-Content $parametersPath -Raw | ConvertFrom-Json
@@ -89,6 +381,580 @@ if ($events.faultInjectedAt -and $events.firstStaleReclaimObservedAt) {
             [datetimeoffset]::Parse($events.faultInjectedAt)).TotalSeconds, 3)
 }
 
+# --- staircase (max-in-flight capacity) analysis ---------------------------------------------------
+# Everything below runs only for a staircase run. Without stages.json the summary keeps exactly the
+# shape it had before the staircase harness existed, so an older run directory still analyzes.
+$staircase = $null
+$stagesPath = Join-Path $runPath "stages.json"
+if (Test-Path $stagesPath) {
+    $stagesDoc = Get-Content $stagesPath -Raw | ConvertFrom-Json
+    $threshold = [double]$stagesDoc.overloadThresholdRowsPerSec
+    $segments = @($stagesDoc.segments)
+    $stageDefs = @($stagesDoc.stages)
+    $unavailableStaircase = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $stagesDoc.drainSeconds) {
+        $unavailableStaircase.Add("stages.json carries no drainSeconds for this run, so the run-level drain time is unavailable: the harness only records it once the backlog reaches zero")
+    }
+
+    $timeseriesPath = Join-Path $runPath "timeseries.csv"
+    $timeseries = if (Test-Path $timeseriesPath) { @(Import-Csv $timeseriesPath) } else { @() }
+    if ($timeseries.Count -eq 0) { $unavailableStaircase.Add("timeseries.csv is missing, so no per-stage throughput, backlog or executor series is reported") }
+
+    $simulationLogPath = Join-Path $runPath "gatling-simulation.log"
+    $httpRows = Get-SubmitHttpRows $simulationLogPath
+    $httpAvailable = Test-Path $simulationLogPath
+    if (-not $httpAvailable) { $unavailableStaircase.Add("gatling-simulation.log is missing, so per-stage HTTP outcomes and 429/503 attribution are unavailable") }
+
+    $reclaimsPath = Join-Path $runPath "stale-reclaims.csv"
+    $reclaimMillis = if (Test-Path $reclaimsPath) {
+        @(Import-Csv $reclaimsPath | ForEach-Object { Get-EpochMillis ([string]$_.timestamp) } | Where-Object { $null -ne $_ })
+    } else { @() }
+
+    # Parsed once: a per-stage window would otherwise re-parse tens of thousands of timestamps.
+    $latencyIndexed = @($rows | ForEach-Object {
+        [pscustomobject]@{ millis = (Get-EpochMillis ([string]$_.submittedAt)); row = $_ }
+    })
+
+    # http-1s.csv is the raw material for the 429 question: it keeps the offered rate next to the
+    # refusals, so a stage can be judged against the limiter rather than by its latency alone.
+    if ($httpAvailable) {
+        $perSecond = @{}
+        foreach ($row in $httpRows) {
+            $second = [long][math]::Floor($row.startMillis / 1000)
+            if (-not $perSecond.ContainsKey($second)) { $perSecond[$second] = @{} }
+            $perSecond[$second][$row.status] = 1 + (Get-BucketCount $perSecond[$second] $row.status)
+        }
+        $secondRows = foreach ($second in (@($perSecond.Keys) | Sort-Object)) {
+            $bucket = $perSecond[$second]
+            $otherKo = 0
+            foreach ($key in @($bucket.Keys)) {
+                if ($key -like "ko*" -and @("ko429", "ko503", "ko500", "ko-connect") -notcontains $key) {
+                    $otherKo += (Get-BucketCount $bucket $key)
+                }
+            }
+            [pscustomobject]@{
+                epochSecond = $second
+                timestampUtc = [datetimeoffset]::FromUnixTimeSeconds($second).ToString("o")
+                stageLabel = Resolve-StageLabelAt $segments ($second * 1000)
+                offered = (Get-BucketCount $bucket "ok") + (Get-BucketCount $bucket "ko429") + (Get-BucketCount $bucket "ko503") + (Get-BucketCount $bucket "ko500") + (Get-BucketCount $bucket "ko-connect") + $otherKo
+                ok = Get-BucketCount $bucket "ok"
+                ko429 = Get-BucketCount $bucket "ko429"
+                ko503 = Get-BucketCount $bucket "ko503"
+                ko500 = Get-BucketCount $bucket "ko500"
+                koConnect = Get-BucketCount $bucket "ko-connect"
+                koOther = $otherKo
+            }
+        }
+        @($secondRows) | Export-Csv (Join-Path $runPath "http-1s.csv") -NoTypeInformation -Encoding utf8
+    }
+
+    $stageResults = New-Object System.Collections.Generic.List[object]
+    # Windows this run can vouch for: the measurement windows of stages that both held steady and
+    # were not refused. They are collected here because the run-level cohort is built further down
+    # from an entirely different source (the cohort column of latency.csv).
+    $reliableWindows = New-Object System.Collections.Generic.List[object]
+    foreach ($stage in $stageDefs) {
+        $mStart = [long]$stage.measurementStartMillis
+        $mEnd = [long]$stage.measurementEndMillis
+        $mSeconds = [math]::Round(($mEnd - $mStart) / 1000.0, 3)
+        $startMillis = [long]$stage.startMillis
+        $windowSeconds = [math]::Round(($stage.endMillis - $startMillis) / 1000.0, 3)
+        $windowRows = @($timeseries | Where-Object { [long]$_.epochMillis -ge $mStart -and [long]$_.epochMillis -lt $mEnd })
+
+        # The pipeline backlog is the judge outbox plus the results the scoreboard has not applied:
+        # either one growing without bound is a stage that cannot hold the offered rate.
+        $series = New-Object System.Collections.Generic.List[object]
+        $executorSeries = New-Object System.Collections.Generic.List[object]
+        foreach ($row in $windowRows) {
+            $judgeValue = 0.0; $scoreboardValue = 0.0
+            $hasJudge = [double]::TryParse([string]$row.unfinishedOutbox, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$judgeValue)
+            $hasScoreboard = [double]::TryParse([string]$row.unappliedScoreboard, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$scoreboardValue)
+            if ($hasJudge -and $hasScoreboard) {
+                $series.Add([pscustomobject]@{
+                    epochMillis = [long]$row.epochMillis
+                    judge = $judgeValue
+                    scoreboard = $scoreboardValue
+                    total = $judgeValue + $scoreboardValue
+                })
+            }
+            # A node that could not be scraped leaves an empty gauge. Summing only the reachable
+            # node and calling it the total would understate the executor, so the row is dropped.
+            $gauges = @{}
+            $gaugesComplete = $true
+            foreach ($column in @("judge1Running", "judge2Running", "judge1Queued", "judge2Queued", "judge1Reserved", "judge2Reserved")) {
+                $value = 0.0
+                if ([double]::TryParse([string]$row.$column, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$value)) {
+                    $gauges[$column] = $value
+                } else { $gaugesComplete = $false }
+            }
+            if ($gaugesComplete) {
+                $executorSeries.Add([pscustomobject]@{
+                    epochMillis = [long]$row.epochMillis
+                    running = $gauges["judge1Running"] + $gauges["judge2Running"]
+                    queued = $gauges["judge1Queued"] + $gauges["judge2Queued"]
+                    reserved = $gauges["judge1Reserved"] + $gauges["judge2Reserved"]
+                })
+            }
+        }
+
+        $totalGrowth = Get-GrowthRate $series "total"
+        $judgeGrowth = Get-GrowthRate $series "judge"
+        $scoreboardGrowth = Get-GrowthRate $series "scoreboard"
+        # The window can hold rows whose backlog cells did not parse, so the sample count that the
+        # classification actually rests on is the series length, not the row count. Reporting the row
+        # count as "samples" while the trend came from fewer would make the reason text wrong.
+        $sampleCount = $windowRows.Count
+        $seriesCount = $series.Count
+        $growthRobustness = Get-GrowthRobustness $series "total" $threshold
+
+        $classification = "unknown"
+        $classificationReason = if ($seriesCount -lt 10) {
+            "only $seriesCount backlog samples in the measurement window ($sampleCount rows); fewer than 10 cannot separate growth from sampling noise"
+        } else {
+            "the measurement window holds $seriesCount usable backlog samples but no rate could be computed from them"
+        }
+        if ($seriesCount -ge 10 -and $null -ne $totalGrowth.rowsPerSec) {
+            if ($totalGrowth.rowsPerSec -gt $threshold) {
+                $classification = "overloaded"
+                $classificationReason = "total pipeline backlog grew $($totalGrowth.rowsPerSec) rows/s across the measurement window, above the $threshold rows/s threshold"
+            } else {
+                $classification = "steady"
+                $classificationReason = "total pipeline backlog changed $($totalGrowth.rowsPerSec) rows/s across the measurement window, at or below the $threshold rows/s threshold"
+            }
+        }
+
+        $http = Get-HttpWindowSummary $httpRows $mStart $mEnd $mSeconds
+        if (-not $httpAvailable) {
+            $http = [ordered]@{ offered=$null; ok=$null; ko429=$null; ko503=$null; ko500=$null; koConnect=$null; koOther=$null; successPercent=$null; achievedOkRps=$null; offeredRps=$null }
+        }
+        $ko429Share = if ($null -ne $http.offered -and $http.offered -gt 0) { [math]::Round($http.ko429 / $http.offered, 4) } else { $null }
+        # Pollution is any refusal, not just the limiter's 429: a 503 or a dropped connection removes
+        # offered work from the stage just as effectively, and the reason text below says so.
+        $refused = if ($null -eq $http.offered) { $null } else { [int]$http.ko429 + [int]$http.ko503 + [int]$http.ko500 + [int]$http.koConnect + [int]$http.koOther }
+        $refusedShare = if ($null -ne $refused -and $http.offered -gt 0) { [math]::Round($refused / $http.offered, 4) } else { $null }
+        $polluted = ($null -ne $refusedShare -and $refusedShare -ge $ApiRateLimitShare)
+        $offeredVsTargetPercent = if ($null -ne $http.offeredRps -and $stage.targetRps -gt 0) { [math]::Round(100.0 * $http.offeredRps / $stage.targetRps, 2) } else { $null }
+
+        # How faithfully the one-second sampler actually ran inside this window, so a stage whose
+        # boundary snapshot was taken late can be recognised rather than trusted.
+        $tickIntervals = @($windowRows | ForEach-Object {
+            $value = 0.0
+            if ([double]::TryParse([string]$_.sampleIntervalMs, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$value)) { $value }
+        })
+        $tickHonesty = [ordered]@{
+            ticks = $sampleCount
+            maxIntervalMs = if ($tickIntervals.Count -gt 0) { [math]::Round((($tickIntervals | Measure-Object -Maximum).Maximum), 3) } else { $null }
+            meanIntervalMs = if ($tickIntervals.Count -gt 0) { [math]::Round((($tickIntervals | Measure-Object -Average).Average), 3) } else { $null }
+            ticksSlowerThan1500Ms = @($tickIntervals | Where-Object { $_ -gt 1500 }).Count
+            maxBoundaryLagMs = (@($stage.prometheusStartLagMs, $stage.prometheusEndLagMs) |
+                Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ } |
+                Measure-Object -Maximum).Maximum
+        }
+
+        $stageLatencyRows = @($latencyIndexed | Where-Object {
+            $null -ne $_.millis -and $_.millis -ge $mStart -and $_.millis -lt $mEnd } | ForEach-Object { $_.row })
+        $latency = Get-LatencySummary $stageLatencyRows
+
+        $reclaimInStage = @($reclaimMillis | Where-Object { $_ -ge $mStart -and $_ -lt $mEnd }).Count
+        $staleCompletions = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_completion_total" 'outcome="stale"'
+        $duplicateLowerMs = if ($null -eq $staleCompletions) { $null } else { [math]::Round($staleCompletions * 50, 3) }
+        $duplicateUpperMs = if ($null -eq $staleCompletions) { $null } else { [math]::Round($staleCompletions * 2000, 3) }
+
+        $accepted = Get-ColumnStats $windowRows "acceptedTotal"
+        $results = Get-ColumnStats $windowRows "resultsTotal"
+        $scoreboardApplied = Get-ColumnStats $windowRows "scoreboardTotal"
+
+        # The claim counters are read once here because two sections quote them: the claim cost table
+        # and the mechanism table below. Reading them twice would double the scrape parsing and let
+        # the two tables disagree if a read ever failed on one path only.
+        $claimCallsDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_claim_calls_total"
+        $claimRowsDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_claim_rows_total"
+        $invocationDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_invocations_total"
+        $durationSumDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_duration_seconds_sum"
+        $durationCountDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_duration_seconds_count"
+
+        # Why the achieved rate falls short of workers / mean-service-time is not visible in the
+        # throughput number alone. These three do make it visible: the service time the JVM actually
+        # timed, the occupancy that the reserved gauge implies (Little's law, reserved = rate x time),
+        # and the gap between them. That gap mixes local queue wait with anything a claim spends
+        # outside the timed region, so a wide gap at mif above the worker count is the queue showing
+        # up, while a wide gap at mif at or below the worker count points at claim/poll overhead
+        # instead - the two runs are compared on exactly that split.
+        $timedJudgeMeanMs = if ($null -ne $durationSumDelta -and $null -ne $durationCountDelta -and $durationCountDelta -gt 0) {
+            [math]::Round(1000.0 * $durationSumDelta / $durationCountDelta, 3)
+        } else { $null }
+        $reservedMean = (Get-ColumnStats $executorSeries "reserved").average
+        $runningMean = (Get-ColumnStats $executorSeries "running").average
+        $achievedResultPerSecond = if ($mSeconds -gt 0 -and $null -ne $results.delta) { [math]::Round($results.delta / $mSeconds, 3) } else { $null }
+        $impliedOccupancyMs = if ($null -ne $reservedMean -and $null -ne $achievedResultPerSecond -and $achievedResultPerSecond -gt 0) {
+            [math]::Round(1000.0 * $reservedMean / $achievedResultPerSecond, 3)
+        } else { $null }
+        $mechanism = [ordered]@{
+            timedJudgeMeanMs = $timedJudgeMeanMs
+            timedJudgeSampleCount = $durationCountDelta
+            impliedOccupancyMs = $impliedOccupancyMs
+            impliedOccupancyBasis = "mean reserved across both nodes divided by the achieved result rate (Little's law). reserved counts claimed-but-not-finished work, so wherever a local queue exists this value is service time plus local queue wait, not claim overhead; only the untimed gap at mif close to the worker count can be read as overhead. Unavailable when either the reserved gauge or the result delta is missing."
+            untimedPerClaimMs = if ($null -ne $impliedOccupancyMs -and $null -ne $timedJudgeMeanMs) {
+                [math]::Round($impliedOccupancyMs - $timedJudgeMeanMs, 3)
+            } else { $null }
+            untimedPerClaimBasis = "implied occupancy minus the JVM-timed mean. The two are not taken over the same window - occupancy is the mean of the one-second reserved gauge across the guarded measurement window, the timed mean is a pair of boundary scrapes spanning the whole hold - so this is an indication of the gap (local queue wait plus anything a claim spends outside the timed region), not a per-claim overhead measured directly. A value near zero, including a small negative one, means only that the two agree to within their windows."
+            reservedMeanBothNodes = $reservedMean
+            runningMeanBothNodes = $runningMean
+            workerCountBothNodes = (2 * [int]$parameters.workerCountPerNode)
+            workerUtilization = if ($null -ne $runningMean -and $parameters.workerCountPerNode -gt 0) {
+                [math]::Round($runningMean / (2.0 * [int]$parameters.workerCountPerNode), 4)
+            } else { $null }
+            claimsPerSecond = if ($null -ne $claimCallsDelta -and $mSeconds -gt 0) { [math]::Round($claimCallsDelta / $mSeconds, 3) } else { $null }
+            rowsPerClaim = if ($null -ne $claimRowsDelta -and $null -ne $claimCallsDelta -and $claimCallsDelta -gt 0) {
+                [math]::Round($claimRowsDelta / $claimCallsDelta, 3)
+            } else { $null }
+            claimRowsPerClaimRowLimit = [int]$parameters.mysqlClaimBatchSize
+            maxInFlightPerNode = [int]$parameters.mysqlMaxInFlightPerNode
+        }
+
+        # A percentile is only a service time where the pipeline kept up and nothing else was
+        # refusing work. Both qualifications are listed rather than the first one that applies: a
+        # stage can be overloaded *and* rate limited, and dropping one hides half the reason.
+        $unusableReasons = New-Object System.Collections.Generic.List[string]
+        if ($classification -eq "overloaded") { $unusableReasons.Add("backlog grew throughout the window, so p95/p99 measure queueing rather than service time") }
+        if ($classification -eq "unknown") { $unusableReasons.Add($classificationReason) }
+        # Criterion (c) is "no refusals", and a window with no HTTP data cannot answer it: $refusedShare
+        # is then null, which is falsy, so $polluted is false and the stage could be certified - and
+        # even published in the measurement-steady cohort - without the refusal check ever running.
+        # A missing artifact is missing evidence, not a clean stage.
+        if ($null -eq $http.offered) {
+            $unusableReasons.Add("the HTTP outcomes for this window are unavailable because the run has no readable gatling-simulation.log, so the refusal check that guards service latency was never evaluated")
+        } elseif ([int]$http.offered -le 0) {
+            $unusableReasons.Add("no submission was offered inside this window, so the refusal check that guards service latency could not be evaluated")
+        }
+        if ($polluted) {
+            $unusableReasons.Add("the API refused $refused of $($http.offered) submissions in this window ($($http.ko429)x429, $($http.ko503)x503, $($http.ko500)x500, $($http.koConnect) connect, $($http.koOther) other), so the latency also includes refusals rather than judge work alone")
+        }
+        # A steady verdict that a single late sample could have flipped is not a base to read service
+        # time from, even though the planned rule called the stage steady.
+        if ($classification -eq "steady" -and $growthRobustness.available -and -not $growthRobustness.stable) {
+            $unusableReasons.Add("the steady verdict is not robust: the same rule gives different answers when the threshold is halved or doubled, or when the first or last sample is dropped")
+        }
+        if ($latency.L_total_ms.count -lt 10) { $unusableReasons.Add("only $($latency.L_total_ms.count) complete submissions were observed inside this window") }
+        $reliable = ($unusableReasons.Count -eq 0)
+        $reliableReason = if ($reliable) {
+            "steady backlog and no API refusals, so the percentiles describe service time"
+        } else { "not usable as steady-state latency: " + ($unusableReasons -join "; ") }
+        if ($reliable -and -not [bool]$stage.isWarmup) {
+            $reliableWindows.Add([pscustomobject]@{
+                stageIndex = $stage.stageIndex
+                targetRps = $stage.targetRps
+                startMillis = $mStart
+                endMillis = $mEnd
+            })
+        }
+
+        $stageResults.Add([ordered]@{
+            stageIndex = $stage.stageIndex
+            label = $stage.label
+            isWarmup = [bool]$stage.isWarmup
+            targetRps = $stage.targetRps
+            population = $stage.population
+            start = $stage.start
+            end = $stage.end
+            windowSeconds = $windowSeconds
+            measurementStart = $stage.measurementStart
+            measurementEnd = $stage.measurementEnd
+            measurementSeconds = $mSeconds
+            traceSegmentIndex = $stage.traceSegmentIndex
+            prometheusStartLabel = $stage.prometheusStartLabel
+            prometheusEndLabel = $stage.prometheusEndLabel
+            prometheusStartLagMs = $stage.prometheusStartLagMs
+            prometheusEndLagMs = $stage.prometheusEndLagMs
+            classification = $classification
+            classificationReason = $classificationReason
+            samples = $sampleCount
+            seriesSamples = $seriesCount
+            growthRobustness = $growthRobustness
+            tickHonesty = $tickHonesty
+            offeredVsTargetPercent = $offeredVsTargetPercent
+            backlogGrowth = [ordered]@{
+                judgeRowsPerSec = $judgeGrowth.rowsPerSec
+                scoreboardRowsPerSec = $scoreboardGrowth.rowsPerSec
+                totalRowsPerSec = $totalGrowth.rowsPerSec
+                judgeStart = $judgeGrowth.start; judgeEnd = $judgeGrowth.end
+                scoreboardStart = $scoreboardGrowth.start; scoreboardEnd = $scoreboardGrowth.end
+                totalStart = $totalGrowth.start; totalEnd = $totalGrowth.end
+                seconds = $totalGrowth.seconds
+            }
+            backlogByHalf = [ordered]@{
+                firstHalfRowsPerSec = (Get-GrowthRate @($series | Select-Object -First ([math]::Floor($series.Count / 2))) "total").rowsPerSec
+                secondHalfRowsPerSec = (Get-GrowthRate @($series | Select-Object -Skip ([math]::Floor($series.Count / 2))) "total").rowsPerSec
+            }
+            accepted = [ordered]@{
+                start = $accepted.first; end = $accepted.last
+                delta = $accepted.delta
+                perSecond = if ($mSeconds -gt 0 -and $null -ne $accepted.delta) { [math]::Round($accepted.delta / $mSeconds, 3) } else { $null }
+            }
+            resultsCompleted = [ordered]@{
+                start = $results.first; end = $results.last
+                delta = $results.delta
+                perSecond = if ($mSeconds -gt 0 -and $null -ne $results.delta) { [math]::Round($results.delta / $mSeconds, 3) } else { $null }
+            }
+            scoreboardApplied = [ordered]@{
+                start = $scoreboardApplied.first; end = $scoreboardApplied.last
+                delta = $scoreboardApplied.delta
+                perSecond = if ($mSeconds -gt 0 -and $null -ne $scoreboardApplied.delta) { [math]::Round($scoreboardApplied.delta / $mSeconds, 3) } else { $null }
+            }
+            http = $http
+            ko429Share = $ko429Share
+            refusedShare = $refusedShare
+            apiRateLimitPolluted = $polluted
+            latency = $latency
+            reliableAsSteadyStateLatency = $reliable
+            reliableAsSteadyStateLatencyReason = $reliableReason
+            overloadQueueingResults = ($classification -eq "overloaded")
+            executor = [ordered]@{
+                judge1 = [ordered]@{
+                    running = Get-ColumnStats $windowRows "judge1Running"
+                    queued = Get-ColumnStats $windowRows "judge1Queued"
+                    reserved = Get-ColumnStats $windowRows "judge1Reserved"
+                }
+                judge2 = [ordered]@{
+                    running = Get-ColumnStats $windowRows "judge2Running"
+                    queued = Get-ColumnStats $windowRows "judge2Queued"
+                    reserved = Get-ColumnStats $windowRows "judge2Reserved"
+                }
+                bothNodes = [ordered]@{
+                    running = Get-ColumnStats $executorSeries "running"
+                    queued = Get-ColumnStats $executorSeries "queued"
+                    reserved = Get-ColumnStats $executorSeries "reserved"
+                }
+            }
+            mysql = [ordered]@{
+                threadsConnected = Get-ColumnStats $windowRows "threadsConnected"
+                threadsRunning = Get-ColumnStats $windowRows "threadsRunning"
+                rowLockCurrentWaits = Get-ColumnStats $windowRows "innodbRowLockCurrentWaits"
+                rowLockWaits = Get-ColumnStats $windowRows "innodbRowLockWaits"
+                questions = Get-ColumnStats $windowRows "questions"
+                rowLockWaitsPerSecond = if ($mSeconds -gt 0 -and $null -ne (Get-ColumnStats $windowRows "innodbRowLockWaits").delta) { [math]::Round((Get-ColumnStats $windowRows "innodbRowLockWaits").delta / $mSeconds, 4) } else { $null }
+                questionsPerSecond = if ($mSeconds -gt 0 -and $null -ne (Get-ColumnStats $windowRows "questions").delta) { [math]::Round((Get-ColumnStats $windowRows "questions").delta / $mSeconds, 4) } else { $null }
+            }
+            claim = [ordered]@{
+                windowBasis = "staleReclaimRowsInWindow counts rows whose outbox updated_at falls in the measurement window; the prometheus deltas run between the hold's own start and end scrapes, which are $($windowSeconds)s apart rather than $($mSeconds)s, because snapshots are only taken at segment boundaries"
+                staleReclaimRowsInWindow = $reclaimInStage
+                claimStaleDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_claim_stale_total"
+                staleCompletionDelta = $staleCompletions
+                judgeInvocationDelta = $invocationDelta
+                judgeDurationSecondsDelta = $durationSumDelta
+                judgeDurationCountDelta = $durationCountDelta
+                claimCallsDelta = $claimCallsDelta
+                claimRowsDelta = $claimRowsDelta
+                executorRejectionsDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_executor_rejections_total"
+                storedResultRepublishDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_stored_result_republish_total"
+                duplicateJudgementMillisLowerBound = $duplicateLowerMs
+                duplicateJudgementMillisUpperBound = $duplicateUpperMs
+                duplicateJudgementBasis = "stale-token completions in this window priced at the deterministic profile's 50ms floor and 2000ms ceiling; the lease cannot say how long a reclaimed attempt actually ran"
+            }
+            # Drain happens once, after every stage, so there is no per-stage drain to report.
+            drain = [ordered]@{ available = $false; reason = "the pipeline is drained once per run after the last stage, so drain is only defined at run level" }
+            mechanism = $mechanism
+        })
+    }
+
+    $measuredStages = @($stageResults | Where-Object { -not $_.isWarmup })
+    $pollutedStages = @($measuredStages | Where-Object { $_.apiRateLimitPolluted })
+    $unclassifiedStages = @($measuredStages | Where-Object { $_.classification -eq "unknown" })
+    $classifiedStages = @($measuredStages | Where-Object { $_.classification -ne "unknown" })
+    $firstOverload = @($classifiedStages | Where-Object { $_.classification -eq "overloaded" } | Select-Object -First 1)
+    $overloadIndex = if ($firstOverload.Count -gt 0) { $firstOverload[0].stageIndex } else { $null }
+    # "The last stage that held" means the last one *before* the first stage that did not, so an
+    # oscillation later in the ladder cannot quietly promote a higher stage into the knee.
+    # Built with an explicit loop rather than an if-expression: PowerShell unrolls the output of an
+    # if statement, so a branch that selects exactly one stage would hand back the stage object
+    # itself, whose .Count is its number of keys and whose [-1] index is a missing dictionary key.
+    # That made a lone steady stage below the first overloaded stage look like no steady stage at all.
+    $steadyBefore = New-Object System.Collections.Generic.List[object]
+    foreach ($candidate in $classifiedStages) {
+        if ($candidate.classification -ne "steady") { continue }
+        if ($null -ne $overloadIndex -and $candidate.stageIndex -ge $overloadIndex) { continue }
+        $steadyBefore.Add($candidate)
+    }
+    $lastSteady = if ($steadyBefore.Count -gt 0) { $steadyBefore[$steadyBefore.Count - 1] } else { $null }
+
+    # A rate-limited stage is still classified: the backlog says whether the pipeline kept up, and
+    # dropping the stage would replace "we could not measure this" with "this held". What the
+    # refusals do invalidate is the stage as evidence about judge capacity, which is a caveat on the
+    # bound rather than a deletion of it.
+    $kneeUpperStage = if ($firstOverload.Count -gt 0) { $firstOverload[0] } else { $null }
+    $kneeConfounded = ($null -ne $kneeUpperStage -and $kneeUpperStage.apiRateLimitPolluted)
+    $kneeLower = if ($null -ne $lastSteady) { $lastSteady.targetRps } else { $null }
+    $kneeUpper = if ($null -ne $kneeUpperStage) { $kneeUpperStage.targetRps } else { $null }
+    $confoundNote = if ($kneeConfounded) {
+        " The $kneeUpper RPS stage was also refused for $([math]::Round(100 * $kneeUpperStage.ko429Share, 3))% of its submissions with 429, so the upper bound is confounded by the API rate limiter and is not a judge-capacity reading."
+    } else { "" }
+    # The lower bound is only as solid as the steady verdict under it. Two ways it can be soft: the
+    # verdict flips under a small change to the rule (robustness.stable = false), or the growth sits
+    # above zero with little room to the threshold. Both are reported instead of being folded into a
+    # bare "held up to N RPS".
+    $lowerRobust = ($null -ne $lastSteady -and $lastSteady.growthRobustness.available -and $lastSteady.growthRobustness.stable)
+    # The upper bound gets the same test. The first stage that did not hold is often decided by a net
+    # drift smaller than a single tick's movement, which would make the "first overloaded" rung a
+    # coin toss rather than the point where capacity ran out.
+    $upperRobust = ($null -ne $kneeUpperStage -and $kneeUpperStage.growthRobustness.available -and $kneeUpperStage.growthRobustness.stable)
+    # Rows, not rows/s: this compares the stage's net drift against the row count that would have
+    # exceeded the threshold, so the unit is a count of backlog rows over the window. Only the lower
+    # margin is a rate (threshold minus growth). Naming it RowsPerSec made a 3-row margin read as a
+    # 3 rows/s one against a 1 rows/s threshold.
+    $upperMarginRows = if ($null -ne $kneeUpperStage -and $null -ne $kneeUpperStage.growthRobustness.netRows -and $null -ne $threshold) {
+        [math]::Round($kneeUpperStage.growthRobustness.netRows - $kneeUpperStage.growthRobustness.netRowsThatWouldExceedThreshold, 3)
+    } else { $null }
+    $upperFragilityNote = if ($null -ne $kneeUpperStage -and -not $upperRobust) {
+        " The $kneeUpper RPS stage's overloaded verdict is also fragile: its net drift was $($kneeUpperStage.growthRobustness.netRows) rows against the $($kneeUpperStage.growthRobustness.netRowsThatWouldExceedThreshold) rows that would exceed the threshold, while its largest single tick moved $($kneeUpperStage.growthRobustness.maxSingleTickSwingRows) rows."
+    } else { "" }
+    $lowerMarginRowsPerSec = if ($null -ne $lastSteady -and $null -ne $lastSteady.backlogGrowth.totalRowsPerSec) {
+        [math]::Round($threshold - $lastSteady.backlogGrowth.totalRowsPerSec, 4)
+    } else { $null }
+    $lowerFragilityNote = if ($null -ne $lastSteady -and -not $lowerRobust) {
+        " The $kneeLower RPS stage's steady verdict is fragile: it grew $($lastSteady.backlogGrowth.totalRowsPerSec) rows/s against a $threshold rows/s threshold (margin $lowerMarginRowsPerSec), and its classification changes when the threshold is halved or doubled or when one end sample is dropped, so treat $kneeLower RPS as an upper edge rather than a proven operating point."
+    } else { "" }
+    # What the interval rests on: a bound whose lower end was never actually reached is weaker than
+    # one bracketed by a stage that held and a stage that did not, and the count says which this is.
+    # The short form exists for the cross-run table, where a three-sentence cell would bury the
+    # comparison; the long form stays the one to read in this run's own summary.
+    $intervalShort = if ($null -ne $kneeLower -and $null -ne $kneeUpper) {
+        "($kneeLower, $kneeUpper] RPS"
+    } elseif ($null -ne $kneeLower) {
+        "above the ladder, >= $kneeLower RPS"
+    } elseif ($null -ne $kneeUpper) {
+        "below the ladder, <= $kneeUpper RPS"
+    } else { "unknown" }
+    $classifiedCount = $classifiedStages.Count
+    $excludedCount = $unclassifiedStages.Count
+    $pollutedCount = $pollutedStages.Count
+    # Each note below opens with a space and closes with a period, so the clause before them has to
+    # end in a period too - otherwise the sentence runs on ("...could be classified The 50 RPS stage's
+    # verdict is fragile") and reads as one unpunctuated thought.
+    $intervalDescription = if ($null -ne $kneeLower -and $null -ne $kneeUpper) {
+        "($kneeLower, $kneeUpper] RPS, from the $classifiedCount of $($measuredStages.Count) measured stages that could be classified.$confoundNote$lowerFragilityNote$upperFragilityNote"
+    } elseif ($null -ne $kneeLower) {
+        "not reached: every one of the $classifiedCount classifiable measured stages held steady up to $kneeLower RPS, so capacity is above the ladder (with $excludedCount measured stages excluded as unclassifiable and $pollutedCount flagged as refused).$confoundNote$lowerFragilityNote"
+    } elseif ($null -ne $kneeUpper) {
+        "below the lowest measured stage: $kneeUpper RPS was already overloaded.$confoundNote$lowerFragilityNote$upperFragilityNote"
+    } else { "unknown: none of the $($measuredStages.Count) measured stages could be classified" }
+
+    $capacityKnee = [ordered]@{
+        sustainedSteadyUpToRps = $kneeLower
+        sustainedSteadyStageVerdictRobust = $lowerRobust
+        sustainedSteadyStageMarginRowsPerSec = $lowerMarginRowsPerSec
+        firstOverloadStageRps = $kneeUpper
+        firstOverloadStageVerdictRobust = $upperRobust
+        firstOverloadStageMarginRows = $upperMarginRows
+        intervalShort = $intervalShort
+        intervalDescription = $intervalDescription
+        confoundedByApiRateLimit = $kneeConfounded
+        basis = "measured stages only (warm-up excluded); the verdict on each stage is the planned endpoint rule (backlog grew more than $threshold rows/s over its measurement window), and a stage whose window holds fewer than 10 usable backlog samples cannot be classified"
+        measuredStageCount = $measuredStages.Count
+        classifiedStageCount = $classifiedCount
+        unclassifiableStageCount = $excludedCount
+        refusedStageCount = $pollutedCount
+        stagesExcludedFromKnee = @($unclassifiedStages | ForEach-Object {
+            [ordered]@{ stageIndex = $_.stageIndex; targetRps = $_.targetRps; reason = $_.classificationReason }
+        })
+        stagesPollutedByApiRateLimit = @($pollutedStages | ForEach-Object {
+            [ordered]@{
+                stageIndex = $_.stageIndex
+                targetRps = $_.targetRps
+                # Every refusal bucket, not just the limiter's 429: the field next to a reason that
+                # lists 503/500/connect must not report the 429 share alone, or a stage refused for a
+                # non-429 reason would publish an understated (or zero) share.
+                refusedShare = $_.refusedShare
+                ko429Share = $_.ko429Share
+                ko429 = $_.http.ko429; ko503 = $_.http.ko503; ko500 = $_.http.ko500
+                koConnect = $_.http.koConnect; koOther = $_.http.koOther
+                reason = "$($_.http.ko429)x429, $($_.http.ko503)x503, $($_.http.ko500)x500, $($_.http.koConnect) connect and $($_.http.koOther) other refusals out of $($_.http.offered) submissions in the measurement window, at or above the $($ApiRateLimitShare * 100)% threshold"
+            }
+        })
+        theoryReference = [ordered]@{
+            note = "the 147.5ms synthetic mean over two nodes would put mif=8 near 108 RPS and mif>=16 near 217 RPS; this is a reference for explaining a difference, not a target the measurement is fitted to"
+            maxInFlight8Rps = 108
+            maxInFlightAtLeast16Rps = 217
+        }
+    }
+
+    # A second latency read that the run can actually vouch for. `all` and `pre-fault-normal` span the
+    # warm-up, every transition, the stages the pipeline could not hold and the drain, so their
+    # p95/p99 mix service time with queueing. This cohort reapplies the same three latencies to just
+    # the measurement windows of the stages that held steady with nothing refused.
+    # ToArray rather than @(): on this PowerShell, the array subexpression operator throws
+    # "Argument types do not match" when handed a generic List[object].
+    $steadyWindows = $reliableWindows.ToArray()
+    $cohortNames += "measurement-steady"
+    # Assigned inside the branches rather than from an if-expression: PowerShell unrolls an if
+    # statement's output, and an OrderedDictionary is enumerable, so the branch value would arrive as
+    # a list of its entries instead of the dictionary itself.
+    if ($steadyWindows.Count -eq 0) {
+        $cohorts["measurement-steady"] = [ordered]@{
+            available = $false
+            reason = "no measured stage was both steady and free of API refusals, so no window in this run can be read as service time"
+        }
+    } else {
+        # The row's own timestamp is read into a local before the inner filter: inside that filter
+        # `$_` is a window, so `$_.millis` would silently be null and no submission would match.
+        $selected = @($latencyIndexed | Where-Object {
+            if ($null -eq $_.millis) { return $false }
+            $atMillis = [long]$_.millis
+            $inWindow = $false
+            foreach ($window in $steadyWindows) {
+                if ($window.startMillis -le $atMillis -and $atMillis -lt $window.endMillis) { $inWindow = $true; break }
+            }
+            return $inWindow
+        } | ForEach-Object { $_.row })
+        $summaryForWindows = Get-LatencySummary $selected
+        $summaryForWindows["available"] = $true
+        $summaryForWindows["windows"] = [object[]]$steadyWindows
+        $summaryForWindows["windowBasis"] = "measurement windows of stages that held steady and saw no API refusals; the run-level cohorts above are not restricted this way"
+        $cohorts["measurement-steady"] = $summaryForWindows
+    }
+
+    $staircase = [ordered]@{
+        mode = $stagesDoc.mode
+        mysqlMaxInFlightPerNode = $parameters.mysqlMaxInFlightPerNode
+        mysqlClaimBatchSize = $parameters.mysqlClaimBatchSize
+        mysqlClaimTimeout = $parameters.mysqlClaimTimeout
+        workerCountPerNode = $parameters.workerCountPerNode
+        stageRps = $stagesDoc.stageRps
+        warmupStageCount = $stagesDoc.warmupStageCount
+        transitionRampSeconds = $stagesDoc.transitionRampSeconds
+        stageHoldSeconds = $stagesDoc.stageHoldSeconds
+        steadyGuardSeconds = $stagesDoc.steadyGuardSeconds
+        overloadThresholdRowsPerSec = $threshold
+        latencyCohortCaveat = "the run-level cohorts (all, pre-fault-normal, fault-window, post-fault-arrivals) cover the whole run - warm-up, every transition, the overload stages and the drain - so their p95/p99 include queueing and are not service-time readings. measurement-steady restricts the same three latencies to the measurement windows of the stages that held steady with no API refusals, and is unavailable when no stage qualified."
+        traceAlignment = $stagesDoc.traceAlignment
+        traceAlignmentErrorSeconds = $stagesDoc.traceAlignmentErrorSeconds
+        traceAnchorUtc = $stagesDoc.traceAnchorUtc
+        tracePlanEndUtc = $stagesDoc.tracePlanEndUtc
+        warmupEndedAt = $stagesDoc.warmupEndedAt
+        measurementStartedAt = $stagesDoc.measurementStartedAt
+        # Drain is a run-level fact: the pipeline is drained once, after the last stage. When the run
+        # never reached quiescence the harness leaves these null, which stays null here rather than
+        # becoming a zero that would read as an instant drain.
+        drainStartedAt = $stagesDoc.drainStartedAt
+        drainEndedAt = $stagesDoc.drainEndedAt
+        drainSeconds = $stagesDoc.drainSeconds
+        expectedPlan = $stagesDoc.expectedPlan
+        apiRateLimitSuspected = ($pollutedStages.Count -gt 0)
+        apiRateLimitShareThreshold = $ApiRateLimitShare
+        samplingInterval = [ordered]@{
+            loadTicks = @($timeseries | Where-Object { $_.phase -eq "load" }).Count
+            drainTicks = @($timeseries | Where-Object { $_.phase -eq "drain" }).Count
+            meanIntervalMs = (Get-ColumnStats @($timeseries | Where-Object { $_.phase -eq "load" }) "sampleIntervalMs").average
+            maxIntervalMs = (Get-ColumnStats @($timeseries | Where-Object { $_.phase -eq "load" }) "sampleIntervalMs").max
+            meanGatherMs = (Get-ColumnStats @($timeseries | Where-Object { $_.phase -eq "load" }) "sampleElapsedMs").average
+        }
+        capacityKnee = $capacityKnee
+        # Stored as a plain array: PowerShell refuses @() around a List[object] read back out of a
+        # dictionary, and both the JSON writer and the Markdown writer walk this collection.
+        stages = [object[]]$stageResults
+        unavailable = [object[]]$unavailableStaircase
+    }
+}
+
 $summary = [ordered]@{
     runId = $parameters.runId
     gitCommit = $parameters.gitCommit
@@ -105,6 +971,10 @@ $summary = [ordered]@{
     capacity = $capacity
     mysql = $verification.mysql
     unavailable = @($verification.unavailable)
+}
+if ($null -ne $staircase) {
+    $summary.staircase = $staircase
+    $summary.unavailable = @($verification.unavailable) + @($staircase.unavailable)
 }
 $summary | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $runPath "summary.json") -Encoding utf8
 
@@ -139,10 +1009,122 @@ foreach ($node in @("judge-1", "judge-2")) {
         $lines += "| $node | $metricName | $($metric.samples) | $($metric.max) | $($metric.average) |"
     }
 }
+if ($null -ne $staircase) {
+    # Without this, the run-level cohort tail and the per-stage tail look like the same kind of
+    # number, and the run-level one is a mixture.
+    $lines += @("", "Cohort scope: $($staircase.latencyCohortCaveat)")
+}
 $lines += @("", "## Explicitly unavailable", "")
-if (@($verification.unavailable).Count -eq 0) { $lines += "- None" } else {
-    $lines += @($verification.unavailable | ForEach-Object { "- $_" })
+if ($summary.unavailable.Count -eq 0) { $lines += "- None" } else {
+    $lines += @($summary.unavailable | ForEach-Object { "- $_" })
+}
+
+if ($null -ne $staircase) {
+    $knee = $staircase.capacityKnee
+    $lines += @(
+        "", "## max-in-flight capacity staircase", "",
+        "- max-in-flight per node: $($staircase.mysqlMaxInFlightPerNode), claim batch $($staircase.mysqlClaimBatchSize), claim timeout $($staircase.mysqlClaimTimeout), workers/node $($staircase.workerCountPerNode)",
+        "- Stage ladder: $($staircase.stageRps -join ', ') RPS, warm-up stages $($staircase.warmupStageCount), hold $($staircase.stageHoldSeconds)s, guard $($staircase.steadyGuardSeconds)s",
+        "- Stage windows vs the injected plan: $($staircase.traceAlignment) (last request $(if ($null -eq $staircase.traceAlignmentErrorSeconds) { 'unavailable' } else { [string]$staircase.traceAlignmentErrorSeconds + 's from the predicted end' }))",
+        "- Sampler period: mean $($staircase.samplingInterval.meanIntervalMs) ms, max $($staircase.samplingInterval.maxIntervalMs) ms, mean gather cost $($staircase.samplingInterval.meanGatherMs) ms",
+        "- Capacity knee: $(if ($null -eq $knee.sustainedSteadyUpToRps -and $null -eq $knee.firstOverloadStageRps) { 'unknown' } else { $knee.intervalDescription })",
+        "- Knee basis: $($knee.classifiedStageCount) of $($knee.measuredStageCount) measured stages could be classified, $($knee.unclassifiableStageCount) could not, $($knee.refusedStageCount) were refused; the knee's lower stage $(if ($knee.sustainedSteadyStageVerdictRobust) { 'survives a small change to the rule' } else { 'does not survive a small change to the rule (margin ' + $(if ($null -eq $knee.sustainedSteadyStageMarginRowsPerSec) { 'unavailable' } else { [string]$knee.sustainedSteadyStageMarginRowsPerSec + ' rows/s' }) + ' below the threshold)' })",
+        "- API rate limit suspected: $(if ($staircase.apiRateLimitSuspected) { 'yes' } else { 'no' })",
+        "",
+        "| Stage | target RPS | window s | measured s | class | total backlog rows/s | first half | second half | achieved OK RPS | offered RPS | success % | 429 | 503 | p95 L_total ms | p99 L_total ms | running max (both) | queued max (both) | reserved max (both) | steady-state latency usable |",
+        "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+    )
+    foreach ($stage in $staircase.stages) {
+        $rowsPerSec = $stage.backlogGrowth.totalRowsPerSec
+        $lines += "| $($stage.label) | $($stage.targetRps) | $($stage.windowSeconds) | $($stage.measurementSeconds) | $($stage.classification) | " +
+            "$(if ($null -eq $rowsPerSec) { 'unavailable' } else { $rowsPerSec }) | " +
+            "$($stage.backlogByHalf.firstHalfRowsPerSec) | $($stage.backlogByHalf.secondHalfRowsPerSec) | " +
+            "$(if ($null -eq $stage.http.achievedOkRps) { 'unavailable' } else { $stage.http.achievedOkRps }) | " +
+            "$(if ($null -eq $stage.http.offeredRps) { 'unavailable' } else { $stage.http.offeredRps }) | " +
+            "$(if ($null -eq $stage.http.successPercent) { 'unavailable' } else { $stage.http.successPercent }) | " +
+            "$(if ($null -eq $stage.http.ko429) { 'unavailable' } else { $stage.http.ko429 }) | " +
+            "$(if ($null -eq $stage.http.ko503) { 'unavailable' } else { $stage.http.ko503 }) | " +
+            "$($stage.latency.L_total_ms.p95) | $($stage.latency.L_total_ms.p99) | " +
+            "$($stage.executor.bothNodes.running.max) | $($stage.executor.bothNodes.queued.max) | $($stage.executor.bothNodes.reserved.max) | " +
+            "$(if ($stage.reliableAsSteadyStateLatency) { 'yes' } else { 'no' }) |"
+    }
+    $lines += @("", "### Where the percentiles may be read as service latency", "")
+    foreach ($stage in $staircase.stages) {
+        if ($stage.isWarmup) { continue }
+        $lines += "- $($stage.label) ($($stage.targetRps) RPS, $($stage.classification)): $(if ($stage.reliableAsSteadyStateLatency) { 'reliable' } else { 'not reliable' }) - $($stage.reliableAsSteadyStateLatencyReason)"
+    }
+    if (@($knee.stagesExcludedFromKnee).Count -gt 0) {
+        $lines += @("", "### Stages that could not be classified", "")
+        foreach ($excluded in $knee.stagesExcludedFromKnee) {
+            $lines += "- $($excluded.targetRps) RPS: $($excluded.reason)"
+        }
+    }
+    if (@($knee.stagesPollutedByApiRateLimit).Count -gt 0) {
+        $lines += @("", "### Stages the API rate limiter confounded", "")
+        foreach ($polluted in $knee.stagesPollutedByApiRateLimit) {
+            $lines += "- $($polluted.targetRps) RPS: $($polluted.reason)"
+        }
+    }
+    $lines += @("", "### Per-stage duplicate and stale work", "",
+        "| Stage | stale reclaim rows (timestamps) | claim_stale delta | stale completions | judge invocations | claim calls | claim rows | rejected | duplicate judge ms (lower-upper) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|")
+    foreach ($stage in $staircase.stages) {
+        $claim = $stage.claim
+        $lines += "| $($stage.label) | $($claim.staleReclaimRowsInWindow) | $(if ($null -eq $claim.claimStaleDelta) { 'unavailable' } else { $claim.claimStaleDelta }) | " +
+            "$(if ($null -eq $claim.staleCompletionDelta) { 'unavailable' } else { $claim.staleCompletionDelta }) | " +
+            "$(if ($null -eq $claim.judgeInvocationDelta) { 'unavailable' } else { $claim.judgeInvocationDelta }) | " +
+            "$(if ($null -eq $claim.claimCallsDelta) { 'unavailable' } else { $claim.claimCallsDelta }) | " +
+            "$(if ($null -eq $claim.claimRowsDelta) { 'unavailable' } else { $claim.claimRowsDelta }) | " +
+            "$(if ($null -eq $claim.executorRejectionsDelta) { 'unavailable' } else { $claim.executorRejectionsDelta }) | " +
+            "$(if ($null -eq $claim.duplicateJudgementMillisLowerBound) { 'unavailable' } else { "$($claim.duplicateJudgementMillisLowerBound)-$($claim.duplicateJudgementMillisUpperBound)" }) |"
+    }
+    $lines += @("", "Per-stage drain is unavailable by construction: $($staircase.stages[0].drain.reason)")
+    $lines += @("", "### Why the achieved rate falls short of workers divided by service time", "",
+        "| Stage | offered vs target % | timed judge mean ms | timed samples | implied occupancy ms | untimed per claim ms | running mean (both) | of $(2 * [int]$staircase.workerCountPerNode) workers | claims/s | rows per claim (batch $($staircase.mysqlClaimBatchSize)) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    foreach ($stage in $staircase.stages) {
+        $mech = $stage.mechanism
+        $lines += "| $($stage.label) | $(if ($null -eq $stage.offeredVsTargetPercent) { 'unavailable' } else { $stage.offeredVsTargetPercent }) | " +
+            "$(if ($null -eq $mech.timedJudgeMeanMs) { 'unavailable' } else { $mech.timedJudgeMeanMs }) | " +
+            "$(if ($null -eq $mech.timedJudgeSampleCount) { 'unavailable' } else { $mech.timedJudgeSampleCount }) | " +
+            "$(if ($null -eq $mech.impliedOccupancyMs) { 'unavailable' } else { $mech.impliedOccupancyMs }) | " +
+            "$(if ($null -eq $mech.untimedPerClaimMs) { 'unavailable' } else { $mech.untimedPerClaimMs }) | " +
+            "$(if ($null -eq $mech.runningMeanBothNodes) { 'unavailable' } else { $mech.runningMeanBothNodes }) | " +
+            "$(if ($null -eq $mech.workerUtilization) { 'unavailable' } else { $mech.workerUtilization }) | " +
+            "$(if ($null -eq $mech.claimsPerSecond) { 'unavailable' } else { $mech.claimsPerSecond }) | " +
+            "$(if ($null -eq $mech.rowsPerClaim) { 'unavailable' } else { $mech.rowsPerClaim }) |"
+    }
+    $lines += @("", "Implied occupancy: $($staircase.stages[0].mechanism.impliedOccupancyBasis)")
+    $lines += @("", "### Would a small change have flipped the steady verdict?", "",
+        "| Stage | endpoint rows/s | least squares rows/s | tick stdev rows | largest single tick swing | net rows that would exceed the threshold | verdict at half / double threshold | without first / last sample | stable |",
+        "|---|---:|---:|---:|---:|---:|---|---|---|")
+    foreach ($stage in $staircase.stages) {
+        $rob = $stage.growthRobustness
+        $lines += "| $($stage.label) | $(if ($null -eq $stage.backlogGrowth.totalRowsPerSec) { 'unavailable' } else { $stage.backlogGrowth.totalRowsPerSec }) | " +
+            "$(if ($null -eq $rob.leastSquaresRowsPerSec) { 'unavailable' } else { $rob.leastSquaresRowsPerSec }) | " +
+            "$(if ($null -eq $rob.perTickStdevRows) { 'unavailable' } else { $rob.perTickStdevRows }) | " +
+            "$(if ($null -eq $rob.maxSingleTickSwingRows) { 'unavailable' } else { $rob.maxSingleTickSwingRows }) | " +
+            "$(if ($null -eq $rob.netRowsThatWouldExceedThreshold) { 'unavailable' } else { $rob.netRowsThatWouldExceedThreshold }) | " +
+            "$(if ($null -eq $rob.classificationAtHalfThreshold) { 'unavailable' } else { "$($rob.classificationAtHalfThreshold) / $($rob.classificationAtDoubleThreshold)" }) | " +
+            "$(if ($null -eq $rob.classificationWithoutFirstSample) { 'unavailable' } else { "$($rob.classificationWithoutFirstSample) / $($rob.classificationWithoutLastSample)" }) | " +
+            "$(if ($null -eq $rob.stable) { 'unavailable' } else { $rob.stable }) |"
+    }
+    $lines += @("", "### Sampler honesty inside each measurement window", "",
+        "| Stage | ticks | mean interval ms | max interval ms | ticks slower than 1500 ms | max boundary snapshot lag ms |",
+        "|---|---:|---:|---:|---:|---:|")
+    foreach ($stage in $staircase.stages) {
+        $tick = $stage.tickHonesty
+        $lines += "| $($stage.label) | $($tick.ticks) | $(if ($null -eq $tick.meanIntervalMs) { 'unavailable' } else { $tick.meanIntervalMs }) | " +
+            "$(if ($null -eq $tick.maxIntervalMs) { 'unavailable' } else { $tick.maxIntervalMs }) | " +
+            "$($tick.ticksSlowerThan1500Ms) | " +
+            "$(if ($null -eq $tick.maxBoundaryLagMs) { 'unavailable' } else { $tick.maxBoundaryLagMs }) |"
+    }
+    $lines += @("", "Theory reference only, not a fitting target: $($knee.theoryReference.note)")
 }
 $lines | Set-Content (Join-Path $runPath "summary.md") -Encoding utf8
 
 Write-Host "Wrote summary.json and summary.md to $runPath"
+
+# Without an explicit exit the script leaves $LASTEXITCODE unset, so a caller that reports the code
+# of a completed analysis gets an empty string instead of 0.
+exit 0
