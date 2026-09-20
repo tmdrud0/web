@@ -41,7 +41,7 @@ rollback 경로에 대한 판정이며, **cold start 경로는 그 판정의 범
 | 그 뒤 | 이 보고서·`ARCHITECTURE.md`의 4라운드 절을 채우는 docs commit(§17) |
 | 5라운드 기준 HEAD | `aa979d2` (기준 + 28 commit) — 5라운드 작업을 시작한 지점. 4라운드 문서 정정 commit의 마지막 |
 | 5라운드 결과 commit | `04ab46b` (기준 + 29 commit) — 반쯤 실패한 start의 정상화. 소스 2 files(그중 신규 0), `+441 / −34` |
-| 그 뒤 | 이 보고서·`ARCHITECTURE.md`의 5라운드 절을 채우는 docs commit(§18) |
+| 그 뒤 | 이 보고서·`ARCHITECTURE.md`의 5라운드 절을 채우는 docs commit `0001d8a`(§18), 그리고 최종 작업 트리 상태를 기록하는 docs commit(§18.4) |
 | 작업 트리 | **3라운드 작업이 커밋되기 전에는 dirty였다** — 커밋 후 `git status --short`가 비는지는 §16.9에 적었다 |
 | 원본 checkout | 건드리지 않음. `reset`/`clean`/강제 checkout 사용 안 함 |
 
@@ -1547,6 +1547,16 @@ suppressed 예외의 **정확한 메시지 단언은 double의 성질**이다. �
 `ContestScoreboardStreamLifecycleTests`가 27 → 31(+4)이고 나머지 18클래스는 4라운드와 같은 수다
 (155 → 159). 실행 뒤 JUnit XML 전체에 `HikariPool|jdbc:mysql|Flyway`가 없음을 확인했다 — DB 활동
 0건. `git diff --check`는 통과했고, 작업 트리에는 소스 2 files만 있다.
+
+**변경 파일(5라운드).** `src/main/java/my/oj/web/contest/scoreboard/stream/ContestScoreboardStreamLifecycle.java`,
+`src/test/java/my/oj/web/contest/scoreboard/stream/ContestScoreboardStreamLifecycleTests.java`,
+`docs/SCOREBOARD_RECOVERY_FINAL_REPORT.md`, `docs/ARCHITECTURE.md`. 신규 파일 0, 신규 의존성 0,
+공개 API 변경 0.
+
+**최종 작업 트리.** 두 commit(`04ab46b` code, `0001d8a` docs)을 만든 뒤 `git status --short`는
+**아무것도 출력하지 않는다**(미추적 파일 없음). 이 문단을 넣는 commit까지 끝난 뒤 다시 확인했고,
+그 시점에도 clean이다 — 이 보고서 자신이 커밋됐으므로 "clean"이 커밋된 파일만 세는 값이 아니라
+작업 트리 전체의 값이다.
 
 **수정 전 실측.** 새 상태 기반 테스트 4건을 **고치지 않은 구현**에 먼저 돌려 **31건 중 4건 실패**를
 확인했다. 실패 메시지가 정확히 이 결함을 가리킨다 — `reportsItselfRunning()`이 true로 남아
