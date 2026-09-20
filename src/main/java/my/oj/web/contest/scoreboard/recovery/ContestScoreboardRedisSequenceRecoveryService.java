@@ -11,6 +11,7 @@ import my.oj.web.contest.submission.core.ContestScoreboardDuplicateSequence;
 import my.oj.web.contest.submission.core.ContestScoreboardSequencedRow;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
+import my.oj.web.submission.SubmissionResult;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -56,6 +57,11 @@ import java.util.Map;
  *   <li>Replay every candidate through the same apply path the live stream uses, which is what
  *       makes a mode switch a change of checkpoint rather than a second scoring implementation.</li>
  * </ol>
+ *
+ * <p>A candidate is only ever a judged result: {@link #collect} drops the unjudged ones as the two
+ * reads hand their rows over, because the script this mode replays through records a submission in
+ * its processed set outside the branch that skips {@code PENDING} - so applying an unjudged result
+ * would swallow its real judgement for good.</p>
  *
  * <p>The walk continues past the first window because a window alone leaves a hole: when the
  * allocator has fallen further than {@code check-window-size} results, the deepest missing rows are
@@ -140,7 +146,7 @@ public class ContestScoreboardRedisSequenceRecoveryService {
         long allocator = sequenceSource.allocatorSequence();
         for (ContestScoreboardSequencedRow row : walk.rows()) {
             if (row.getAppliedSequence() > allocator) {
-                candidates.putIfAbsent(row.getSubmissionId(), row);
+                collect(candidates, row);
             }
         }
 
@@ -158,6 +164,29 @@ public class ContestScoreboardRedisSequenceRecoveryService {
                 scan.saturated() || walk.saturated(),
                 ordered.size()
         );
+    }
+
+    /**
+     * Adds the row to the candidates unless the scoreboard must not be shown it.
+     *
+     * <p>An unjudged result is such a row. The script records a submission in its processed set
+     * <em>outside</em> the branch that skips {@code PENDING}, so applying one would make that
+     * submission's real judgement a no-op for good - the failure the replay query's own filter
+     * exists to prevent, and this mode replays through the same script, so it owes the same
+     * filter.</p>
+     *
+     * <p>It is applied as candidates are collected rather than in the queries, and that placement is
+     * deliberate: the descending walk pages by sequence and treats a page shorter than the window as
+     * the end of the set, so a query that dropped rows would make a window look exhausted above rows
+     * the walk still needed. Filtering here leaves the walk's row set, and therefore its paging,
+     * exactly as it was.</p>
+     */
+    private static void collect(Map<Long, ContestScoreboardSequencedRow> candidates,
+                                ContestScoreboardSequencedRow row) {
+        if (row.getResult() == null || row.getResult() == SubmissionResult.PENDING) {
+            return;
+        }
+        candidates.putIfAbsent(row.getSubmissionId(), row);
     }
 
     /**
@@ -186,7 +215,7 @@ public class ContestScoreboardRedisSequenceRecoveryService {
                     .map(ContestScoreboardDuplicateSequence::getAppliedSequence)
                     .toList();
             for (ContestScoreboardSequencedRow row : resultRepository.findRowsByAppliedSequences(sequences)) {
-                candidates.putIfAbsent(row.getSubmissionId(), row);
+                collect(candidates, row);
             }
             if (page.size() < config.checkWindowSize()) {
                 return new DuplicateScan(groups, false);

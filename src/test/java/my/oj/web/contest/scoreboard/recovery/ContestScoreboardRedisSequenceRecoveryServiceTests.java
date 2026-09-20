@@ -265,7 +265,7 @@ class ContestScoreboardRedisSequenceRecoveryServiceTests {
 
         ContestScoreboardRecoveryProperties.RedisSequence config =
                 new ContestScoreboardRecoveryProperties.RedisSequence(
-                        Duration.ofSeconds(30), Duration.ofSeconds(30), 100, 3, 5, 1000, 1, 4,
+                        Duration.ofSeconds(30), Duration.ofSeconds(30), 100, 3, 5, 1, 4,
                         Duration.ofMillis(20), true);
         service(config).check();
 
@@ -360,7 +360,7 @@ class ContestScoreboardRedisSequenceRecoveryServiceTests {
 
     private static ContestScoreboardRecoveryProperties.RedisSequence config(int windowSize, int maxWindows) {
         return new ContestScoreboardRecoveryProperties.RedisSequence(
-                Duration.ofSeconds(30), Duration.ofSeconds(30), windowSize, maxWindows, 2, 1000, 500, 3,
+                Duration.ofSeconds(30), Duration.ofSeconds(30), windowSize, maxWindows, 2, 500, 3,
                 Duration.ofMillis(50), true);
     }
 

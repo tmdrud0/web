@@ -14,13 +14,17 @@ import org.springframework.data.redis.core.script.RedisScript;
  * correctness rule; this set only avoids recalculating duplicate stream entries. A contest reset
  * clears it so a DB rebuild can repopulate empty standings without advancing KEYS[1].
  *
- * <p>When {@code ARGV[10]} is {@code 1} the script also issues a recovery sequence: {@code INCR}
- * on KEYS[7] plus {@code HSET} of {@code submissionId -> sequence} in KEYS[8]. The sequence is
- * issued inside this one invocation precisely so that it cannot diverge from the scoreboard it
- * describes - a snapshot that rolls the standings back rolls the allocator and the mapping back
- * with them. The reply is unchanged (the same stream offset as before), so the caller reads the
- * issued sequence back from KEYS[8] rather than from a second round trip. With {@code ARGV[10]}
- * at {@code 0} the script does no sequence work at all and behaves exactly as it did before.
+ * <p>When {@code ARGV[10]} is {@code 1} the script also issues a recovery sequence: it reads the
+ * allocator in KEYS[7], takes the next value above it - stepped past any mapping already held for
+ * this submission, so a rewound allocator cannot re-issue a sequence a surviving mapping owns - then
+ * {@code SET}s the allocator to it and {@code HSET}s {@code submissionId -> sequence} in KEYS[8].
+ * The sequence is issued inside this one invocation precisely so that it cannot diverge from the
+ * scoreboard it describes - a snapshot that rolls the standings back rolls the allocator and the
+ * mapping back with them. The reply is unchanged (the same stream offset as before), so the caller
+ * reads the issued sequence back from KEYS[8] rather than from a second round trip. A submission
+ * already in KEYS[6] returns before any of this, so a re-delivered event is issued no sequence at
+ * all. With {@code ARGV[10]} at {@code 0} the script does no sequence work and behaves exactly as it
+ * did before.
  */
 final class ContestScoreboardRedisScript {
 

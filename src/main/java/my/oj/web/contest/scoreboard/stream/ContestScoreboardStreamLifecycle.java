@@ -27,8 +27,14 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
     private final ContestScoreboardStreamMetrics metrics;
     private final ContestScoreboardRecoveryProperties properties;
     private volatile boolean running;
-    /** The failure count already answered by a resubscribe, so one failure is not retried forever. */
-    private long handledFailures;
+    /**
+     * The failure count already answered by a resubscribe, so one failure is not retried forever.
+     *
+     * <p>Volatile because the pass that judges it runs on the scheduler thread while the value is
+     * written under the monitor: without it a stale read costs a redundant stop/start of a consumer
+     * whose failure was already answered.</p>
+     */
+    private volatile long handledFailures;
 
     ContestScoreboardStreamLifecycle(
             @Qualifier("contestScoreboardStreamListenerContainer") SimpleMessageListenerContainer container,
@@ -131,11 +137,13 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
                 }
                 // The checkpoint is trusted here - this process applied up to it - so the batch is
                 // resumed at the next offset rather than by re-reading retention, whatever the startup
-                // policy says about a checkpoint on the way up.
+                // policy says about a checkpoint on the way up. An unset checkpoint is the exception
+                // that naming this as offset+1 would misreport: the broker is asked for "first".
+                Object requested = resumeAfter(storedOffset);
                 log.warn("Resubscribing the scoreboard stream consumer at {} to re-read a failed batch",
-                        storedOffset + 1L);
+                        requested);
                 metrics.recordFailureRestart();
-                startAt(storedOffset, resumeAfter(storedOffset));
+                startAt(storedOffset, requested);
             }
         } catch (RuntimeException failure) {
             log.warn("Could not inspect or restart the scoreboard stream consumer", failure);

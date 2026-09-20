@@ -36,6 +36,10 @@ class ContestScoreboardRecoveryModeWiringTests {
     private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
             .withUserConfiguration(
                     Dependencies.class,
+                    // The production class, not a mock: this runner's job is to decide whether the
+                    // service comes up in every mode, and a bean the test itself registers would
+                    // answer that whichever way the service were annotated.
+                    ContestScoreboardFullReplayService.class,
                     ContestScoreboardFullReplayStartupRunner.class,
                     ContestScoreboardRedisSequenceConfig.class,
                     ContestScoreboardRedisSequenceRecoveryService.class,
@@ -43,12 +47,20 @@ class ContestScoreboardRecoveryModeWiringTests {
                     ContestScoreboardRedisSequenceStartupCheck.class
             );
 
+    /**
+     * The service is unconditional - the retention-gap fallback replays through it in every mode, so
+     * a mode without it could not bridge a gap. The modes other than its own are checked as well as
+     * the default, because "available in every mode" is the claim.
+     */
     @Test
     void theReplayServiceIsAvailableInEveryMode() {
-        contextRunner.run(context -> {
-            assertThat(context).hasSingleBean(ContestScoreboardFullReplayService.class);
-            assertThat(context).doesNotHaveBean(ContestScoreboardFullReplayStartupRunner.class);
-        });
+        for (String mode : new String[]{"stream-offset", "full-replay", "redis-seq"}) {
+            contextRunner
+                    .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                    .run(context -> assertThat(context)
+                            .as("mode=%s", mode)
+                            .hasSingleBean(ContestScoreboardFullReplayService.class));
+        }
     }
 
     @Test
@@ -135,11 +147,6 @@ class ContestScoreboardRecoveryModeWiringTests {
     @Configuration
     @EnableConfigurationProperties(ContestScoreboardRecoveryProperties.class)
     static class Dependencies {
-
-        @Bean
-        ContestScoreboardFullReplayService fullReplayService() {
-            return mock(ContestScoreboardFullReplayService.class);
-        }
 
         @Bean
         ContestScoreboardApplier scoreboardApplier() {

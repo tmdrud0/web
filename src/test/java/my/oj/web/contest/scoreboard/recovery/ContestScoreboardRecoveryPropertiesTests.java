@@ -32,7 +32,6 @@ class ContestScoreboardRecoveryPropertiesTests {
             assertThat(properties.redisSeq().checkWindowSize()).isEqualTo(1000);
             assertThat(properties.redisSeq().maxWindowsPerPass()).isEqualTo(10);
             assertThat(properties.redisSeq().maxIterations()).isEqualTo(5);
-            assertThat(properties.redisSeq().dbBatchSize()).isEqualTo(1000);
             assertThat(properties.redisSeq().replayBatchSize()).isEqualTo(500);
             assertThat(properties.redisSeq().retryMaxAttempts()).isEqualTo(3);
             assertThat(properties.redisSeq().retryBackoff()).isEqualTo(Duration.ofMillis(50));
@@ -83,7 +82,6 @@ class ContestScoreboardRecoveryPropertiesTests {
         assertRejected("contest.scoreboard.recovery.redis-seq.check-window-size=0");
         assertRejected("contest.scoreboard.recovery.redis-seq.max-windows-per-pass=0");
         assertRejected("contest.scoreboard.recovery.redis-seq.max-iterations=0");
-        assertRejected("contest.scoreboard.recovery.redis-seq.db-batch-size=0");
         assertRejected("contest.scoreboard.recovery.redis-seq.replay-batch-size=0");
         assertRejected("contest.scoreboard.recovery.redis-seq.retry-max-attempts=0");
     }

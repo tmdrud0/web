@@ -21,11 +21,13 @@ public class JdbcContestScoreboardAppliedAtWriter {
             """;
 
     /**
-     * {@code scoreboard_applied_seq} is overwritten rather than coalesced, unlike the timestamp: a
-     * replayed result must converge on the sequence the scoreboard now holds for it, otherwise it
-     * stays above the allocator and is replayed again on every check. A null sequence leaves the
-     * column alone instead of erasing it - a result the scoreboard never sequenced carries no
-     * information about what an earlier application recorded.
+     * A sequence this batch issued overwrites {@code scoreboard_applied_seq}, while the timestamp
+     * beside it keeps its first value. The overwrite is what makes a replayed result converge on the
+     * sequence the scoreboard now holds for it - left holding its old sequence it would stay above
+     * the allocator and be replayed again on every check. The {@code COALESCE} here is not the
+     * timestamp's: a null sequence (an application that was issued none) leaves the column alone
+     * instead of erasing it, because a result the scoreboard never sequenced carries no information
+     * about what an earlier application recorded.
      */
     private static final String MARK_APPLIED_WITH_SEQUENCE_SQL = """
             UPDATE contest_submission_result

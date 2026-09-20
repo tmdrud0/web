@@ -43,7 +43,6 @@ public final class ContestScoreboardRecoverySummary {
                         .append(" check-window-size=").append(redisSeq.checkWindowSize())
                         .append(" max-windows-per-pass=").append(redisSeq.maxWindowsPerPass())
                         .append(" max-iterations=").append(redisSeq.maxIterations())
-                        .append(" db-batch-size=").append(redisSeq.dbBatchSize())
                         .append(" replay-batch-size=").append(redisSeq.replayBatchSize())
                         .append(" retry-max-attempts=").append(redisSeq.retryMaxAttempts())
                         .append(" retry-backoff=").append(duration(redisSeq.retryBackoff()))

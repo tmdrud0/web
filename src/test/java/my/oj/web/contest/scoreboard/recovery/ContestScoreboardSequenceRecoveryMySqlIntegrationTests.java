@@ -231,6 +231,76 @@ class ContestScoreboardSequenceRecoveryMySqlIntegrationTests {
                 .doesNotContain(judged.get(1).attempt().submissionId());
     }
 
+    /**
+     * An unjudged result is not a candidate, in either of the shapes the checks look for.
+     *
+     * <p>Each unjudged row below carries exactly the marks that make a row a candidate: one sits above
+     * the allocator, and two share a sequence with each other. Replaying one is not a wasted write.
+     * The script records a submission in its processed set <em>outside</em> the branch that skips
+     * {@code PENDING}, and the in-memory scoreboard mirrors that, so the submission would be recorded
+     * as applied while it was unjudged, and its real judgement would then be absorbed as a duplicate
+     * for good.</p>
+     *
+     * <p>The shape is seeded rather than produced, and deliberately so. A sequence is only ever
+     * written for a result the scoreboard applied, and the judge path inserts a result row with
+     * {@code INSERT IGNORE} rather than rewriting one - so an unjudged row holding a sequence has to
+     * come from outside that path, such as a rejudge or an operator's repair. It is the value being
+     * unjudged that decides what this mode owes it, not how it got there, and this is where that
+     * decision is pinned.</p>
+     *
+     * <p>The last step is the assertion that matters: not that a mapping is absent from a map, but
+     * that the judgement arriving afterwards still lands. It is the only observable that separates
+     * "the scoreboard was never shown this row" from "it was shown and absorbed it".</p>
+     */
+    @Test
+    void anUnjudgedResultIsNeverOfferedToTheScoreboard() {
+        SeededContest contest = seedContest("seq-pending", 1, 5);
+        List<Judged> judged = attempts(contest, 2);
+        Judged aboveAllocator = unjudged(contest, 922_000_000_000_000_000L, contest.userIds().get(2));
+        Judged sharingASequence = unjudged(contest, 923_000_000_000_000_000L, contest.userIds().get(3));
+        Judged sharingTheSameSequence = unjudged(contest, 924_000_000_000_000_000L, contest.userIds().get(4));
+        List<Judged> unjudged = List.of(aboveAllocator, sharingASequence, sharingTheSameSequence);
+
+        for (Judged one : judged) {
+            apply(one);
+        }
+        // The database kept a sequence for the judged results - the allocator is at two - and the
+        // unjudged rows hold the two shapes the checks key on. The pair's seven is above the
+        // allocator as well, so both scans reach it and only the pair's own reuse distinguishes them.
+        writeSequences(judged, 1L);
+        writeSequence(aboveAllocator, 3L);
+        writeSequence(sharingASequence, 7L);
+        writeSequence(sharingTheSameSequence, 7L);
+        assertThat(applier.allocatorSequence()).isEqualTo(2L);
+
+        ContestScoreboardRedisSequenceRecoveryService.SequenceCheckReport report = recoveryService.check();
+
+        // The reuse is found - it is a real reuse, and reporting it is the check's job - and neither
+        // of its members is offered, nor is the row above the allocator. A round with no candidates
+        // ends the pass, so this is the whole of what the mode did.
+        assertThat(report.duplicateGroups()).isEqualTo(1);
+        assertThat(report.replayed()).isZero();
+        assertThat(report.rounds()).isEqualTo(1);
+        assertThat(report.unresolved()).isFalse();
+
+        List<Long> unjudgedIds = unjudged.stream().map(one -> one.attempt().submissionId()).toList();
+        // The scoreboard was never shown them: no sequence was issued, and the marker wrote nothing.
+        assertThat(applier.appliedSequences(unjudgedIds)).isEmpty();
+        assertThat(appliedTimestamps(unjudged)).containsOnlyNulls();
+        // And they were left exactly where they were: a row this mode declines to touch keeps both
+        // its stored sequence and its missing timestamp.
+        assertThat(storedSequences(unjudged)).containsExactly(3L, 7L, 7L);
+        assertThat(rankingUserIds(contest)).containsExactlyInAnyOrderElementsOf(
+                judged.stream().map(one -> one.attempt().userId()).toList());
+
+        // The judgement arrives, as it would on the stream. It lands - which is what the exclusion
+        // protects, because had the unjudged row been replayed the submission would already be in the
+        // processed set and this update would be absorbed with the user never appearing.
+        judge(aboveAllocator);
+        apply(aboveAllocator, SubmissionResult.ACCEPTED);
+        assertThat(rankingUserIds(contest)).contains(aboveAllocator.attempt().userId());
+    }
+
     private SeededContest seedContest(String namePrefix, int problemCount, int userCount) {
         return ContestScoreboardTestData.seedContest(jdbcTemplate, namePrefix, CONTEST_START, problemCount, userCount);
     }
@@ -253,6 +323,14 @@ class ContestScoreboardSequenceRecoveryMySqlIntegrationTests {
     }
 
     private void apply(Judged judged) {
+        apply(judged, judged.attempt().result());
+    }
+
+    /**
+     * Applies an attempt as if the stream had delivered it just now, optionally under a result other
+     * than the one it was seeded with - which is how a later judgement is delivered.
+     */
+    private void apply(Judged judged, SubmissionResult result) {
         Attempt attempt = judged.attempt();
         applier.apply(ContestScoreboardApplier.ApplyRequest.rebuild(
                 attempt.submissionId(),
@@ -263,10 +341,37 @@ class ContestScoreboardSequenceRecoveryMySqlIntegrationTests {
                         attempt.userId(),
                         CONTEST_START,
                         CONTEST_START.plusMinutes(attempt.submittedMinute()),
-                        attempt.result(),
+                        result,
                         null
                 )
         ));
+    }
+
+    /** A stored result that has not been judged yet, in the shape the result table holds it in. */
+    private Judged unjudged(SeededContest contest, long submissionId, long userId) {
+        Attempt attempt = new Attempt(
+                submissionId,
+                contest.problemIds().get(0),
+                userId,
+                3,
+                4,
+                SubmissionResult.PENDING
+        );
+        ContestScoreboardTestData.insertAttempts(
+                jdbcTemplate, contest.contestId(), CONTEST_START, List.of(attempt), true);
+        return new Judged(contest, attempt);
+    }
+
+    /** Settles a result the way a later judgement would, both columns included. */
+    private void judge(Judged judged) {
+        jdbcTemplate.update("""
+                UPDATE contest_submission_result
+                SET provisional_result = ?, final_result = ?
+                WHERE submission_id = ?
+                """,
+                SubmissionResult.ACCEPTED.name(),
+                SubmissionResult.ACCEPTED.name(),
+                judged.attempt().submissionId());
     }
 
     /** Writes each attempt's pre-rollback sequence, as an application before the snapshot recorded it. */
@@ -330,7 +435,7 @@ class ContestScoreboardSequenceRecoveryMySqlIntegrationTests {
                 ContestScoreboardRecoveryMode.REDIS_SEQ,
                 new ContestScoreboardRecoveryProperties.FullReplay(1000, 500, true),
                 new ContestScoreboardRecoveryProperties.RedisSequence(
-                        Duration.ofSeconds(30), Duration.ofSeconds(30), windowSize, maxWindows, 3, 1000, 500,
+                        Duration.ofSeconds(30), Duration.ofSeconds(30), windowSize, maxWindows, 3, 500,
                         3, Duration.ofMillis(10), true),
                 new ContestScoreboardRecoveryProperties.StreamOffset(
                         ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback.FULL_REPLAY,

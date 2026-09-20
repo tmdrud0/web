@@ -159,7 +159,6 @@ class ContestScoreboardRecoverySummaryTests {
                         1000,
                         10,
                         5,
-                        1000,
                         500,
                         3,
                         Duration.ofMillis(50),

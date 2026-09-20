@@ -191,7 +191,7 @@ class ContestScoreboardStreamLifecycleTests {
                 ContestScoreboardRecoveryMode.STREAM_OFFSET,
                 new ContestScoreboardRecoveryProperties.FullReplay(1000, 500, true),
                 new ContestScoreboardRecoveryProperties.RedisSequence(
-                        Duration.ofSeconds(30), Duration.ofSeconds(30), 1000, 10, 5, 1000, 500, 3,
+                        Duration.ofSeconds(30), Duration.ofSeconds(30), 1000, 10, 5, 500, 3,
                         Duration.ofMillis(50), true),
                 new ContestScoreboardRecoveryProperties.StreamOffset(
                         ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback.FULL_REPLAY,

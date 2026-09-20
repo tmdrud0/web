@@ -194,11 +194,15 @@ seq는 **Redis가 발급**하고, 할당자와 매핑이 같은 Redis에 있으�
   않는다. 매핑이 다시 발급되지 않는다는 뜻이며, **응답값은 stream offset 그대로**다. 그래서 호출자는
   발급된 seq를 두 번째 왕복 없이 `KEYS[8]`에서 되읽는다. 재전달된 이벤트가 새 seq를 받지 않는다는
   옛 규칙의 의도는 이렇게 남는다 — 다만 **반환값이 아니다.**
-- DB 영속화는 `scoreboard_applied_at = COALESCE(...)`(최초 적용 시각 보존)와
-  `scoreboard_applied_seq = ?`(덮어쓰기)를 한 배치 UPDATE로 함께 쓴다. seq를 COALESCE하면 재생된
-  행이 옛 seq를 계속 들고 `seq > allocator` 후보로 영원히 남는다. 중복 seq는 재생 **이전에** 검사가
-  잡으므로 증거를 잃지 않는다.
+- DB 영속화는 `scoreboard_applied_at = COALESCE(...)`(최초 적용 시각 보존)와 `scoreboard_applied_seq`
+  (발급된 seq가 있으면 덮어쓰고, 없으면 `COALESCE`가 옛 값을 남긴다)를 한 배치 UPDATE로 함께 쓴다.
+  seq를 덮어쓰는 것이 재생된 행을 할당자 아래로 수렴시키는 방법이다 — 옛 seq를 계속 들고 있으면
+  `seq > allocator` 후보로 영원히 남는다. 중복 seq는 재생 **이전에** 검사가 잡으므로 증거를 잃지 않는다.
 - stream-offset 모드는 seq 플래그가 꺼져 있으므로 위 분기 자체를 타지 않는다.
+- **미채점 행은 후보가 아니다.** 두 읽기(중복 그룹의 행, 내림차순 walk)가 행을 넘겨줄 때
+  `ContestScoreboardRedisSequenceRecoveryService.collect`가 걸러낸다. 쿼리에서 거르지 않는 이유는
+  walk가 **sequence로 페이징**하고 window보다 짧은 page를 "집합의 끝"으로 읽기 때문이다 — 쿼리에서
+  행을 떨어뜨리면 아직 필요한 행 위에서 walk가 끝난 것처럼 보인다.
 
 한 회차는 **중복 검사 → lost-tail 검사 → 재생** 순서다.
 
@@ -225,6 +229,16 @@ chunk 단위로만 잡고** `retry-max-attempts`/`retry-backoff`를 적용한다
 `redis-seq.unresolved` 지표와 로그로 보고한다. 반대로 **아직 처리되지 않은** 행의 재생은 수렴한다 —
 적용이 그 행에 seq를 발급하고 할당자를 그 값으로 함께 올리므로, 되읽은 seq가 할당자보다 클 수 없다.
 
+**구성원에 미채점 행이 있는 중복 그룹**도 같은 이유로 해소되지 않지만, 경로가 다르다. 그 행은
+후보에서 제외되므로 **재생 자체가 일어나지 않고**, 남은 구성원이 이미 처리된 행이면 발급할 seq도
+없다. 그래서 후보가 0건인 회차로 끝나 `unresolved`는 서지 않는다 — 그룹을 고치려면 미채점 행을
+적용해야 하는데, 그것이 바로 이 모드가 하지 않기로 한 일이기 때문이다. 이 상태는 매 회차
+`redis-seq.duplicates`가 0이 아닌 채로 남아 **지표로는 드러난다.** 참고로 미채점 행을 적용해
+그룹을 "해소"하려는 시도는 해소가 아니라 악화다 — 위에서 본 대로 그 행에는 seq가 발급되지 않으므로
+그룹은 그대로 남고, 제출만 `processed` set에 찍혀 실제 채점 결과가 영구히 삼켜진다
+(`ContestScoreboardSequenceRecoveryMySqlIntegrationTests.anUnjudgedResultIsNeverOfferedToTheScoreboard`
+가 이 두 가지를 함께 고정한다).
+
 ## 4. 중요한 불변식
 
 - scoreboard 결과는 event 순서와 중복 횟수에 무관해야 한다. Redis Lua와
@@ -242,8 +256,9 @@ chunk 단위로만 잡고** `retry-max-attempts`/`retry-backoff`를 적용한다
 - **미채점(PENDING) 결과를 scoreboard에 적용하지 않는다.** Lua는 `ARGV[4] == 'PENDING'`일 때
   standings 변형만 건너뛰고 `sadd processed submissionId`는 그 블록 **바깥**에서 무조건 실행한다.
   PENDING을 한 번 적용하면 그 제출이 `processed` set에 들어가 이후 `alreadyProcessed == 1` 분기가
-  **실제 채점 결과를 영구히 삼킨다.** 그래서 두 replay 경로(`ContestScoreboardFullReplayService`,
-  `ContestScoreboardRebuildService`)가 모두 PENDING을 후보에서 제외한다.
+  **실제 채점 결과를 영구히 삼킨다.** 그래서 **세 replay 경로 전부**가 PENDING을 후보에서 제외한다 —
+  `ContestScoreboardFullReplayService`와 `ContestScoreboardRebuildService`는 쿼리에서,
+  `ContestScoreboardRedisSequenceRecoveryService`는 후보를 모을 때(§3.4) 제외한다.
 - `scoreboard_applied_at`은 `COALESCE`로 최초 적용 시각을 보존하고, `scoreboard_applied_seq`는
   덮어쓴다(§3.4).
 - AMQP 0.9.1 stream consumer에는 명시적 prefetch가 필요하다. 현재 구성은 consumer 1개,
@@ -288,7 +303,6 @@ chunk 단위로만 잡고** `retry-max-attempts`/`retry-backoff`를 적용한다
 | `...recovery.redis-seq.check-window-size` | `1000` |
 | `...recovery.redis-seq.max-windows-per-pass` | `10` |
 | `...recovery.redis-seq.max-iterations` | `5` |
-| `...recovery.redis-seq.db-batch-size` | `1000` |
 | `...recovery.redis-seq.replay-batch-size` | `500` |
 | `...recovery.redis-seq.retry-max-attempts` | `3` |
 | `...recovery.redis-seq.retry-backoff` | `50ms` |

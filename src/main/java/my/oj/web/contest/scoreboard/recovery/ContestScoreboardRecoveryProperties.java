@@ -42,7 +42,6 @@ public record ContestScoreboardRecoveryProperties(
             @DefaultValue("1000") @Min(1) int checkWindowSize,
             @DefaultValue("10") @Min(1) int maxWindowsPerPass,
             @DefaultValue("5") @Min(1) int maxIterations,
-            @DefaultValue("1000") @Min(1) int dbBatchSize,
             @DefaultValue("500") @Min(1) int replayBatchSize,
             @DefaultValue("3") @Min(1) int retryMaxAttempts,
             @DefaultValue("50ms") Duration retryBackoff,

@@ -37,7 +37,7 @@ class ContestScoreboardFullReplayStartupRunnerTests {
                 ContestScoreboardRecoveryMode.FULL_REPLAY,
                 new ContestScoreboardRecoveryProperties.FullReplay(1000, 500, startupReplayEnabled),
                 new ContestScoreboardRecoveryProperties.RedisSequence(
-                        Duration.ofSeconds(30), Duration.ofSeconds(30), 1000, 10, 5, 1000, 500,
+                        Duration.ofSeconds(30), Duration.ofSeconds(30), 1000, 10, 5, 500,
                         3, Duration.ofMillis(50), true),
                 new ContestScoreboardRecoveryProperties.StreamOffset(
                         ContestScoreboardRecoveryProperties.StreamOffset.RetentionGapFallback.FULL_REPLAY,
