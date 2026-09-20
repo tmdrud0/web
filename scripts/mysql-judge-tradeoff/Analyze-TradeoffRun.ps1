@@ -23,6 +23,14 @@ function Get-Percentile {
     return [math]::Round([double]$sorted[$index], 3)
 }
 
+function Get-RatioOrNull {
+    param($Value, $Denominator, [int]$Places = 6)
+    # A rate over zero accepted submissions is not zero, it is undefined; the caller writes null and
+    # the report says unavailable rather than publishing a zero that would read as "none happened".
+    if ($null -eq $Value -or $null -eq $Denominator -or $Denominator -le 0) { return $null }
+    return [math]::Round($Value / $Denominator, $Places)
+}
+
 function Get-LatencySummary {
     param([object[]]$Rows)
     $result = [ordered]@{}
@@ -385,6 +393,7 @@ if ($events.faultInjectedAt -and $events.firstStaleReclaimObservedAt) {
 # Everything below runs only for a staircase run. Without stages.json the summary keeps exactly the
 # shape it had before the staircase harness existed, so an older run directory still analyzes.
 $staircase = $null
+$duplication = $null
 $stagesPath = Join-Path $runPath "stages.json"
 if (Test-Path $stagesPath) {
     $stagesDoc = Get-Content $stagesPath -Raw | ConvertFrom-Json
@@ -726,6 +735,23 @@ if (Test-Path $stagesPath) {
                     reserved = Get-ColumnStats $executorSeries "reserved"
                 }
             }
+            # The claim path is only bounded as designed if the reserved counter never passes the
+            # configured max-in-flight, and the workers are only as busy as designed if running never
+            # passes the worker count. Both are checked against the code's own limits rather than
+            # against each other, so a run where a cap was exceeded is visible instead of inferred.
+            executorCaps = [ordered]@{
+                runningMaxBothNodes = (Get-ColumnStats $executorSeries "running").max
+                runningLimitBothNodes = 2 * [int]$parameters.workerCountPerNode
+                reservedMaxBothNodes = (Get-ColumnStats $executorSeries "reserved").max
+                reservedLimitBothNodes = 2 * [int]$parameters.mysqlMaxInFlightPerNode
+                withinConfiguredCaps = (
+                    $null -ne (Get-ColumnStats $executorSeries "running").max -and
+                    $null -ne (Get-ColumnStats $executorSeries "reserved").max -and
+                    (Get-ColumnStats $executorSeries "running").max -le (2 * [int]$parameters.workerCountPerNode) -and
+                    (Get-ColumnStats $executorSeries "reserved").max -le (2 * [int]$parameters.mysqlMaxInFlightPerNode)
+                )
+                basis = "both nodes' gauges summed per tick; the limits are 2 x workerCountPerNode for running and 2 x mysqlMaxInFlightPerNode for reserved, as configured in parameters.json"
+            }
             mysql = [ordered]@{
                 threadsConnected = Get-ColumnStats $windowRows "threadsConnected"
                 threadsRunning = Get-ColumnStats $windowRows "threadsRunning"
@@ -912,6 +938,169 @@ if (Test-Path $stagesPath) {
         $cohorts["measurement-steady"] = $summaryForWindows
     }
 
+    # --- duplicate claims and duplicate judging (normal-timeout runs only) -------------------------
+    # Three quantities that are easy to conflate and are not the same thing:
+    #   1. a durable duplicate *claim*: an outbox row whose attempts counter went above 1, i.e. the
+    #      lease expired and the row was handed to a judge a second time. This is what the claim
+    #      timeout controls, and it is measured from the rows themselves (attempts is durable).
+    #   2. an actual duplicate *judge execution*: an execution whose result was thrown away because
+    #      another attempt had already published under a newer token. In the dispatcher that is
+    #      exactly completion{outcome="stale"}: judgeSubmission ran, the fenced UPDATE matched no row,
+    #      and the work was discarded - so the submission was judged twice for one result.
+    #   3. token-fencing evidence: the counters showing the fence worked - the stale completions
+    #      above, the expired-lease rows seen at claim time, and the reclaims answered from the
+    #      stored result instead of a second execution.
+    # The counters also carry an accounting identity, which is checked here rather than assumed.
+    # Every judge() call ends in exactly one of publish (success), fence refusal (stale) or failure
+    # (failure); and a publish is either a new result row or a stored-result republish. So
+    #   invocations - results = republish + failure + stale
+    # and a nonzero residual means a counter path that did not record, not extra duplicates.
+    if ($stagesDoc.mode -eq "normal-timeout") {
+        $workCost = $verification.workCost
+        $acceptedCount = $verification.counts.accepted
+        $resultRows = $verification.counts.results
+        $attemptRowsPath = Join-Path $runPath "claim-attempts.tsv"
+        $attemptHistogram = [ordered]@{}
+        $rowsAboveOne = $null
+        if (Test-Path $attemptRowsPath) {
+            foreach ($line in @(Get-Content $attemptRowsPath | Select-Object -Skip 1)) {
+                $parts = $line -split "`t"
+                if ($parts.Count -lt 2) { continue }
+                $attemptHistogram[$parts[0]] = [long]$parts[1]
+                if ([int]$parts[0] -gt 1) {
+                    if ($null -eq $rowsAboveOne) { $rowsAboveOne = 0L }
+                    $rowsAboveOne = $rowsAboveOne + [long]$parts[1]
+                }
+            }
+        }
+
+        $measuredStageList = @($stageResults | Where-Object { -not $_.isWarmup })
+        $primaryStage = if ($measuredStageList.Count -gt 0) { $measuredStageList[0] } else { $null }
+
+        $duplicateClaims = $workCost.duplicateClaimEstimate
+        $staleExecutions = $workCost.staleTokenCompletions
+        $failedExecutions = $workCost.completionFailure
+        $republishes = $workCost.storedResultRepublishes
+        $claimStaleRows = $workCost.staleReclaims
+        $invocations = $workCost.judgeInvocations
+        $invocationMinusResults = if ($null -eq $invocations -or $null -eq $resultRows) { $null } else { $invocations - $resultRows }
+        $accountedCompletions = if (@($republishes, $failedExecutions, $staleExecutions) -contains $null) { $null } else {
+            $republishes + $failedExecutions + $staleExecutions
+        }
+        $accountingResidual = if ($null -eq $invocationMinusResults -or $null -eq $accountedCompletions) { $null } else {
+            $invocationMinusResults - $accountedCompletions
+        }
+
+        # Everything below decides whether the six-run comparison may read this run as a steady
+        # state. Each criterion is stored with its own answer, so a run that fails one is flagged on
+        # that criterion rather than dropped silently.
+        $warmupEvidence = $verification.warmup
+        $drainSucceeded = ($null -ne $stagesDoc.drainSeconds)
+        $warmupQuiesced = ($null -ne $warmupEvidence -and [bool]$warmupEvidence.quiescent -and
+            $null -ne $warmupEvidence.acceptedGrowthAfterBaseline -and [long]$warmupEvidence.acceptedGrowthAfterBaseline -eq 0)
+        $noRefusals = ($null -ne $primaryStage -and $null -ne $primaryStage.http.offered -and -not [bool]$primaryStage.apiRateLimitPolluted)
+        $withinCaps = ($null -ne $primaryStage -and [bool]$primaryStage.executorCaps.withinConfiguredCaps)
+        # "Not persistently growing" is stricter than the endpoint classification: a window can end
+        # at or below the threshold while its second half still drifts up, and that is a backlog on
+        # its way up rather than a steady state.
+        $steadyBacklog = ($null -ne $primaryStage -and $primaryStage.classification -eq "steady" -and
+            $null -ne $primaryStage.backlogByHalf.secondHalfRowsPerSec -and
+            [double]$primaryStage.backlogByHalf.secondHalfRowsPerSec -le [double]$threshold)
+        $integrityPassed = [bool]$verification.integrity.passed
+        $criteria = [ordered]@{
+            integrityPassed = $integrityPassed
+            uniqueEqualsAccepted = ($acceptedCount -eq $verification.counts.uniqueSubmissions)
+            resultsEqualAccepted = ($resultRows -eq $acceptedCount)
+            scoreboardEqualsResults = ($verification.counts.scoreboardApplied -eq $resultRows)
+            noLostOrIncomplete = ($null -ne $verification.integrity.lostOrIncomplete -and [long]$verification.integrity.lostOrIncomplete -eq 0)
+            noFinalResultMismatch = ($null -ne $verification.integrity.finalResultMismatch -and [long]$verification.integrity.finalResultMismatch -eq 0)
+            noApiRefusals = $noRefusals
+            backlogNotPersistentlyGrowing = $steadyBacklog
+            drainSucceeded = $drainSucceeded
+            warmupQuiescedBeforeBaseline = $warmupQuiesced
+            executorWithinConfiguredCaps = $withinCaps
+        }
+        $failedCriteria = New-Object System.Collections.Generic.List[string]
+        foreach ($name in @($criteria.Keys)) {
+            if (-not [bool]$criteria[$name]) { $failedCriteria.Add($name) }
+        }
+
+        $duplication = [ordered]@{
+            mode = $stagesDoc.mode
+            measuredStage = if ($null -ne $primaryStage) { $primaryStage.label } else { $null }
+            measurementWindowSeconds = if ($null -ne $primaryStage) { $primaryStage.measurementSeconds } else { $null }
+            targetRps = if ($null -ne $primaryStage) { $primaryStage.targetRps } else { $null }
+            # The denominators every rate below is taken against.
+            acceptedSubmissions = $acceptedCount
+            uniqueSubmissions = $verification.counts.uniqueSubmissions
+            mysqlClaimTimeout = $parameters.mysqlClaimTimeout
+            mysqlMaxInFlightPerNode = $parameters.mysqlMaxInFlightPerNode
+            # 1. Durable duplicate claim: read from the outbox rows of the measurement contest. The
+            # warm-up contest is a different contest and cannot contribute to any of these counts.
+            durableDuplicateClaim = [ordered]@{
+                count = $duplicateClaims
+                basis = "SUM(GREATEST(attempts - 1, 0)) over the measurement contest's outbox rows; attempts is written on every claim and never read by the production path, so it is a durable record of how many times a row was handed out beyond the first"
+                rowsWithAttemptsAboveOne = $rowsAboveOne
+                submissionsWithAttemptsAboveOne = $rowsAboveOne
+                attemptsHistogram = $attemptHistogram
+                attemptDistributionFile = "claim-attempts.tsv"
+                reclaimRowsFile = "stale-reclaims.csv"
+                ratePerAccepted = Get-RatioOrNull $duplicateClaims $acceptedCount
+                per10kAccepted = Get-RatioOrNull ($duplicateClaims * 10000) $acceptedCount 3
+                staleReclaimsObservedAtClaimTime = $claimStaleRows
+                staleReclaimRowsInMeasurementWindow = if ($null -ne $primaryStage) { $primaryStage.claim.staleReclaimRowsInWindow } else { $null }
+                staleReclaimWindowBasis = if ($null -ne $primaryStage) { $primaryStage.claim.windowBasis } else { $null }
+            }
+            # 2. Actual duplicate judge execution. stale completions are the executions whose result
+            # was discarded by the fence, which is what "the submission was judged twice" means.
+            actualDuplicateJudgement = [ordered]@{
+                duplicateJudgeExecutions = $staleExecutions
+                duplicateJudgeExecutionsBasis = "completion{outcome=stale}: judgeSubmission ran and its fenced completion UPDATE matched no row because another attempt had already published under a newer token, so this execution's result was thrown away"
+                uniqueResults = $resultRows
+                judgeInvocations = $invocations
+                judgeInvocationsMinusResults = $invocationMinusResults
+                judgeInvocationsMinusResultsBasis = "an upper bound on duplicate plus failed executions, not a duplicate count: it also contains the executions that threw and the reclaims answered from the stored result without re-judging"
+                failedExecutions = $failedExecutions
+                storedResultRepublishes = $republishes
+                accountedCompletions = $accountedCompletions
+                accountingResidual = $accountingResidual
+                accountingIdentity = "invocations - results = republish + failure + stale; a nonzero residual means a counter path did not record, and is reported rather than folded into the duplicate count"
+                ratePerAccepted = Get-RatioOrNull $staleExecutions $acceptedCount
+                per10kAccepted = Get-RatioOrNull ($staleExecutions * 10000) $acceptedCount 3
+                duplicateJudgeMillisLowerBound = $workCost.duplicateJudgeMillisLowerBound
+                duplicateJudgeMillisUpperBound = $workCost.duplicateJudgeMillisUpperBound
+                duplicateJudgeMillisLowerBoundBasis = "stale completions priced at the deterministic profile's 50ms floor; the lease cannot say how long a discarded attempt actually ran"
+                duplicateJudgeMillisUpperBoundBasis = "the same count priced at the profile's 2000ms ceiling; the true cost lies between the two bounds and the profile, not the elapsed time, decides where"
+            }
+            # 3. Token fencing: what stopped a duplicate execution from writing a second result.
+            tokenFencing = [ordered]@{
+                staleTokenCompletions = $staleExecutions
+                claimStaleObservations = $claimStaleRows
+                storedResultRepublishes = $republishes
+                storedResultRepublishesBasis = "a reclaimed row whose result already existed is answered from the stored result: the short-circuit returns before the timed judge call, so it costs a republish and not a second execution"
+                completionSuccess = $workCost.completionSuccess
+                completionSuccessIdentity = "success = results + republish, because every published result row is published once and a republish publishes no new result row"
+            }
+            # The warm-up phase, recorded so the exclusion is checkable rather than asserted.
+            warmupExclusion = [ordered]@{
+                separateContest = $true
+                warmupContestId = if ($null -ne $warmupEvidence) { $warmupEvidence.contestId } else { $null }
+                quiescedBeforeBaseline = $warmupQuiesced
+                quiescenceSeconds = if ($null -ne $warmupEvidence) { $warmupEvidence.quiescenceSeconds } else { $null }
+                acceptedGrowthAfterBaseline = if ($null -ne $warmupEvidence) { $warmupEvidence.acceptedGrowthAfterBaseline } else { $null }
+                duplicateClaimsInWarmup = if ($null -ne $warmupEvidence) { $warmupEvidence.duplicateClaimsInWarmup } else { $null }
+                excludedFrom = @("accepted", "results", "scoreboard", "latency", "throughput", "duplicateClaims", "judgeInvocationDelta")
+                gatlingLog = "warmup-gatling-simulation.log"
+                warmupOfferedSubmissions = if (Test-Path (Join-Path $runPath "warmup-gatling-simulation.log")) {
+                    @(Get-SubmitHttpRows (Join-Path $runPath "warmup-gatling-simulation.log")).Count
+                } else { $null }
+            }
+            steadyStateQualified = ($failedCriteria.Count -eq 0)
+            steadyStateCriteria = $criteria
+            failedCriteria = [object[]]$failedCriteria
+        }
+    }
+
     $staircase = [ordered]@{
         mode = $stagesDoc.mode
         mysqlMaxInFlightPerNode = $parameters.mysqlMaxInFlightPerNode
@@ -942,11 +1131,15 @@ if (Test-Path $stagesPath) {
         apiRateLimitShareThreshold = $ApiRateLimitShare
         samplingInterval = [ordered]@{
             loadTicks = @($timeseries | Where-Object { $_.phase -eq "load" }).Count
+            # The warm-up phase of a normal-timeout run samples with its own phase label, so its rows
+            # are inside timeseries.csv but outside every window this analysis reads.
+            warmupTicks = @($timeseries | Where-Object { $_.phase -eq "warmup" }).Count
             drainTicks = @($timeseries | Where-Object { $_.phase -eq "drain" }).Count
             meanIntervalMs = (Get-ColumnStats @($timeseries | Where-Object { $_.phase -eq "load" }) "sampleIntervalMs").average
             maxIntervalMs = (Get-ColumnStats @($timeseries | Where-Object { $_.phase -eq "load" }) "sampleIntervalMs").max
             meanGatherMs = (Get-ColumnStats @($timeseries | Where-Object { $_.phase -eq "load" }) "sampleElapsedMs").average
         }
+        warmupPhase = $stagesDoc.warmupPhase
         capacityKnee = $capacityKnee
         # Stored as a plain array: PowerShell refuses @() around a List[object] read back out of a
         # dictionary, and both the JSON writer and the Markdown writer walk this collection.
@@ -975,6 +1168,9 @@ $summary = [ordered]@{
 if ($null -ne $staircase) {
     $summary.staircase = $staircase
     $summary.unavailable = @($verification.unavailable) + @($staircase.unavailable)
+}
+if ($null -ne $duplication) {
+    $summary.duplication = $duplication
 }
 $summary | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $runPath "summary.json") -Encoding utf8
 
@@ -1021,6 +1217,47 @@ if ($summary.unavailable.Count -eq 0) { $lines += "- None" } else {
 
 if ($null -ne $staircase) {
     $knee = $staircase.capacityKnee
+    if ($staircase.mode -eq "normal-timeout") {
+        $lines += @(
+            "", "## Single-rate normal-timeout run", "",
+            "- max-in-flight per node: $($staircase.mysqlMaxInFlightPerNode), claim batch $($staircase.mysqlClaimBatchSize), claim timeout $($staircase.mysqlClaimTimeout), workers/node $($staircase.workerCountPerNode)",
+            "- Offered rate: $($staircase.stageRps -join ', ') RPS, ramp $($staircase.transitionRampSeconds)s, hold $($staircase.stageHoldSeconds)s, guard $($staircase.steadyGuardSeconds)s",
+            "- Phase windows vs the injected plan: $($staircase.traceAlignment) (last request $(if ($null -eq $staircase.traceAlignmentErrorSeconds) { 'unavailable' } else { [string]$staircase.traceAlignmentErrorSeconds + 's from the predicted end' }))",
+            "- Warm-up: a separate contest at the same rate, drained to quiescence before the baseline scrape; its rows are outside every count below. Ticks sampled while it ran: $($staircase.samplingInterval.warmupTicks).",
+            "- Sampler period: mean $($staircase.samplingInterval.meanIntervalMs) ms, max $($staircase.samplingInterval.maxIntervalMs) ms, mean gather cost $($staircase.samplingInterval.meanGatherMs) ms",
+            "- Capacity knee: not defined for this run - a single offered rate cannot bracket a knee, and the interval text below is a one-rung ladder, not a capacity reading.",
+            "- API rate limit suspected: $(if ($staircase.apiRateLimitSuspected) { 'yes' } else { 'no' })"
+        )
+        if ($null -ne $duplication) {
+            $dc = $duplication.durableDuplicateClaim
+            $dj = $duplication.actualDuplicateJudgement
+            $tf = $duplication.tokenFencing
+            $lines += @(
+                "", "### Duplicate claims and duplicate judging", "",
+                "Three different quantities. They are not interchangeable: a duplicate claim only becomes a duplicate judgement if the earlier attempt is still running when the row is reclaimed, and the fence is what stops the second one from writing a second result.",
+                "",
+                "| Quantity | Value | per accepted | per 10k accepted |",
+                "|---|---:|---:|---:|",
+                "| Durable duplicate claim (attempts > 1) | $(if ($null -eq $dc.count) { 'unavailable' } else { $dc.count }) | $(if ($null -eq $dc.ratePerAccepted) { 'unavailable' } else { $dc.ratePerAccepted }) | $(if ($null -eq $dc.per10kAccepted) { 'unavailable' } else { $dc.per10kAccepted }) |",
+                "| Actual duplicate judge execution (stale completions) | $(if ($null -eq $dj.duplicateJudgeExecutions) { 'unavailable' } else { $dj.duplicateJudgeExecutions }) | $(if ($null -eq $dj.ratePerAccepted) { 'unavailable' } else { $dj.ratePerAccepted }) | $(if ($null -eq $dj.per10kAccepted) { 'unavailable' } else { $dj.per10kAccepted }) |",
+                "",
+                "- Accepted submissions: $(if ($null -eq $duplication.acceptedSubmissions) { 'unavailable' } else { $duplication.acceptedSubmissions }) (unique $(if ($null -eq $duplication.uniqueSubmissions) { 'unavailable' } else { $duplication.uniqueSubmissions })); unique results $(if ($null -eq $dj.uniqueResults) { 'unavailable' } else { $dj.uniqueResults }); judge invocations $(if ($null -eq $dj.judgeInvocations) { 'unavailable' } else { $dj.judgeInvocations }).",
+                "- Judge invocations minus unique results: $(if ($null -eq $dj.judgeInvocationsMinusResults) { 'unavailable' } else { $dj.judgeInvocationsMinusResults }) = republishes $(if ($null -eq $tf.storedResultRepublishes) { 'unavailable' } else { $tf.storedResultRepublishes }) + failures $(if ($null -eq $dj.failedExecutions) { 'unavailable' } else { $dj.failedExecutions }) + stale $(if ($null -eq $tf.staleTokenCompletions) { 'unavailable' } else { $tf.staleTokenCompletions }); residual $(if ($null -eq $dj.accountingResidual) { 'unavailable' } else { $dj.accountingResidual }).",
+                "- Discarded judge work, priced at the deterministic profile: $(if ($null -eq $dj.duplicateJudgeMillisLowerBound) { 'unavailable' } else { "$($dj.duplicateJudgeMillisLowerBound)-$($dj.duplicateJudgeMillisUpperBound) ms" }).",
+                # Read the keys, not PSObject.Properties: on an OrderedDictionary the latter yields the
+                # dictionary's own members (Count, Keys, Values...), which would print a property dump
+                # in place of the histogram.
+                "- Attempts histogram (attempts: rows): $(if (@($dc.attemptsHistogram.Keys).Count -eq 0) { 'unavailable' } else { (@($dc.attemptsHistogram.Keys) | ForEach-Object { "$($_):$($dc.attemptsHistogram[$_])" }) -join ', ' })",
+                "- Steady-state qualified: $(if ($duplication.steadyStateQualified) { 'yes' } else { 'no - failed: ' + ($duplication.failedCriteria -join ', ') })",
+                "",
+                "| Inclusion criterion | Result |",
+                "|---|---|"
+            )
+            foreach ($criterionName in @($duplication.steadyStateCriteria.Keys)) {
+                $lines += "| $criterionName | $($duplication.steadyStateCriteria[$criterionName]) |"
+            }
+        }
+    } else {
     $lines += @(
         "", "## max-in-flight capacity staircase", "",
         "- max-in-flight per node: $($staircase.mysqlMaxInFlightPerNode), claim batch $($staircase.mysqlClaimBatchSize), claim timeout $($staircase.mysqlClaimTimeout), workers/node $($staircase.workerCountPerNode)",
@@ -1120,6 +1357,7 @@ if ($null -ne $staircase) {
             "$(if ($null -eq $tick.maxBoundaryLagMs) { 'unavailable' } else { $tick.maxBoundaryLagMs }) |"
     }
     $lines += @("", "Theory reference only, not a fitting target: $($knee.theoryReference.note)")
+    }
 }
 $lines | Set-Content (Join-Path $runPath "summary.md") -Encoding utf8
 
