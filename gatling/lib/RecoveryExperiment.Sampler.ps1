@@ -893,8 +893,8 @@ function Get-RecoveryObservation {
     $observation["redisKeyspaceHits"] = Get-RedisInfoCounter -Info $info -Name "keyspace_hits"
     $observation["redisKeyspaceMisses"] = Get-RedisInfoCounter -Info $info -Name "keyspace_misses"
     $observation["redisEvictedKeys"] = Get-RedisInfoCounter -Info $info -Name "evicted_keys"
-    $observation["redisUsedCpuSys"] = Get-RedisInfoCounter -Info $info -Name "used_cpu_sys"
-    $observation["redisUsedCpuUser"] = Get-RedisInfoCounter -Info $info -Name "used_cpu_user"
+    $observation["redisUsedCpuSys"] = Get-RedisInfoSeconds -Info $info -Name "used_cpu_sys"
+    $observation["redisUsedCpuUser"] = Get-RedisInfoSeconds -Info $info -Name "used_cpu_user"
     if ($commandStats.Contains("eval")) {
         $eval = $commandStats["eval"]
         $observation["redisEvalCalls"] = Get-DictionaryValue -Map $eval -Name "calls"
@@ -1045,6 +1045,23 @@ function Get-RedisInfoCounter {
         return "unavailable"
     }
     return ConvertTo-RequiredInt64 -Value $Info[$Name] -Description "Redis INFO $Name"
+}
+
+# Not every number INFO reports is a count. The CPU fields are seconds of CPU time, printed with six
+# decimals (`used_cpu_sys:0.215420`), so the integer reader above refuses them - and it refused the
+# first poll that reached them, taking the run with it. Reading them as the seconds they are is not a
+# loosened parse: the value was never an integer, and rounding it to one would report a CPU that only
+# ever ticked in whole seconds, which at this Redis's rate is a column of zeros.
+function Get-RedisInfoSeconds {
+    param(
+        [Parameter(Mandatory = $true)]$Info,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if (-not $Info.Contains($Name)) {
+        return "unavailable"
+    }
+    return ConvertTo-RequiredDouble -Value $Info[$Name] -Description "Redis INFO $Name"
 }
 
 function Get-MetricValue {

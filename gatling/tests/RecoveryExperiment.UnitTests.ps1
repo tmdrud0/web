@@ -35,6 +35,24 @@ Test-Case "ConvertTo-RequiredDouble rejects non-finite values" {
     Assert-Throws { ConvertTo-RequiredDouble -Value "+Inf" -Description "test" } "infinity is rejected"
 }
 
+Test-Case "the Redis CPU counters are read as the fractions INFO prints" {
+    # `INFO cpu` prints `used_cpu_sys:0.215420` - seconds of CPU time, with decimals - so read as an Int64
+    # the value is rejected, and the rejection lands inside a poll rather than in a gate: the reading is
+    # taken in step 6, after every precondition has passed. Both readers are asserted here against the
+    # same text, because the fix is not a looser parse but the right one for each field: the counts beside
+    # the CPU pair stay integers, and the reader that refused the fraction must go on refusing it.
+    $info = [ordered]@{
+        used_cpu_sys             = "0.215420"
+        used_cpu_user            = "1.041412"
+        total_commands_processed = "12345"
+    }
+    Assert-Equal 0.21542 (Get-RedisInfoSeconds -Info $info -Name "used_cpu_sys") "a fractional seconds value parses"
+    Assert-Equal 1.041412 (Get-RedisInfoSeconds -Info $info -Name "used_cpu_user") "and so does the second one"
+    Assert-Equal 12345.0 (Get-RedisInfoSeconds -Info $info -Name "total_commands_processed") "a whole-number field still reads"
+    Assert-Equal "unavailable" (Get-RedisInfoSeconds -Info $info -Name "used_cpu_sys_children") "a field INFO did not print is unavailable, not zero"
+    Assert-Throws { Get-RedisInfoCounter -Info $info -Name "used_cpu_sys" } "the integer reader still refuses the fraction it cannot hold"
+}
+
 Test-Case "ConvertFrom-SqlCell treats the text NULL as an absent value" {
     # `mysql -N -B` prints SQL NULL as the four characters NULL, so `MIN(LENGTH(id))` over no rows reaches
     # a caller as a string that passes both `$null -ne $cell` and an IsNullOrWhiteSpace check. The oracle's
