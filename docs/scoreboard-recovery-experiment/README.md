@@ -180,6 +180,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File gatling\run-recovery-pilot.p
 
 `-RunIndex 9`처럼 pilot 대역(1–3) 밖의 값을 주면 pilot 산출물과 섞이지 않는다.
 
+**스택을 직접 올려야 할 때 — 서비스 이름을 반드시 지정한다.** 병합된 compose 파일들에
+서비스 이름 없이 `up -d`를 실행하면 base `compose.yaml`의 `mysql` 서비스까지 기동해
+`oj-loadtest-mysql`이 생긴다. 이 실험은 "프로젝트에 이미 설정된 외부 MySQL을 쓴다"는 결정 위에
+있으므로 그것은 측정 조건을 바꾸는 일이고, `Assert-PilotStackHealthy`가 16개 컨테이너를 세어
+run을 중단시킨다(15개 기대). 하네스가 쓰는 기동 목록은 `Get-PilotStartServices`에 있고,
+그 밖의 목적으로 올릴 때도 같은 목록을 쓴다:
+
+```powershell
+# 올바름: 하네스가 쓰는 것과 같은 서비스 목록
+docker compose -p oj-loadtest --project-directory . `
+  -f compose.yaml -f compose.loadtest.yaml -f compose.observability.yaml -f compose.recovery-pilot.yaml `
+  up -d nginx redis rabbitmq web-1 web-2 batch-1 judge-1 judge-2 `
+        prometheus grafana alertmanager cadvisor mysqld-exporter redis-exporter nginx-exporter
+
+# 틀림: mysql 까지 올라온다
+docker compose -p oj-loadtest ... up -d
+```
+
 ### 4.5 종료 코드 — run의 완결성이지 모드의 성질이 아니다
 
 | 코드 | 의미 | suite의 처리 |
