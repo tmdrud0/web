@@ -1087,6 +1087,11 @@ $faultRecovery = $null
 $stagesPath = Join-Path $runPath "stages.json"
 if (Test-Path $stagesPath) {
     $stagesDoc = Get-Content $stagesPath -Raw | ConvertFrom-Json
+    # The open-arrival burst is the one mode whose offered rate is a schedule rather than a population,
+    # so three things this file reads as "steady state" mean something else for it: there is no warm-up
+    # phase to quiesce, the executor's cap gauges exist only when the mysql dispatcher is bound, and the
+    # precondition that replaces the closed model's is whether the arrival schedule was delivered.
+    $openBurstRun = ($stagesDoc.mode -eq "open-burst")
     $threshold = [double]$stagesDoc.overloadThresholdRowsPerSec
     $segments = @($stagesDoc.segments)
     $stageDefs = @($stagesDoc.stages)
@@ -1728,7 +1733,16 @@ if (Test-Path $stagesPath) {
     # (failure); and a publish is either a new result row or a stored-result republish. So
     #   invocations - results = republish + failure + stale
     # and a nonzero residual means a counter path that did not record, not extra duplicates.
-    if ($stagesDoc.mode -eq "normal-timeout") {
+    #
+    # The open-arrival burst is read here too, and for the same reason a normal-timeout run is: its
+    # measurement contest is one contest with one start snapshot taken after a separate preparation
+    # phase and one end snapshot taken after the drain, which is exactly what makes
+    # invocation - unique submission a valid class-specific duplicate count. The claim and completion
+    # counters (contest.judge.claim.*, contest.judge.completion.*) are registered only when the mysql
+    # dispatcher is bound, so a rabbit burst reads them as unavailable rather than as zero; the durable
+    # attempts column behind the duplicate-claim count exists in both modes and is what the comparison
+    # between them rests on.
+    if (@("normal-timeout", "open-burst") -contains $stagesDoc.mode) {
         $workCost = $verification.workCost
         $acceptedCount = $verification.counts.accepted
         $resultRows = $verification.counts.results
@@ -1889,7 +1903,23 @@ if (Test-Path $stagesPath) {
         $warmupQuiesced = ($null -ne $warmupEvidence -and [bool]$warmupEvidence.quiescent -and
             $null -ne $warmupEvidence.acceptedGrowthAfterBaseline -and [long]$warmupEvidence.acceptedGrowthAfterBaseline -eq 0)
         $noRefusals = ($null -ne $primaryStage -and $null -ne $primaryStage.http.offered -and -not [bool]$primaryStage.apiRateLimitPolluted)
-        $withinCaps = ($null -ne $primaryStage -and [bool]$primaryStage.executorCaps.withinConfiguredCaps)
+        # An open-arrival burst replaces the closed model's precondition with one of its own - whether
+        # the arrival schedule was actually delivered - and keeps the warm-up's: it is offered a closed
+        # hold in a contest of its own that must have drained before the burst's baseline was taken,
+        # exactly as the closed runs are. Both are answered, and neither is relaxed, so a run whose
+        # offer fell short or whose warm-up was still judging cannot read as clean.
+        $arrivalScheduleDelivered = if ($openBurstRun) { [bool]$verification.openBurst.supplySucceeded } else { $null }
+        $executorCapsReadable = ($null -ne $primaryStage -and $null -ne $primaryStage.executorCaps.runningMaxBothNodes -and
+            $null -ne $primaryStage.executorCaps.reservedMaxBothNodes)
+        # contest.judge.executor.* is registered by MysqlContestJudgeMetrics, which is conditional on the
+        # mysql dispatch mode. In a rabbit burst there is no cap to exceed, and reading its absent gauges
+        # as a cap violation would name the wrong layer - the same distinction the supply verdict draws
+        # between a refusal the stack made and evidence that was never collected. Null here means "no cap
+        # was configured on this path", which is reported as a criterion that did not apply rather than
+        # as one that passed.
+        $withinCaps = if ($openBurstRun -and -not $executorCapsReadable) { $null } elseif ($null -ne $primaryStage) {
+            [bool]$primaryStage.executorCaps.withinConfiguredCaps
+        } else { $false }
         # "Not persistently growing" is stricter than the endpoint classification: a window can end
         # at or below the threshold while its second half still drifts up, and that is a backlog on
         # its way up rather than a steady state.
@@ -1910,8 +1940,18 @@ if (Test-Path $stagesPath) {
             warmupQuiescedBeforeBaseline = $warmupQuiesced
             executorWithinConfiguredCaps = $withinCaps
         }
+        if ($openBurstRun) {
+            # Added to the closed model's criteria rather than swapped for one of them: the burst's own
+            # precondition is a question the closed runs never ask, and the warm-up's is one it does.
+            $criteria["arrivalScheduleDelivered"] = $arrivalScheduleDelivered
+        }
         $failedCriteria = New-Object System.Collections.Generic.List[string]
+        # A null criterion is a question this run's path could not ask, which is not the same as one it
+        # answered no to. It is collected separately so "steady-state qualified" cannot be reached by a
+        # criterion that was never evaluated, and so the report can say which question went unasked.
+        $inapplicableCriteria = New-Object System.Collections.Generic.List[string]
         foreach ($name in @($criteria.Keys)) {
+            if ($null -eq $criteria[$name]) { $inapplicableCriteria.Add($name); continue }
             if (-not [bool]$criteria[$name]) { $failedCriteria.Add($name) }
         }
 
@@ -1983,7 +2023,10 @@ if (Test-Path $stagesPath) {
                 completionSuccess = $workCost.completionSuccess
                 completionSuccessIdentity = "success = results, because exactly one success publishes each result row and a republish publishes an already-published result rather than a new one. Measured in every run; the earlier claim that success = results + republish was false and would have implied that the republishes went unrecorded"
             }
-            # The warm-up phase, recorded so the exclusion is checkable rather than asserted.
+            # The warm-up phase, recorded so the exclusion is checkable rather than asserted. The burst
+            # has one too - a closed hold at a rate of its own, in a contest of its own, drained before
+            # the burst's baseline - so the same record is written for it; its preparation phase, which
+            # has no closed model counterpart, is recorded under preparationExclusion as well.
             warmupExclusion = [ordered]@{
                 separateContest = $true
                 warmupContestId = if ($null -ne $warmupEvidence) { $warmupEvidence.contestId } else { $null }
@@ -1996,10 +2039,37 @@ if (Test-Path $stagesPath) {
                 warmupOfferedSubmissions = if (Test-Path (Join-Path $runPath "warmup-gatling-simulation.log")) {
                     @(Get-SubmitHttpRows (Join-Path $runPath "warmup-gatling-simulation.log")).Count
                 } else { $null }
+                # A burst's warm-up is offered a rate of its own rather than the measured one, and the
+                # measurement's accounts are not the warm-up contest's, so it could not contribute a
+                # submission even if the quiescence gate had not been passed. Recorded because it is
+                # the difference between this exclusion and the closed runs'.
+                offeredRateBasis = if ($openBurstRun) {
+                    "the warm-up contest is a different contest at a different rate, with its own accounts; nothing it submitted can be joined by a query scoped to the measurement contest"
+                } else { $null }
             }
+            # What the burst's own preparation phase contributed, so its exclusion is checkable too. It
+            # logged in to the measurement contest's own accounts and submitted nothing, so there is no
+            # count to subtract - but a login inside the measured window would mean the preparation had
+            # not finished when the offer started, which is why the logins-in-window number is here
+            # rather than only in the supply verdict.
+            preparationExclusion = if ($openBurstRun) {
+                [ordered]@{
+                    phase = "auth-preparation"
+                    contest = "the measurement contest itself"
+                    submittedNothing = $true
+                    reason = "the preparation phase obtained sessions for the measurement contest's own accounts through POST /api/login and submitted no solution, so it added no submission, no result and no latency row to exclude; the sessions it produced are replayed inside the measured window"
+                    authPrepFile = "auth-prep.json"
+                    authContextFile = "auth-contexts.tsv"
+                    loginsOffered = if ($null -ne $verification.openBurst.preparation) { $verification.openBurst.preparation.loginsOffered } else { $null }
+                    contextsPrepared = if ($null -ne $verification.openBurst.preparation) { $verification.openBurst.preparation.contextsPrepared } else { $null }
+                    loginsInsideMeasuredWindow = if ($null -ne $verification.openBurst.window) { $verification.openBurst.window.loginsInWindow } else { $null }
+                    loginsInsideMeasuredWindowBasis = "a login inside the measured window is a preparation that did not finish before the offer started; it is a supply-verdict check rather than an exclusion"
+                }
+            } else { $null }
             steadyStateQualified = ($failedCriteria.Count -eq 0)
             steadyStateCriteria = $criteria
             failedCriteria = [object[]]$failedCriteria
+            inapplicableCriteria = [object[]]$inapplicableCriteria
         }
     }
 
@@ -2015,6 +2085,101 @@ if (Test-Path $stagesPath) {
                 $cohortNames += $name
                 $cohorts[$name] = $faultRecovery.cohorts[$name]
             }
+        }
+    }
+
+    # The burst's own reading of what the stack did with the offer it was given, recomputed from
+    # timeseries.csv the same way every other rate in this file is, so a re-analysis reproduces it. The
+    # harness recorded the offer and what the client saw; the database's answer belongs to the analyzer.
+    $openBurstAnalysis = $null
+    if ($openBurstRun) {
+        $burstStartMillis = $null
+        $burstEndMillis = $null
+        $burstWindowSource = "the recorder's own steady window, the same boundaries its per-second buckets were cut from"
+        if ($null -ne $stagesDoc.openBurst) {
+            if ($null -ne $stagesDoc.openBurst.windowStartUtc) { $burstStartMillis = [datetimeoffset]::Parse($stagesDoc.openBurst.windowStartUtc).ToUnixTimeMilliseconds() }
+            if ($null -ne $stagesDoc.openBurst.windowEndUtc) { $burstEndMillis = [datetimeoffset]::Parse($stagesDoc.openBurst.windowEndUtc).ToUnixTimeMilliseconds() }
+        }
+        if (($null -eq $burstStartMillis -or $null -eq $burstEndMillis) -and $null -ne $primaryStage) {
+            $burstStartMillis = [long]$primaryStage.measurementStartMillis
+            $burstEndMillis = [long]$primaryStage.measurementEndMillis
+            $burstWindowSource = "the trace-derived hold, because the recorder was written without its boundary fields"
+        }
+        # The last tick at or before each boundary, so the rate is an endpoint delta over the ticks'
+        # own elapsed time. The rows inside the window alone would miss the head of it: the first tick
+        # inside the window is already a second of submissions in.
+        $burstBaselineRow = $null
+        $burstEndRow = $null
+        if ($null -ne $burstStartMillis -and $null -ne $burstEndMillis) {
+            foreach ($row in $timeseries) {
+                $at = [long]$row.epochMillis
+                if ($at -le $burstStartMillis) { $burstBaselineRow = $row }
+                if ($at -le $burstEndMillis) { $burstEndRow = $row }
+            }
+        }
+        $burstDelivery = $null
+        if ($null -ne $burstBaselineRow -and $null -ne $burstEndRow) {
+            $burstElapsedSeconds = [math]::Round(([long]$burstEndRow.epochMillis - [long]$burstBaselineRow.epochMillis) / 1000.0, 3)
+            if ($burstElapsedSeconds -gt 0) {
+                $burstDeliveryAvailable = $true
+                $burstRates = [ordered]@{}
+                $burstCounts = [ordered]@{}
+                foreach ($metric in @("acceptedTotal", "resultsTotal", "scoreboardTotal")) {
+                    $from = ConvertTo-LongOrNull ([string]$burstBaselineRow.$metric)
+                    $to = ConvertTo-LongOrNull ([string]$burstEndRow.$metric)
+                    if ($null -eq $from -or $null -eq $to) {
+                        $burstDeliveryAvailable = $false
+                        $burstRates[$metric] = $null
+                        $burstCounts[$metric] = $null
+                        continue
+                    }
+                    $burstRates[$metric] = [math]::Round(($to - $from) / $burstElapsedSeconds, 3)
+                    $burstCounts[$metric] = $to - $from
+                }
+                $burstDelivery = [ordered]@{
+                    available = $burstDeliveryAvailable
+                    basis = "the last 1s sample at or before each boundary of the burst's own window, read from timeseries.csv; the rate is the endpoint delta over the two ticks' own elapsed time, not an average of per-tick deltas"
+                    windowSeconds = $burstElapsedSeconds
+                    acceptedInWindow = $burstCounts["acceptedTotal"]
+                    resultsInWindow = $burstCounts["resultsTotal"]
+                    scoreboardAppliedInWindow = $burstCounts["scoreboardTotal"]
+                    acceptedPerSecond = $burstRates["acceptedTotal"]
+                    resultsPerSecond = $burstRates["resultsTotal"]
+                    scoreboardAppliedPerSecond = $burstRates["scoreboardTotal"]
+                    judgeBacklogAtWindowEnd = ConvertTo-LongOrNull ([string]$burstEndRow.unfinishedOutbox)
+                    scoreboardPendingAtWindowEnd = ConvertTo-LongOrNull ([string]$burstEndRow.unappliedScoreboard)
+                    ticksInWindow = @($timeseries | Where-Object {
+                        [long]$_.epochMillis -ge $burstStartMillis -and [long]$_.epochMillis -lt $burstEndMillis }).Count
+                }
+            }
+        }
+        $openBurstAnalysis = [ordered]@{
+            model = if ($null -ne $stagesDoc.openBurst) { $stagesDoc.openBurst.model } else { "open-arrival" }
+            windowSource = $burstWindowSource
+            windowStartUtc = if ($null -ne $stagesDoc.openBurst) { $stagesDoc.openBurst.windowStartUtc } else { $null }
+            windowEndUtc = if ($null -ne $stagesDoc.openBurst) { $stagesDoc.openBurst.windowEndUtc } else { $null }
+            # Recomputed here rather than copied from the harness, so the supply verdict's own claim
+            # about where its window was can be checked against the stages and the samples.
+            delivery = $burstDelivery
+            deliveryUnavailableReason = if ($null -ne $burstDelivery) { $null } else {
+                "no two 1s samples bracketed the burst's window, so no rate could be taken over it; the offer itself is recorded in openBurst.recorder"
+            }
+            # The generator's document and the verdict, kept whole: a reader who disagrees with the
+            # verdict has the evidence it was computed from rather than the verdict's account of it.
+            recorder = if ($null -ne $stagesDoc.openBurst) { $stagesDoc.openBurst.recorder } else { $null }
+            supply = if ($null -ne $stagesDoc.openBurst) { $stagesDoc.openBurst.supply } else { $null }
+            clientObservation = if ($null -ne $stagesDoc.openBurst) { [ordered]@{
+                submitsInWindow = $stagesDoc.openBurst.submitsInWindow
+                loginsInWindow = $stagesDoc.openBurst.loginsInWindow
+                connectRefusalsInWindow = $stagesDoc.openBurst.connectRefusalsInWindow
+                unauthenticatedInWindow = $stagesDoc.openBurst.unauthenticatedInWindow
+                serverRefusalsInWindow = $stagesDoc.openBurst.serverRefusalsInWindow
+                statusCompositionInWindow = $stagesDoc.openBurst.statusCompositionInWindow
+                refusalBasis = $stagesDoc.openBurst.refusalBasis
+            } } else { $null }
+            preparation = if ($null -ne $verification.openBurst) { $verification.openBurst.preparation } else { $null }
+            drainSeconds = $stagesDoc.drainSeconds
+            judgementBasis = "the offer is the arrival count the load generator recorded at dispatch, before any response existed; the application's answer to that offer is a separate finding and never lowers the offered rate"
         }
     }
 
@@ -2034,6 +2199,8 @@ if (Test-Path $stagesPath) {
             "the run-level cohorts are read from the measurement contest alone, so the warm-up phase - a different contest - is outside every one of them. A fault was injected inside the measured window, so the all cohort spans the pre-fault steady state, the outage, the recovery and the drain together and its p95/p99 are queueing rather than service time. The fault-recovery cohorts partition that same contest: pre-fault-steady is the 25s of steady state before injection, fault-down-arrivals are submissions that arrived between the kill and the node confirming an active dispatcher, reclaimed-after-fault are the submissions whose outbox row was handed out again after the lease expired, post-restart-recovery runs from that confirmation to backlog normalisation, and post-recovery-steady is the load after normalisation. measurement-steady is unavailable by design here. killed-node-claimed stays unavailable because the outbox stores no claim owner."
         } elseif ($stagesDoc.mode -eq "normal-timeout") {
             "the run-level cohorts are read from the measurement contest alone, so the warm-up phase - a different contest - is outside every one of them. What they do span is the measured phase's ramp, its hold and its guard, so their p95/p99 include the ramp and are not service-time readings. measurement-steady restricts the same three latencies to the measured window of the measured stage and is unavailable when that stage did not hold steady. The fault cohorts (fault-window, post-fault-arrivals, killed-node-claimed) do not apply to a run with no fault injected, and pre-fault-normal is simply the whole measurement contest here."
+        } elseif ($openBurstRun) {
+            "the run-level cohorts are read from the measurement contest alone, so the warm-up phase - a different contest - is outside every one of them. What they do span is the burst: the 1s arrival ramp into the hold and the whole of the drain follow the hold, so their p95/p99 are not service-time readings. measurement-steady restricts the same three latencies to the hold's own measurement window and is unavailable when that window did not hold steady. The fault cohorts do not apply to a run with no fault injected. The preparation phase adds nothing to exclude: it submitted no solution."
         } else {
             "the run-level cohorts (all, pre-fault-normal, fault-window, post-fault-arrivals) cover the whole run - warm-up, every transition, the overload stages and the drain - so their p95/p99 include queueing and are not service-time readings. measurement-steady restricts the same three latencies to the measurement windows of the stages that held steady with no API refusals, and is unavailable when no stage qualified."
         }
@@ -2063,6 +2230,10 @@ if (Test-Path $stagesPath) {
             meanGatherMs = (Get-ColumnStats @($timeseries | Where-Object { $_.phase -eq "load" }) "sampleElapsedMs").average
         }
         warmupPhase = $stagesDoc.warmupPhase
+        # Set only in open-burst mode: the open-arrival model's own reading, which is not a stage ladder
+        # and cannot be read off `stages` - the offer is an arrival schedule, and whether it was
+        # delivered is a question about the generator rather than about the stack that answered it.
+        openBurst = $openBurstAnalysis
         capacityKnee = $capacityKnee
         # Stored as a plain array: PowerShell refuses @() around a List[object] read back out of a
         # dictionary, and both the JSON writer and the Markdown writer walk this collection.
@@ -2072,13 +2243,15 @@ if (Test-Path $stagesPath) {
 }
 
 # The Executor capacity table sits above the measured throughput and is read next to it, so for a
-# normal-timeout run it is taken over the measured phase only. The warm-up is a separate contest at
+# measured-phase mode it is taken over the measured phase only. The warm-up is a separate contest at
 # the same rate, and folding its ticks into the same average would describe neither phase; the
 # whole-run maximum is kept in the scope line, because a cap exceeded at any point is worth seeing
-# even though it is the measured window's occupancy that explains the measured rate. Staircase and
-# fault runs are untouched: their capacity.csv has no warm-up phase to separate out.
+# even though it is the measured window's occupancy that explains the measured rate. An open-arrival
+# burst is scoped the same way for the same reason: its measured window is the hold and the drain that
+# follows it is not part of the offer. Staircase and fault runs are untouched: their capacity.csv has
+# no warm-up phase to separate out.
 $capacityScope = "every sampled tick of the run"
-if ($null -ne $staircase -and @("normal-timeout", "fault-recovery") -contains $staircase.mode -and (Test-Path $capacityPath)) {
+if ($null -ne $staircase -and @("normal-timeout", "fault-recovery", "open-burst") -contains $staircase.mode -and (Test-Path $capacityPath)) {
     $measuredPhaseRows = @(Import-Csv $capacityPath | Where-Object { $_.phase -eq "load" })
     if ($measuredPhaseRows.Count -gt 0) {
         $wholeRunReserved = @(
@@ -2145,6 +2318,7 @@ if ($null -ne $faultRecovery) {
 $summary | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $runPath "summary.json") -Encoding utf8
 
 $isNormalTimeout = ($null -ne $staircase -and $staircase.mode -eq "normal-timeout")
+$isOpenBurst = ($null -ne $staircase -and $staircase.mode -eq "open-burst")
 $isFaultRecovery = ($null -ne $faultRecovery)
 $lines = @(
     "# MySQL judge tradeoff run $($parameters.runId)", "",
@@ -2157,6 +2331,10 @@ if ($isNormalTimeout) {
     # measurements of something that was never attempted; the counts above are the measurement
     # contest's, and the warm-up wrote to a different one.
     $lines += @("- Fault injection: none, by design; the counts above are the measurement contest's whole run, and the warm-up wrote to a separate contest.")
+} elseif ($isOpenBurst) {
+    # Same reasoning as the normal-timeout case, and one more: the preparation phase wrote to the same
+    # contest but submitted nothing, so the counts above are still the measurement contest's own.
+    $lines += @("- Fault injection: none, by design; the counts above are the measurement contest's whole run, and the preparation phase obtained sessions without submitting anything to it.")
 } elseif ($isFaultRecovery) {
     $lines += @(
         "- Fault: SIGKILL on $($parameters.killedNode), injected once the trigger window was open and the node was observed to hold work; down for $($faultRecovery.recoveryTimes.downDurationSeconds)s measured as restartRequestedAt - faultInjectedAt against a configured $($faultRecovery.recoveryTimes.downDurationConfiguredSeconds)s",
@@ -2282,7 +2460,7 @@ foreach ($node in @("judge-1", "judge-2")) {
         $lines += "| $node | $metricName | $($metric.samples) | $($metric.max) | $($metric.average) |"
     }
 }
-if ($isNormalTimeout) { $lines += @("", "Executor scope: $capacityScope.") }
+if ($isNormalTimeout -or $isOpenBurst) { $lines += @("", "Executor scope: $capacityScope.") }
 if ($null -ne $staircase) {
     # Without this, the run-level cohort tail and the per-stage tail look like the same kind of
     # number, and the run-level one is a mixture.
@@ -2295,7 +2473,172 @@ if ($summary.unavailable.Count -eq 0) { $lines += "- None" } else {
 
 if ($null -ne $staircase) {
     $knee = $staircase.capacityKnee
-    if ($staircase.mode -eq "normal-timeout") {
+    if ($isOpenBurst) {
+        # Read in the order the question is asked: what was offered, what was started, whether that is
+        # the offer the plan names, and only then what the stack did with it. The offer and the answer
+        # are kept apart on purpose - folding a 503 into the offered rate is what made an earlier run
+        # report 382.3/s against the 653.8/s the database recorded for the same load.
+        $burst = $staircase.openBurst
+        $plan = $staircase.expectedPlan
+        $rec = $burst.recorder
+        $sup = $burst.supply
+        $del = $burst.delivery
+        $cl = $burst.clientObservation
+        $prep = $burst.preparation
+        $wm = $summary.duplication.warmupExclusion
+        $lines += @(
+            "", "## Open-arrival judge burst", "",
+            "The offer is an arrival schedule rather than a population: arrivals are injected at a rate whatever the state of the ones before them, so the measured quantity is what the stack does when submissions start at a fixed rate, not how many users it can keep busy. Every number below is either what the load generator recorded at dispatch or what the database answered, and the two are never mixed.",
+            "",
+            "### The offer",
+            "",
+            "- Schedule: $($plan.rampFromRps) -> $($plan.targetRps) starts/s over $($plan.rampSeconds)s, then held at $($plan.targetRps)/s for $($plan.steadySeconds)s ($($plan.arrivalInjection))",
+            "- Planned starts: $(if ($null -eq $plan.plannedStarts) { 'unavailable' } else { $plan.plannedStarts }) - $($plan.plannedRampArrivals) in the ramp plus $($plan.plannedSteadyArrivals) in the hold. The hold's count is exact, because a constant rate for a whole number of seconds is rate x seconds; the ramp's is the plan's estimate and the ramp is outside every measured window",
+            "- Measured window: $($plan.measuredWindow)",
+            "- Start counting: $($plan.startsAreCounted)",
+            "- Window anchored on $($plan.anchorSource)",
+            "",
+            "### What the load generator started",
+            "",
+            "| Quantity | Value |",
+            "|---|---:|",
+            "| Starts dispatched (all arrivals) | $(if ($null -eq $rec.arrivalCount) { 'unavailable' } else { $rec.arrivalCount }) |",
+            "| Starts dispatched inside the measured window | $(if ($null -eq $rec.arrivalsInWindow) { 'unavailable' } else { $rec.arrivalsInWindow }) of $($plan.plannedSteadyArrivals) planned |",
+            "| Arrivals before / after the window | $(if ($null -eq $rec.arrivalsBeforeWindow) { 'unavailable' } else { $rec.arrivalsBeforeWindow }) / $(if ($null -eq $rec.arrivalsAfterWindow) { 'unavailable' } else { $rec.arrivalsAfterWindow }) |",
+            "| Observed rate inside the window | $(if ($null -eq $rec.observedRateInWindow) { 'unavailable' } else { [string]$rec.observedRateInWindow + ' /s' }) |",
+            "| Worst single second off target | $(if ($null -eq $rec.worstBucketDeviationPercent) { 'unavailable' } else { [string]$rec.worstBucketDeviationPercent + ' %' }) |",
+            "| Bucket alignment | $($rec.bucketAlignment) |",
+            "| Generator-internal errors | $(if ($null -eq $rec.engineErrors) { 'unavailable' } else { $rec.engineErrors }) |",
+            "| Per-arrival records dropped | $(if ($null -eq $rec.droppedRecords) { 'unavailable' } else { $rec.droppedRecords }) |",
+            "| Anchor source | $($rec.anchorSource) |",
+            "| Attempts completed / still incomplete at the deadline | $(if ($null -eq $rec.completedAttempts) { 'unavailable' } else { $rec.completedAttempts }) / $(if ($null -eq $rec.incompleteAttempts) { 'unavailable' } else { $rec.incompleteAttempts }) |",
+            "| Completion timeout forced termination | $($rec.forcedTermination) |",
+            "| Attempts answered ok / not ok | $(if ($null -eq $rec.okAttempts) { 'unavailable' } else { $rec.okAttempts }) / $(if ($null -eq $rec.koAttempts) { 'unavailable' } else { $rec.koAttempts }) |",
+            "| Sessions loaded / served / reused | $(if ($null -eq $rec.authContextsLoaded) { 'unavailable' } else { $rec.authContextsLoaded }) / $(if ($null -eq $rec.authContextsServed) { 'unavailable' } else { $rec.authContextsServed }) / $(if ($null -eq $rec.authContextReuse) { 'unavailable' } else { $rec.authContextReuse }) |",
+            "",
+            "Per-second start counts and the per-attempt record are kept where they were written: request-starts-1s.csv and submission-attempts.csv. A start is recorded at dispatch, before any response exists, so a submission that was never answered is a start that still happened and cannot lower the offered rate.",
+            "",
+            "### Was this the offer it names?",
+            "",
+            "- Supply verdict: $($sup.verdict) (supplySucceeded=$($sup.supplySucceeded))",
+            "- Failed checks: $(if (@($sup.failedFindings).Count -eq 0) { 'none' } else { @($sup.failedFindings) -join ', ' })"
+        )
+        $lines += @("", "| Supply check | Passed | Detail |", "|---|---|---|")
+        foreach ($finding in @($sup.findings)) {
+            $lines += "| $($finding.code) | $(if ($null -eq $finding.passed) { 'unavailable' } else { $finding.passed }) | $($finding.detail) |"
+        }
+        # The composition arrives from JSON as a PSCustomObject rather than as the hashtable the harness
+        # wrote, so its names come from PSObject.Properties there and from Keys when it is a dictionary
+        # (an in-process re-analysis). Reading .Keys on a PSCustomObject yields nothing at all, which
+        # would print "unavailable" over a composition that was recorded.
+        $composition = if ($null -eq $cl.statusCompositionInWindow) { 'unavailable' } else {
+            $compositionNames = if ($cl.statusCompositionInWindow -is [System.Collections.IDictionary]) {
+                @($cl.statusCompositionInWindow.Keys)
+            } else {
+                @($cl.statusCompositionInWindow.PSObject.Properties | ForEach-Object { $_.Name })
+            }
+            (@($compositionNames | Sort-Object) | ForEach-Object { "$($_):$($cl.statusCompositionInWindow.$_)" }) -join ', '
+        }
+        $lines += @(
+            "",
+            "The supply verdict is deliberately not folded into integrity: a run can have perfect integrity and still not have been offered the load it names. Both are reported, and the run's own unavailable list names the second one when it fails.",
+            "",
+            "### What the client saw inside the same window",
+            "",
+            "- Requests started in the window: $(if ($null -eq $cl.submitsInWindow) { 'unavailable' } else { $cl.submitsInWindow }) submissions and $(if ($null -eq $cl.loginsInWindow) { 'unavailable' } else { $cl.loginsInWindow }) logins",
+            "- Refusals below the application: $(if ($null -eq $cl.connectRefusalsInWindow) { 'unavailable' } else { $cl.connectRefusalsInWindow }) could not connect",
+            "- Refusals naming the preparation: $(if ($null -eq $cl.unauthenticatedInWindow) { 'unavailable' } else { $cl.unauthenticatedInWindow }) were answered 401/403, so the session the arrival carried was not accepted. These are kept out of the count below: reporting them as backpressure would attribute the finding this comparison exists to make to the wrong layer",
+            "- Refusals naming the stack: $(if ($null -eq $cl.serverRefusalsInWindow) { 'unavailable' } else { $cl.serverRefusalsInWindow }) were answered 429/5xx or failed without a status - work the stack could see and declined",
+            "- Status composition in the window: $composition",
+            "- Basis: $($cl.refusalBasis)",
+            "",
+            "### Warm-up",
+            "",
+            "- $(if ($null -eq $staircase.warmupPhase) { 'unavailable' } else { "$($staircase.warmupPhase.targetRps) RPS for $($staircase.warmupPhase.holdSeconds)s in '$($staircase.warmupPhase.contestPrefix)' (population $($staircase.warmupPhase.population), its own contest), drained to quiescence in $(if ($null -eq $wm.quiescenceSeconds) { 'unavailable' } else { [string]$wm.quiescenceSeconds + 's' }) before the burst's baseline was taken" })",
+            "- Quiesced before the baseline: $(if ($null -eq $wm) { 'unavailable' } else { $wm.quiescedBeforeBaseline }); accepted growth after the baseline $(if ($null -eq $wm) { 'unavailable' } else { $wm.acceptedGrowthAfterBaseline })",
+            "- Excluded from the measured aggregates: $(if ($null -eq $wm) { 'unavailable' } else { @($wm.excludedFrom) -join ', ' }); its offered submissions are in $(if ($null -eq $wm) { 'unavailable' } else { $wm.gatlingLog })",
+            "- $(if ($null -eq $wm) { 'unavailable' } else { $wm.offeredRateBasis })",
+            "",
+            "### Preparation",
+            "",
+            "- $(if ($null -eq $prep) { 'unavailable' } else { "$($prep.contextsPrepared) sessions prepared from $($prep.loginsOffered) offered logins at $($prep.rps)/s for $($prep.seconds)s" })",
+            "- Cookie replayed: $(if ($null -eq $prep) { 'unavailable' } else { $prep.cookieName }); Gatling exit code $(if ($null -eq $prep) { 'unavailable' } else { $prep.gatlingExitCode }); artifacts auth-prep.json and auth-contexts.tsv",
+            "- $(if ($null -eq $prep) { 'unavailable' } else { $prep.basis })",
+            "",
+            "### What the database answered inside the same window",
+            ""
+        )
+        if ($null -eq $del) {
+            $lines += @("- Unavailable: $($burst.deliveryUnavailableReason)")
+        } else {
+            $lines += @(
+                "- Window: $($burst.windowStartUtc) .. $($burst.windowEndUtc) ($($burst.windowSource)); $($del.windowSeconds)s of sampler time, $($del.ticksInWindow) ticks inside it",
+                "- Accepted $(if ($null -eq $del.acceptedPerSecond) { 'unavailable' } else { [string]$del.acceptedPerSecond + ' /s' }) ($(if ($null -eq $del.acceptedInWindow) { 'unavailable' } else { $del.acceptedInWindow }) submissions), results $(if ($null -eq $del.resultsPerSecond) { 'unavailable' } else { [string]$del.resultsPerSecond + ' /s' }) ($(if ($null -eq $del.resultsInWindow) { 'unavailable' } else { $del.resultsInWindow })), scoreboard applied $(if ($null -eq $del.scoreboardAppliedPerSecond) { 'unavailable' } else { [string]$del.scoreboardAppliedPerSecond + ' /s' }) ($(if ($null -eq $del.scoreboardAppliedInWindow) { 'unavailable' } else { $del.scoreboardAppliedInWindow }))",
+                "- Backlog at the window's end: judge outbox $(if ($null -eq $del.judgeBacklogAtWindowEnd) { 'unavailable' } else { $del.judgeBacklogAtWindowEnd }) rows, scoreboard pending $(if ($null -eq $del.scoreboardPendingAtWindowEnd) { 'unavailable' } else { $del.scoreboardPendingAtWindowEnd }) rows",
+                "- Basis: $($del.basis)",
+                "- Drain after the window: $(if ($null -eq $burst.drainSeconds) { 'unavailable' } else { [string]$burst.drainSeconds + 's' }) to a zero backlog"
+            )
+        }
+        $lines += @(
+            "",
+            "### Measured stage",
+            "",
+            "The burst's hold is carried as a single stage by the same machinery the ladder uses, so its measurement window, its backlog trend and its HTTP outcomes are read by the same rules:",
+            "",
+            "| Stage | target RPS | window s | measured s | class | total backlog rows/s | first half | second half | achieved OK RPS | offered RPS | success % | 429 | 503 | connect | other | p95 L_total ms | p99 L_total ms |",
+            "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        )
+        foreach ($stage in $staircase.stages) {
+            $rowsPerSec = $stage.backlogGrowth.totalRowsPerSec
+            $lines += "| $($stage.label) | $($stage.targetRps) | $($stage.windowSeconds) | $($stage.measurementSeconds) | $($stage.classification) | " +
+                "$(if ($null -eq $rowsPerSec) { 'unavailable' } else { $rowsPerSec }) | " +
+                "$($stage.backlogByHalf.firstHalfRowsPerSec) | $($stage.backlogByHalf.secondHalfRowsPerSec) | " +
+                "$(if ($null -eq $stage.http.achievedOkRps) { 'unavailable' } else { $stage.http.achievedOkRps }) | " +
+                "$(if ($null -eq $stage.http.offeredRps) { 'unavailable' } else { $stage.http.offeredRps }) | " +
+                "$(if ($null -eq $stage.http.successPercent) { 'unavailable' } else { $stage.http.successPercent }) | " +
+                "$(if ($null -eq $stage.http.ko429) { 'unavailable' } else { $stage.http.ko429 }) | " +
+                "$(if ($null -eq $stage.http.ko503) { 'unavailable' } else { $stage.http.ko503 }) | " +
+                "$(if ($null -eq $stage.http.koConnect) { 'unavailable' } else { $stage.http.koConnect }) | " +
+                "$(if ($null -eq $stage.http.koOther) { 'unavailable' } else { $stage.http.koOther }) | " +
+                "$($stage.latency.L_total_ms.p95) | $($stage.latency.L_total_ms.p99) |"
+        }
+        $lines += @(
+            "",
+            "- Classification: $($staircase.stages[0].classificationReason)",
+            "- Sampler honesty: $(if ($null -eq $staircase.stages[0].tickHonesty.meanIntervalMs) { 'unavailable' } else { [string]$staircase.stages[0].tickHonesty.meanIntervalMs + ' ms mean interval' }), longest $(if ($null -eq $staircase.stages[0].tickHonesty.maxIntervalMs) { 'unavailable' } else { [string]$staircase.stages[0].tickHonesty.maxIntervalMs + ' ms' }), $($staircase.stages[0].tickHonesty.ticksSlowerThan1500Ms) ticks slower than 1500 ms",
+            "- Capacity knee: not defined for this run - an arrival schedule held at one rate is a single rung, and a one-rung ladder is not a capacity reading.",
+            "- API rate limit suspected: $(if ($staircase.apiRateLimitSuspected) { 'yes' } else { 'no' })"
+        )
+        if ($null -ne $duplication) {
+            $dc = $duplication.durableDuplicateClaim
+            $dj = $duplication.actualDuplicateJudgement
+            $tf = $duplication.tokenFencing
+            $lines += @(
+                "", "### Duplicate claims and duplicate judging", "",
+                "Three different quantities, and the open model changes none of them: a duplicate claim is an outbox row whose lease expired and was handed out again, a duplicate judgement is a second judgeSubmission call for one submission, and the fence is what stops the second one from writing a second result. In a mysql burst the claim counters are the dispatcher's own; in a rabbit burst the outbox is relayed to the broker and those counters do not exist, which is why the durable attempts column is the number the two dispatch paths can be compared on.",
+                "",
+                "| Quantity | Value | per accepted | per 10k accepted |",
+                "|---|---:|---:|---:|",
+                "| Durable duplicate claim (attempts > 1) | $(if ($null -eq $dc.count) { 'unavailable' } else { $dc.count }) | $(if ($null -eq $dc.ratePerAccepted) { 'unavailable' } else { $dc.ratePerAccepted }) | $(if ($null -eq $dc.per10kAccepted) { 'unavailable' } else { $dc.per10kAccepted }) |",
+                "| Actual duplicate judge execution (invocation excess) | $(if ($null -eq $dj.duplicateJudgeExecutions) { 'unavailable' } else { $dj.duplicateJudgeExecutions }) | $(if ($null -eq $dj.ratePerAccepted) { 'unavailable' } else { $dj.ratePerAccepted }) | $(if ($null -eq $dj.per10kAccepted) { 'unavailable' } else { $dj.per10kAccepted }) |",
+                "| Stale token completions (not the duplicate count) | $(if ($null -eq $tf.staleTokenCompletions) { 'unavailable' } else { $tf.staleTokenCompletions }) | | |",
+                "",
+                "- Accepted submissions: $(if ($null -eq $duplication.acceptedSubmissions) { 'unavailable' } else { $duplication.acceptedSubmissions }) (unique $(if ($null -eq $duplication.uniqueSubmissions) { 'unavailable' } else { $duplication.uniqueSubmissions })); unique results $(if ($null -eq $dj.uniqueResults) { 'unavailable' } else { $dj.uniqueResults }); judge invocations $(if ($null -eq $dj.judgeInvocations) { 'unavailable' } else { $dj.judgeInvocations }).",
+                "- Duplicate judge executions, two independent routes: stale - republishes - failures = $(if ($null -eq $dj.duplicateJudgeExecutions) { 'unavailable' } else { $dj.duplicateJudgeExecutions }); invocations - results - failures = $(if ($null -eq $dj.duplicateJudgeExecutionsFromInvocations) { 'unavailable' } else { $dj.duplicateJudgeExecutionsFromInvocations }); agree = $(if ($null -eq $dj.duplicateJudgeExecutionsRoutesAgree) { 'unavailable' } elseif ($dj.duplicateJudgeExecutionsRoutesAgree) { 'yes' } else { 'NO' }).",
+                "- Accounting: invocations $(if ($null -eq $dj.judgeInvocations) { 'unavailable' } else { $dj.judgeInvocations }) + republishes $(if ($null -eq $tf.storedResultRepublishes) { 'unavailable' } else { $tf.storedResultRepublishes }) = results $(if ($null -eq $dj.uniqueResults) { 'unavailable' } else { $dj.uniqueResults }) + stale $(if ($null -eq $tf.staleTokenCompletions) { 'unavailable' } else { $tf.staleTokenCompletions }) + failures $(if ($null -eq $dj.failedExecutions) { 'unavailable' } else { $dj.failedExecutions }); residual $(if ($null -eq $dj.accountingResidual) { 'unavailable' } else { $dj.accountingResidual }).",
+                # Read the keys, not PSObject.Properties: on an OrderedDictionary the latter yields the
+                # dictionary's own members rather than the histogram.
+                "- Attempts histogram (attempts: rows): $(if (@($dc.attemptsHistogram.Keys).Count -eq 0) { 'unavailable' } else { (@($dc.attemptsHistogram.Keys) | ForEach-Object { "$($_):$($dc.attemptsHistogram[$_])" }) -join ', ' })",
+                "- Steady-state qualified: $(if ($duplication.steadyStateQualified) { 'yes' } else { 'no - failed: ' + ($duplication.failedCriteria -join ', ') } )$(if (@($duplication.inapplicableCriteria).Count -gt 0) { ' (not asked on this path: ' + (@($duplication.inapplicableCriteria) -join ', ') + ')' } else { '' })",
+                "",
+                "| Inclusion criterion | Result |",
+                "|---|---|"
+            )
+            foreach ($criterionName in @($duplication.steadyStateCriteria.Keys)) {
+                $lines += "| $criterionName | $(if ($null -eq $duplication.steadyStateCriteria[$criterionName]) { 'not applicable on this path' } else { $duplication.steadyStateCriteria[$criterionName] }) |"
+            }
+        }
+    } elseif ($staircase.mode -eq "normal-timeout") {
         $lines += @(
             "", "## Single-rate normal-timeout run", "",
             "- max-in-flight per node: $($staircase.mysqlMaxInFlightPerNode), claim batch $($staircase.mysqlClaimBatchSize), claim timeout $($staircase.mysqlClaimTimeout), workers/node $($staircase.workerCountPerNode)",

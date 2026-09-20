@@ -88,7 +88,40 @@ param(
     [int]$FaultTriggerWaitSeconds = 15,
     [int]$FaultMinRunning = 1,
     [int]$FaultMinReserved = 4,
-    [int]$FaultFallbackMinReserved = 1
+    [int]$FaultFallbackMinReserved = 1,
+    # Open-arrival burst. The closed model answers "what does this population sustain"; this answers
+    # "what happens when the arrivals keep coming", which is the question a capacity claim has to
+    # survive. The arrivals are a clock, not a population: the offered rate is scheduled and pushed
+    # in whether or not the previous submission has been answered, so a stack that saturates cannot
+    # lower its own offered rate - which is what a closed model does, and what made an earlier run's
+    # 382.3/s offered against 653.8/s accepted read as a fact about the server.
+    #
+    # -TargetRps is the burst's rate, and it is the same parameter the closed runs use so that the two
+    # models are offered with one name. What the closed parameters cannot express is the shape:
+    # -BurstRampSeconds is the ramp the injector interpolates over (excluded from every measured
+    # window), -BurstSteadySeconds is the hold, and -BurstCompletionTimeoutSeconds is the room left
+    # for arrivals already in flight. The measured window is the hold exactly, so -SteadyGuardSeconds
+    # must be 0 here: the guard is a closed-model device for dropping the head of a hold that a ramp's
+    # users are still delivering their first submissions into, and there is no such head when the
+    # arrivals are scheduled.
+    [switch]$OpenBurst,
+    [double]$BurstRampFromRps = 1,
+    [int]$BurstRampSeconds = 1,
+    [int]$BurstSteadySeconds = 10,
+    [int]$BurstCompletionTimeoutSeconds = 120,
+    # The per-second deviation the offer is judged against. A ten-second total can be right with a
+    # second inside it that is nowhere near the rate, and the offer is a rate - so the worst single
+    # second is checked rather than only the average of the ten.
+    [double]$BurstTolerancePercent = 10,
+    # The preparation phase's own rate and window. One session per arrival, because the API's
+    # submission rate limiter is keyed on (contest, user) and a pool smaller than the arrival count
+    # would put two concurrent submissions on one account. Its rate is deliberately not the burst's:
+    # logging in at the measured rate would build the login storm the separation exists to remove.
+    [double]$BurstAuthRps = 200,
+    [int]$BurstAuthSeconds = 60,
+    # Spring Session's cookie name. Read rather than assumed by the preparation phase, which captures
+    # whatever the login response set and then checks the name against this.
+    [string]$BurstAuthCookieName = "SESSION"
 )
 
 $ErrorActionPreference = "Stop"
@@ -195,10 +228,25 @@ if ($Staircase) {
 # defines its stage labels and the other two differ in what they do to the cluster mid-hold.
 $phasedLoad = [bool]$NormalTimeout -or [bool]$FaultRecovery
 $stagedLoad = [bool]$Staircase -or $phasedLoad
+# The open-arrival burst is its own model rather than a fourth staged mode: the staged runs are all
+# closed - a population paces itself and the offered rate is whatever that population sustains - and
+# every one of them reads its measurement off a traced hold whose head is the ramp. The burst's offer
+# is a schedule, so it has no population to ramp and no head to drop. Sharing the mode variable with
+# them would silently change the closed runs' shape; kept apart, the two models coexist in one harness
+# and a run says in its own parameters which one it ran.
+$openBurst = [bool]$OpenBurst
 if ($Staircase -and $NormalTimeout) { throw "-Staircase and -NormalTimeout are different experiments; pass one of them." }
 if ($Staircase -and $FaultRecovery) { throw "-Staircase and -FaultRecovery are different experiments; pass one of them." }
 if ($NormalTimeout -and $FaultRecovery) { throw "-NormalTimeout and -FaultRecovery are different experiments; pass one of them." }
 if ($FaultEnabled -and $FaultRecovery) { throw "-FaultEnabled kills at a fixed second and -FaultRecovery triggers on active work; pass one of them." }
+if ($openBurst -and $stagedLoad) { throw "-OpenBurst is the open-arrival model and -Staircase/-NormalTimeout/-FaultRecovery are the closed one; pass one of them." }
+if ($openBurst -and $FaultEnabled) { throw "-OpenBurst measures what a sustained arrival rate does to the stack and does not inject faults." }
+# Everything that traces a hold: the closed staged runs place their window from a trace file, and the
+# burst writes its own schedule to one. The preflight and fault machinery below stay on the narrower
+# $stagedLoad - those are the closed model's devices and neither applies to a burst. The warm-up does
+# apply to both, and only the warm-up: the burst is offered a closed 100 RPS hold in a contest of its
+# own first, so the stack the arrival schedule lands on has already been through the judge path.
+$traceLoad = $stagedLoad -or $openBurst
 $warmupPrefix = ""
 $measurementPrefix = ""
 $preflightPrefix = ""
@@ -312,8 +360,73 @@ if ($FaultRecovery) {
         throw "-MeasurementSeconds must be at least $($faultWorstCaseSeconds + 45) for this trigger: the window opens at ${FaultMinSteadySeconds}s, waits up to ${FaultTriggerWaitSeconds}s, the outage lasts ${DownDurationSeconds}s, and at least 45s must remain for readiness plus the post-recovery steady window."
     }
 }
-$effectiveHoldSeconds = if ($phasedLoad) { $measurementHoldSeconds } else { $StageHoldSeconds }
-$workloadPrefix = if ($phasedLoad) { $measurementPrefix } else { "tradeoff_seed_$LatencySeed" }
+$effectiveHoldSeconds = if ($openBurst) { $BurstSteadySeconds } elseif ($phasedLoad) { $measurementHoldSeconds } else { $StageHoldSeconds }
+$workloadPrefix = if ($openBurst) { "burst_open_meas_$LatencySeed" } elseif ($phasedLoad) { $measurementPrefix } else { "tradeoff_seed_$LatencySeed" }
+
+# The burst's own plan arithmetic, which is the simulation's `Plan` restated so a dry run can be
+# checked against it before a stack is started. The steady count is exact - a constant rate for a whole
+# number of seconds is rate * seconds - and the ramp count is an estimate, because the injector's ramp
+# is an interpolation the client does not promise the shape of. Nothing downstream depends on the
+# estimate: the ramp is outside every measured window by construction, and the count the run reports is
+# the one the recorder measured.
+#
+# The rounding is floor(x + 0.5) rather than this PowerShell's [math]::Round, which rounds half to even:
+# the JVM's math.round rounds half up, and at the default ramp (1 -> 1000 over one second) the two
+# disagree on exactly this number - 500.5 is 501 there and 500 here. That one-arrival difference is not
+# cosmetic: the supply verdict compares the recorder's own planned starts against this value, so a
+# disagreement would report the load generator as failing to deliver a schedule it in fact delivered.
+$burstPlannedRampArrivals = [long][math]::Floor((($BurstRampFromRps + $TargetRps) / 2) * $BurstRampSeconds + 0.5)
+$burstPlannedSteadyArrivals = [long][math]::Floor($TargetRps * $BurstSteadySeconds + 0.5)
+$burstPlannedStarts = $burstPlannedRampArrivals + $burstPlannedSteadyArrivals
+if ($openBurst) {
+    if (-not $PSBoundParameters.ContainsKey("TargetRps")) { throw "-OpenBurst requires an explicit -TargetRps: the arrival rate is the input the whole comparison is offered at, not a default." }
+    if ($TargetRps -le 0) { throw "-TargetRps must be greater than 0: it is the arrival rate the burst is offered at." }
+    if ($BurstRampFromRps -le 0) { throw "-BurstRampFromRps must be greater than 0: a ramp has to start somewhere." }
+    if ($BurstRampFromRps -gt $TargetRps) { throw "-BurstRampFromRps must not exceed -TargetRps." }
+    if ($BurstRampSeconds -lt 1) { throw "-BurstRampSeconds must be at least 1; the ramp is a schedule, not an instant." }
+    if ($BurstSteadySeconds -lt 1) { throw "-BurstSteadySeconds must be at least 1: the measured window is the hold and it has to exist." }
+    if ($BurstCompletionTimeoutSeconds -lt 1) { throw "-BurstCompletionTimeoutSeconds must be at least 1: it is the room left for arrivals already in flight to be answered." }
+    # The measured window is the hold exactly. The guard is the closed model's device for dropping the
+    # head of a hold that a ramp's population is still delivering its first submissions into, and there
+    # is no such head when the arrivals are scheduled - so a nonzero guard here would not protect the
+    # window, it would silently shorten it and then judge the offer against a rate measured over fewer
+    # seconds than the schedule offered.
+    if ($SteadyGuardSeconds -ne 0) {
+        throw "-OpenBurst measures the hold itself, so -SteadyGuardSeconds must be 0; a nonzero guard would truncate the measured window rather than protect it. (Got $SteadyGuardSeconds.)"
+    }
+    # One arrival, one session: the submission API's rate limiter is keyed on (contest, user), so a pool
+    # smaller than the arrival count puts two concurrent submissions on one account and the second is
+    # refused by the limiter rather than by the system under test. The preparation must therefore be
+    # sized to the whole schedule, not to its peak rate.
+    if ($UserCount -lt $burstPlannedStarts) {
+        throw "-OpenBurst needs -UserCount of at least $burstPlannedStarts (the whole schedule: $burstPlannedSteadyArrivals steady + $burstPlannedRampArrivals ramp): each arrival replays its own prepared session."
+    }
+    if ($BurstAuthRps -le 0) { throw "-BurstAuthRps must be greater than 0." }
+    if ($BurstAuthSeconds -lt 1) { throw "-BurstAuthSeconds must be at least 1." }
+    if ($BurstAuthRps * $BurstAuthSeconds -lt $burstPlannedStarts) {
+        throw "-BurstAuthSeconds at -BurstAuthRps offers $([long][math]::Round($BurstAuthRps * $BurstAuthSeconds)) logins against a schedule of $burstPlannedStarts arrivals; the preparation has to cover every arrival."
+    }
+    if ($BurstAuthCookieName.Trim().Length -eq 0) { throw "-BurstAuthCookieName must name the session cookie the burst replays." }
+    if ($DrainTimeoutSeconds -lt 300) { throw "Open-burst runs require -DrainTimeoutSeconds of at least 300." }
+    # The warm-up is the closed model's 100 RPS hold in a contest of its own, drained to quiescence
+    # before anything is measured. It exists for the same reason it exists in the closed runs: the
+    # first submissions into a JVM that has not yet run a judge call are measuring the JIT and the
+    # connection-pool fill, not the dispatch path this comparison is about. Its rate is required
+    # explicitly and is deliberately not the burst's own - warming up at the measured rate would build
+    # the very backlog the burst exists to observe. Same device, and the same parameter names, as the
+    # closed burst this model replaces, so the two are offered with one vocabulary.
+    if (-not $PSBoundParameters.ContainsKey("WarmupTargetRps")) { throw "-OpenBurst requires an explicit -WarmupTargetRps: the warm-up is a closed hold at a rate of its own, not at the burst's rate." }
+    if ($WarmupTargetRps -le 0) { throw "-WarmupTargetRps must be greater than 0: the burst is offered to a stack that has been warmed, not to a cold one." }
+    if ($WarmupSeconds -lt 10) { throw "-WarmupSeconds must be at least 10, or the warm-up phase is too short to have warmed anything." }
+    $warmupPhaseRps = [double]$WarmupTargetRps
+    $warmupPopulation = [int][math]::Max(1, [math]::Ceiling($warmupPhaseRps * 3100 / 1000))
+    if ($UserCount -lt $warmupPopulation) { throw "UserCount must be at least $warmupPopulation for the warm-up phase's 3100ms per-user pace." }
+    # Its own prefix, so the warm-up contest is a third contest and no warm-up row can be joined by a
+    # query scoped to the measurement. Fresh rather than shared with the closed runs, for the same
+    # reason the burst's own prefix is: the seed's reset is scoped to its prefix, and reusing one an
+    # earlier run used would delete that run's rows.
+    $warmupPrefix = "burst_warm_$LatencySeed"
+}
 
 # Whether a fault was actually injected, as opposed to merely requested. This is not the same as the
 # mode: a recovery run can reach the end of its trigger window and be marked as injected without
@@ -337,18 +450,70 @@ $assertMinSuccess = if ($Staircase) {
     if ($PSBoundParameters.ContainsKey("AssertMinSuccessPercent")) { $AssertMinSuccessPercent } else { 95 }
 } else { 95 }
 
-$neededUsers = if ($Staircase) {
+$neededUsers = if ($openBurst) {
+    # Not a pace: the burst's arrivals are scheduled, so the user count is not what produces the rate.
+    # What it has to cover is the whole schedule, because each arrival replays its own prepared session
+    # and a pool that runs out puts two concurrent submissions on one account.
+    [int]$burstPlannedStarts
+} elseif ($Staircase) {
     [int][math]::Ceiling(($stageRpsList | Measure-Object -Maximum).Maximum * 3.1)
 } else {
     [int][math]::Ceiling($TargetRps * 3.1)
 }
-if ($UserCount -lt $neededUsers) { throw "UserCount must be at least $neededUsers for the 3100ms per-user pace." }
+if ($UserCount -lt $neededUsers) {
+    if ($openBurst) { throw "UserCount must be at least ${neededUsers}: the burst replays one prepared session per arrival." }
+    throw "UserCount must be at least $neededUsers for the 3100ms per-user pace."
+}
 
 # What the harness expects the JVM to plan, derived from the parameters alone. The authoritative
 # boundaries are the ones the simulation writes to the trace file; this is here so a dry run can
 # be checked against the intended shape before a four minute stack is started for real.
 $expectedPlan = $null
-if ($Staircase) {
+if ($openBurst) {
+    # Derived from the parameters alone and restated from the simulation's own `Plan`, so a dry run can
+    # be checked against the intended shape before a stack is started for it. The steady count is exact
+    # (a constant rate for a whole number of seconds is rate * seconds) and the ramp count is the plan's
+    # estimate, which nothing downstream depends on - the ramp is outside every measured window.
+    $expectedPlan = [ordered]@{
+        model = "open-arrival"
+        targetRps = $TargetRps
+        rampFromRps = $BurstRampFromRps
+        rampSeconds = $BurstRampSeconds
+        steadySeconds = $BurstSteadySeconds
+        completionTimeoutSeconds = $BurstCompletionTimeoutSeconds
+        maxDurationSeconds = $BurstRampSeconds + $BurstSteadySeconds + $BurstCompletionTimeoutSeconds
+        plannedRampArrivals = $burstPlannedRampArrivals
+        plannedSteadyArrivals = $burstPlannedSteadyArrivals
+        plannedStarts = $burstPlannedStarts
+        measuredWindow = "the steady hold itself: the ramp is excluded because a ramp is not a rate, and there is no steady guard because the arrivals are scheduled rather than carried by a population still delivering its first submissions into the window's head"
+        measuredWindowSeconds = $BurstSteadySeconds
+        steadyGuardSeconds = 0
+        arrivalInjection = "rampUsersPerSec($BurstRampFromRps).to($TargetRps) for ${BurstRampSeconds}s, then constantUsersPerSec($TargetRps) for ${BurstSteadySeconds}s"
+        startsAreCounted = "at dispatch, before any response exists (open-burst-recorder.json); a submission that was never answered is a start that still happened"
+        anchorSource = "the marker user the injector starts at arrival-schedule time zero, which writes the trace and arms the recorder with the same instant"
+        preparationPhase = [ordered]@{
+            contestPrefix = $workloadPrefix
+            logins = [long][math]::Round($BurstAuthRps * $BurstAuthSeconds)
+            rps = $BurstAuthRps
+            seconds = $BurstAuthSeconds
+            cookieName = $BurstAuthCookieName
+            sessionPerArrival = "one prepared session per arrival, because the submission rate limiter is keyed on (contest, user)"
+        }
+        # The closed hold that precedes all of it, in a contest of its own. Counted in totalSeconds
+        # because it is a phase this run spends real time on, at the ramp it is offered over.
+        warmupPhase = [ordered]@{
+            contestPrefix = $warmupPrefix
+            targetRps = $warmupPhaseRps
+            population = $warmupPopulation
+            rampSeconds = $RampSeconds
+            holdSeconds = $WarmupSeconds
+            seconds = $RampSeconds + $WarmupSeconds
+            simulationClass = "my.oj.perf.ContestSubmissionStepLoadSimulation"
+            basis = "a closed hold at a rate of its own, drained to quiescence before the preparation; the burst is offered to a stack that has already run the judge path rather than to a cold one"
+        }
+        totalSeconds = $RampSeconds + $WarmupSeconds + $BurstAuthSeconds + $BurstRampSeconds + $BurstSteadySeconds + $BurstCompletionTimeoutSeconds
+    }
+} elseif ($Staircase) {
     $populations = @($stageRpsList | ForEach-Object { [int][math]::Max(1, [math]::Ceiling($_ * 3100 / 1000)) })
     $expectedPlan = [ordered]@{
         populations = $populations
@@ -443,6 +608,41 @@ $parameters = [ordered]@{
     killedNode = $KilledNode; downDurationSeconds = $DownDurationSeconds
     userCount = $UserCount; drainTimeoutSeconds = $DrainTimeoutSeconds
     judgeNodeCount = 2; generatedAt = [datetimeoffset]::UtcNow.ToString("o")
+}
+if ($openBurst) {
+    $parameters.openBurst = [ordered]@{
+        enabled = $true
+        model = "open-arrival"
+        targetRps = $TargetRps
+        rampFromRps = $BurstRampFromRps
+        rampSeconds = $BurstRampSeconds
+        steadySeconds = $BurstSteadySeconds
+        completionTimeoutSeconds = $BurstCompletionTimeoutSeconds
+        measurementWindowSeconds = $BurstSteadySeconds
+        steadyGuardSeconds = 0
+        # A closed hold in its own contest, offered before the preparation and drained to quiescence
+        # before the burst's baseline is taken. Recorded here because it is a phase of this run.
+        warmupTargetRps = $warmupPhaseRps
+        warmupSeconds = $WarmupSeconds
+        warmupPrefix = $warmupPrefix
+        warmupSimulationClass = "my.oj.perf.ContestSubmissionStepLoadSimulation"
+        warmupTraceFile = "warmup-stage-trace.csv"
+        warmupBasis = "the closed model's hold at a rate of its own, in a contest scoped to its own prefix, drained to quiescence before the preparation establishes the sessions the arrival schedule replays; warming up at the burst's rate would build the backlog the burst exists to observe"
+        # Named for what it is rather than for the closed model's parameter: the burst has one contest
+        # and one phase, and the prefix is the contest's workload identity.
+        contestPrefix = $workloadPrefix
+        authPrepRps = $BurstAuthRps
+        authPrepSeconds = $BurstAuthSeconds
+        authCookieName = $BurstAuthCookieName
+        authContextFile = (Join-Path $runDirectory "auth-contexts.tsv") -replace '\\', '/'
+        simulationClass = "my.oj.perf.ContestSubmissionOpenBurstSimulation"
+        preparationSimulationClass = "my.oj.perf.AuthPrepSimulation"
+        stageTraceFile = "stage-trace.csv"
+        recorderFile = "open-burst-recorder.json"
+        supplyVerdictFile = "supply.json"
+        offerBasis = "starts counted by the load generator at dispatch (open-burst-recorder.json), judged against the schedule in expectedPlan.plannedStarts; a generator shortfall, a refused connection and an application refusal are separate findings and are never averaged into one"
+        expectedPlan = $expectedPlan
+    }
 }
 if ($Staircase) {
     $parameters.staircase = [ordered]@{
@@ -1372,6 +1572,49 @@ function Start-GatlingLoadPhase {
         startedAt = $startedAt
         firstSubmissionAt = [datetimeoffset]::UtcNow.ToString("o")
     }
+}
+
+function Start-OpenBurstAuthPrepPhase {
+    param(
+        [Parameter(Mandatory = $true)][string]$ContextFilePath,
+        [Parameter(Mandatory = $true)][string]$ArtifactDirectory
+    )
+    # The burst's preparation: the sessions, established before the measured window and written to a file
+    # the measurement replays. It is its own Gatling invocation rather than a warm-up phase, because a
+    # warm-up is the wrong shape twice over - it is offered the measured rate, and offering 1000 logins
+    # a second builds exactly the login storm this phase exists to remove, and it writes to a contest of
+    # its own, while a session has to be opened against the contest the measurement submits into.
+    #
+    # The phase is bounded by its own schedule (prepSeconds plus the room its completion timeout leaves
+    # for logins in flight), and it returns when the JVM exits. A JVM that never exits is a phase that
+    # never ends, so the wait is bounded here as well: a hang would otherwise be discovered as a
+    # mysterious silence rather than as a number.
+    #
+    # Every -D property comes before -cp, because the JVM reads them up to the class name and treats
+    # anything after it as a program argument.
+    $phaseProperties = @(
+        "-Xms256m", "-Xmx1g", "-Dperf.baseUrl=$baseUrl",
+        "-Dperf.userPrefix=$workloadPrefix", "-Dperf.userIndex.start=1", "-Dperf.userIndex.end=$UserCount",
+        "-Dperf.authPrepRps=$BurstAuthRps", "-Dperf.authPrepSeconds=$BurstAuthSeconds",
+        "-Dperf.authCookieName=$BurstAuthCookieName",
+        "-Dperf.authContextFile=$ContextFilePath", "-Dperf.artifactDir=$ArtifactDirectory"
+    )
+    $phaseArgs = $phaseProperties + @(
+        "-cp", $classpath, "io.gatling.app.Gatling", "-s", "my.oj.perf.AuthPrepSimulation",
+        "-rf", $resultsFolder, "-rd", "mysql-judge-tradeoff-$RunId-authprep"
+    )
+    $startedAt = Get-Date
+    $process = Start-GatlingProcess -JavaArgs $phaseArgs
+    # The JVM's own startup is not part of the schedule, so it is added on top of the phase's bound
+    # rather than inside it. 180s is far above what this stack has ever needed to start.
+    $deadline = (Get-Date).AddSeconds($BurstAuthSeconds + $BurstCompletionTimeoutSeconds + 180)
+    while (-not $process.HasExited) {
+        if ((Get-Date) -ge $deadline) {
+            throw "The session preparation phase did not finish within $($BurstAuthSeconds + $BurstCompletionTimeoutSeconds + 180)s; it is stopped rather than left running into the measurement."
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return [pscustomobject]@{ process = $process; startedAt = $startedAt }
 }
 
 function Get-JudgeLiveState {
@@ -2614,6 +2857,13 @@ function Invoke-FaultRecoveryPhase {
     }
 }
 
+# The supply verdict is a library rather than a block of this file because it is the one part of the
+# burst that is checked by tests instead of only by a run: what the generator was offered, and whether
+# the shortfall - if there is one - belongs to the generator, the ingress preparation, the ingress
+# itself or the stack. Dot-sourced here, before the run, so a library that cannot be loaded stops the
+# harness rather than failing after a ten-minute load.
+. (Join-Path $PSScriptRoot "OpenBurstSupply.ps1")
+
 $env:CONTEST_JUDGE_DISPATCH_MODE = $DispatchMode
 $env:CONTEST_JUDGE_CONCURRENCY = "$WorkerCount"
 $env:CONTEST_JUDGE_PREFETCH = "$RabbitPrefetch"
@@ -2639,11 +2889,20 @@ $gatlingStarted = $null
 if ($DryRun) {
     Invoke-Compose -Arguments @("config") | Set-Content (Join-Path $runDirectory "compose-config.yaml") -Encoding utf8
     "Dry run only; no containers or load were started." | Set-Content (Join-Path $runDirectory "DRY_RUN.txt") -Encoding utf8
-    if ($stagedLoad) {
+    if ($traceLoad) {
         # The boundaries themselves come from the JVM trace at run time; this only states the
         # shape the parameters imply, so a wrong ladder is caught before the stack is built.
         $expectedPlan | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDirectory "expected-plan.json") -Encoding utf8
-        if ($NormalTimeout) {
+        if ($openBurst) {
+            Write-Host ("Open-arrival burst: warm-up at $warmupPhaseRps RPS for ${WarmupSeconds}s in '$warmupPrefix' " +
+                "(population $warmupPopulation) in its own contest, drained to quiescence; then ${BurstAuthRps} logins/s for ${BurstAuthSeconds}s in '$workloadPrefix' " +
+                "(~$([long][math]::Round($BurstAuthRps * $BurstAuthSeconds)) prepared sessions, $BurstAuthCookieName), " +
+                "then arrivals ramping $BurstRampFromRps -> $TargetRps /s over ${BurstRampSeconds}s and held at $TargetRps /s for ${BurstSteadySeconds}s. " +
+                "Measured window: the ${BurstSteadySeconds}s hold itself, no steady guard. " +
+                "Planned starts $burstPlannedStarts ($burstPlannedRampArrivals ramp + $burstPlannedSteadyArrivals steady), " +
+                "arrival-rate band $([long][math]::Round($TargetRps * $BurstSteadySeconds * 0.95))..$([long][math]::Round($TargetRps * $BurstSteadySeconds * 1.05)) with a $BurstTolerancePercent% per-second tolerance, " +
+                "completion timeout ${BurstCompletionTimeoutSeconds}s, total $($expectedPlan.totalSeconds)s, users $UserCount.")
+        } elseif ($NormalTimeout) {
             Write-Host "Normal timeout: warm-up at $warmupPhaseRps RPS for ${WarmupSeconds}s in '$warmupPrefix' (population $warmupPopulation), full drain, then measurement at $TargetRps RPS for ${MeasurementSeconds}s in '$measurementPrefix' (hold ${effectiveHoldSeconds}s = measurement + ${SteadyGuardSeconds}s guard), claim timeout $MySqlClaimTimeout, total $($expectedPlan.totalSeconds)s, population $($expectedPlan.population)."
             if ($AuthPrepSeconds -gt 0) {
                 Write-Host "Session preparation: each phase's population logs in across its ${AuthPrepSeconds}s ramp (~$([math]::Round($measurementPopulation / $AuthPrepSeconds, 1)) logins/s) and no submission is sent until the gate at the ramp's end; the measured window of $($MeasurementSeconds)s opens $($SteadyGuardSeconds)s after that."
@@ -2707,6 +2966,19 @@ $events.nodeReadyFailure = $null; $events.throughputRecoveredAt = $null
 $events.backlogNormalizedAt = $null; $events.judgeBacklogNormalizedAt = $null
 $events.scoreboardBacklogNormalizedAt = $null; $events.recoveryTimeout = $null
 $events.postRecoveryWindow = $null
+# Open-arrival burst. Null in every closed-model run, which is a different statement from zero: the
+# burst's preparation, its supply verdict and the window it was judged over do not exist for a run
+# that was offered a population instead of a schedule.
+$events.burstPrefix = $null
+$events.authPrepStartedAt = $null; $events.authPrepEndedAt = $null; $events.authPrepGatlingExitCode = $null
+$events.authPrepContextsPrepared = $null; $events.authPrepContextsInFile = $null
+$events.authPrepLoginFailures = $null; $events.authPrepCookieName = $null; $events.authPrepFile = $null
+$events.supplyVerdict = $null; $events.supplySucceeded = $null; $events.supplyFindingsFailed = $null
+$events.supplyStarts = $null; $events.supplyStartsInWindow = $null; $events.supplyObservedRatePerSecond = $null
+$events.burstWindowStartUtc = $null; $events.burstWindowEndUtc = $null
+$events.burstSubmitsInWindow = $null; $events.burstLoginsInWindow = $null
+$events.burstConnectRefusals = $null; $events.burstUnauthenticated = $null
+$events.burstServerRefusals = $null; $events.burstRefusalComposition = $null
 # How many sampler rows needed a retry before they were written. Counted rather than assumed to be
 # zero: a run whose series was written a quarter of a second late reads differently from one that
 # was written on the tick, and the count is the only way to tell them apart afterwards.
@@ -2716,6 +2988,9 @@ $script:sampleWriteRetries = 0
 # and a failure raised from there must still leave the failure path the instant the log it read can be
 # found by. This is what the phase's artifacts are located by after the fact.
 $script:preflightPhaseStartedAt = $null
+# Script scope for the same reason as the preflight's: the burst's preparation phase starts its own
+# Gatling process, and a failure raised from its gate must still leave the log it was read with.
+$script:authPrepPhaseStartedAt = $null
 $staircaseTrace = $null; $staircaseStages = @(); $capturedBoundaries = @{}
 $warmupSeed = $null; $warmupTrace = $null; $warmupStages = @(); $warmupQuiescence = $null
 $warmupAcceptedAtBaseline = $null
@@ -2736,7 +3011,27 @@ try {
     Wait-Healthy
     Invoke-Compose -Arguments @("restart", "nginx")
     Wait-Healthy
-    if ($stagedLoad) {
+    if ($openBurst) {
+        # One contest, and one prefix that no earlier run used. The burst submits into this contest and
+        # its preparation logs in as this contest's users, so every count the run reports - the drain,
+        # the integrity join, the judge work - is scoped to the one contest the measurement was offered
+        # against. The prefix is fresh rather than shared with the closed runs because the seed's reset
+        # is scoped to its own prefix: seeding under a prefix an earlier run used would delete that
+        # run's rows, and the comparison this burst exists for is against exactly those rows.
+        $seedBody = @{ userCount=$UserCount; problemCount=5; durationMinutes=60; reset=$true }
+        $events.burstPrefix = $workloadPrefix
+        # The warm-up contest is seeded here with the measurement's rather than between the phases:
+        # seeding is database work, and putting it between the warm-up and the burst would move the
+        # load it is meant to precede.
+        $warmupSeed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" `
+            -Body (@{ prefix=$warmupPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec 60
+        $seed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" `
+            -Body (@{ prefix=$workloadPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec 300
+        if ([long]$warmupSeed.contestId -eq [long]$seed.contestId) {
+            throw "The warm-up and measurement contests resolved to the same contest id, so the warm-up's work would land in the measured window."
+        }
+        $events.warmupContestId = [long]$warmupSeed.contestId
+    } elseif ($stagedLoad) {
         # Two contests inside one stack lifetime. The warm-up writes to one and the measurement to
         # the other, so no warm-up row can be counted inside a measured window. The duplicate
         # registry is keyed by (contestId, problemId, userId, codeHash), so the identical
@@ -2773,9 +3068,9 @@ try {
     $contestId = [long]$seed.contestId
     # In a phased-load run this first snapshot is the warm-up phase's starting point; the baseline
     # the measured window is read against is taken again once the warm-up has drained.
-    Save-MetricsSnapshot $(if ($stagedLoad) { "warmup-start" } else { "start" })
+    Save-MetricsSnapshot $(if ($traceLoad) { "warmup-start" } else { "start" })
 
-    if ($stagedLoad) {
+    if ($traceLoad) {
         # The per-second sampler reads these in the same statement as the backlog counts; prove
         # they are readable now rather than discovering it once a four minute load is under way.
         $probe = @(Invoke-SqlRows "SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Threads_connected'")
@@ -2789,6 +3084,100 @@ try {
     $classpath = (Get-Content (Join-Path $repoRoot "gatling\build\standalone-gatling\classpath.txt") -Raw).Trim()
     $resultsFolder = Join-Path $repoRoot "gatling\build\reports\gatling"
     $tracePath = (Join-Path $runDirectory "stage-trace.csv") -replace '\\', '/'
+
+    if ($openBurst) {
+        # The warm-up first: a closed hold at its own rate in a contest of its own, drained to
+        # quiescence. It has to finish before the preparation starts, because the preparation's logins
+        # are real work on the same stack and a baseline taken while the warm-up was still judging
+        # would charge warm-up work to the burst.
+        $warmupTracePath = (Join-Path $runDirectory "warmup-stage-trace.csv") -replace '\\', '/'
+        $events.warmupPhaseStartedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $warmupPhase = Start-GatlingLoadPhase -PhaseName "warmup" -Seed $warmupSeed -UserPrefix $warmupPrefix `
+            -Rps $warmupPhaseRps -HoldSeconds $WarmupSeconds -TracePath $warmupTracePath
+        $warmupStarted = $warmupPhase.startedAt
+        $warmupTrace = Get-StaircaseTrace -Path (Join-Path $runDirectory "warmup-stage-trace.csv")
+        if ($null -eq $warmupTrace) {
+            throw "The warm-up phase's trace file is missing or incomplete, so its window cannot be placed."
+        }
+        $warmupStages = @(Get-StaircaseStages -Trace $warmupTrace)
+        Wait-GatlingWithSamples -Process $warmupPhase.process -Trace $warmupTrace -ContestId $events.warmupContestId -Phase "warmup"
+        $warmupPhase.process.WaitForExit()
+        $events.warmupGatlingExitCode = $warmupPhase.process.ExitCode
+        $events.warmupPhaseEndedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $events.warmupEndedAt = $events.warmupPhaseEndedAt
+        if ($null -eq (Find-GatlingReport -StartedAt $warmupStarted)) {
+            throw "The warm-up phase produced no Gatling report, so its log cannot be inspected."
+        }
+        Copy-GatlingArtifacts -StartedAt $warmupStarted -NamePrefix "warmup-" | Out-Null
+        Export-GatlingPerSecond -Rows (Get-GatlingRequestRows -Path (Join-Path $runDirectory "warmup-gatling-simulation.log")) `
+            -Path (Join-Path $runDirectory "warmup-requests-1s.csv") | Out-Null
+        $warmupQuiescence = Wait-PipelineQuiescent -ContestId $events.warmupContestId -TimeoutSeconds 300 -Purpose "the warm-up contest" -AllowMissingExecutorGauges:($DispatchMode -eq "rabbit")
+        if (-not $warmupQuiescence.quiescent) {
+            throw "The warm-up phase never reached quiescence ($($warmupQuiescence.reason)); without it the burst's baseline would be taken over a stack still finishing the warm-up's work."
+        }
+        $events.warmupQuiescedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $events.warmupQuiescenceSeconds = $warmupQuiescence.seconds
+        Write-Host "Warm-up: $warmupPhaseRps RPS for ${WarmupSeconds}s in '$warmupPrefix' (population $warmupPopulation), drained to quiescence in $($warmupQuiescence.seconds)s; then the preparation, then the burst."
+        # The preparation phase, and the one gate that stops the burst before it is offered: a schedule
+        # of arrivals is only the load it claims to be if every arrival has a session of its own to
+        # submit with. A short preparation would send some arrivals under another arrival's session -
+        # which the API's per-(contest,user) limiter refuses, and a refusal inside the measured window
+        # reads as the stack declining work it could see. That is the finding this whole comparison
+        # exists to make, so it must not be produced by a preparation mistake.
+        #
+        # The paths are forward-slashed because they are handed to a JVM: `Paths.get` on Windows accepts
+        # either separator, and the quoted command line the harness builds treats a backslash as an
+        # escape character inside a quoted argument.
+        $burstArtifactDir = $runDirectory -replace '\\', '/'
+        $burstContextPath = (Join-Path $runDirectory "auth-contexts.tsv") -replace '\\', '/'
+        $burstAuthPrepPath = Join-Path $runDirectory "auth-prep.json"
+        $events.authPrepStartedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $script:authPrepPhaseStartedAt = Get-Date
+        $authPrepHolder = Start-OpenBurstAuthPrepPhase -ContextFilePath $burstContextPath -ArtifactDirectory $burstArtifactDir
+        $events.authPrepEndedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $events.authPrepGatlingExitCode = $authPrepHolder.process.ExitCode
+        Copy-GatlingArtifacts -StartedAt $authPrepHolder.startedAt -NamePrefix "authprep-" | Out-Null
+        $authPrep = Read-OpenBurstJson -Path $burstAuthPrepPath
+        if ($null -eq $authPrep) {
+            throw "The session preparation phase wrote no $burstAuthPrepPath, so the burst has no sessions to replay."
+        }
+        $events.authPrepContextsPrepared = ConvertTo-OpenBurstLong (Get-OpenBurstField $authPrep "contextsPrepared")
+        $events.authPrepLoginFailures = ConvertTo-OpenBurstLong (Get-OpenBurstField $authPrep "loginFailures")
+        $events.authPrepCookieName = Get-OpenBurstField $authPrep "authCookieName"
+        $events.authPrepFile = $burstContextPath
+        # The file the burst reads is checked here rather than only trusted, because the simulation reads
+        # it at construction and would stop the run with its own message - leaving a run directory that
+        # says nothing about why. Reading it here means the count is in this run's own events.
+        if (-not (Test-Path -LiteralPath $burstContextPath)) {
+            throw "The preparation phase wrote no session file at $burstContextPath, so no arrival can be given a session."
+        }
+        $preparedContexts = @(Get-Content -LiteralPath $burstContextPath | Select-Object -Skip 1 | Where-Object { $_.Trim().Length -gt 0 }).Count
+        $events.authPrepContextsInFile = $preparedContexts
+        Write-Host "Session preparation: $preparedContexts sessions established over $($BurstAuthSeconds)s at $BurstAuthRps/s ($($events.authPrepLoginFailures) login failures), cookie '$($events.authPrepCookieName)'; the measured window is offered $(Format-OpenBurstValue $events.authPrepContextsPrepared) prepared sessions against a schedule of $burstPlannedStarts arrivals."
+        if ($preparedContexts -lt $burstPlannedStarts) {
+            # Written before the throw, and written with the verdict the shortfall belongs to, because
+            # this is the one failure the run can report without ever being offered: the schedule was
+            # never delivered, and it was not delivered because the sessions were not there.
+            $earlyFindings = New-Object System.Collections.Generic.List[object]
+            $earlyFindings.Add([pscustomobject]@{
+                code = "auth-preparation-failed"; passed = $false
+                detail = "the preparation produced $preparedContexts sessions for a schedule of $burstPlannedStarts arrivals"
+            })
+            $earlyVerdict = New-OpenBurstVerdict -Findings $earlyFindings -Failed @("auth-preparation-failed") `
+                -Recorder $null -Prep $authPrep -LoginsInWindow 0 -ConnectRefusals 0 -ServerRefusals 0 -Unauthenticated 0 `
+                -TolerancePercent $BurstTolerancePercent -TargetRps $TargetRps -PlannedStarts $burstPlannedStarts `
+                -LowerStarts 0 -UpperStarts 0 -LowerRate 0 -UpperRate 0 -PlannedSteady $burstPlannedSteadyArrivals
+            $earlyVerdict | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDirectory "supply.json") -Encoding utf8
+            throw "The burst was not offered: $preparedContexts sessions were prepared for a schedule of $burstPlannedStarts arrivals, and an arrival without its own session would be refused by the (contest, user) rate limiter rather than by the stack."
+        }
+        # The baseline the measured window is read against is taken here, after the warm-up has drained
+        # and the preparation has ended: the warm-up's and the logins' work are both real work on the
+        # same stack, and charging either to the burst's deltas would attribute another phase's cost to
+        # the measurement.
+        Save-MetricsSnapshot "start"
+        $events.measurementBaselineAt = [datetimeoffset]::UtcNow.ToString("o")
+        $warmupAcceptedAtBaseline = $warmupQuiescence.accepted
+    }
 
     if ($stagedLoad -and $IngressPreflight) {
         # Before the warm-up rather than between the phases: the question is whether the fresh stack
@@ -2858,7 +3247,20 @@ try {
         "-Dperf.userIndex.start=1", "-Dperf.userIndex.end=$UserCount",
         "-Dperf.contestId=$($seed.contestId)", "-Dperf.problemId.start=$($seed.firstProblemId)", "-Dperf.problemId.end=$($seed.lastProblemId)"
     )
-    if ($stagedLoad) {
+    if ($openBurst) {
+        # The arrival schedule, and the artifacts the verdict is computed from. Every property the
+        # simulation reads is passed rather than left to its default, including the ones whose defaults
+        # happen to agree: a burst that silently took a default would be a burst whose shape was decided
+        # by the code rather than by the parameters this run recorded.
+        $javaArgs += @(
+            "-Dperf.burstTargetRps=$TargetRps", "-Dperf.burstRampFromRps=$BurstRampFromRps",
+            "-Dperf.burstRampSeconds=$BurstRampSeconds", "-Dperf.burstSteadySeconds=$BurstSteadySeconds",
+            "-Dperf.burstCompletionTimeoutSeconds=$BurstCompletionTimeoutSeconds",
+            "-Dperf.authContextFile=$burstContextPath", "-Dperf.artifactDir=$burstArtifactDir",
+            "-Dperf.stageTraceFile=$tracePath",
+            "-cp", $classpath, "io.gatling.app.Gatling", "-s", "my.oj.perf.ContestSubmissionOpenBurstSimulation"
+        )
+    } elseif ($stagedLoad) {
         $javaArgs += @(
             "-Dperf.rampSeconds=$RampSeconds", "-Dperf.stepHoldSeconds=$effectiveHoldSeconds",
             "-Dperf.stageRps=$($stageRpsList -join ',')", "-Dperf.warmupStageCount=$WarmupStageCount",
@@ -2940,7 +3342,7 @@ try {
             Start-Sleep -Seconds 1
         }
         Observe-FaultRecovery "load-end"
-    } elseif ($stagedLoad) {
+    } elseif ($traceLoad) {
         # Each round trip costs most of a second, so a loop that sleeps a further full second
         # samples at about 1.5s. This one sleeps only up to the next tick and records the period
         # it actually achieved, which is what the per-stage windows are read against.
@@ -2995,7 +3397,7 @@ try {
         }
     }
     $gatling.WaitForExit()
-    if ($stagedLoad) {
+    if ($traceLoad) {
         # Capture a final boundary that may have landed between the last sampler tick and process
         # exit. Missing it would make all counter deltas for the final hold unavailable.
         Save-StaircaseBoundarySnapshots -Trace $staircaseTrace `
@@ -3023,7 +3425,7 @@ try {
     $deadline = (Get-Date).AddSeconds($DrainTimeoutSeconds)
     $backlog = $null
     do {
-        if ($stagedLoad) {
+        if ($traceLoad) {
             # This run's own work, not every contest row in the database.
             $drainSample = Save-StaircaseSample -Phase "drain" -Trace $staircaseTrace -ContestId $contestId
             # A tick whose counts did not arrive leaves the backlog unknown, not zero. Reading it as
@@ -3072,7 +3474,7 @@ try {
             throw "The warm-up contest accepted $($warmupAcceptedAtEnd - $warmupAcceptedAtBaseline) more submissions after the baseline was taken, so the measured window's counter delta includes warm-up work."
         }
     }
-    if ($stagedLoad) {
+    if ($traceLoad) {
         Copy-GatlingArtifacts -StartedAt $gatlingStarted | Out-Null
         # The measured phase's own request stream, per second and per name. The analyzer's http-1s.csv
         # is the submit-only view its stage windows are read from; this is the raw one, and it is what
@@ -3165,8 +3567,104 @@ try {
                 prometheusEndLagMs = if ($capturedBoundaries.ContainsKey($endLabel)) { $capturedBoundaries[$endLabel] - $_.endMillis } else { $null }
             }
         })
+        # The supply verdict, computed from the recorder the load generator wrote rather than from the
+        # client's completion log - which is the whole reason this model exists. A submission that was
+        # never answered is missing from a completion log, and a saturated stack is exactly what
+        # produces those, so reading the offer off the completions would make a shortfall of the stack
+        # indistinguishable from a shortfall of the generator. The request rows below still answer their
+        # own question - what the application refused, and what never reached a socket - and they are
+        # passed to the verdict as separate facts rather than merged into the start count.
+        $openBurstDocument = $null
+        if ($openBurst) {
+            $burstRecorder = Read-OpenBurstJson -Path (Join-Path $runDirectory "open-burst-recorder.json")
+            if ($null -eq $burstRecorder) {
+                throw "The burst wrote no open-burst-recorder.json, so the number of starts it delivered is unavailable and its offer cannot be judged."
+            }
+            # The window is taken from the recorder, which is the authority the per-second buckets were
+            # cut from: the harness's trace-derived window and the recorder's are derived from the same
+            # anchor, and reading this one means the log's window and the buckets' window are the same
+            # window by construction rather than by two clocks that happened to agree.
+            $burstWindowStart = $null; $burstWindowEnd = $null
+            $steadyStartUtc = Get-OpenBurstField $burstRecorder "steadyStartUtc"
+            $steadyEndUtc = Get-OpenBurstField $burstRecorder "steadyEndUtc"
+            if ($steadyStartUtc -and $steadyEndUtc) {
+                $burstWindowStart = [datetimeoffset]::Parse($steadyStartUtc).ToUnixTimeMilliseconds()
+                $burstWindowEnd = [datetimeoffset]::Parse($steadyEndUtc).ToUnixTimeMilliseconds()
+            } elseif ($measured.Count -gt 0) {
+                # Only reachable if the recorder was written without its boundary fields, which is
+                # itself a finding: the trace-derived window is then the only window available.
+                $burstWindowStart = [long]$measured[0].measurementStartMillis
+                $burstWindowEnd = [long]$measured[0].measurementEndMillis
+            }
+            $burstLoginsInWindow = $null; $burstConnectRefusals = $null; $burstUnauthenticated = $null
+            $burstAppRefusals = $null; $burstInWindowSubmits = $null; $burstStatusCounts = $null
+            if ($null -ne $burstWindowStart) {
+                $burstInWindowSubmits = @($measurementSubmits | Where-Object {
+                    $_.startMillis -ge $burstWindowStart -and $_.startMillis -lt $burstWindowEnd })
+                $burstLoginsInWindow = @($measurementLogins | Where-Object {
+                    $_.startMillis -ge $burstWindowStart -and $_.startMillis -lt $burstWindowEnd }).Count
+                $burstConnectRefusals = @($burstInWindowSubmits | Where-Object { $_.status -eq "ko-connect" }).Count
+                # A 401 or a 403 is a refusal at the application, but it is not the application
+                # declining work it could see: the session the arrival carried was not accepted. Kept
+                # apart from the refusals below so a mis-prepared session is never reported as the
+                # backpressure this comparison exists to look for.
+                $burstUnauthenticated = @($burstInWindowSubmits | Where-Object { $_.status -eq "ko401" -or $_.status -eq "ko403" }).Count
+                # Everything else the client observed inside the window: 429/5xx, and the failures the
+                # log does not give a status for. The composition is recorded beside the count so the
+                # reader can see what was folded into it.
+                $burstAppRefusals = @($burstInWindowSubmits | Where-Object {
+                    $_.status -ne "ok" -and $_.status -ne "ko-connect" -and $_.status -ne "ko401" -and $_.status -ne "ko403" }).Count
+                $burstStatusCounts = @{}
+                foreach ($status in ($burstInWindowSubmits | Select-Object -ExpandProperty status -Unique)) {
+                    $burstStatusCounts[$status] = @($burstInWindowSubmits | Where-Object { $_.status -eq $status }).Count
+                }
+            }
+            $burstSupplyVerdict = Get-OpenBurstSupplyVerdict -Recorder $burstRecorder -Prep $authPrep `
+                -LoginsInWindow $burstLoginsInWindow -ConnectRefusals $burstConnectRefusals `
+                -ServerRefusals $burstAppRefusals -Unauthenticated $burstUnauthenticated `
+                -TolerancePercent $BurstTolerancePercent -TargetRps $TargetRps `
+                -SteadySeconds $BurstSteadySeconds -PlannedStarts $burstPlannedStarts
+            $burstSupplyVerdict | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDirectory "supply.json") -Encoding utf8
+            $events.supplyVerdict = $burstSupplyVerdict.verdict
+            $events.supplySucceeded = $burstSupplyVerdict.supplySucceeded
+            $events.supplyStarts = $burstSupplyVerdict.starts
+            $events.supplyStartsInWindow = $burstSupplyVerdict.startsInWindow
+            $events.supplyObservedRatePerSecond = $burstSupplyVerdict.observedRatePerSecond
+            $events.burstWindowStartUtc = $steadyStartUtc
+            $events.burstWindowEndUtc = $steadyEndUtc
+            $events.burstSubmitsInWindow = if ($null -eq $burstInWindowSubmits) { $null } else { $burstInWindowSubmits.Count }
+            $events.burstLoginsInWindow = $burstLoginsInWindow
+            $events.burstServerRefusals = $burstAppRefusals
+            $events.burstUnauthenticated = $burstUnauthenticated
+            $events.burstConnectRefusals = $burstConnectRefusals
+            $events.burstRefusalComposition = if ($null -eq $burstStatusCounts) { $null } else { $burstStatusCounts }
+            $events.supplyFindingsFailed = $burstSupplyVerdict.failedFindings
+            $openBurstDocument = [ordered]@{
+                model = "open-arrival"
+                # The load generator's own document, verbatim, so the run's account of what it started
+                # is readable without the verdict's arithmetic in between.
+                recorder = $burstRecorder
+                supply = $burstSupplyVerdict
+                supplyVerdictFile = "supply.json"
+                # What the client observed inside the same window, as the verdict's inputs.
+                windowStartUtc = $steadyStartUtc
+                windowEndUtc = $steadyEndUtc
+                windowSource = if ($steadyStartUtc -and $steadyEndUtc) { "the recorder's own steady window, the same boundaries its per-second buckets were cut from" } else { "the trace-derived hold, because the recorder was written without its boundary fields" }
+                submitsInWindow = $events.burstSubmitsInWindow
+                loginsInWindow = $burstLoginsInWindow
+                connectRefusalsInWindow = $burstConnectRefusals
+                unauthenticatedInWindow = $burstUnauthenticated
+                serverRefusalsInWindow = $burstAppRefusals
+                statusCompositionInWindow = $burstStatusCounts
+                refusalBasis = "connect refusals are ko-connect; 401/403 are unauthenticated (a preparation finding); everything else that was not ok - 429/5xx and the failures with no status - is the application's answer to an offer that was delivered"
+                authPrep = $authPrep
+                authPrepFile = "auth-prep.json"
+                authContextFile = "auth-contexts.tsv"
+            }
+            Write-Host "Open-arrival supply: $($burstSupplyVerdict.verdict) (supplySucceeded=$($burstSupplyVerdict.supplySucceeded)) - starts $($burstSupplyVerdict.starts) of $burstPlannedStarts planned, $($burstSupplyVerdict.startsInWindow) inside the ${BurstSteadySeconds}s window at $($burstSupplyVerdict.observedRatePerSecond)/s against $TargetRps/s, worst second off by $($burstSupplyVerdict.worstBucketDeviationPercent)%; client saw $($events.burstSubmitsInWindow) submits in the window ($burstConnectRefusals connect refusals, $burstUnauthenticated unauthenticated, $burstAppRefusals application refusals)."
+        }
         $warmupDocument = $null
-        if ($stagedLoad) {
+        if ($stagedLoad -or $openBurst) {
             $warmupDocument = [ordered]@{
                 contestId = $events.warmupContestId
                 contestPrefix = $warmupPrefix
@@ -3197,7 +3695,7 @@ try {
             }
         }
         [ordered]@{
-            mode = if ($FaultRecovery) { "fault-recovery" } elseif ($NormalTimeout) { "normal-timeout" } else { "staircase" }
+            mode = if ($openBurst) { "open-burst" } elseif ($FaultRecovery) { "fault-recovery" } elseif ($NormalTimeout) { "normal-timeout" } else { "staircase" }
             stageRps = $stageRpsList
             warmupStageCount = $WarmupStageCount
             transitionRampSeconds = $RampSeconds
@@ -3218,6 +3716,9 @@ try {
             # Set only in normal-timeout mode. In staircase mode the warm-up is a stage of the same
             # run and is described by `stages` instead.
             warmupPhase = $warmupDocument
+            # Set only in open-burst mode: the arrival model, the recorder's own document, and the
+            # supply verdict, none of which the closed model has or needs.
+            openBurst = $openBurstDocument
             segments = $segmentsDocument
             stages = $stagesDocument
         } | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $runDirectory "stages.json") -Encoding utf8
@@ -3266,6 +3767,12 @@ try {
         $unavailable.Add("integrity: at least one of the accepted/unique/result/scoreboard counts returned no row, so integrity is undecidable for this run and it must not be treated as passed")
     }
     $unavailable.Add("total HTTP submission attempts are unavailable because requests still in flight at Gatling maxDuration can persist after the client log closes; completedHttpRequests is reported separately")
+    # A burst whose offer was short is not a capacity measurement, and the reason is named rather than
+    # left for a reader to infer from the verdict: the comparison this run exists for is only valid on
+    # a run that was offered its schedule.
+    if ($openBurst -and -not $events.supplySucceeded) {
+        $unavailable.Add("the arrival schedule this run names was NOT delivered ($($events.supplyVerdict)): the offer is short or its evidence is incomplete, so this run cannot support a statement about what the stack does when 1000 submissions a second are offered. The failed checks are in supply.json and db-verification.json under openBurst.supplyFindingsFailed.")
+    }
     # A re-claim is not a duplicate execution: the process that owned the claim is gone. In a SIGKILL
     # run this identity would compare a lower-bound invocation count against a durable result count, so
     # it is reported as unavailable rather than as a small or negative number.
@@ -3273,7 +3780,7 @@ try {
     $duplicateJudgeMillisLowerBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 50 }
     $duplicateJudgeMillisUpperBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 2000 }
     $warmupVerification = $null
-    if ($stagedLoad) {
+    if ($stagedLoad -or $openBurst) {
         $warmupAcceptedAtEndRead = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id=$($events.warmupContestId)"
         $warmupResults = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($events.warmupContestId)"
         $warmupDuplicateClaims = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(attempts - 1, 0)),0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.warmupContestId)"
@@ -3301,6 +3808,63 @@ try {
             attemptsHistogram = $warmupAttemptsHistogram
             excludedFromMeasuredAggregates = @("latency", "accepted", "results", "scoreboard", "duplicateClaims", "judgeInvocationDelta", "throughput")
             gatlingLog = "warmup-gatling-simulation.log"
+        }
+    }
+    # The burst's own verification, which is about the offer rather than about the stack: whether the
+    # schedule this run claims to have offered is the schedule it delivered. It is kept separate from
+    # the integrity block above because they are answers to different questions - a run can have
+    # perfect integrity (every accepted submission was judged and applied) and still not have been
+    # offered the load it names, and that is the failure mode this model exists to make visible.
+    $openBurstVerification = $null
+    if ($openBurst) {
+        $openBurstVerification = [ordered]@{
+            model = "open-arrival"
+            supplyVerdict = $events.supplyVerdict
+            supplySucceeded = $events.supplySucceeded
+            supplyFile = "supply.json"
+            supplyFindingsFailed = $events.supplyFindingsFailed
+            # The generator's own document, kept whole rather than summarised: the verdict's arithmetic
+            # is reproducible from this alone, and a reader who disagrees with the verdict has the
+            # evidence it was computed from rather than the verdict's account of it.
+            recorderFile = "open-burst-recorder.json"
+            recorder = $openBurstDocument.recorder
+            perSecondStartsFile = "request-starts-1s.csv"
+            perAttemptFile = "submission-attempts.csv"
+            starts = $events.supplyStarts
+            startsInWindow = $events.supplyStartsInWindow
+            observedRatePerSecond = $events.supplyObservedRatePerSecond
+            plannedStarts = $burstPlannedStarts
+            plannedSteadyArrivals = $burstPlannedSteadyArrivals
+            targetRps = $TargetRps
+            measuredOverSeconds = $BurstSteadySeconds
+            preparation = [ordered]@{
+                phase = "auth-preparation"
+                simulationClass = "my.oj.perf.AuthPrepSimulation"
+                contextsPrepared = $events.authPrepContextsPrepared
+                contextsInFile = $events.authPrepContextsInFile
+                loginFailures = $events.authPrepLoginFailures
+                cookieName = $events.authPrepCookieName
+                loginsOffered = [long][math]::Round($BurstAuthRps * $BurstAuthSeconds)
+                rps = $BurstAuthRps
+                seconds = $BurstAuthSeconds
+                gatlingExitCode = $events.authPrepGatlingExitCode
+                startedAt = $events.authPrepStartedAt
+                endedAt = $events.authPrepEndedAt
+                gatlingLog = "authprep-gatling-simulation.log"
+                basis = "the sessions the burst replays were made by the product's own POST /api/login and captured as the session cookie the response set; no endpoint was added and no authentication is bypassed"
+            }
+            window = [ordered]@{
+                startUtc = $events.burstWindowStartUtc
+                endUtc = $events.burstWindowEndUtc
+                source = $openBurstDocument.windowSource
+                submitsInWindow = $events.burstSubmitsInWindow
+                loginsInWindow = $events.burstLoginsInWindow
+                connectRefusalsInWindow = $events.burstConnectRefusals
+                unauthenticatedInWindow = $events.burstUnauthenticated
+                serverRefusalsInWindow = $events.burstServerRefusals
+                statusComposition = $events.burstRefusalComposition
+            }
+            judgementBasis = "the offer is the arrival count the load generator recorded at dispatch, before any response existed, judged against the schedule in expectedPlan.plannedStarts; the application's answer to that offer is a separate finding and never lowers the offered rate"
         }
     }
     # The harness records what it observed and when; the derived comparison numbers belong to the
@@ -3437,6 +4001,11 @@ try {
         cohortAvailability = @{ killedNodeClaimed=[bool]$claimSnapshot.exact }
         mysql = @{ statusSnapshots="metrics/*-mysql-status.tsv"; cpu=$null; lockAndConnectionCounters="captured" }
         warmup = $warmupVerification
+        # Set only in open-burst mode: whether this run was actually offered the arrival schedule it
+        # names. It is deliberately not folded into `integrity`, because the two are different
+        # questions and a run whose integrity passed is still not a capacity measurement if its offer
+        # was short.
+        openBurst = $openBurstVerification
         faultRecovery = $faultRecoveryVerification
         unavailable = @($unavailable)
     }
@@ -3461,7 +4030,7 @@ try {
     # list because a preflight refusal is the one failure whose evidence is the ingress rather than
     # the database: preflight.json, its per-second request rows and the nginx log beside them are
     # what say whether the connection was refused below the application.
-    foreach ($artifact in @("timeseries.csv", "stage-trace.csv", "warmup-stage-trace.csv", "preflight-stage-trace.csv", "preflight.json", "preflight-requests-1s.csv", "preflight-nginx.log", "requests-1s.csv", "warmup-requests-1s.csv", "capacity.csv", "backlog.csv", "kill-snapshot.json", "recovery-samples.csv", "latency.csv", "stale-reclaims.csv")) {
+    foreach ($artifact in @("timeseries.csv", "stage-trace.csv", "warmup-stage-trace.csv", "preflight-stage-trace.csv", "preflight.json", "preflight-requests-1s.csv", "preflight-nginx.log", "requests-1s.csv", "warmup-requests-1s.csv", "capacity.csv", "backlog.csv", "kill-snapshot.json", "recovery-samples.csv", "latency.csv", "stale-reclaims.csv", "open-burst-recorder.json", "submission-attempts.csv", "request-starts-1s.csv", "supply.json", "auth-prep.json", "auth-contexts.tsv")) {
         $candidate = Join-Path $runDirectory $artifact
         if (Test-Path $candidate) { Write-Host "Preserved for diagnosis: $candidate" }
     }
@@ -3469,6 +4038,11 @@ try {
     # thrown from inside the preflight still leaves the log its counts were read from.
     if ($null -ne $script:preflightPhaseStartedAt -and -not (Test-Path (Join-Path $runDirectory "preflight-gatling-simulation.log"))) {
         try { Copy-GatlingArtifacts -StartedAt $script:preflightPhaseStartedAt -NamePrefix "preflight-" | Out-Null } catch { Write-Warning $_ }
+    }
+    # Same reason for the burst's preparation phase: a failure raised from the phase's own gate must
+    # still leave the log that says whether the logins were refused or simply not offered.
+    if ($null -ne $script:authPrepPhaseStartedAt -and -not (Test-Path (Join-Path $runDirectory "authprep-gatling-simulation.log"))) {
+        try { Copy-GatlingArtifacts -StartedAt $script:authPrepPhaseStartedAt -NamePrefix "authprep-" | Out-Null } catch { Write-Warning $_ }
     }
     # A fault run dies after the kill often enough that latency.csv is still missing when the failure
     # path runs. The raw rows are in the database and the export is read-only, so reconstruct the file
