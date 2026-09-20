@@ -17,8 +17,8 @@
 | 새 브랜치 | `codex/scoreboard-recovery-tradeoff` |
 | 기준 commit | `0d36f26481df6e75f2b22edd44b6f787ce6c7bc6` (`codex/contest-judge-stream-publish`, 계획의 예상값과 일치) |
 | 1라운드 HEAD | `60d98ec` (기준 + 11 commit) |
-| 2라운드 HEAD | `7af681e` (기준 + 18 commit, 98 files, +9305 / −270) |
-| 작업 트리 | 이 보고서를 커밋한 뒤 기록한다 — §1.1 |
+| 2라운드 HEAD | `535855d` (기준 + 19 commit, 101 files, +10171 / −281) |
+| 작업 트리 | **clean (미추적 파일 없음)** — 이 보고서를 커밋한 `535855d`에서 측정. §1.1 |
 | 원본 checkout | 건드리지 않음. `reset`/`clean`/강제 checkout 사용 안 함 |
 
 공개 API 변경 없음. **신규 의존성 없음**(`build.gradle` 무변경).
@@ -31,13 +31,16 @@
 참이지만, 변경 파일 수를 보고하면서 보고서 자신을 빠뜨리면 그 수가 틀린다.
 
 이 절의 값은 **이 보고서가 커밋된 뒤에** 다시 측정해 기록했다(요구사항: clean 상태와 변경 파일 수는
-보고서를 커밋한 다음에만 다시 기록한다).
+보고서를 커밋한 다음에만 다시 기록한다). 이 보고서를 커밋한 `535855d`에서 측정한 값이며, 그 측정
+자체는 이 절을 채우는 커밋에 들어간다.
 
-| 측정 | 값 |
+| 측정 | 값 (`535855d` 기준) |
 |---|---|
-| 작업 트리 | clean (미추적 파일 없음) |
-| `60d98ec..HEAD` (2라운드) | 55 files changed, 3776 insertions(+), 423 deletions(−) |
-| `0d36f26..HEAD` (전체) | 98 files changed, 9305 insertions(+), 270 deletions(−) |
+| 작업 트리 | **clean — `git status --short`가 아무것도 출력하지 않는다** (미추적 파일 없음) |
+| `60d98ec..HEAD` (2라운드) | 59 files changed, 4664 insertions(+), 456 deletions(−) |
+| `0d36f26..HEAD` (전체) | 101 files changed, 10171 insertions(+), 281 deletions(−) |
+
+세 수치 모두 **보고서 자신을 포함한다** — 그것이 1라운드의 "clean"이 틀렸던 바로 그 지점이다.
 
 ## 2. 감사 결과 (요구 14항목: 이전 → 이번 작업 후)
 
@@ -131,7 +134,7 @@ checkpoint에서의 재구독**으로 구현하고(`recoverConsumption`이 롤�
   unit/MySQL, lifecycle, batch-failure Rabbit, requeue 실측 probe, 모드 기동 2종 등
 - **docs 2**: `ARCHITECTURE.md`, `PORTFOLIO_SCOREBOARD_RECOVERY.md`
 
-### 5.2 [정정] 2라운드 (`60d98ec..HEAD`) — 55 files, +3776 / −423
+### 5.2 [정정] 2라운드 (`60d98ec..HEAD`) — 59 files, +4664 / −456
 
 - **main 신규 11**: `recovery/` 7 (`ContestScoreboardRecoveryStrategy`,
   `StreamOffsetRecoveryStrategy`, `FullReplayRecoveryStrategy`, `RedisSequenceRecoveryStrategy`,
@@ -262,9 +265,10 @@ c307ceb refactor: lift the scoreboard processing lock out of the stream package
 0f7bb14 feat: select the contest scoreboard recovery mode from configuration
 ```
 
-### 8.2 2라운드 (`60d98ec` → `7af681e`)
+### 8.2 2라운드 (`60d98ec` → `535855d`)
 
 ```
+535855d docs: correct the scoreboard recovery report against the implementation
 7af681e test: fail a scoreboard batch halfway through real Redis
 dc008cc fix: declare the recovery owner in the two stream consumer tests
 801e6fc fix: refuse a non-positive recovery duration at startup
@@ -273,6 +277,9 @@ a2c446b fix: apply the scoreboard replay outside the database transaction
 30d3641 fix: anchor the scoreboard stream consumer at the stored checkpoint
 274b389 refactor: decide scoreboard history recovery per mode
 ```
+
+(`535855d` 뒤에 이 보고서의 §1.1을 측정값으로 채우는 커밋이 하나 더 온다 — 그 커밋은 위 diff에
+포함되지 않는다. 보고서를 커밋한 다음에만 그 값을 기록하라는 요구사항 때문에 순서가 이렇게 된다.)
 
 ## 9. 독립 검토 결과
 
