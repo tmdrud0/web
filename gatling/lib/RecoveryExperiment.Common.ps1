@@ -481,23 +481,59 @@ function Assert-PrometheusTargetsHealthy {
     $config = Get-RecoveryConfig
     $samples = @(Invoke-PrometheusQuery -Query "up" -Description "target health")
     $up = 0d
+    $down = New-Object 'System.Collections.Generic.List[string]'
     foreach ($sample in $samples) {
         $pair = @($sample.value)
         if ($pair.Count -lt 2) {
             throw "Prometheus target health returned a malformed sample."
         }
-        $up += ConvertTo-RequiredDouble -Value $pair[1] -Description "Prometheus up"
+        $value = ConvertTo-RequiredDouble -Value $pair[1] -Description "Prometheus up"
+        $up += $value
+        if ($value -ne 1d) {
+            $down.Add("$([string]$sample.metric.job)/$([string]$sample.metric.instance)")
+        }
     }
     if ($samples.Count -ne $config.ExpectedPrometheusTargets -or $up -ne [double]$config.ExpectedPrometheusTargets) {
+        # Named, not only counted. `sum(up)=10` says an input to the measurement is missing without saying
+        # which one, and those two numbers were the whole of what the first run to reach this gate reported.
+        $missing = if ($down.Count -gt 0) { " down: $($down -join ', ')" } else { "" }
         throw "Prometheus targets are incomplete: count(up)=$($samples.Count), sum(up)=$up; " +
-            "expected $($config.ExpectedPrometheusTargets)/$($config.ExpectedPrometheusTargets)."
+        "expected $($config.ExpectedPrometheusTargets)/$($config.ExpectedPrometheusTargets).$missing"
     }
     $apps = @($samples | Where-Object { [string]$_.metric.job -eq "oj-app" })
     $rabbitDetailed = @($samples | Where-Object { [string]$_.metric.job -eq "rabbitmq-per-queue" })
     if ($apps.Count -ne 5 -or $rabbitDetailed.Count -ne 1) {
         throw "Prometheus comparison targets are incomplete: oj-app=$($apps.Count)/5, " +
-            "rabbitmq-per-queue=$($rabbitDetailed.Count)/1."
+        "rabbitmq-per-queue=$($rabbitDetailed.Count)/1."
     }
+}
+
+# The app tier's targets appear in Prometheus well after their containers report healthy: a JVM has to
+# finish starting before `/actuator/prometheus` answers, and Prometheus scrapes on its own interval.
+# Measured on this machine, the gap is about forty seconds - at the moment `Wait-PilotStackHealthy`
+# returns, 7 of the 12 targets are scrapeable, and the last two arrive around forty seconds later. So the
+# assertion above, made once at that moment, could not pass at all.
+#
+# Waiting is not the same as waiting for a recovery, and the difference is what makes this safe: the load
+# has not started, no fault has been injected, and no scoreboard exists yet. What it buys is that the
+# baseline window's resource metrics are complete. A run that began with two targets unscraped would
+# report app CPU and memory for part of its baseline as missing, and the honest consequence of that is a
+# measurement that cannot be compared with the others - not one with a quiet gap in it.
+function Wait-PrometheusTargetsHealthy {
+    $config = Get-RecoveryConfig
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($config.ReadyTimeoutSeconds)
+    $lastError = $null
+    while ([DateTimeOffset]::UtcNow -lt $deadline) {
+        try {
+            Assert-PrometheusTargetsHealthy
+            return
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw "Prometheus did not report every target healthy within $($config.ReadyTimeoutSeconds) seconds: $lastError"
 }
 
 # --- containers ------------------------------------------------------------------------------------

@@ -399,7 +399,9 @@ try {
     }
     Write-Output "  stack healthy; batch-1 environment: mode=$($runtime.Mode) deterministic=$($runtime.DeterministicJudging) acceptPermille=$($runtime.AcceptPermille) db=$($runtime.DbHost)/$($runtime.DbName)"
 
-    [void](Assert-PrometheusTargetsHealthy)
+    # The observation pipeline has to be complete before the baseline, and the app tier's targets reach
+    # Prometheus about forty seconds after their containers report healthy.
+    Wait-PrometheusTargetsHealthy
     [void](Assert-ExperimentSeedUsable -Phase "before the load")
 
     # --- 4. validate ------------------------------------------------------------------------------
