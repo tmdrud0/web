@@ -107,6 +107,12 @@ class ContestScoreboardRedisSequenceScheduler implements SchedulingConfigurer {
      * prevent. So the consumer keeps waiting, the next period asks again - rounds replay what they find,
      * so the next pass has less to look at - and a pass that can never cover the history leaves the
      * instance loudly not consuming rather than quietly recovering by the wrong basis.</p>
+     *
+     * <p>A release that could not bring the consumer up is caught here rather than thrown out of the
+     * task. The reason is the one above: a fixed-delay task that throws is cancelled, so a broker that is
+     * not reachable for one period would take the whole mode's checking down with it. What is started
+     * stays started - the cutover keeps a failed release waiting - so the next period, which reports the
+     * boundary again as soon as its pass covers the history, is the retry.</p>
      */
     void runCheck(String trigger) {
         Optional<Boolean> covered = gate.tryRun(PassKind.SEQUENCE_CHECK, () -> {
@@ -132,7 +138,14 @@ class ContestScoreboardRedisSequenceScheduler implements SchedulingConfigurer {
             return;
         }
         if (covered.get()) {
-            cutover.markCovered("the redis-seq " + trigger + " check");
+            try {
+                cutover.markCovered("the redis-seq " + trigger + " check");
+            } catch (RuntimeException failure) {
+                log.error("The redis-seq {} check covered the scoreboard history, but the stream consumer "
+                                + "it releases could not be started; the consumer stays held and the next "
+                                + "check will try again",
+                        trigger, failure);
+            }
             return;
         }
         log.error("Contest scoreboard sequence check ({}) did not cover the scoreboard history, so the "

@@ -74,6 +74,33 @@ class ContestScoreboardFullReplayStartupRunnerTests {
         assertThat(gate.held()).isFalse();
     }
 
+    /**
+     * A release that ran but could not start the consumer is neither swallowed nor lost.
+     *
+     * <p>Swallowed would mean a JVM that started with nothing consuming while its logs said the history
+     * was recovered - the quiet failure this boundary exists to prevent - so the exception is thrown out
+     * of the runner and the application fails to start. Lost would mean the same thing one restart later,
+     * so the action stays waiting on the boundary for the next pass that reports it.</p>
+     */
+    @Test
+    void aConsumerThatCouldNotBeStartedFailsTheStartupAndStaysWaiting() {
+        cutover.whenCovered(() -> {
+            throw new IllegalStateException("the broker is not reachable yet");
+        });
+
+        assertThatThrownBy(() ->
+                        new ContestScoreboardFullReplayStartupRunner(fullReplayService, properties(true), gate(), cutover)
+                                .run(null))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("the broker is not reachable yet");
+
+        assertThat(cutover.isCovered())
+                .as("the replay did run: the history is covered even though the consumer is not up")
+                .isTrue();
+        assertThat(cutover.awaiting()).isEqualTo(1);
+        verify(fullReplayService).replayAllContests();
+    }
+
     private static ContestScoreboardRecoveryPassGate gate() {
         return new ContestScoreboardRecoveryPassGate(new SimpleMeterRegistry());
     }

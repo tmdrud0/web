@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.lenient;
@@ -66,6 +67,10 @@ class ContestScoreboardStreamLifecycleTests {
         cutover = new ContestScoreboardRecoveryCutover();
         registry = new SimpleMeterRegistry();
         lenient().when(strategy.mode()).thenReturn(ContestScoreboardRecoveryMode.STREAM_OFFSET);
+        // A container that has started its consumers. The lifecycle asks this of the container rather
+        // than trusting start() to have done something - see the tests below, which are the other
+        // answer - so a mock that answered 0 would make every start here look like a failed one.
+        lenient().when(container.getActiveConsumerCount()).thenReturn(1);
     }
 
     @Test
@@ -162,11 +167,17 @@ class ContestScoreboardStreamLifecycleTests {
         lifecycle.start();
 
         verify(container, never()).start();
-        assertThat(lifecycle.isRunning()).isFalse();
+        assertThat(lifecycle.consuming())
+                .as("nothing is reading the stream, so no pass may take this consumer for a running one")
+                .isFalse();
+        assertThat(lifecycle.isRunning())
+                .as("started and waiting on the boundary - a lifecycle Spring has to be able to stop")
+                .isTrue();
 
         cutover.markCovered("the mode's startup pass");
 
         assertThat(consumerArguments()).containsEntry("x-stream-offset", 4L);
+        assertThat(lifecycle.consuming()).isTrue();
         assertThat(lifecycle.isRunning()).isTrue();
     }
 
@@ -213,6 +224,11 @@ class ContestScoreboardStreamLifecycleTests {
      * A release that arrives while the context is going down must not start a listener container behind
      * it. The pass that releases it is allowed to run long - a full replay of every contest does - so the
      * two can meet.
+     *
+     * <p>What reaches this guard in a real deployment is the close, not a call to {@code stop()} by hand:
+     * Spring asks a bean it considers running to stop, which is what the held lifecycle reports itself as
+     * - see {@code ContestScoreboardStreamLifecycleContextTests}, which closes a real context for exactly
+     * this reason.</p>
      */
     @Test
     void aConsumerReleasedAfterShutdownIsNotStarted() {
@@ -224,14 +240,39 @@ class ContestScoreboardStreamLifecycleTests {
         cutover.markCovered("the mode's startup pass");
 
         verify(container, never()).start();
+        assertThat(lifecycle.consuming()).isFalse();
         assertThat(lifecycle.isRunning()).isFalse();
+    }
+
+    /**
+     * Spring's own stop and start of one bean, which is the other way this lifecycle is restarted inside
+     * one context. The hold is re-armed rather than skipped: a stop is not a way past the mode's history
+     * recovery, and the consumer still starts exactly once when the boundary is finally reported.
+     */
+    @Test
+    void aRestartAfterAStopIsHeldAgain() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        when(strategy.recoversHistoryBeforeConsuming()).thenReturn(true);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+
+        lifecycle.stop();
+        lifecycle.start();
+
+        verify(container, never()).start();
+
+        cutover.markCovered("the mode's startup pass");
+
+        verify(container, times(1)).start();
+        assertThat(lifecycle.consuming()).isTrue();
     }
 
     /**
      * The supervisor is the one thing that must not start a held consumer on a timer: it runs on an
      * interval and it restarts the consumer for reasons of its own, so a pass that ignored the boundary
      * would begin consuming within a second of the JVM coming up - ahead of the recovery the wait exists
-     * for.
+     * for. The lifecycle reports itself started while it waits, which is why the guard is the container
+     * state and not {@code isRunning()}.
      */
     @Test
     void theSupervisorDoesNotStartAHeldConsumer() {
@@ -244,6 +285,10 @@ class ContestScoreboardStreamLifecycleTests {
         lifecycle.recoverConsumption();
 
         verify(container, never()).start();
+        assertThat(lifecycle.isRunning())
+                .as("the pass declines to act, not because the lifecycle is stopped")
+                .isTrue();
+        assertThat(lifecycle.consuming()).isFalse();
     }
 
     /**
@@ -599,6 +644,71 @@ class ContestScoreboardStreamLifecycleTests {
                 strategy,
                 cutover
         );
+    }
+
+    /**
+     * A container that returned from {@code start()} with nothing consuming is a start that failed.
+     *
+     * <p>Spring AMQP sets the container's running flag before it starts its consumers and does not clear
+     * it when that part fails, so a container whose start half-failed reports itself running with no
+     * consumer in it - and the next {@code start()} on it returns immediately, having started nothing.
+     * Believing that return value is how the retry this boundary exists for gets thrown away: the action
+     * would be counted as served, the cutover would forget it, and the scoreboard would stop being
+     * consumed while every log line said the history was recovered.</p>
+     *
+     * <p>So what the lifecycle asks is the container's consumer count, and a start that leaves it empty
+     * is reported as the failure it is: the action stays waiting, and the report that follows is the
+     * retry - which is this test's second half, where the container really does come up.</p>
+     */
+    @Test
+    void aStartThatLeftNoConsumerIsNotTakenForAStartedConsumer() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        when(strategy.recoversHistoryBeforeConsuming()).thenReturn(true);
+        // The first start returns with no consumer in the container; the retry finds one.
+        when(container.getActiveConsumerCount()).thenReturn(0, 1);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+
+        assertThatThrownBy(() -> cutover.markCovered("the mode's startup pass"))
+                .as("a release that started nothing is not swallowed")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("no active consumer");
+        assertThat(lifecycle.consuming()).isFalse();
+
+        // Still waiting on the boundary, which is what lets the next report bring it up: the count of
+        // waiters belongs to the cutover's own tests, the behaviour to this one.
+        cutover.markCovered("the redis-seq duplicate-check check");
+
+        assertThat(lifecycle.consuming()).isTrue();
+    }
+
+    /**
+     * A resubscribe that could not bring the container back is asked about again.
+     *
+     * <p>The failed batch has no other way of coming back: the checkpoint cannot move past it, and
+     * nothing at the broker redelivers it. Recording the batch as handled before the restart succeeded
+     * - while the container is stopped and the failure count is the only thing left to ask - is a retry
+     * thrown away for the life of the JVM, which is the same loss the rollback side of this pass was
+     * fixed for.</p>
+     */
+    @Test
+    void aFailedBatchIsAskedAboutAgainWhenTheResubscribeCouldNotStart() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        // The service coming up has a consumer, the resubscribe's start leaves none, the retry has one.
+        when(container.getActiveConsumerCount()).thenReturn(1, 0, 1);
+        lifecycle.start();
+        position.recordFailedBatch();
+
+        lifecycle.recoverConsumption();
+        assertThat(counter("contest.scoreboard.stream.failure.restarts")).isEqualTo(1.0);
+
+        lifecycle.recoverConsumption();
+
+        assertThat(counter("contest.scoreboard.stream.failure.restarts"))
+                .as("the restarted consumer is what re-reads the batch, so a restart that failed is not a retry spent")
+                .isEqualTo(2.0);
+        assertThat(lifecycle.consuming()).isTrue();
     }
 
     private double counter(String name) {

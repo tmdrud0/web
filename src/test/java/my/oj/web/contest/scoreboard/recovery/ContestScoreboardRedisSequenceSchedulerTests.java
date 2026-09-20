@@ -10,6 +10,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -154,6 +155,40 @@ class ContestScoreboardRedisSequenceSchedulerTests {
         });
 
         assertThat(cutover.isCovered()).isFalse();
+    }
+
+    /**
+     * A covering check whose release could not bring the consumer up must not take the checking down with
+     * it, and must not be the last word either.
+     *
+     * <p>Both halves matter and they are the same defect from either side: a fixed-delay task that throws
+     * is cancelled, so a broker that is unreachable for one period would leave the mode checking nothing
+     * - and a boundary that was recorded as released-and-done would leave the consumer held with no later
+     * report to release it. The next covering check is that later report, which is why the release is
+     * retried from here rather than only from the startup check.</p>
+     */
+    @Test
+    void aCoveringCheckWhoseConsumerCouldNotStartRetriesOnTheNextPeriod() {
+        AtomicInteger attempts = new AtomicInteger();
+        cutover.whenCovered(() -> {
+            if (attempts.incrementAndGet() == 1) {
+                throw new IllegalStateException("the broker is not reachable yet");
+            }
+        });
+        when(recoveryService.check()).thenReturn(new SequenceCheckReport(1, 0, 0, false, false));
+
+        assertThatCode(() -> scheduler().runCheck("startup")).doesNotThrowAnyException();
+        assertThat(attempts).hasValue(1);
+        assertThat(cutover.awaiting())
+                .as("the consumer that could not start is still waiting on the boundary")
+                .isEqualTo(1);
+
+        scheduler().runCheck("duplicate-check");
+
+        assertThat(attempts)
+                .as("the next covering check releases the consumer that is still waiting")
+                .hasValue(2);
+        assertThat(cutover.awaiting()).isZero();
     }
 
     private ContestScoreboardRedisSequenceScheduler scheduler() {

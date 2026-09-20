@@ -30,7 +30,31 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
     private final ContestScoreboardRecoveryProperties properties;
     private final ContestScoreboardRecoveryStrategy strategy;
     private final ContestScoreboardRecoveryCutover cutover;
-    private volatile boolean running;
+    /**
+     * Whether Spring has started this lifecycle and has not stopped it again.
+     *
+     * <p>This is what {@link #isRunning()} answers, and it is deliberately not "the container is up".
+     * The two come apart exactly while the consumer is held for a mode's own history recovery, and
+     * Spring acts on the difference: {@code DefaultLifecycleProcessor.doStop} asks a bean to stop only
+     * under {@code bean.isRunning()}. A lifecycle that reported itself stopped while it was still
+     * waiting would be a bean the context closes without stopping - the {@link #stopping} flag below
+     * would never be set, and the pass that finishes late would start a listener container into a
+     * context that is already going down.</p>
+     *
+     * <p>What is being honoured is the lifecycle's own contract: start has been accepted and the
+     * component is doing what it was configured to do, which for a held consumer is waiting for the
+     * boundary its mode's recovery reports. Whether anything is being read from the broker is
+     * {@link #consuming}.</p>
+     */
+    private volatile boolean started;
+    /**
+     * Whether the listener container is actually up and reading the stream.
+     *
+     * <p>Distinct from {@link #started} so that nothing mistakes a held consumer for a running one: the
+     * supervisor pass answers an interval's question about a consumer that is reading, and a resubscribe
+     * has nothing to resume. The guard below is this field, not {@code isRunning()}.</p>
+     */
+    private volatile boolean consuming;
     /**
      * Whether the context is going down, so a consumer released by the history-recovery boundary after
      * this point is not started into a closing context.
@@ -109,65 +133,100 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
      * <p>So the wait is on {@link ContestScoreboardRecoveryCutover}, which the pass itself reports. The
      * consumer is not started at a different offset and nothing is skipped while it waits - the hold
      * changes when consumption begins, not where it begins.</p>
+     *
+     * <p>A held start counts as a started lifecycle ({@link #isRunning()}), because it is one: Spring
+     * has been told the component is running, and the close that follows asks this instance to stop for
+     * exactly that reason. What has not happened is the container coming up, which is
+     * {@link #consuming()}.</p>
      */
     @Override
     public synchronized void start() {
-        if (running) {
+        if (started) {
             return;
         }
         stopping = false;
+        started = true;
         if (strategy.recoversHistoryBeforeConsuming()) {
-            log.info("Holding the scoreboard stream consumer until the {} history recovery has run; the "
-                            + "consumer will resume at the stored checkpoint, which the recovery does not move",
-                    strategy.mode().propertyValue());
             cutover.whenCovered(this::startAfterHistoryRecovery);
+            if (!consuming) {
+                // Only when it is still held: a restart inside a live context can reach the boundary
+                // that has already been crossed, in which case the action ran above and started the
+                // container, and logging "holding" over that would describe the state it just left.
+                log.info("Holding the scoreboard stream consumer until the {} history recovery has run; the "
+                                + "consumer will resume at the stored checkpoint, which the recovery does not move",
+                        strategy.mode().propertyValue());
+            }
             return;
         }
         startAtStoredOffset();
-        running = true;
     }
 
     /**
      * The other half of a held start, run when the mode's history recovery reports the history covered.
      *
-     * <p>Idempotent against the two ways it can be reached more than once: a lifecycle already running
-     * (a shutdown and restart inside one context), and a context that is going down. Neither may leave
-     * a listener container starting behind it.</p>
+     * <p>Idempotent against the three ways it can be reached more than once: a lifecycle already
+     * consuming (a shutdown and restart inside one context), a context that is going down, and the
+     * cutover's own retry after this action failed. None may leave a listener container starting behind
+     * them.</p>
+     *
+     * <p>A start that throws leaves {@link #consuming} false on purpose, so the cutover keeps the action
+     * waiting and the next report of the boundary - the redis-seq periodic check is one - tries again
+     * rather than leaving a consumer that never comes up.</p>
      */
     private synchronized void startAfterHistoryRecovery() {
-        if (running || stopping) {
+        if (consuming || stopping) {
             return;
         }
         startAtStoredOffset();
-        running = true;
     }
 
+    /**
+     * Stops the container if it is up, and records the close either way.
+     *
+     * <p>The flag is set before the container is touched, and it is set whether or not anything was
+     * consuming: this is the only thing that keeps a release arriving during the close from starting a
+     * container into it, and a consumer that is still held has no container to stop but is the one that
+     * most needs the flag.</p>
+     */
     @Override
     public synchronized void stop() {
         stopping = true;
-        if (!running) {
+        started = false;
+        if (!consuming) {
             return;
         }
         container.stop();
-        running = false;
+        consuming = false;
     }
 
     @Override
     public void stop(Runnable callback) {
         synchronized (this) {
             stopping = true;
-            if (!running) {
+            started = false;
+            if (!consuming) {
                 callback.run();
                 return;
             }
-            running = false;
+            consuming = false;
         }
         container.stop(callback);
     }
 
     @Override
     public boolean isRunning() {
-        return running;
+        return started;
+    }
+
+    /**
+     * Whether the listener container is up, as opposed to started and waiting for the history boundary.
+     *
+     * <p>The question every pass that restarts a consumer has to ask: a held consumer has no position to
+     * resume and no batch to re-read, so a supervisor that treated it as running would begin consuming
+     * ahead of the recovery the hold exists for.</p>
+     */
+    boolean consuming() {
+        return consuming;
     }
 
     @Override
@@ -212,9 +271,15 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
      * to stop asking about the batch. In the rewinding mode the two coincide, because that mode's answer
      * <em>is</em> a restart at the checkpoint: it re-reads the failed batch on the way past, and this pass
      * counts the batch as handled rather than restarting a second time for it.</p>
+     *
+     * <p>What this pass asks about is a consumer that is reading. A held one is not asked about at all:
+     * it has no position to resume from and no batch to re-read, and starting it here would begin
+     * consumption ahead of the recovery the hold exists for - the very thing the boundary is. That is
+     * why the guard is {@link #consuming()} rather than {@link #isRunning()}, which a held consumer
+     * answers true to because Spring has to see it as started to stop it.</p>
      */
     void recoverConsumption() {
-        if (!running) {
+        if (!consuming) {
             return;
         }
         try {
@@ -235,7 +300,7 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
                 return;
             }
             synchronized (this) {
-                if (!running) {
+                if (!consuming) {
                     return;
                 }
                 boolean answeredNow = false;
@@ -261,11 +326,16 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
                     return;
                 }
                 container.stop();
-                handledFailures = failures;
                 metrics.recordFailureRestart();
                 log.warn("Resubscribing the scoreboard stream consumer at {} to re-read a failed batch",
                         storedOffset);
                 startAt(storedOffset, offsetValue(storedOffset));
+                // Only once the container is back up. Recording the batch as handled before the
+                // restart succeeded - while the container is stopped and the failure count is the only
+                // thing that would ask about it again - is a retry thrown away: the next pass returns on
+                // this comparison and nothing else in the JVM asks. A start that threw leaves the count
+                // where it was, so the next cycle restarts again.
+                handledFailures = failures;
             }
         } catch (RuntimeException failure) {
             log.warn("Could not inspect or restart the scoreboard stream consumer", failure);
@@ -374,6 +444,14 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
      * checkpoint known to be wrong. Every message at or below it is re-delivered and the script
      * returns the stored offset without touching the standings, so the re-read costs traffic and
      * changes nothing.</p>
+     *
+     * <p>What the caller is told on return is that a consumer is up, which is asked of the container
+     * rather than assumed. Spring AMQP sets the container's running flag before it starts its consumers
+     * and does not clear it when that part fails, so {@code start()} can return having started nothing -
+     * and a later attempt on that container returns immediately, because it already reports itself
+     * running. Believing the return value there is how a consumer that is down gets recorded as one that
+     * is up: the retry would be counted as served, the cutover would forget it, and the scoreboard would
+     * stop being consumed with every log line saying otherwise.</p>
      */
     private void startAt(long storedOffset, Object requestedOffset) {
         completion.repairPending();
@@ -381,6 +459,14 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
         metrics.initializeOffset(storedOffset);
         container.setConsumerArguments(Map.of("x-stream-offset", requestedOffset));
         container.start();
+        if (container.getActiveConsumerCount() <= 0) {
+            throw new IllegalStateException("The scoreboard stream listener container returned from start() "
+                    + "with no active consumer: the container can report itself running while nothing is "
+                    + "consuming, because Spring AMQP sets that flag before its consumers are started and "
+                    + "leaves it set when that part fails. Nothing is consuming, so this start is reported "
+                    + "as the failure it is - whoever asked for it keeps waiting and asks again");
+        }
+        consuming = true;
         log.info("Started scoreboard stream consumer at {}", requestedOffset);
     }
 

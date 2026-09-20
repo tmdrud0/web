@@ -40,6 +40,18 @@ import org.springframework.stereotype.Component;
  * absence is the one way consumption can fail to begin: a replay that threw fails the application
  * rather than leaving a consumer held behind it, and a gate held by another pass is logged at ERROR
  * naming what stayed held.</p>
+ *
+ * <p>A release that ran but could not start the consumer is not swallowed either, and this is the
+ * reason: the boundary is what an operator is waiting on, and a JVM that came up with nothing consuming
+ * while reporting its history recovered would be the quiet failure this whole boundary exists to
+ * prevent. The exception is thrown out of this runner, so the application fails to start loudly.</p>
+ *
+ * <p>Keeping the failed action waiting on the boundary (see {@link ContestScoreboardRecoveryCutover})
+ * does not buy a retry inside this JVM, and it is not relied on here: in this mode <em>this runner is
+ * the only thing that reports the boundary</em>. The retention-gap fallback replays through the same
+ * service but reports nothing, and there is no periodic report as there is in {@code redis-seq}. The
+ * retry is the restart, which runs this pass again - so the failure has to reach the caller rather than
+ * be left to a later report that will not come.</p>
  */
 @Component
 @ConditionalOnProperty(
