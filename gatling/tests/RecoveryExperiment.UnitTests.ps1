@@ -507,6 +507,30 @@ Test-Case "a leftover row's name is attributed to the run id that wrote it" {
     Assert-Equal $null (Get-RunIdFromUserName -Name "sbrec_fullreplay_1_user_7x") "a trailing character in the index is not a seeded user"
 }
 
+Test-Case "the login feeder's prefix builds the name the seeder inserted" {
+    # The two shapes this experiment writes, and the one removal that separates them. The rows are
+    # `sbrec_<runId>_user_<n>` and the seeded `UserPrefix` already ends in `user`; `ApiLoad.loginFeeder`
+    # appends `_user_<n>` itself, so it has to be given the prefix without that suffix.
+    #
+    # Passing the row prefix asked for `sbrec_<runId>_user_user_<n>`, which is nobody: all 187 logins of a
+    # calibration run answered 401, the feeder ran dry, the engine stopped one second in, and the run
+    # spent two minutes waiting for applied results that could not arrive - reporting that wait as the
+    # pipeline's behaviour. The check below is the relation itself, so a prefix that produces a name the
+    # seeder would never insert cannot pass it.
+    $rowPrefix = "sbrec_fullreplay_1_user"
+    $feederPrefix = Get-FeederUserPrefix -UserPrefix $rowPrefix
+    Assert-Equal "sbrec_fullreplay_1" $feederPrefix "the feeder prefix is the row prefix without its _user suffix"
+    # What Gatling builds from the feeder prefix, against what the seeder inserted. Equality here is the
+    # whole requirement: a login asks for exactly one of these names.
+    Assert-Equal "${rowPrefix}_1" "${feederPrefix}_user_1" "the feeder's first user is the first seeded row"
+    Assert-Equal "${rowPrefix}_200" "${feederPrefix}_user_200" "and its last user is the last seeded row"
+
+    # A prefix that does not carry the suffix is left alone, so this cannot quietly shorten a name it was
+    # not asked to change - and a `_user` in the middle is not a suffix.
+    Assert-Equal "sbrec_fullreplay_1" (Get-FeederUserPrefix -UserPrefix "sbrec_fullreplay_1") "a prefix without the suffix is unchanged"
+    Assert-Equal "sbrec_x_user_y" (Get-FeederUserPrefix -UserPrefix "sbrec_x_user_y") "a _user that is not the suffix stays"
+}
+
 # --- the harness's own sources ---------------------------------------------------------------------
 # The two defects below were found by running the harness and not by reading it, and each of them made a
 # whole calibration suite say something untrue. Both are silent in the way that matters - the first

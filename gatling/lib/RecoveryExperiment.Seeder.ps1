@@ -142,6 +142,23 @@ function Assert-ExperimentDataAbsent {
     return $counts
 }
 
+# The prefix the Gatling login feeder builds a user name from.
+#
+# `ApiLoad.loginFeeder` appends `_user_<n>` itself, so what it needs is the row prefix with that suffix
+# taken off: the seeded rows are `sbrec_<runId>_user_<n>` and this answers `sbrec_<runId>`. The two are
+# one removal apart, and the difference is invisible until a login is attempted - which is how it was
+# found. Passing the row prefix made every attempt ask for `sbrec_<runId>_user_user_<n>`, a user that
+# exists for nobody: all 187 logins answered 401, the feeder ran dry, and the engine stopped on
+# `Feeder in-memory is now empty` one second into the run. What the run then reported, two minutes
+# later, was `at least 60 applied results did not happen` - a sentence about the pipeline, for a load
+# generator that had already died. `New-ExperimentSeed` calls this and checks the result against the
+# names it actually inserted, so the two shapes cannot drift apart silently again.
+function Get-FeederUserPrefix {
+    param([Parameter(Mandatory = $true)][string]$UserPrefix)
+
+    return ($UserPrefix -replace '_user$', '')
+}
+
 # Creates the contest, its problems and its users, in that order, in one connection.
 #
 # The window is expressed relative to the database's own clock rather than to the harness's: the JVM
@@ -233,6 +250,9 @@ SELECT CONCAT('SBRE_SEED_USERS=', MIN(id), '|', MAX(id), '|', COUNT(*), '|', SUM
         UserIdEnd = [long]$users[1]
         UserCount = [long]$users[2]
         UserPrefix = "${prefix}user"
+        # What the load generator authenticates as, which is a different shape from the row names above
+        # and the only value that makes its login feeder produce a name that exists.
+        FeederUserPrefix = Get-FeederUserPrefix -UserPrefix "${prefix}user"
         Password = "pass"
         SeededAtUtc = [DateTimeOffset]::UtcNow.UtcDateTime.ToString("o")
         SeededAtMysql = Get-MySqlNow
@@ -247,6 +267,15 @@ SELECT CONCAT('SBRE_SEED_USERS=', MIN(id), '|', MAX(id), '|', COUNT(*), '|', SUM
     }
     if ($seed.UserCount -ne $UserCount -or [long]$users[3] -ne 0 -or [long]$users[4] -ne 0) {
         throw "The seeded users are not all '$prefix' users with password 'pass': ${users -join '|'}"
+    }
+    # The name the load generator will ask for, checked against the shape that was inserted rather than
+    # against the prefix it was derived from. A wrong prefix here does not fail - it produces 401s and an
+    # empty feeder - so it is refused where it can still be refused cheaply.
+    $feederAsksFor = "$($seed.FeederUserPrefix)_user_1"
+    if ($feederAsksFor -ne "$($seed.UserPrefix)_1") {
+        throw ("The load generator would log in as '$feederAsksFor' but the seeded rows are named " +
+            "'$($seed.UserPrefix)_1'. Every login would be refused with 401 and the run would measure " +
+            "an idle system. Refusing the seed instead.")
     }
 
     if (-not (Test-Path -LiteralPath $EvidenceDirectory)) {

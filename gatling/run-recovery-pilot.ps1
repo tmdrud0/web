@@ -311,14 +311,43 @@ function Wait-PilotCondition {
         [Parameter(Mandatory = $true)][string]$Description,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
         [Parameter(Mandatory = $true)][scriptblock]$Predicate,
-        [AllowEmptyCollection()][string[]]$Lost = @()
+        [AllowEmptyCollection()][string[]]$Lost = @(),
+        # The load generator, for a wait that is for something the load is supposed to cause. Without it a
+        # generator that died one second in is indistinguishable from a pipeline that never applied a
+        # result: the wait runs out its timeout and reports the absence, which reads as the mode's
+        # behaviour rather than as the harness's. Measured - a run whose logins all answered 401 and whose
+        # feeder then ran dry was reported as "at least 60 applied results did not happen", a sentence
+        # about the pipeline, two minutes after its load had stopped.
+        [Diagnostics.Process]$LoadProcess = $null
     )
 
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     $last = $null
     while ($true) {
         $last = Invoke-PilotPoll -Phase $Phase -Lost $Lost
+        # The predicate is asked first: a load generator that has finished is not a fault when the thing
+        # being waited for has arrived, and every wait here is for that thing, not for the load.
         if (& $Predicate $last) { return $last }
+        if ($null -ne $LoadProcess -and $LoadProcess.HasExited) {
+            # Touched before `ExitCode` for the reason the launch site gives: with redirected output,
+            # `ExitCode` on a Process from `Start-Process -PassThru` answers null until its handle has
+            # been read, and a null that reaches an `[int]` binds to 0 - this harness's word for a
+            # complete run. Read here rather than relied on from the launch site, because this function
+            # is handed a Process and cannot see how it was started.
+            $null = $LoadProcess.Handle
+            $loadExitCode = $LoadProcess.ExitCode
+            # Two things can end the load, and the message says which evidence separates them rather
+            # than picking one. Either way the wait cannot be satisfied, so both readings end the wait
+            # now instead of at the timeout - which is the point, because the timeout's own message
+            # describes the pipeline and reads as the mode's behaviour.
+            throw ("The load generator exited with code $loadExitCode while waiting for " +
+                "$Description, so it was producing nothing further. Either it finished its ramp and hold " +
+                "before that could happen - raise -HoldSeconds - or it failed; the requests it made and " +
+                "the statuses it was answered with are in $artifacts\gatling\stdout.txt. Last reading: " +
+                "applied=$($last.oracleAppliedResults), digestMatches=$($last.digestMatches), " +
+                "quiescent=$($last.quiescent), pending=$($last.streamPendingEvents), " +
+                "checkpoint=$($last.checkpointOffset).")
+        }
         if ([DateTimeOffset]::UtcNow -ge $deadline) {
             throw ("$Description did not happen within $TimeoutSeconds seconds. Last reading: " +
                 "applied=$($last.oracleAppliedResults), digestMatches=$($last.digestMatches), " +
@@ -449,7 +478,7 @@ try {
         "-Dperf.deterministic=true",
         "-Dperf.problemId.start=$($script:seed.ProblemIdStart)",
         "-Dperf.problemId.end=$($script:seed.ProblemIdEnd)",
-        "-Dperf.userPrefix=$($script:seed.UserPrefix)",
+        "-Dperf.userPrefix=$($script:seed.FeederUserPrefix)",
         "-Dperf.userIndex.start=1",
         "-Dperf.userIndex.end=$($script:seed.UserCount)",
         "-Dperf.targetRps=$TargetRps",
@@ -487,6 +516,7 @@ try {
     # --- 6. baseline ------------------------------------------------------------------------------
 
     $baselineRow = Wait-PilotCondition -Phase "loading" -TimeoutSeconds $SettleTimeoutSeconds `
+        -LoadProcess $script:gatlingProcess `
         -Description "at least $BaselineResults applied results" `
         -Predicate { param($row) $n = Get-RowNumber -Row $row -Name "oracleAppliedResults"; $null -ne $n -and $n -ge $BaselineResults }
 
