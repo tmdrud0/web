@@ -20,8 +20,9 @@
 | 2라운드 HEAD | `535855d` (기준 + 19 commit) |
 | 검토 기준 HEAD | `7af681e` (기준 + 20 commit) — 읽기 전용 검토자가 본 지점 |
 | 검토 수정 HEAD | `b98c83f` (기준 + 21 commit, 60 files, +5190 / −476) |
-| **최종 HEAD** | **`655838e`** (기준 + 22 commit, 102 files, +10725 / −283) |
-| 작업 트리 | **clean (미추적 파일 없음)** — 최종 HEAD에서 측정. §1.1 |
+| 측정 지점 HEAD | `655838e` (기준 + 22 commit, 102 files, +10725 / −283) |
+| 그 뒤 | 이 보고서의 문구·수치만 고치는 docs commit 3건(`b6eff86`, `e8a5e8d`, 그리고 이 절을 적는 commit) |
+| 작업 트리 | **clean (미추적 파일 없음)** — 측정 지점 HEAD와 그 이후 모두에서 확인 |
 
 마지막 한 commit(`655838e`)은 이 절을 측정값으로 채우는 commit이다 — 즉 위 수치는 그 commit 자신을
 포함하고, `b98c83f..655838e`의 차이는 정확히 그 commit의 `+67 / −21`이다. 이것이 "clean 상태와 변경
@@ -297,9 +298,12 @@ c307ceb refactor: lift the scoreboard processing lock out of the stream package
 0f7bb14 feat: select the contest scoreboard recovery mode from configuration
 ```
 
-### 8.2 2라운드 (`60d98ec` → `b98c83f`)
+### 8.2 2라운드 (`60d98ec` → `b98c83f`, 이후 보고서 정정 commit)
 
 ```
+e8a5e8d docs: name the commit each diff figure was measured at
+b6eff86 docs: label the tree-state measurements by the commit they describe
+655838e docs: record the tree state and the discrimination the review fixes left
 b98c83f fix: read the scoreboard recovery range from both of its ends
 136440e docs: record the tree state the report describes
 535855d docs: correct the scoreboard recovery report against the implementation
