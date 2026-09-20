@@ -1126,35 +1126,73 @@ function Get-RabbitAddressMap {
 }
 
 function Get-RabbitChannels {
-    # The live queue's consumer channels. `messages_unacknowledged` per channel is the only per-node
-    # reading the broker offers, because the judge's own actuator gauges are mysql-only - so "does
-    # judge-1 hold work" is answered from here or not at all.
+    # The live queue's consumer channels, each with what it is holding. The unacknowledged count per
+    # channel is the only per-node reading the broker offers, because the judge's own actuator gauges
+    # are mysql-only - so "does judge-1 hold work" is answered from here or not at all.
+    #
+    # Two endpoints, joined by channel name, because neither alone can answer it on RabbitMQ 4.1. The
+    # queue's `consumer_details` is what says which channels are consuming the live queue, but its
+    # entries carry no unacknowledged count (arguments, channel_details, ack_required, active,
+    # activity_status, consumer_tag, consumer_timeout, exclusive, prefetch_count, queue). The count
+    # lives on the channel list instead. Reading the count off `consumer_details` yields null for
+    # every channel, and null here means "unreadable" - so the trigger would report no active work on
+    # a node that is demonstrably mid-judgement, which is how this run was first lost.
+    #
+    # The membership comes from the queue and the count from one channel-list read, so the per-node
+    # sum is internally consistent; the queue's own messages_unacknowledged is read at a different
+    # instant and can differ from it by whatever flowed between the two reads.
     $document = Get-RabbitApiBody -Path "/api/queues/%2F/$($script:rabbitLiveQueue)"
     if ($null -eq $document) { return $null }
-    $channels = $document.PSObject.Properties["consumer_details"]
-    if ($null -eq $channels -or $null -eq $channels.Value) { return @() }
+    $details = $document.PSObject.Properties["consumer_details"]
+    # A live queue with no consumers is a real zero and must not fall through to the channel read: the
+    # wire payload for it is an empty array, not null, so a null test alone does not catch it, and if
+    # the broker answers an empty channel list too - which it legitimately does when nothing is
+    # connected - the caller would be told the reading failed on a queue that simply had no consumers.
+    if ($null -eq $details -or $null -eq $details.Value -or @($details.Value).Count -eq 0) { return , @() }
+    $channelList = Get-RabbitApiBody -Path "/api/channels"
+    if ($null -eq $channelList) { return $null }
+    $byName = @{}
+    foreach ($entry in @($channelList)) {
+        $name = $entry.PSObject.Properties["name"]
+        if ($null -ne $name -and -not [string]::IsNullOrWhiteSpace([string]$name.Value)) {
+            $byName[[string]$name.Value] = $entry
+        }
+    }
     $map = Get-RabbitAddressMap
     $rows = @()
-    foreach ($entry in @($channels.Value)) {
+    foreach ($entry in @($details.Value)) {
         $channel = $entry.PSObject.Properties["channel_details"]
         $peerHost = $null
+        $channelName = $null
         if ($null -ne $channel -and $null -ne $channel.Value) {
             $peer = $channel.Value.PSObject.Properties["peer_host"]
             if ($null -ne $peer) { $peerHost = [string]$peer.Value }
+            $name = $channel.Value.PSObject.Properties["name"]
+            if ($null -ne $name) { $channelName = [string]$name.Value }
         }
         $node = $null
         if (-not [string]::IsNullOrWhiteSpace($peerHost)) {
             $hostOnly = $peerHost.Split(":")[0]
             if ($map.ContainsKey($hostOnly)) { $node = $map[$hostOnly] }
         }
+        # A channel the queue lists but the channel endpoint does not answer for stays null rather
+        # than becoming 0: the caller turns null into "this reading failed", and a 0 there would
+        # claim the node holds nothing.
+        $source = $null
+        if (-not [string]::IsNullOrWhiteSpace($channelName) -and $byName.ContainsKey($channelName)) {
+            $source = $byName[$channelName]
+        }
         $rows += [pscustomobject]@{
             node = $node
             peerHost = $peerHost
-            unacked = Get-RabbitNumber -Object $entry -Name "messages_unacknowledged"
-            prefetch = Get-RabbitNumber -Object $entry -Name "prefetch_count"
+            channelName = $channelName
+            unacked = Get-RabbitNumber -Object $source -Name "messages_unacknowledged"
+            prefetch = Get-RabbitNumber -Object $source -Name "prefetch_count"
         }
     }
-    return $rows
+    # Comma-wrapped: an empty array returned bare unrolls to nothing, and the caller would read that
+    # as an unreadable broker instead of as a live queue with no consumers on it.
+    return , $rows
 }
 
 function Get-RabbitNodeUnacked {
@@ -1165,13 +1203,23 @@ function Get-RabbitNodeUnacked {
     if ($null -eq $channels) { return $null }
     $total = 0.0
     $counted = 0
+    $unread = 0
     foreach ($channel in $channels) {
         if ($channel.node -ne $Node) { continue }
-        if ($null -eq $channel.unacked) { return $null }
+        if ($null -eq $channel.unacked) { $unread++; continue }
         $total += $channel.unacked
         $counted++
     }
-    return [pscustomobject]@{ unacked = $total; channels = $counted; totalChannels = @($channels).Count }
+    # Channels resolved for this node, but not one of them carried a count. That is the signature of
+    # reading the wrong field rather than of a node holding nothing, so it is reported as unreadable:
+    # a change in the broker's payload must not be able to present itself as "no active work".
+    if ($counted -eq 0 -and $unread -gt 0) { return $null }
+    return [pscustomobject]@{
+        unacked = $total
+        channels = $counted
+        unreadChannels = $unread
+        totalChannels = @($channels).Count
+    }
 }
 
 function Get-RabbitQueueState {
@@ -2585,6 +2633,13 @@ function Wait-JudgeNodeReady {
         [Parameter(Mandatory = $true)][int]$Port,
         [int]$ReadinessTimeoutSeconds = 180,
         [int]$DispatcherTimeoutSeconds = 90,
+        # The caller's observation tick and the sink it keeps for each gate's instant. Both were lost
+        # from this block when gate 4's evidence was made dispatch-specific, and every caller's -OnPoll
+        # and -Progress then failed to bind - the fault run caught it as "$Node did not reach ready: A
+        # parameter cannot be found that matches parameter name 'OnPoll'", so the restart's readiness
+        # anchors were never recorded and the fault-down cohort ran on to the end of the run.
+        [scriptblock]$OnPoll = $null,
+        $Progress = $null,
         # Gate 4's evidence is dispatch-specific, so both halves of it are passed in. The defaults
         # reproduce the mysql behaviour exactly: read `contest_judge_claim_calls_total` from the
         # node's own metrics endpoint and call the dispatcher active once that reading is strictly
@@ -3179,13 +3234,14 @@ function Invoke-FaultRecoveryPhase {
                         thresholdReadings = [ordered]@{
                             killedNodeUnacknowledged = $unacked1
                             killedNodeConsumerChannels = $channels1
+                            killedNodeUnreadChannels = if ($null -eq $nodeUnacked) { $null } else { $nodeUnacked.unreadChannels }
                             liveQueueConsumerChannels = if ($null -eq $nodeUnacked) { $null } else { $nodeUnacked.totalChannels }
                             invocationsBefore = if ($null -eq $invocationsBefore) { $null } else { $invocationsBefore.invocations }
                             invocationsAfter = if ($null -eq $invocationsAfter) { $null } else { $invocationsAfter.invocations }
                             republishesBefore = if ($null -eq $invocationsBefore) { $null } else { $invocationsBefore.stored_result_republish }
                             republishesAfter = if ($null -eq $invocationsAfter) { $null } else { $invocationsAfter.stored_result_republish }
                             invocationsAdvanced = $invocationsAdvanced
-                            basis = "the per-node unacknowledged count is summed over the live queue's consumer channels whose peer address resolves to the killed node's container address at the moment of the read; the invocation and republish counters are read 1s apart as corroboration, and a counter that could not be read is null, never 0"
+                            basis = "the live queue names its consumer channels and the channel list gives each one's unacknowledged count; the two are joined by channel name, and the count is summed over the channels whose peer address resolves to the killed node's container address at the moment of the channel-list read. The invocation and republish counters are read 1s apart as corroboration, and a counter that could not be read is null, never 0"
                         }
                         activeWorkSeen = $activeWorkSeen
                         faultNotInjectedWithActiveWork = (-not $activeWorkSeen)
