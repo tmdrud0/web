@@ -184,7 +184,12 @@ function Get-RedisCensus {
         PrefixHistogram = @()
     }
     $census["Dbsize"] = Get-RedisInt64 -RedisArguments @("DBSIZE")
-    $keys = @(Invoke-RedisText -RedisArguments @("--scan")) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    # The `Where-Object` is applied to the array rather than to the pipeline, and that distinction is the
+    # whole of the line. A pipeline that emits nothing assigns `$null`, and `$null.Count` is an error under
+    # StrictMode - which is precisely the state this function is called in after `FLUSHALL`: the empty
+    # instance is the *successful* reset, so the unguarded version failed the run it had just cleared.
+    $keys = @(@(Invoke-RedisText -RedisArguments @("--scan")) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     $histogram = @{}
     $scoreboard = 0
     foreach ($key in $keys) {
@@ -342,6 +347,12 @@ function Invoke-ScoreboardRollback {
 }
 
 # --- batch-1 ---------------------------------------------------------------------------------------
+
+# Declared here rather than left to the first `Pause-Batch`, because "not paused" is the true state before
+# anything runs and the failure path calls `Resume-Batch` unconditionally: on a run that died before it got
+# as far as pausing, reading an undeclared variable is an error under StrictMode, so the cleanup path threw
+# a second exception over the top of the one that had actually stopped the run.
+$script:recoveryBatchPaused = $false
 
 function Pause-Batch {
     if ($script:recoveryBatchPaused) {

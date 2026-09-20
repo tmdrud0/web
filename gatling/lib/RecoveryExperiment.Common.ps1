@@ -26,6 +26,12 @@ $ErrorActionPreference = "Stop"
 
 $script:recoveryInvariantCulture = [Globalization.CultureInfo]::InvariantCulture
 
+# Declared, so that a run which fails before `Initialize-RecoveryExperiment` gets as far as setting it can
+# still be described by the code that reports the failure. Reading an undeclared variable is an error
+# under StrictMode, and the cleanup paths are exactly where that is least affordable: the first
+# calibration attempt lost the real error behind a second one raised by its own failure handler.
+$script:recoveryConfig = $null
+
 # The one namespace every rollback and every key census is scoped to. Confirmed single-valued in the
 # product: ContestScoreboardRedisKeys.PREFIX is `contest:scoreboard:` and no other key family in the
 # scoreboard write path leaves it.
@@ -498,9 +504,12 @@ function Assert-PrometheusTargetsHealthy {
 
 function Get-ProjectContainers {
     $config = Get-RecoveryConfig
-    $ids = @(Invoke-NativeCommand -Executable "docker" -Arguments @(
-            "ps", "-aq", "--filter", "label=com.docker.compose.project=$($config.ProjectName)"
-        )) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    # The `@(...)` is around the pipeline and not around `Invoke-NativeCommand`, because with no project
+    # container running `docker ps -aq` prints nothing: an unwrapped pipeline would assign null and the
+    # `.Count` on the next line would throw on the very state this branch exists to answer for.
+    $ids = @(@(Invoke-NativeCommand -Executable "docker" -Arguments @(
+                "ps", "-aq", "--filter", "label=com.docker.compose.project=$($config.ProjectName)"
+            )) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     if ($ids.Count -eq 0) {
         return @()
     }

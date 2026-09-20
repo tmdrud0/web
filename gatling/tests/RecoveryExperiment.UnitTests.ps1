@@ -465,6 +465,56 @@ Test-Case "a process whose exit code is read has its handle read first" {
     }
 }
 
+# Every assignment of the shape `$name = @( ... ) | ...`, where the `@(` has already closed by the time
+# the pipe is reached, returned as `@("file|name|line)`. The `@(...)` there surrounds only the first
+# command in the pipeline, so it protects nothing: a pipeline that emits no rows still assigns `$null`,
+# and `$null.Count` is an error under StrictMode rather than zero. The scan balances parentheses from the
+# `@(` to find where it really closes, so a nested `@(...)` does not end it early.
+function Get-ArrayWrapPipelines {
+    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Text)
+
+    $found = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($match in [regex]::Matches($Text, '\$(\w+)\s*=\s*@\(')) {
+        $open = $match.Index + $match.Length - 1
+        $depth = 0
+        $position = $open
+        while ($position -lt $Text.Length) {
+            if ($Text[$position] -eq '(') { $depth++ }
+            elseif ($Text[$position] -eq ')') {
+                $depth--
+                if ($depth -eq 0) { break }
+            }
+            $position++
+        }
+        if ($position -ge $Text.Length) { continue }
+        $rest = $Text.Substring($position + 1)
+        if ($rest -notmatch '^\s*\|') { continue }
+        $line = ($Text.Substring(0, $match.Index) -split "`n").Count
+        $found.Add("$Name|$($match.Groups[1].Value)|$line")
+    }
+    return $found
+}
+
+Test-Case "an array wrap is not left to protect a pipeline it has already closed" {
+    # The empty-instance census after FLUSHALL is this harness's *successful* reset, and that is exactly
+    # the input `@(redis-cli --scan) | Where-Object { ... }` could not survive: the scan returns no rows,
+    # the statement assigns null, and `$keys.Count` three lines later threw. It failed the run it had just
+    # cleared. So: if a variable is assigned from that shape, it may not then be counted or indexed.
+    $checked = 0
+    foreach ($source in @(Get-HarnessSourceFiles)) {
+        $text = Get-Content -LiteralPath $source.FullName -Raw
+        foreach ($entry in @(Get-ArrayWrapPipelines -Name $source.Name -Text $text)) {
+            $parts = $entry -split '\|'
+            $name = $parts[1]
+            $checked++
+            $counted = $text -match "\`$$name\.Count|\`$$name\["
+            Assert-True (-not $counted) `
+                "$($source.Name):$($parts[2]) assigns `$$name from `@(...) | ...`, which closes the wrap before the pipe, and then counts or indexes it - so an empty result is null and not an empty array"
+        }
+    }
+    Assert-True ($checked -ge 2) "the scan found the harness's array-wrapped pipelines ($checked found)"
+}
+
 # --- report -------------------------------------------------------------------------------------
 
 Write-TestSummary -Suite "RecoveryExperiment unit tests"
