@@ -171,7 +171,13 @@ $warmupPrefix = ""
 $measurementPrefix = ""
 $measurementHoldSeconds = 0
 if ($phasedLoad) {
-    if ($DispatchMode -ne "mysql") { throw "A phased-load run measures MySQL claim dispatch, so -DispatchMode must be mysql." }
+    # The fault-recovery run is still mysql-only: its whole subject is what a killed claim lease
+    # does to the rows it held, and rabbit has no claim lease to lose. The normal-timeout run holds
+    # one rate across two contests and says nothing about the claim protocol, so it is meaningful
+    # for either dispatch path - and a rabbit capacity question is exactly that shape.
+    if ($DispatchMode -ne "mysql" -and -not ($NormalTimeout -and $DispatchMode -eq "rabbit")) {
+        throw "A phased-load run is mysql, or rabbit with -NormalTimeout; -FaultRecovery measures a MySQL claim lease."
+    }
     if ($FaultEnabled) { throw "A phased-load run drives the fault from its own trigger, so -FaultEnabled does not apply to it." }
     if (-not $PSBoundParameters.ContainsKey("TargetRps")) { throw "A phased-load run requires an explicit -TargetRps: the offered rate is an input to the comparison, not a default." }
     if ($WarmupSeconds -lt 12) { throw "-WarmupSeconds must be at least 12, or the warm-up phase is not long enough to reach a steady state." }
@@ -875,7 +881,12 @@ function Wait-PipelineQuiescent {
         [Parameter(Mandatory = $true)][long]$ContestId,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
         [int]$StableSeconds = 3,
-        [string]$Purpose = "this contest"
+        [string]$Purpose = "this contest",
+        # The executor gauges are registered by the MySQL dispatcher only, so a rabbit run has no
+        # "reserved" to read and would otherwise never be callable quiescent. This is passed from
+        # the dispatch mode rather than inferred from a missing scrape, so an unavailable reading on
+        # a path that does have the gauge still blocks quiescence as before.
+        [switch]$AllowMissingExecutorGauges
     )
     # A single "backlog reads zero" sample is not enough to place a metric baseline. Three gaps make
     # it insufficient. First, a row is PUBLISHED the moment it is handed to a worker, so an
@@ -888,6 +899,12 @@ function Wait-PipelineQuiescent {
     # running. Quiescence is therefore this whole predicate held for consecutive seconds: nothing
     # unfinished anywhere in the outbox, no judge holding a claim, this contest's submissions all
     # judged and all applied to the scoreboard, and the judge invocation total unchanged.
+    #
+    # "no judge holding a claim" is the one term that is dispatch-specific. Under rabbit a message
+    # handed to a consumer is already PUBLISHED in the outbox and has no result row until the judge
+    # stores one, so results == accepted is what says nothing is in flight there, and it is the same
+    # invariant the integrity check reports at the end. The term is dropped only when the caller
+    # says the path has no gauge to read, and the reason string records that it was dropped.
     $startedAt = [datetimeoffset]::UtcNow
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $streak = 0
@@ -903,17 +920,22 @@ function Wait-PipelineQuiescent {
         $reserved = 0.0
         $invocations = 0.0
         $readable = $true
+        $gaugesMissing = $false
         foreach ($port in @(19001, 19002)) {
             $state = Get-JudgeLiveState -Port $port
-            if ($null -eq $state.reserved -or $null -eq $state.invocations) { $readable = $false } else {
+            if ($null -eq $state.invocations) { $readable = $false; continue }
+            $invocations += $state.invocations
+            if ($null -eq $state.reserved) {
+                if ($AllowMissingExecutorGauges) { $gaugesMissing = $true } else { $readable = $false }
+            } else {
                 $reserved += $state.reserved
-                $invocations += $state.invocations
             }
         }
         $quiet = $false
         if ($readable -and $null -ne $unfinished -and $null -ne $accepted -and $null -ne $results -and $null -ne $applied) {
-            $reason = "outbox unfinished $unfinished, judge reserved $reserved, accepted $accepted, results $results, scoreboard applied $applied, judge invocations $invocations"
-            $quiet = ($unfinished -eq 0 -and $reserved -eq 0 -and $results -eq $accepted -and $applied -eq $accepted -and
+            $gaugeTerm = if ($gaugesMissing) { "executor reserved gauge absent on this dispatch path and dropped" } else { "judge reserved $reserved" }
+            $reason = "outbox unfinished $unfinished, $gaugeTerm, accepted $accepted, results $results, scoreboard applied $applied, judge invocations $invocations"
+            $quiet = ($unfinished -eq 0 -and ($gaugesMissing -or $reserved -eq 0) -and $results -eq $accepted -and $applied -eq $accepted -and
                 ($null -eq $lastInvocations -or $invocations -eq $lastInvocations))
         } else {
             $reason = "at least one reading was unavailable or the judge endpoints could not be scraped (outbox $unfinished, accepted $accepted, results $results, applied $applied, both nodes readable $readable)"
@@ -2196,7 +2218,7 @@ try {
         # The measured window's counters are taken as a delta from the scrape below, so the warm-up
         # must be fully finished - judged, applied and no worker still inside a judge call - before
         # it is taken. Otherwise warm-up work is charged to the measured phase.
-        $warmupQuiescence = Wait-PipelineQuiescent -ContestId $events.warmupContestId -TimeoutSeconds 300 -Purpose "the warm-up contest"
+        $warmupQuiescence = Wait-PipelineQuiescent -ContestId $events.warmupContestId -TimeoutSeconds 300 -Purpose "the warm-up contest" -AllowMissingExecutorGauges:($DispatchMode -eq "rabbit")
         if (-not $warmupQuiescence.quiescent) {
             throw "The warm-up phase never reached quiescence ($($warmupQuiescence.reason)); without it the measured window has no clean baseline."
         }
@@ -2385,10 +2407,18 @@ try {
             # zero would end the drain on an unmeasured sample and record a drained run, so the
             # backlog stays $null and the loop keeps polling; the loop's exit test below refuses to
             # call a run drained while the last reading is unknown.
-            if ($null -eq $drainSample.unfinishedContest -or $null -eq $drainSample.unappliedContest) {
+            if ($null -eq $drainSample.unfinishedContest -or $null -eq $drainSample.unappliedContest -or
+                $null -eq $drainSample.accepted -or $null -eq $drainSample.results) {
                 $backlog = $null
             } else {
-                $backlog = $drainSample.unfinishedContest + $drainSample.unappliedContest
+                # The two row counts alone are not a drain of the pipeline. Under rabbit a message
+                # is PUBLISHED the moment the broker confirms it, so a queue full of messages the
+                # judges have not reached yet is neither unfinished nor unapplied and both terms
+                # read zero. A submission with no result row is exactly that in-flight work, so
+                # results == accepted is what closes the gap - and it is the same invariant the
+                # integrity check reports, which is why a drained run cannot disagree with it.
+                $backlog = $drainSample.unfinishedContest + $drainSample.unappliedContest +
+                    [math]::Max(0, $drainSample.accepted - $drainSample.results)
             }
         } else {
             $backlog = Save-BacklogSample "drain"
