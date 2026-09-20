@@ -51,12 +51,43 @@ function Assert-True {
     }
 }
 
+# A number passed as a bareword argument to an untyped parameter keeps the text that was typed for its
+# rendering. `Assert-Equal 3L $x` binds Int64 3 whose `[string]` is `"3L"`, while `$x`'s own Int64 3
+# renders `"3"` - so the assertion fails on two values that are equal and the message reads
+# `(expected '3L', got '3')`, naming no cause. Measured rather than inferred: the same probe binds
+# `3kb` as Int32 3 rendering `"3kb"` and `0x1F` as Int32 31 rendering `"0x1F"`, while `[string]` of
+# each literal in expression position is the numeral itself.
+#
+# Comparing by rendered text is this harness's whole method, so a value whose text is not its value
+# cannot be compared by it at all. That is refused here, at the argument, rather than reported as a
+# mismatch the reader has to diagnose. A quoted `"3L"` is a string and is left alone: the text is then
+# what the caller meant.
+function Assert-RendersAsItsValue {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Value,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    if ($null -eq $Value) { return }
+    if ($Value -isnot [ValueType]) { return }
+    $code = [Type]::GetTypeCode($Value.GetType())
+    if ($code -lt [TypeCode]::SByte -or $code -gt [TypeCode]::Decimal) { return }
+    $text = [string]$Value
+    if ($text -match '^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$') { return }
+    throw ("$Description is a number whose text is not its value ('$text'). A bareword argument keeps " +
+        "the text that was typed - write a plain numeral such as '3', or quote the value if the text " +
+        "is what you mean to compare.")
+}
+
 function Assert-Equal {
     param(
         [Parameter(Mandatory = $true)][AllowNull()]$Expected,
         [Parameter(Mandatory = $true)][AllowNull()]$Actual,
         [Parameter(Mandatory = $true)][string]$Description
     )
+
+    Assert-RendersAsItsValue -Value $Expected -Description "the expected value of '$Description'"
+    Assert-RendersAsItsValue -Value $Actual -Description "the actual value of '$Description'"
 
     if ($Expected -is [double] -or $Actual -is [double]) {
         if ([Math]::Abs([double]$Expected - [double]$Actual) -gt 1e-9) {
@@ -76,6 +107,17 @@ function Assert-SequenceEqual {
         [Parameter(Mandatory = $true)][string]$Description
     )
 
+    # Same refusal as `Assert-Equal`, per element. Not redundant with it, and not triggerable the same
+    # way: the `[object[]]` parameter converts a suffixed bareword written inside the literal, so
+    # `Assert-SequenceEqual @(1L) @(1)` does not throw - measured - while the same value arriving
+    # through a variable does, because whichever untyped parameter took the bareword first is where the
+    # text was kept.
+    foreach ($element in @($Expected)) {
+        Assert-RendersAsItsValue -Value $element -Description "an expected element of '$Description'"
+    }
+    foreach ($element in @($Actual)) {
+        Assert-RendersAsItsValue -Value $element -Description "an actual element of '$Description'"
+    }
     $left = (@($Expected) | ForEach-Object { [string]$_ }) -join "|"
     $right = (@($Actual) | ForEach-Object { [string]$_ }) -join "|"
     if ($left -ne $right) {

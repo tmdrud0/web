@@ -132,11 +132,11 @@ Test-Case "an absent project queue reads as empty, and an unreadable row is refu
     # stream queue holding real backlog would have been reported as drained, and the run would have
     # called the pipeline quiescent with messages still in it. The zeros are right for a queue that is
     # not there and must not be reachable for a queue that is.
-    # The expected values below are written bare (`3`, not `3L`) even though every count here is an Int64.
-    # In command-argument position the token `3L` is Int64 3, but `Assert-Equal`'s `[string]` cast renders
-    # it as the literal text `"3L"` while the property it is compared against renders as `"3"` - so the
-    # assertion fails on a value that is equal, and the message reads `(expected '3L', got '3')`. Bare
-    # integers stringify both ways and are what the rest of this suite already writes.
+    # The expected values below are written bare (`3`, not `3L`). Not style: in command-argument position
+    # the token `3L` binds as Int64 3 whose `[string]` is `"3L"`, so `Assert-Equal 3L $x` failed on a
+    # value that was equal with a message reading `(expected '3L', got '3')`. `Assert-Equal` now refuses
+    # that argument outright - see "a number whose text is not its value is refused" - and this suite is
+    # what found it.
     $queues = [ordered]@{}
     $queues["contest.judge.live"] = [pscustomobject]@{ Ready = 3L; Unacked = 1L; Consumers = 2L }
     $present = Get-QueueCounts -Queues $queues -Name "contest.judge.live"
@@ -694,6 +694,38 @@ Test-Case "no parameter is mandatory and given a default at the same time" {
         }
     }
     Assert-True ($checked -eq 0) "the scan found $checked parameter(s) declared both ways"
+}
+
+Test-Case "a number whose text is not its value is refused, and a quoted one is not" {
+    # The trap, as the spellings that hit it and the spellings that must not. A suffixed bareword in
+    # command-argument position binds Int64 3 that renders `"3L"`, so comparing it by text compared
+    # `"3L"` against `"3"` and failed on two values that were equal. Every case below was run before it
+    # was written down, including the two that do not throw.
+    Assert-Throws { Assert-Equal 3L 3 "a suffixed expected value" } `
+        "a bareword carrying a suffix is refused rather than compared as its text"
+    Assert-Throws { Assert-Equal 3 3L "a suffixed actual value" } `
+        "and refused as the actual value too"
+    Assert-Throws { Assert-Equal 3kb 3072 "a magnitude suffix" } `
+        "a magnitude suffix is refused, because it does not bind as the number it looks like"
+    Assert-Throws { Assert-Equal 0x1F 31 "a hex literal" } `
+        "a hex literal is refused for the same reason: it binds 31 and renders '0x1F'"
+
+    # A value that arrives through a variable is the only way one can reach a sequence assertion: the
+    # `[object[]]` parameter converts a bareword written inside the literal, which is why the second
+    # case here does not throw and is asserted as such rather than assumed.
+    $poisoned = & { param($Value) return $Value } 1L
+    Assert-Throws { Assert-SequenceEqual @($poisoned) @(1) "a poisoned element" } `
+        "an element that carries text is refused through a variable"
+    Assert-SequenceEqual @(1L) @(1) "a bareword written in the literal is converted by the parameter"
+
+    # The honest spellings, which the guard must leave working - the point is to refuse a lying
+    # comparison, not to narrow what can be compared.
+    Assert-Equal 3 3 "a plain numeral compares to itself"
+    Assert-Equal "3L" "3L" "a quoted value whose text is the point is left alone"
+    Assert-Equal 3.5 3.5 "a decimal compares"
+    Assert-Equal 1e-9 1e-9 "an exponent compares"
+    Assert-Equal "abc" "abc" "a plain string compares"
+    Assert-Equal $null $null "and an absent value still compares"
 }
 
 # --- report -------------------------------------------------------------------------------------
