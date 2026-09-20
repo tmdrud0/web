@@ -429,12 +429,16 @@ function Reset-ExperimentQueue {
         throw "Queue '$($config.QueueName)' has $($stream.Consumers) consumer(s). Stop the application " +
         "containers before resetting the queue, so the reset is not what the next run measures."
     }
-    $live = $before["contest.judge.live"]
-    $dead = $before["contest.judge.dead"]
-    $liveReady = if ($null -eq $live) { 0L } else { [long]$live.Ready }
-    $liveUnacked = if ($null -eq $live) { 0L } else { [long]$live.Unacked }
-    $deadReady = if ($null -eq $dead) { 0L } else { [long]$dead.Ready }
-    $deadUnacked = if ($null -eq $dead) { 0L } else { [long]$dead.Unacked }
+    # Absence is read once, by the reader that answers zeros for a queue that is not there, rather than
+    # guarded again here: the branch above needs to know the difference between absent and consumer-less
+    # - only one of them is its business - but the four counts below do not, and a second way of spelling
+    # "absent counts as none" is a second way for the two spellings to disagree.
+    $live = Get-QueueCounts -Queues $before -Name "contest.judge.live"
+    $dead = Get-QueueCounts -Queues $before -Name "contest.judge.dead"
+    $liveReady = [long]$live.Ready
+    $liveUnacked = [long]$live.Unacked
+    $deadReady = [long]$dead.Ready
+    $deadUnacked = [long]$dead.Unacked
     if ($liveReady -ne 0 -or $liveUnacked -ne 0 -or $deadReady -ne 0 -or $deadUnacked -ne 0) {
         $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $EvidencePath -Encoding utf8
         throw "The previous run left work in the judge queues (live ready=$liveReady unacked=$liveUnacked, " +

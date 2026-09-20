@@ -120,6 +120,55 @@ Test-Case "the pilot stack declares fifteen containers and no mysql" {
     Assert-Equal 0 (@($services | Where-Object { $_ -eq "mysql" }).Count) "mysql is not started"
 }
 
+Test-Case "an absent project queue reads as empty, and an unreadable row is refused" {
+    # `Assert-OnlyProjectQueues` permits a project queue to be absent - a reset produces that state, and
+    # so does a broker the application has never started against - and every reader beside it dereferenced
+    # the queue anyway. Under `Set-StrictMode -Version Latest` that is a PropertyNotFoundException thrown
+    # from inside a poll, on the state the check next door had just declared legal; observed, not
+    # inferred, before the fix.
+    #
+    # The second half is why the reader's silent skip was worse than a crash. A row it could not parse
+    # left the queue out of the map, and a missing queue now reads as empty and consumer-less - so a
+    # stream queue holding real backlog would have been reported as drained, and the run would have
+    # called the pipeline quiescent with messages still in it. The zeros are right for a queue that is
+    # not there and must not be reachable for a queue that is.
+    # The expected values below are written bare (`3`, not `3L`) even though every count here is an Int64.
+    # In command-argument position the token `3L` is Int64 3, but `Assert-Equal`'s `[string]` cast renders
+    # it as the literal text `"3L"` while the property it is compared against renders as `"3"` - so the
+    # assertion fails on a value that is equal, and the message reads `(expected '3L', got '3')`. Bare
+    # integers stringify both ways and are what the rest of this suite already writes.
+    $queues = [ordered]@{}
+    $queues["contest.judge.live"] = [pscustomobject]@{ Ready = 3L; Unacked = 1L; Consumers = 2L }
+    $present = Get-QueueCounts -Queues $queues -Name "contest.judge.live"
+    Assert-Equal 3 $present.Ready "a queue that is there is read as it reported"
+    Assert-Equal 1 $present.Unacked "and its unacked count with it"
+    Assert-Equal 2 $present.Consumers "and its consumer count"
+    $absent = Get-QueueCounts -Queues $queues -Name "contest.judge.result.stream"
+    Assert-Equal 0 $absent.Ready "an absent queue holds no messages"
+    Assert-Equal 0 $absent.Unacked "and has none unacknowledged"
+    Assert-Equal 0 $absent.Consumers "and has no consumer, which keeps the quiescence gate shut on a deleted stream"
+
+    # The parse itself, separated from the docker call that fetches the lines so that it can be asserted
+    # at all. The shape is `rabbitmqctl list_queues -q name messages_ready messages_unacknowledged
+    # consumers`.
+    $rows = ConvertTo-RabbitQueueRows -Lines @(
+        "contest.judge.live 3 1 2",
+        "contest.judge.dead 0 0 1",
+        "contest.judge.result.stream 12 0 1"
+    )
+    Assert-Equal 3 $rows["contest.judge.live"].Ready "the ready count is read from its column"
+    Assert-Equal 1 $rows["contest.judge.live"].Unacked "the unacked count too"
+    Assert-Equal 2 $rows["contest.judge.live"].Consumers "and the consumer count"
+    Assert-Equal 12 $rows["contest.judge.result.stream"].Ready "a queue with backlog reads its backlog"
+    # A row the reader cannot understand must not become an absent queue: absence now reads as zero, so
+    # skipping this row would report a queue with twelve messages as drained.
+    Assert-Throws { ConvertTo-RabbitQueueRows -Lines @("contest.judge.live 3 1") } "a row with missing columns is refused, not skipped"
+    Assert-Throws { ConvertTo-RabbitQueueRows -Lines @("") } "a blank row is refused, not skipped"
+
+    Assert-Throws { Assert-OnlyProjectQueues -Queues ([ordered]@{ "someone.elses.queue" = $present }) } `
+        "a queue this project does not declare is still refused"
+}
+
 Test-Case "the project declares exactly three queues" {
     $queues = Get-ProjectQueueNames
     Assert-Equal 3 $queues.Count "three queues are declared"

@@ -168,11 +168,27 @@ function Get-RabbitQueueState {
             "exec", $config.RabbitContainer, "rabbitmqctl", "list_queues", "-q",
             "name", "messages_ready", "messages_unacknowledged", "consumers"
         ))
+    return ConvertTo-RabbitQueueRows -Lines $lines
+}
+
+# `rabbitmqctl list_queues -q name messages_ready messages_unacknowledged consumers`, one row per queue,
+# read from the end so that a queue name containing spaces still lands in the name.
+#
+# Separated from the docker call that fetches the lines because that call needs a broker and this does
+# not, and because the failure it must not have is silent. A row it cannot parse is refused rather than
+# skipped: a skipped row leaves the queue out of the map, and a missing queue reads as empty and
+# consumer-less, so a stream queue holding real backlog would be reported as drained and the run would
+# call the pipeline quiescent with messages still in it. Skipping was the dangerous direction, not
+# crashing.
+function ConvertTo-RabbitQueueRows {
+    param([AllowEmptyCollection()]$Lines)
+
     $queues = [ordered]@{}
-    foreach ($line in $lines) {
+    foreach ($line in @($Lines)) {
         $fields = @(([string]$line -split '\s+') | Where-Object { $_ })
         if ($fields.Count -lt 4) {
-            continue
+            throw ("rabbitmqctl list_queues printed a row this reader cannot read ($($fields.Count) " +
+                "field(s), need name, messages_ready, messages_unacknowledged and consumers): '${line}'.")
         }
         $ready = 0L
         $unacked = 0L
@@ -188,6 +204,30 @@ function Get-RabbitQueueState {
         }
     }
     return $queues
+}
+
+# One queue's counts, with absence read as empty rather than as an error.
+#
+# `Assert-OnlyProjectQueues` deliberately permits a project queue to be absent - it is the state a reset
+# produces, and the state a broker the application has never started against is in - and the readers
+# immediately after it dereferenced the queue anyway. Under `Set-StrictMode -Version Latest` that is not
+# a null propagation: `$live.Ready` on a missing queue throws PropertyNotFoundException, from the middle
+# of a poll, on exactly the state the check beside it had just declared legal. Two neighbours disagreeing
+# about whether absence is allowed is the defect; absence being allowed is the correct half.
+#
+# A queue that is not there holds no messages and has no consumer, which is what these zeros say. The
+# consumer count is the one that must not be guessed: `Consumers = 0` on an absent stream queue keeps the
+# quiescence gate shut, which is right - a stream queue that has been deleted is not a drained pipeline.
+function Get-QueueCounts {
+    param(
+        [Parameter(Mandatory = $true)]$Queues,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($Queues.Contains($Name)) {
+        return $Queues[$Name]
+    }
+    return [pscustomobject]@{ Ready = 0L; Unacked = 0L; Consumers = 0L }
 }
 
 # The three queues this project declares. Used both to read state and, before a reset deletes one, to
@@ -500,9 +540,9 @@ function Get-PipelineOperationalState {
     }
     $pendingEvents = ConvertTo-RequiredDouble -Value @($pendingSamples[0].value)[1] -Description "stream pending events"
 
-    $live = $queues["contest.judge.live"]
-    $dead = $queues["contest.judge.dead"]
-    $stream = $queues["contest.judge.result.stream"]
+    $live = Get-QueueCounts -Queues $queues -Name "contest.judge.live"
+    $dead = Get-QueueCounts -Queues $queues -Name "contest.judge.dead"
+    $stream = Get-QueueCounts -Queues $queues -Name "contest.judge.result.stream"
 
     # A consumer that has stopped is not a drained pipeline even when every queue it feeds is empty,
     # which is exactly the state `stream-offset` passes through while it resubscribes.
