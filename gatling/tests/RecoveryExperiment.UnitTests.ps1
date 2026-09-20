@@ -53,6 +53,37 @@ Test-Case "the Redis CPU counters are read as the fractions INFO prints" {
     Assert-Throws { Get-RedisInfoCounter -Info $info -Name "used_cpu_sys" } "the integer reader still refuses the fraction it cannot hold"
 }
 
+Test-Case "a labelled reading keeps the series its label names and no others" {
+    # Two meters this harness reads carry a label that separates things which must not be added: the JVM
+    # reports `jvm_memory_used_bytes` once per pool, each labelled with its area (three heap pools and
+    # five non-heap ones), and the rollback retry counter carries the outcome it counted. Reduced by name
+    # alone, the first answers "how much memory is in the JVM" under a column named for the heap - 3.07x
+    # and 3.26x the heap on the two live web nodes, measured - and the second adds a pass that held the
+    # gate to an attempt that ran and failed.
+    #
+    # The samples below are the shape Prometheus returns, and the second reading of the same list is the
+    # point: one query, two answers. The fourth sample carries no `area` property at all, which is what
+    # most of a poll's series look like - and it is the case that broke the first version of this filter:
+    # under `Set-StrictMode -Version Latest` reading a property a sample does not have throws rather than
+    # yielding a null, so a fixture that gave every sample an empty `area` instead of omitting it would
+    # have agreed with a filter that stopped the poll.
+    $samples = @(
+        [pscustomobject]@{ metric = [pscustomobject]@{ __name__ = "jvm_memory_used_bytes"; area = "heap"; id = "Eden Space" }; value = @(0, "100") },
+        [pscustomobject]@{ metric = [pscustomobject]@{ __name__ = "jvm_memory_used_bytes"; area = "heap"; id = "Tenured Gen" }; value = @(0, "250") },
+        [pscustomobject]@{ metric = [pscustomobject]@{ __name__ = "jvm_memory_used_bytes"; area = "nonheap"; id = "Metaspace" }; value = @(0, "900") },
+        [pscustomobject]@{ metric = [pscustomobject]@{ __name__ = "process_cpu_usage" }; value = @(0, "0.5") }
+    )
+    $heap = ConvertTo-PrometheusSampleMap -Samples $samples -Description "test heap" -LabelName "area" -LabelValue "heap"
+    Assert-Equal 350.0 $heap["jvm_memory_used_bytes"] "the heap reading sums the heap pools"
+    Assert-True (-not $heap.Contains("process_cpu_usage")) "a series without the label is not in a labelled reading"
+    $all = ConvertTo-PrometheusSampleMap -Samples $samples -Description "test all"
+    Assert-Equal 1250.0 $all["jvm_memory_used_bytes"] "an unfiltered reading sums every pool, which is the reading the heap column must not be"
+    Assert-Equal 0.5 $all["process_cpu_usage"] "and still carries the meters with no label at all"
+    Assert-Equal "unavailable" (Get-MetricValue -Metrics $heap -Name "jvm_gc_pause_seconds") "a name the reading did not return is unavailable, not zero"
+    Assert-Equal "" (Get-PrometheusLabelValue -Metric $samples[3].metric -LabelName "area") "a series with no such label reads as the empty string rather than throwing"
+    Assert-Equal "heap" (Get-PrometheusLabelValue -Metric $samples[0].metric -LabelName "area") "a label that is there is read"
+}
+
 Test-Case "ConvertFrom-SqlCell treats the text NULL as an absent value" {
     # `mysql -N -B` prints SQL NULL as the four characters NULL, so `MIN(LENGTH(id))` over no rows reaches
     # a caller as a string that passes both `$null -ne $cell` and an IsNullOrWhiteSpace check. The oracle's

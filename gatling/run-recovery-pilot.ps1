@@ -689,7 +689,12 @@ try {
         rollbackObservedDelta = Format-PilotNumber $observedTotal
         rollbackRestartsDelta = Format-PilotNumber $restartsTotal
         rollbackUnrecoverableDelta = Format-PilotNumber $unrecoverableTotal
-        rollbackRetryDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "rollbackRetryBusyTotal")
+        # Two outcomes, two columns. The counter the registering code exposes carries the outcome it was
+        # counted for, and the two are different events: a pass that held the gate retried nothing, while
+        # an attempt that ran and failed is work this mode did and could not finish. One delta named for
+        # the retries would have reported the second as though it were the first.
+        rollbackRetryBusyDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "rollbackRetryBusyTotal")
+        rollbackRetryRetryableDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "rollbackRetryRetryableTotal")
         recoveryLogEvents = $script:recoveryEvents.Count
         recoveryLogKinds = (@($script:recoveryEvents | ForEach-Object { $_.Kind } | Select-Object -Unique) -join " ")
 

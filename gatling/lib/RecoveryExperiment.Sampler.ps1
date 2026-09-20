@@ -218,24 +218,64 @@ function Assert-OnlyProjectQueues {
 # alone in others. Stripping backslashes before comparing means the reader does not have to know which
 # one is running, and a queue named `contest.judge.result.stream` is found either way.
 function Remove-PrometheusLabelEscapes {
-    param([Parameter(Mandatory = $true)][string]$Value)
+    # `AllowEmptyString` because a Prometheus label value may be empty, and the series that carry no such
+    # label at all arrive the same way - `[string]$sample.metric.area` of a sample with no `area` is the
+    # empty string. Mandatory alone refuses it, which turns "this series has no label here" into a
+    # binding error thrown from inside a poll rather than into the answer "not this one".
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
 
     return $Value.Replace("\", "")
+}
+
+# A label's value, or the empty string when the series carries no such label.
+#
+# `$sample.metric.area` does not answer that question under `Set-StrictMode -Version Latest`: a sample
+# whose metric has no `area` property throws PropertyNotFoundException rather than yielding a null, so
+# asking for the label and asking whether it is there have to be the same question. Most of the series
+# one poll returns carry none of the labels a reading filters on - the filter is there for the few that
+# do - so this is the common path rather than an edge, and getting it wrong stops the poll that was
+# supposed to start the measurement.
+function Get-PrometheusLabelValue {
+    param(
+        [Parameter(Mandatory = $true)]$Metric,
+        [Parameter(Mandatory = $true)][string]$LabelName
+    )
+
+    if (-not ($Metric.PSObject.Properties.Name -contains $LabelName)) {
+        return ""
+    }
+    return Remove-PrometheusLabelEscapes -Value ([string]$Metric.$LabelName)
 }
 
 # One request per poll. The whole metric surface of a single role is small next to the state it
 # describes, so asking for it in one query with a name pattern is cheaper than a query per meter - and
 # the pattern is anchored on prefixes the registering code owns, so a rename shows up as a missing
 # series rather than as a wrong number under a plausible name.
-function Get-PrometheusSampleMap {
+#
+# The samples are an argument rather than something this fetches, so that one query can be read more
+# than one way. Reducing a sample list to one value per name is the step that loses the labels, and two
+# of the meters here carry a label that separates things which must not be added together: the JVM
+# reports `jvm_memory_used_bytes` once per pool, each labelled with the area it belongs to (three heap
+# pools, five non-heap ones), and the rollback retry counter carries the outcome it was counted for.
+# Summed by name the first answers "how much memory is in the JVM" under a column named for the heap -
+# 3.07x and 3.26x the heap on the two live web nodes, measured - and the second adds a busy gate to a
+# failed attempt. A caller that needs one label's series says so
+# here, where the label is still visible, and pays for the query once: `-LabelName` and `-LabelValue`
+# are a filter, not a requirement, and the callers that want every series pass neither.
+function ConvertTo-PrometheusSampleMap {
     param(
-        [Parameter(Mandatory = $true)][string]$Query,
-        [Parameter(Mandatory = $true)][string]$Description
+        [AllowEmptyCollection()]$Samples,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [string]$LabelName = "",
+        [string]$LabelValue = ""
     )
 
-    $samples = @(Invoke-PrometheusQuery -Query $Query -Description $Description)
     $values = [ordered]@{}
-    foreach ($sample in $samples) {
+    foreach ($sample in @($Samples)) {
+        if ($LabelName.Length -gt 0 -and
+            (Get-PrometheusLabelValue -Metric $sample.metric -LabelName $LabelName) -ne $LabelValue) {
+            continue
+        }
         $name = [string]$sample.metric.__name__
         $pair = @($sample.value)
         if ($pair.Count -lt 2) {
@@ -258,6 +298,10 @@ function Get-PrometheusSampleMap {
 # The per-role prefix every meter this experiment reads is registered under, plus the process and
 # container meters that say what the role cost. Histogram buckets are included so that the Lua
 # pipeline's latency can be reconstructed from them rather than only its total.
+#
+# `jvm_memory_used_bytes` is selected whole here and separated by area in the reader, because the
+# alternative - a matcher inside this pattern - would apply to every name in it, and a series without
+# that label is not a series that fails the matcher, it is one that disappears from the poll.
 function Get-RoleMetricQuery {
     param([Parameter(Mandatory = $true)][string]$Node)
 
@@ -281,7 +325,7 @@ function Get-PrometheusLabeledSampleMap {
     $values = [ordered]@{}
     foreach ($sample in $samples) {
         $name = [string]$sample.metric.__name__
-        $label = Remove-PrometheusLabelEscapes -Value ([string]$sample.metric.$LabelName)
+        $label = Get-PrometheusLabelValue -Metric $sample.metric -LabelName $LabelName
         if ($label -ne $LabelValue) {
             continue
         }
@@ -862,7 +906,24 @@ function Get-RecoveryObservation {
     $pollWatch = [Diagnostics.Stopwatch]::StartNew()
 
     $promWatch = [Diagnostics.Stopwatch]::StartNew()
-    $roleMetrics = Get-PrometheusSampleMap -Query (Get-RoleMetricQuery -Node "batch-1") -Description "batch-1 metrics"
+    # One query, four readings of it. Each reading picks the series its column is actually about: the
+    # whole surface for the meters that carry no separating label, the heap area alone for the memory
+    # column, and one outcome each for the two retry columns. Fetching separately would be four requests
+    # a second through the same socket, and would leave the four readings describing four different
+    # instants - which is the one thing a poll is supposed to avoid.
+    $roleSamples = @(Invoke-PrometheusQuery -Query (Get-RoleMetricQuery -Node "batch-1") `
+            -Description "batch-1 metrics")
+    $roleMetrics = ConvertTo-PrometheusSampleMap -Samples $roleSamples -Description "batch-1 metrics"
+    $roleHeapMetrics = ConvertTo-PrometheusSampleMap -Samples $roleSamples `
+        -Description "batch-1 heap" -LabelName "area" -LabelValue "heap"
+    # `outcome` is the label the registering code puts on the retry counter, one series per retryable
+    # outcome, spelled in the enum's own lower-hyphenated form. The two are read apart because they are
+    # two different events - a pass that held the gate and an attempt that ran and failed - and the
+    # column named for the first must not carry the second.
+    $roleBusyRetryMetrics = ConvertTo-PrometheusSampleMap -Samples $roleSamples `
+        -Description "batch-1 busy retry" -LabelName "outcome" -LabelValue "busy-retry-later"
+    $roleRetryableRetryMetrics = ConvertTo-PrometheusSampleMap -Samples $roleSamples `
+        -Description "batch-1 retryable retry" -LabelName "outcome" -LabelValue "retryable-failure"
     $pipelineBuckets = Get-PrometheusHistogram `
         -Query '{job="oj-app",node="batch-1",__name__="contest_scoreboard_redis_pipeline_seconds_bucket"}' `
         -Description "redis pipeline buckets"
@@ -919,7 +980,8 @@ function Get-RecoveryObservation {
     $observation["rollbackObservedTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_rollback_observed_total"
     $observation["rollbackRestartsTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_rollback_restarts_total"
     $observation["rollbackUnrecoverableTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_rollback_unrecoverable_total"
-    $observation["rollbackRetryBusyTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_rollback_retry_total"
+    $observation["rollbackRetryBusyTotal"] = Get-MetricValue -Metrics $roleBusyRetryMetrics -Name "contest_scoreboard_stream_rollback_retry_total"
+    $observation["rollbackRetryRetryableTotal"] = Get-MetricValue -Metrics $roleRetryableRetryMetrics -Name "contest_scoreboard_stream_rollback_retry_total"
     $observation["streamFailuresTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_failures_total"
     $observation["streamOffsetGapsTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_offset_gaps_total"
     $observation["streamFailureRestartsTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_failure_restarts_total"
@@ -936,7 +998,7 @@ function Get-RecoveryObservation {
     $observation["hikariActive"] = Get-MetricValue -Metrics $roleMetrics -Name "hikaricp_connections_active"
     $observation["hikariPending"] = Get-MetricValue -Metrics $roleMetrics -Name "hikaricp_connections_pending"
     $observation["appProcessCpu"] = Get-MetricValue -Metrics $roleMetrics -Name "process_cpu_usage"
-    $observation["appHeapUsedBytes"] = Get-MetricValue -Metrics $roleMetrics -Name "jvm_memory_used_bytes"
+    $observation["appHeapUsedBytes"] = Get-MetricValue -Metrics $roleHeapMetrics -Name "jvm_memory_used_bytes"
     $observation["appCgroupCpuSeconds"] = Get-MetricValue -Metrics $roleMetrics -Name "cgroup_cpu_usage_seconds_total"
     $observation["appCgroupMemoryWorkingSetBytes"] = Get-MetricValue -Metrics $roleMetrics -Name "cgroup_memory_working_set_bytes"
     $observation["appCgroupThrottledPeriods"] = Get-MetricValue -Metrics $roleMetrics -Name "cgroup_cpu_throttled_periods_total"
