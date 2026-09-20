@@ -45,7 +45,10 @@ param(
     [int]$IngressSloP95Millis = 60000,
 
     [string]$ArtifactRoot = "var\scoreboard-recovery",
-    [string]$DbName = "oj_test",
+    # Empty means "resolve it the way the runs do": the overlay's variable first, then the base one,
+    # then `oj_test`. Passed down explicitly once resolved, so every run of the suite measures one
+    # schema - and each run checks it against the one the batch role actually connected to.
+    [string]$DbName = "",
     [switch]$Build,
     # Stop after the first run that could not be measured at all, so a broken prerequisite is diagnosed
     # once instead of nine times. Runs that were measured but came out incomplete do not stop the suite:
@@ -63,6 +66,12 @@ $modes = @("full-replay", "redis-seq", "stream-offset")
 
 if ([string]::IsNullOrWhiteSpace($env:DB_PASSWORD)) {
     throw "DB_PASSWORD is not set. Export it before running the suite; no part of this harness reads it from a file."
+}
+
+if ([string]::IsNullOrWhiteSpace($DbName)) {
+    $DbName = if (-not [string]::IsNullOrWhiteSpace($env:RECOVERY_PILOT_DB_NAME)) { $env:RECOVERY_PILOT_DB_NAME }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:DB_NAME)) { $env:DB_NAME }
+    else { "oj_test" }
 }
 
 function Get-SuiteRunId {
@@ -213,7 +222,8 @@ foreach ($entry in $schedule) {
         "-DrainTimeoutSeconds", $DrainTimeoutSeconds,
         "-GatlingTimeoutSeconds", $GatlingTimeoutSeconds,
         "-IngressSloP95Millis", $IngressSloP95Millis,
-        "-ArtifactRoot", $ArtifactRoot
+        "-ArtifactRoot", $ArtifactRoot,
+        "-DbName", $DbName
     )
     if ($Build) { $runArgumentList += "-Build" }
     foreach ($argument in $runArgumentList) {

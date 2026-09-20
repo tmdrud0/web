@@ -72,6 +72,10 @@ param(
     [int]$IngressSloP95Millis = 60000,
 
     [string]$ArtifactRoot = "var\scoreboard-recovery",
+    # Left empty so that the database the harness reads and the one the stack connects to are resolved
+    # from the same place. The overlay names it `RECOVERY_PILOT_DB_NAME`, and a run whose harness read
+    # one schema while the application wrote another would report a scoreboard that never moved.
+    [string]$DbName = "",
     # Rebuild the five application images first. Off by default because it costs minutes and nothing in
     # this experiment changes the application between runs.
     [switch]$Build,
@@ -224,9 +228,16 @@ if ([string]::IsNullOrWhiteSpace($env:DB_PASSWORD)) {
     throw "DB_PASSWORD is not set. Export it before running: the harness never reads it from a file, and it is never written to an artifact."
 }
 
+# The same variable the overlay reads, so the schema this harness measures is the schema the stack was
+# pointed at. A mismatch is not silent: `Assert-BatchRecoveryMode` reads the batch role's own DB_NAME
+# back out of its environment and this run refuses when the two disagree.
+$resolvedDbName = if (-not [string]::IsNullOrWhiteSpace($DbName)) { $DbName }
+elseif (-not [string]::IsNullOrWhiteSpace($env:RECOVERY_PILOT_DB_NAME)) { $env:RECOVERY_PILOT_DB_NAME }
+elseif (-not [string]::IsNullOrWhiteSpace($env:DB_NAME)) { $env:DB_NAME }
+else { "oj_test" }
+
 [void](Initialize-RecoveryExperiment -WorktreeRoot $repoRoot -ArtifactDirectory $artifacts `
-        -RunId $runId -Mode $Mode -DbPassword $env:DB_PASSWORD `
-        -DbName $(if ($env:DB_NAME) { $env:DB_NAME } else { "oj_test" }))
+        -RunId $runId -Mode $Mode -DbPassword $env:DB_PASSWORD -DbName $resolvedDbName)
 $config = Get-RecoveryConfig
 
 $concurrentUsers = [long][math]::Ceiling($TargetRps * $SubmitIntervalMillis / 1000.0)
@@ -374,6 +385,14 @@ try {
     $script:stackStarted = $true
     Wait-PilotStackHealthy
     $runtime = Assert-BatchRecoveryMode
+    if ([string]$runtime.DbName -ne $config.DbName) {
+        # Read back from the container rather than assumed from the overlay: the two names come from
+        # different variables, and a run whose harness read one schema while the application wrote
+        # another would measure a scoreboard that never moved, with nothing in the figures to say so.
+        throw ("The batch role is connected to database '$($runtime.DbName)' but this run reads " +
+            "'$($config.DbName)'. Point both at the same schema - the overlay takes " +
+            "RECOVERY_PILOT_DB_NAME or the harness takes -DbName - before measuring anything.")
+    }
     Write-Output "  stack healthy; batch-1 environment: mode=$($runtime.Mode) deterministic=$($runtime.DeterministicJudging) acceptPermille=$($runtime.AcceptPermille) db=$($runtime.DbHost)/$($runtime.DbName)"
 
     [void](Assert-PrometheusTargetsHealthy)
