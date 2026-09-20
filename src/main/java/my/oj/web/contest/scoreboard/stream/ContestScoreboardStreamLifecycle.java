@@ -171,7 +171,13 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
      *
      * <p>A start that throws leaves {@link #consuming} false on purpose, so the cutover keeps the action
      * waiting and the next report of the boundary - the redis-seq periodic check is one - tries again
-     * rather than leaving a consumer that never comes up.</p>
+     * rather than leaving a consumer that never comes up. When that failure is one that left the
+     * container reporting itself running with nothing consuming - the shape that would make the next
+     * attempt return early out of {@code start()} having started nothing - the container is taken back
+     * out of that state before the failure is reported, by
+     * {@link #normaliseAfterAFailedStart(RuntimeException)}; a failure that never raised that flag has
+     * nothing to take back out, and the same call is a no-op on it. Either way the retry is an attempt
+     * rather than a formality.</p>
      */
     private synchronized void startAfterHistoryRecovery() {
         if (consuming || stopping) {
@@ -452,22 +458,98 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
      * running. Believing the return value there is how a consumer that is down gets recorded as one that
      * is up: the retry would be counted as served, the cutover would forget it, and the scoreboard would
      * stop being consumed with every log line saying otherwise.</p>
+     *
+     * <p>Both shapes of a failed start - one that threw and one that left no consumer - are reported to
+     * the caller only after the container has been taken back out of that half-started state
+     * ({@link #normaliseAfterAFailedStart(RuntimeException)}), so the retry the caller is being asked for
+     * is one that can really start something.</p>
      */
     private void startAt(long storedOffset, Object requestedOffset) {
         completion.repairPending();
         position.consumerRestarted();
         metrics.initializeOffset(storedOffset);
         container.setConsumerArguments(Map.of("x-stream-offset", requestedOffset));
-        container.start();
-        if (container.getActiveConsumerCount() <= 0) {
-            throw new IllegalStateException("The scoreboard stream listener container returned from start() "
-                    + "with no active consumer: the container can report itself running while nothing is "
-                    + "consuming, because Spring AMQP sets that flag before its consumers are started and "
-                    + "leaves it set when that part fails. Nothing is consuming, so this start is reported "
-                    + "as the failure it is - whoever asked for it keeps waiting and asks again");
+        RuntimeException failure = startAndConfirmAConsumer();
+        if (failure != null) {
+            throw failure;
         }
         consuming = true;
         log.info("Started scoreboard stream consumer at {}", requestedOffset);
+    }
+
+    /**
+     * Starts the container, confirms a consumer came with it, and returns the failure to report when it
+     * did not.
+     *
+     * <p>Asking the container rather than trusting {@code start()} to have returned is the first half -
+     * the reason is in {@link #startAt} - and taking it back out of the state a failed start leaves it in
+     * is the second.</p>
+     *
+     * @return the failure for whoever asked for this start, or {@code null} when one is consuming
+     */
+    private RuntimeException startAndConfirmAConsumer() {
+        try {
+            container.start();
+        } catch (RuntimeException failure) {
+            return normaliseAfterAFailedStart(failure);
+        }
+        if (container.getActiveConsumerCount() > 0) {
+            return null;
+        }
+        return normaliseAfterAFailedStart(new IllegalStateException(
+                "The scoreboard stream listener container returned from start() with no active consumer: "
+                        + "the container can report itself running while nothing is consuming, because "
+                        + "Spring AMQP sets that flag before its consumers are started and leaves it set "
+                        + "when that part fails. Nothing is consuming, so this start is reported as the "
+                        + "failure it is: the container is stopped again so that a later attempt can "
+                        + "really start it, and whoever asked for it keeps waiting and asks again"));
+    }
+
+    /**
+     * Takes a container whose start failed back out of the state that would swallow the retry, and
+     * returns the failure to report.
+     *
+     * <h2>Why reporting the failure is not enough</h2>
+     *
+     * <p>A start fails in one of two places, and only the second leaves anything behind. Failures raised
+     * <em>before</em> the container's running flag goes up - {@code afterPropertiesSet()} and the checks
+     * around it, where a broker that is simply not up yet fails - leave the flag down and nothing to take
+     * back out; the stop below is a no-op on those. Failures raised <em>after</em> it leave a container
+     * that reports itself running with nothing consuming: {@code SimpleMessageListenerContainer.doStart()}
+     * raises that flag by calling its superclass first, so everything it does about its own consumers -
+     * starting them and waiting for them - happens afterwards, and {@code start()} does not lower the
+     * flag on the way out (it opens with a return under {@code isRunning()} and its handler only converts
+     * whatever it caught to a runtime one). That second state is the one this stop exists for.</p>
+     *
+     * <p>That state is what would make the retry this boundary keeps an action for impossible. Every
+     * later {@code start()} returns at that first line having started nothing, so an action the cutover
+     * kept waiting would be retried for the life of the JVM against a container that is permanently a
+     * no-op - a retry that only looks like one. A container's consumers are also only released by a stop,
+     * so a later start can meet {@code "A stopped container should not have consumers"} instead.</p>
+     *
+     * <p>{@code stop()} is what takes it back out, and the only call that reliably does:
+     * {@code AbstractMessageListenerContainer.stop()} lowers the flag in a {@code finally}, so the
+     * container is startable again even when the stop itself throws. That is also why the stop's own
+     * failure does not replace the start's - the caller has to hear about the start, and the stop's
+     * trouble is reported beside it as a suppressed exception rather than instead of it. Stopping a
+     * container that never raised its flag is the same call and is handled: it reports that it is already
+     * stopped and returns.</p>
+     *
+     * <p>Only a failed start is treated this way, and a start that worked never reaches here. Stopping a
+     * container with a live consumer would drop one that is reading, which is exactly what the modes that
+     * do not own the stream must not have happen while they rebuild.</p>
+     */
+    private RuntimeException normaliseAfterAFailedStart(RuntimeException startFailure) {
+        try {
+            container.stop();
+        } catch (RuntimeException stopFailure) {
+            startFailure.addSuppressed(stopFailure);
+            log.warn("The scoreboard stream listener container could not be stopped after its start "
+                    + "failed; the stop's own failure is reported with the start's, and Spring AMQP lowers "
+                    + "the container's running flag in a finally, so the next attempt can still start it",
+                    stopFailure);
+        }
+        return startFailure;
     }
 
     private static Object offsetValue(long storedOffset) {

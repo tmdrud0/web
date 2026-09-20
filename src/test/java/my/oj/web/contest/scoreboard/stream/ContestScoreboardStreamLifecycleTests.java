@@ -11,6 +11,7 @@ import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy.O
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.amqp.AmqpIllegalStateException;
 import org.springframework.amqp.rabbit.listener.SimpleMessageListenerContainer;
 
 import java.time.Duration;
@@ -18,6 +19,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.lenient;
@@ -68,8 +70,13 @@ class ContestScoreboardStreamLifecycleTests {
         registry = new SimpleMeterRegistry();
         lenient().when(strategy.mode()).thenReturn(ContestScoreboardRecoveryMode.STREAM_OFFSET);
         // A container that has started its consumers. The lifecycle asks this of the container rather
-        // than trusting start() to have done something - see the tests below, which are the other
-        // answer - so a mock that answered 0 would make every start here look like a failed one.
+        // than trusting start() to have done something, so a mock that answered 0 would make every start
+        // here look like a failed one.
+        //
+        // What this mock cannot answer is what a start that failed does to the container: it has no
+        // state to be left in. The tests for that build the lifecycle on StatefulListenerContainer
+        // instead, and the sequential getActiveConsumerCount() stubs they replaced are the reason why -
+        // see aStartOnAContainerThatStillReportsItselfRunningIsANoOp.
         lenient().when(container.getActiveConsumerCount()).thenReturn(1);
     }
 
@@ -634,8 +641,17 @@ class ContestScoreboardStreamLifecycleTests {
     }
 
     private ContestScoreboardStreamLifecycle lifecycle(StartupOffset startupOffset) {
+        return lifecycle(container, startupOffset);
+    }
+
+    /**
+     * The same lifecycle on a container with state of its own, which is the only kind that can answer
+     * what a failed start left behind.
+     */
+    private ContestScoreboardStreamLifecycle lifecycle(
+            SimpleMessageListenerContainer listenerContainer, StartupOffset startupOffset) {
         return new ContestScoreboardStreamLifecycle(
-                container,
+                listenerContainer,
                 applier,
                 mock(ContestScoreboardAppliedAtCompletion.class),
                 position,
@@ -647,39 +663,176 @@ class ContestScoreboardStreamLifecycleTests {
     }
 
     /**
-     * A container that returned from {@code start()} with nothing consuming is a start that failed.
+     * The property this round turns on, on the container model itself: a start on a container that still
+     * reports itself running is Spring AMQP's early return and nothing else.
      *
-     * <p>Spring AMQP sets the container's running flag before it starts its consumers and does not clear
-     * it when that part fails, so a container whose start half-failed reports itself running with no
-     * consumer in it - and the next {@code start()} on it returns immediately, having started nothing.
-     * Believing that return value is how the retry this boundary exists for gets thrown away: the action
-     * would be counted as served, the cutover would forget it, and the scoreboard would stop being
-     * consumed while every log line said the history was recovered.</p>
-     *
-     * <p>So what the lifecycle asks is the container's consumer count, and a start that leaves it empty
-     * is reported as the failure it is: the action stays waiting, and the report that follows is the
-     * retry - which is this test's second half, where the container really does come up.</p>
+     * <p>It is asserted rather than assumed because every test below reads the container the way the
+     * lifecycle has to. A model that let a second start through would make them all pass without anything
+     * being repaired - which is the sequential stub's mistake, moved into a new place.</p>
      */
     @Test
-    void aStartThatLeftNoConsumerIsNotTakenForAStartedConsumer() {
+    void aStartOnAContainerThatStillReportsItselfRunningIsANoOp() {
+        StatefulListenerContainer container = new StatefulListenerContainer();
+        container.willLeaveNoConsumer();
+        container.start();
+
+        // What a retry meets if nothing took the container back out of the half-started state.
+        container.willStartAConsumer();
+        container.start();
+
+        assertThat(container.skippedStarts())
+                .as("the consumer the second start was set up to bring never got the chance")
+                .isEqualTo(1);
+        assertThat(container.getActiveConsumerCount()).isZero();
+        assertThat(container.reportsItselfRunning()).isTrue();
+    }
+
+    /**
+     * A start that left no consumer behind is taken back out of the state that would swallow the retry,
+     * and the retry then really starts one.
+     *
+     * <p>Spring AMQP raises the container's running flag before it starts its consumers and does not
+     * lower it when that part fails, so a container whose start half-failed reports itself running with
+     * nothing consuming - and {@code start()} returns at its first line for every attempt after that.
+     * Reporting the failure without taking the container back out of that state is a retry that only
+     * looks like one: the action stays waiting and is retried against a container that is permanently a
+     * no-op.</p>
+     *
+     * <p>The stub this replaced could not see any of that. {@code getActiveConsumerCount()} answering
+     * {@code 0} and then {@code 1} lets any second start look successful, while a real container refuses
+     * one that was never taken out of the half-started state - so the count of skipped starts below is
+     * what tells a retry that worked from one that was waved through.</p>
+     */
+    @Test
+    void aStartThatLeftNoConsumerIsTakenBackOutAndTheRetryReallyStartsOne() {
         when(applier.currentStreamOffset()).thenReturn(4L);
         when(strategy.recoversHistoryBeforeConsuming()).thenReturn(true);
-        // The first start returns with no consumer in the container; the retry finds one.
-        when(container.getActiveConsumerCount()).thenReturn(0, 1);
-        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        StatefulListenerContainer container = new StatefulListenerContainer();
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(container, StartupOffset.STORED);
         lifecycle.start();
+        // The broker is not ready: the flag goes up - Spring AMQP raises it before its consumers - and
+        // no consumer comes with it.
+        container.willLeaveNoConsumer();
 
         assertThatThrownBy(() -> cutover.markCovered("the mode's startup pass"))
                 .as("a release that started nothing is not swallowed")
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("no active consumer");
         assertThat(lifecycle.consuming()).isFalse();
+        assertThat(container.reportsItselfRunning())
+                .as("left where the failed start put it, this is the state that makes every later "
+                        + "start a no-op")
+                .isFalse();
+        assertThat(container.stops())
+                .as("the container was taken back out before the failure was reported")
+                .isEqualTo(1);
 
-        // Still waiting on the boundary, which is what lets the next report bring it up: the count of
-        // waiters belongs to the cutover's own tests, the behaviour to this one.
+        // The broker comes back, and the report that was kept waiting is the retry.
+        container.willStartAConsumer();
         cutover.markCovered("the redis-seq duplicate-check check");
 
         assertThat(lifecycle.consuming()).isTrue();
+        assertThat(container.consumerArguments()).containsEntry("x-stream-offset", 4L);
+        assertThat(container.skippedStarts())
+                .as("no attempt was thrown away on a container that still reported itself running")
+                .isZero();
+
+        // Served, so it is not waiting any more: a third report does not start a second consumer.
+        cutover.markCovered("the redis-seq lost-tail check");
+        assertThat(container.attempts()).isEqualTo(2);
+    }
+
+    /**
+     * The other shape of a failed start: it throws. The broker's own failure is what the caller hears,
+     * and the container is still taken back out of the half-started state first - Spring AMQP raises the
+     * flag before the part that fails here too, and its {@code start()} does not lower it on the way out.
+     */
+    @Test
+    void aStartThatThrewIsStillRetriedAfterTheContainerIsTakenBackOut() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        when(strategy.recoversHistoryBeforeConsuming()).thenReturn(true);
+        StatefulListenerContainer container = new StatefulListenerContainer();
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(container, StartupOffset.STORED);
+        lifecycle.start();
+        container.willFailToStart();
+
+        assertThatThrownBy(() -> cutover.markCovered("the mode's startup pass"))
+                .as("the failure is reported as the container raised it, not as something invented here")
+                .isInstanceOf(AmqpIllegalStateException.class)
+                .hasMessageContaining("Fatal exception on listener startup");
+        assertThat(lifecycle.consuming()).isFalse();
+        assertThat(container.reportsItselfRunning()).isFalse();
+
+        container.willStartAConsumer();
+        cutover.markCovered("the redis-seq duplicate-check check");
+
+        assertThat(lifecycle.consuming()).isTrue();
+        assertThat(container.skippedStarts()).isZero();
+    }
+
+    /**
+     * When the stop that takes the container back out fails, the start's failure is still the one
+     * reported - and the stop's is reported beside it. Neither is dropped: the caller has to hear about
+     * the start, and an operator has to hear that the repair did not go cleanly.
+     *
+     * <p>The retry works anyway, and that is not luck: Spring AMQP lowers the container's running flag in
+     * a {@code finally}, so the flag is down even when the stop throws.</p>
+     */
+    @Test
+    void aStopThatCouldNotTakeTheContainerBackOutDoesNotReplaceTheStartFailure() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        when(strategy.recoversHistoryBeforeConsuming()).thenReturn(true);
+        StatefulListenerContainer container = new StatefulListenerContainer();
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(container, StartupOffset.STORED);
+        lifecycle.start();
+        container.willLeaveNoConsumer();
+        container.willFailToStop(new IllegalStateException("the container could not be stopped"));
+
+        IllegalStateException failure = catchThrowableOfType(
+                IllegalStateException.class,
+                () -> cutover.markCovered("the mode's startup pass"));
+
+        assertThat(failure)
+                .as("the start's own failure is the one on top")
+                .hasMessageContaining("no active consumer");
+        assertThat(failure.getSuppressed())
+                .as("and the stop's is reported with it, not instead of it")
+                .hasSize(1);
+        // The same object, not a re-wrapped one: the repair hands the stop's own failure to the caller
+        // rather than reporting one it built. That it is the same *text* is this model's doing - a real
+        // container puts a non-AMQP stop failure through convertRabbitAccessException, which would
+        // prefix it - so what is asserted is that the failure is passed through, and the message is how
+        // that is read here.
+        assertThat(failure.getSuppressed()[0]).hasMessage("the container could not be stopped");
+        assertThat(container.reportsItselfRunning())
+                .as("Spring AMQP lowers the flag in a finally, so even that stop left it startable")
+                .isFalse();
+
+        container.willStartAConsumer();
+        cutover.markCovered("the redis-seq duplicate-check check");
+
+        assertThat(lifecycle.consuming()).isTrue();
+    }
+
+    /**
+     * Nothing is being repaired on a start that worked, so the consumer that came up is left alone.
+     *
+     * <p>This one passes on the implementation before the repair as well - nothing was stopped there
+     * either - so it is not evidence of the defect. It is here so that the repair cannot grow into an
+     * unconditional stop without a test noticing, which is the way this fix could do harm.</p>
+     */
+    @Test
+    void aConsumerThatCameUpIsNotStopped() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        StatefulListenerContainer container = new StatefulListenerContainer();
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(container, StartupOffset.STORED);
+
+        lifecycle.start();
+
+        assertThat(lifecycle.consuming()).isTrue();
+        assertThat(container.stops())
+                .as("the repair is for a start that failed, and this one did not")
+                .isZero();
     }
 
     /**
@@ -687,28 +840,36 @@ class ContestScoreboardStreamLifecycleTests {
      *
      * <p>The failed batch has no other way of coming back: the checkpoint cannot move past it, and
      * nothing at the broker redelivers it. Recording the batch as handled before the restart succeeded
-     * - while the container is stopped and the failure count is the only thing left to ask - is a retry
-     * thrown away for the life of the JVM, which is the same loss the rollback side of this pass was
-     * fixed for.</p>
+     * - while the failure count is the only thing left to ask - is a retry thrown away for the life of
+     * the JVM, which is the same loss the rollback side of this pass was fixed for.</p>
      */
     @Test
     void aFailedBatchIsAskedAboutAgainWhenTheResubscribeCouldNotStart() {
         when(applier.currentStreamOffset()).thenReturn(4L);
-        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
-        // The service coming up has a consumer, the resubscribe's start leaves none, the retry has one.
-        when(container.getActiveConsumerCount()).thenReturn(1, 0, 1);
+        StatefulListenerContainer container = new StatefulListenerContainer();
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(container, StartupOffset.STORED);
         lifecycle.start();
         position.recordFailedBatch();
+        // The resubscribe's own start half-fails: the flag goes up and no consumer comes with it. The
+        // resubscribe stopped the container first, so the flag is up here only because this start
+        // raised it again - and it is up with nothing behind it, which is what the next cycle would
+        // meet as an early return.
+        container.willLeaveNoConsumer();
 
         lifecycle.recoverConsumption();
         assertThat(counter("contest.scoreboard.stream.failure.restarts")).isEqualTo(1.0);
+        assertThat(container.getActiveConsumerCount()).isZero();
+        assertThat(container.reportsItselfRunning()).isFalse();
 
+        container.willStartAConsumer();
         lifecycle.recoverConsumption();
 
         assertThat(counter("contest.scoreboard.stream.failure.restarts"))
-                .as("the restarted consumer is what re-reads the batch, so a restart that failed is not a retry spent")
+                .as("the restarted consumer is what re-reads the batch, so a restart that failed is not "
+                        + "a retry spent")
                 .isEqualTo(2.0);
         assertThat(lifecycle.consuming()).isTrue();
+        assertThat(container.consumerArguments()).containsEntry("x-stream-offset", 4L);
     }
 
     private double counter(String name) {
@@ -747,5 +908,169 @@ class ContestScoreboardStreamLifecycleTests {
                         startupOffset
                 )
         , new ContestScoreboardRecoveryProperties.RecoveryOwner(true));
+    }
+
+    /**
+     * The listener container as Spring AMQP behaves, as state rather than as a script of stubbed returns.
+     *
+     * <h2>Why a state model instead of the sequential stub</h2>
+     *
+     * <p>{@code getActiveConsumerCount()} answering {@code 0} and then {@code 1} says nothing about the
+     * container. A real one keeps the running flag its failed start raised and answers every later
+     * {@code start()} with an early return, so a second start against it starts nothing however the
+     * count is stubbed - and a test built on those stubs cannot tell a start that was retried from one
+     * that was skipped. That difference is the whole of what the tests above are about, so the model
+     * carries the state instead: the flag, the consumers behind it, and what a start does to both.</p>
+     *
+     * <p>{@code start()} therefore reads its own state rather than counting calls, and {@code stop()}
+     * lowers the flag whether or not it has been asked to fail - which is what makes it the call that can
+     * always take a container back out of a half-started state.</p>
+     *
+     * <h2>What it does not reproduce</h2>
+     *
+     * <p>The broker, the consumers themselves, and the real {@code stop(Runnable)} ordering, where a real
+     * container hands the wait to a task executor and can return before its consumers are down. Nor the
+     * wait for its consumers to start and the timeout it can give up on - {@code consumerStartTimeout},
+     * a minute by default in this library - which the model skips by never waiting at all. Nothing here
+     * asserts on any of those.</p>
+     *
+     * <p>Two gaps are worth naming because the production code and these tests lean on what fills them.
+     * The first is that there is no {@code consumers} field: the real container's is written only by
+     * {@code initializeConsumers} and by the shutdown callback that nulls it, and {@code doStart()} throws
+     * {@code "A stopped container should not have consumers"} when it is non-null - a hazard the
+     * production javadoc gives as a reason for stopping, and one this model cannot be put into at all.
+     * The second is {@link #willFailToStop}: it hands the failure straight back, while the real
+     * {@code stop()} puts a non-AMQP failure through {@code convertRabbitAccessException}, which ends in
+     * an {@code UncategorizedAmqpException} carrying only the cause - so the message the caller sees for
+     * {@code "the container could not be stopped"} would be prefixed, and the exact-message assertion on
+     * the suppressed exception below is a statement about this model rather than about the container. A
+     * real stop can also fail from inside its cancellation loop, before the callback that nulls
+     * {@code consumers} and before {@code initialized} is cleared - a state that makes the next start
+     * throw the message above, and one the model cannot reach either.</p>
+     *
+     * <p>Nor does {@link #reportsItselfRunning()} read Spring AMQP's own flag: {@code isRunning()} is
+     * final and reads a private field that only {@code doStart()} raises - which a subclass cannot reach
+     * without dragging in the whole container startup - so the model keeps its own copy of it. It is the
+     * same flag Spring AMQP's early return tests, and it is deliberately not named {@code isRunning()},
+     * which every instance of this class answers {@code false} to whatever state it is in.</p>
+     */
+    static final class StatefulListenerContainer extends SimpleMessageListenerContainer {
+
+        /** How a start that is not skipped goes, as one of the shapes a real one can take. */
+        enum StartOutcome {
+            /** It works: the flag goes up and a consumer comes with it. */
+            STARTS_A_CONSUMER,
+            /**
+             * The half-failure: the flag goes up - Spring AMQP raises it before its consumers are started
+             * - and nothing consumes, which is the state every later start returns early out of.
+             */
+            LEAVES_NO_CONSUMER,
+            /**
+             * It throws after the flag went up, which is what the real wait for its consumers does
+             * ({@code AmqpIllegalStateException("Fatal exception on listener startup")}).
+             */
+            THROWS
+        }
+
+        private StartOutcome outcome = StartOutcome.STARTS_A_CONSUMER;
+        private RuntimeException stopFailure;
+        private boolean running;
+        private int consumers;
+        private int attempts;
+        private int skipped;
+        private int stops;
+        private Map<String, Object> consumerArguments;
+
+        @Override
+        public void start() {
+            if (running) {
+                // Spring AMQP's own first line: a container that reports itself running is not started
+                // again. A start that half-failed leaves exactly this flag up with no consumer behind
+                // it, so every later start would return here having started nothing.
+                skipped++;
+                return;
+            }
+            attempts++;
+            // Raised before the consumers, as SimpleMessageListenerContainer.doStart() raises it: it
+            // calls its superclass first and starts its consumers afterwards.
+            running = true;
+            switch (outcome) {
+                case STARTS_A_CONSUMER -> consumers = 1;
+                case LEAVES_NO_CONSUMER -> consumers = 0;
+                case THROWS -> throw new AmqpIllegalStateException("Fatal exception on listener startup");
+            }
+        }
+
+        @Override
+        public void stop() {
+            stops++;
+            // Lowered in a finally by the real one, so it is down even when the stop throws - which is
+            // what makes stop the call that can always take a container back out of a half-started state.
+            running = false;
+            consumers = 0;
+            RuntimeException failure = stopFailure;
+            if (failure != null) {
+                throw failure;
+            }
+        }
+
+        @Override
+        public int getActiveConsumerCount() {
+            return consumers;
+        }
+
+        @Override
+        public void setConsumerArguments(Map<String, Object> consumerArguments) {
+            this.consumerArguments = consumerArguments;
+        }
+
+        /** The broker has recovered, or never had a problem: the next start brings a consumer. */
+        StatefulListenerContainer willStartAConsumer() {
+            return withOutcome(StartOutcome.STARTS_A_CONSUMER);
+        }
+
+        /** The next start leaves the flag up and nothing consuming. */
+        StatefulListenerContainer willLeaveNoConsumer() {
+            return withOutcome(StartOutcome.LEAVES_NO_CONSUMER);
+        }
+
+        /** The next start throws after the flag went up. */
+        StatefulListenerContainer willFailToStart() {
+            return withOutcome(StartOutcome.THROWS);
+        }
+
+        /** The container's own stop is broken; the flag still comes down. */
+        StatefulListenerContainer willFailToStop(RuntimeException failure) {
+            this.stopFailure = failure;
+            return this;
+        }
+
+        /** The flag Spring AMQP's early return tests, which {@code isRunning()} cannot be asked for here. */
+        boolean reportsItselfRunning() {
+            return running;
+        }
+
+        /** Starts that got past the early return. */
+        int attempts() {
+            return attempts;
+        }
+
+        /** Starts the early return swallowed, which is what a container left half-started produces. */
+        int skippedStarts() {
+            return skipped;
+        }
+
+        int stops() {
+            return stops;
+        }
+
+        Map<String, Object> consumerArguments() {
+            return consumerArguments;
+        }
+
+        private StatefulListenerContainer withOutcome(StartOutcome next) {
+            this.outcome = next;
+            return this;
+        }
     }
 }
