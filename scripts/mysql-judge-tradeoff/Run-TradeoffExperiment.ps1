@@ -72,6 +72,23 @@ if ($MySqlClaimTimeout -match '^([+-]?\d+)([a-zA-Z]{0,2})$') {
     throw "-MySqlClaimTimeout '$MySqlClaimTimeout' is not bindable: use a whole number of milliseconds, seconds, minutes or hours (for example 2500ms), or an ISO-8601 duration such as PT2.5S."
 }
 
+# A negative or zero lease is accepted by the regex above and by the app, which maps it to
+# Duration.ZERO - every PUBLISHING row would then be reclaimable on the next poll, which is not an
+# experiment but a broken configuration. Refused here so it cannot be run by accident.
+if ($claimTimeoutProperty -match '^([+-]?\d+)') {
+    if ([double]$Matches[1] -le 0) {
+        throw "-MySqlClaimTimeout '$MySqlClaimTimeout' is not a usable lease: it must be greater than zero."
+    }
+} elseif ($claimTimeoutProperty -match '^[+-]?[pP]') {
+    try {
+        if ([System.Xml.XmlConvert]::ToTimeSpan($claimTimeoutProperty).TotalMilliseconds -le 0) {
+            throw "-MySqlClaimTimeout '$MySqlClaimTimeout' is not a usable lease: it must be greater than zero."
+        }
+    } catch [System.FormatException] {
+        throw "-MySqlClaimTimeout '$MySqlClaimTimeout' is not an ISO-8601 duration."
+    }
+}
+
 $stageRpsList = @()
 if ($Staircase) {
     if ($FaultEnabled) { throw "-Staircase measures steady-state capacity and does not inject faults." }
@@ -180,8 +197,18 @@ New-Item -ItemType Directory -Force -Path $runDirectory | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $runDirectory "metrics") | Out-Null
 
 $gitCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+# The commit alone cannot say whether the code that ran was the code at that commit. The harness is a
+# file in the working tree, so a fix can be carried uncommitted across a whole matrix - which is
+# exactly how the trace-argument fix that unblocked the 2026-09-20 runs was carried, leaving six runs
+# that record a commit whose harness cannot reproduce them. These two fields make a run's own
+# provenance checkable afterwards: the hash names the revision that actually executed, and the dirty
+# flag says whether the tree it came from also held uncommitted changes elsewhere.
+$harnessHash = (Get-FileHash -Algorithm SHA256 -Path $PSCommandPath).Hash
+$harnessDirty = @(& git -C $repoRoot status --porcelain -- scripts/mysql-judge-tradeoff).Count -gt 0
 $parameters = [ordered]@{
-    runId = $RunId; gitCommit = $gitCommit; dispatchMode = $DispatchMode
+    runId = $RunId; gitCommit = $gitCommit
+    harnessScriptSha256 = $harnessHash; harnessTreeDirty = $harnessDirty
+    dispatchMode = $DispatchMode
     targetRps = $TargetRps; durationSeconds = $DurationSeconds; rampSeconds = $RampSeconds
     workerCountPerNode = $WorkerCount; mysqlClaimBatchSize = $MySqlClaimBatchSize
     mysqlMaxInFlightPerNode = $MySqlMaxInFlight; mysqlClaimTimeout = $MySqlClaimTimeout
@@ -513,7 +540,13 @@ function Start-GatlingProcess {
     $startInfo.FileName = (Get-Command java.exe).Source
     $startInfo.UseShellExecute = $false
     $startInfo.Arguments = (($JavaArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
-    return [System.Diagnostics.Process]::Start($startInfo)
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    # Recorded so the failure path can stop it. A load generator left pointing at a stack that is
+    # being removed reports nothing but client-side connection errors, which read like a server
+    # fault: the first normal-timeout run aborted before its warm-up window and the only symptom
+    # left behind was 881 "Premature close" errors that were the teardown racing a live JVM.
+    $script:lastGatlingProcess = $process
+    return $process
 }
 
 function Start-GatlingLoadPhase {
@@ -529,18 +562,24 @@ function Start-GatlingLoadPhase {
     # the first-submission anchor that the already-published runs were measured with, and rewriting
     # it to share this helper would put a refactor between those numbers and the code that produced
     # them for no gain here.
-    $phaseArgs = @(
+    # Every -D property must come before -cp: the JVM reads them up to the class name, and anything
+    # after it is a program argument, which is where the trace property used to sit. Gatling then
+    # answered with "Unknown option -Dperf.stageTraceFile=..." and wrote no trace at all, so the
+    # harness had no warm-up window to place and aborted the run.
+    $phaseProperties = @(
         "-Xms256m", "-Xmx1g", "-Dperf.baseUrl=$baseUrl", "-Dperf.assert.minRequests=1",
         "-Dperf.assert.minSuccessPercent=$assertMinSuccess", "-Dperf.assert.p95Millis=$AssertP95Millis",
         "-Dperf.submitIntervalMillis=3100", "-Dperf.userPrefix=$UserPrefix", "-Dperf.workloadSeed=$LatencySeed",
         "-Dperf.userIndex.start=1", "-Dperf.userIndex.end=$UserCount",
         "-Dperf.contestId=$($Seed.contestId)", "-Dperf.problemId.start=$($Seed.firstProblemId)", "-Dperf.problemId.end=$($Seed.lastProblemId)",
         "-Dperf.rampSeconds=$RampSeconds", "-Dperf.stepHoldSeconds=$HoldSeconds",
-        "-Dperf.stageRps=$TargetRps", "-Dperf.warmupStageCount=0",
-        "-cp", $classpath, "io.gatling.app.Gatling", "-s", "my.oj.perf.ContestSubmissionStepLoadSimulation"
+        "-Dperf.stageRps=$TargetRps", "-Dperf.warmupStageCount=0"
     )
-    if ($TracePath) { $phaseArgs += "-Dperf.stageTraceFile=$TracePath" }
-    $phaseArgs += @("-rf", $resultsFolder, "-rd", "mysql-judge-tradeoff-$RunId-$PhaseName")
+    if ($TracePath) { $phaseProperties += "-Dperf.stageTraceFile=$TracePath" }
+    $phaseArgs = $phaseProperties + @(
+        "-cp", $classpath, "io.gatling.app.Gatling", "-s", "my.oj.perf.ContestSubmissionStepLoadSimulation",
+        "-rf", $resultsFolder, "-rd", "mysql-judge-tradeoff-$RunId-$PhaseName"
+    )
     $startedAt = Get-Date
     $process = Start-GatlingProcess -JavaArgs $phaseArgs
     # Anchor the phase clock to the first persisted submission rather than to process creation:
@@ -1079,6 +1118,7 @@ try {
     $startInfo.UseShellExecute = $false
     $startInfo.Arguments = (($javaArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
     $gatling = [System.Diagnostics.Process]::Start($startInfo)
+    $script:lastGatlingProcess = $gatling
     # Java/Gatling startup can take longer than a short fault offset. Anchor the
     # experiment clock to the first persisted submission, not process creation.
     $loadStartDeadline = (Get-Date).AddSeconds(60)
@@ -1451,6 +1491,19 @@ try {
     }
     throw
 } finally {
+    # Before the stack goes away: nothing may still be pointed at it. A stray load generator turns
+    # the teardown into a burst of connection errors that look like a fault in the system under
+    # test, which is how the first normal-timeout run's failure was misread.
+    $stray = $script:lastGatlingProcess
+    if ($null -ne $stray) {
+        try {
+            if (-not $stray.HasExited) {
+                Write-Warning "Stopping the Gatling process (pid $($stray.Id)) that outlived the run."
+                $stray.Kill()
+                $stray.WaitForExit(10000) | Out-Null
+            }
+        } catch { Write-Warning $_ }
+    }
     if ($started -and -not $KeepStack) {
         try { Invoke-Compose -Arguments @("down") } catch { Write-Warning $_ }
     }
