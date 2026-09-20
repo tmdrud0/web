@@ -4,15 +4,17 @@
 폐기된 seq 설계와의 차이는 [`PORTFOLIO_SCOREBOARD_RECOVERY.md`](PORTFOLIO_SCOREBOARD_RECOVERY.md)를
 본다.
 
-**이 문서는 네 라운드로 이루어진다.** 1라운드(`0d36f26..60d98ec`)에서 세 모드를 구현했고, 그 결과에
+**이 문서는 다섯 라운드로 이루어진다.** 1라운드(`0d36f26..60d98ec`)에서 세 모드를 구현했고, 그 결과에
 대한 독립 검토(§9.1)가 **"세 모드가 실제로 분리되어 있지 않다"**는 지적을 포함해 14건을 냈다.
 2라운드(`60d98ec..b98c83f`, §14)에서 그 지적과 함께 나온 다섯 결함을 고쳤다. 3라운드(`b815378..`,
 §16)에서 **owner 설정이 실행 경계가 아니었던 것**, **busy recovery pass가 rollback 재시도를 잃던
 것**, **JVM cold start에서 모드가 격리되지 않던 것** 세 결함을 고쳤다. 4라운드(`54c990e..aa979d2`,
 §17)에서 **cutover 해제가 실패하면 consumer 시작이 영영 사라지던 것**과 **대기 중인 lifecycle이
 Spring 종료 경로에 닿지 못하던 것** 두 결함을 고치고, 그 diff에 대한 읽기 전용 검토(§17.6)의 지적
-중 이번 라운드가 만든 것만 반영했다. **라운드별 서술과 뒤에서 정정된 서술을 구분해서 읽어야 한다**
-— 정정 대상은 각 절에 `[정정]`으로 표시했다.
+중 이번 라운드가 만든 것만 반영했다. 5라운드(`aa979d2..`, §18)에서 **반쯤 실패한 start가 컨테이너를
+재시도할 수 없는 상태로 남겨 4라운드가 근거로 든 "다음 주기 재시도"가 성립하지 않던 것**을 고쳤다.
+**라운드별 서술과 뒤에서 정정된 서술을 구분해서 읽어야 한다** — 정정 대상은 각 절에 `[정정]`으로
+표시했다.
 
 3라운드가 왜 필요했는지는 §16.0에 한 문단으로 적었다: 앞의 두 라운드가 **rollback(Redis가 살아
 있고 JVM도 살아 있는 상태에서의 회귀)** 만 다루었고, **JVM cold start**(JVM이 다시 뜨는 경우)는
@@ -37,6 +39,9 @@ rollback 경로에 대한 판정이며, **cold start 경로는 그 판정의 범
 | 4라운드 기준 HEAD | `54c990e` (기준 + 27 commit) — 4라운드 작업을 시작한 지점 |
 | 4라운드 결과 commit | `aa979d2` (기준 + 28 commit) — 두 결함과 검토 지적 수정. 소스 9 files, `+818 / −41`(그중 신규 1 file = 217 lines) |
 | 그 뒤 | 이 보고서·`ARCHITECTURE.md`의 4라운드 절을 채우는 docs commit(§17) |
+| 5라운드 기준 HEAD | `aa979d2` (기준 + 28 commit) — 5라운드 작업을 시작한 지점. 4라운드 문서 정정 commit의 마지막 |
+| 5라운드 결과 commit | `04ab46b` (기준 + 29 commit) — 반쯤 실패한 start의 정상화. 소스 2 files(그중 신규 0), `+441 / −34` |
+| 그 뒤 | 이 보고서·`ARCHITECTURE.md`의 5라운드 절을 채우는 docs commit(§18) |
 | 작업 트리 | **3라운드 작업이 커밋되기 전에는 dirty였다** — 커밋 후 `git status --short`가 비는지는 §16.9에 적었다 |
 | 원본 checkout | 건드리지 않음. `reset`/`clean`/강제 checkout 사용 안 함 |
 
@@ -1262,6 +1267,13 @@ consumer는 JVM 수명 동안 내려간 채 남고, 로그에는 "역사를 덮�
   사라지기 때문이다. `ContestScoreboardFullReplayStartupRunner`는 반대로 예외를 그대로 던져 **기동을
   실패**시킨다(아무것도 소비하지 않으면서 복구했다고 기록된 JVM을 만들지 않는다).
 
+**[정정 — 5라운드]** 위 "**재시도 트리거가 실재한다**"는 **트리거**에 대해서는 맞다 — 동작은
+보존되고 보고도 다시 온다. 그러나 그 재시도가 **성공할 수 있다**는 뜻은 아니었다. 반쯤 실패한
+start는 컨테이너의 running 플래그를 올린 채 consumer를 0건으로 남기고, 그 상태에서 다음
+`container.start()`는 `isRunning()` 조기 반환으로 **아무것도 하지 않는다.** 즉 트리거는 실재했지만
+재시도가 만난 컨테이너는 재시도할 수 있는 상태가 아니었다 — §18.1. 아래 §17.3·§17.4의 해당
+테스트 2건도 5라운드에서 상태 기반으로 다시 쓰였다(§18.3).
+
 ### 17.2 결함 2 — held 상태와 Spring context 종료의 경합
 
 **원인.** 비-stream 모드(`full-replay`·`redis-seq`)에서 `lifecycle.start()`는 consumer를 대기시키고
@@ -1305,6 +1317,13 @@ callback을 정확히 한 번 완료한다. 대기 중 시작이 실패하면 `c
 | 재시작이 실패하면 그 batch를 다시 묻는다 | `….aFailedBatchIsAskedAboutAgainWhenTheResubscribeCouldNotStart`(신규, §17.6) |
 | 동시에 온 두 번째 보고가 같은 동작을 다시 돌리지 않는다 | `….aSecondReportDoesNotRunWhatTheFirstIsAlreadyRunning`(신규, §17.6) |
 
+**[정정 — 5라운드]** 위 표의 두 줄이 5라운드에서 바뀌었다(§18.3). `start()`가 돌아왔다고 consumer가
+떴다고 보지 않는다 — `aStartThatLeftNoConsumerIsNotTakenForAStartedConsumer`는 **이름이 바뀌었고**
+(→ `aStartThatLeftNoConsumerIsTakenBackOutAndTheRetryReallyStartsOne`), 재시작이 실패하면 그
+batch를 다시 묻는다 — `aFailedBatchIsAskedAboutAgainWhenTheResubscribeCouldNotStart`는 **이름은
+그대로**이나 mock의 `0 → 1` 순차 스텁 대신 상태 기반 double 위에서 돈다. 두 테스트 모두 "재시도가
+일어났다"가 아니라 "정상화가 실제로 일어났고 그 다음 start가 실제로 시도됐다"를 단언한다.
+
 `ContestScoreboardStreamLifecycleContextTests`는 **실제 `SpringApplication`** 을 띄우고 실제로
 `context.close()`를 부른다 — 이 클래스가 `lifecycle.stop()`을 직접 부르면 결함 2를 되살려도 초록이
 되므로, 그 방법을 쓰지 않았다(작업 지시가 금지한 바로 그 회피다). 컨테이너만 mock이고 그
@@ -1343,6 +1362,12 @@ simpleMessageListenerContainer.start()` — **종료 뒤에 실제로 start가 �
 통과했다. 되돌린 파일은 저장소 밖 사본(`AppData\Local\Temp\scoreboard-round4\backup2\`)에서
 원복했고, 원복 뒤 19클래스 전체를 다시 초록으로 확인했다. 되돌림 패치는 모두 `MEASUREMENT ONLY`
 표식을 달았고 작업 트리에는 남기지 않았다.
+
+**[정정 — 5라운드]** 위 되돌림 표의 마지막 두 줄이 가리키는 테스트 2건은 5라운드에서 상태 기반으로
+다시 쓰였고, 그중 하나는 **이름도 바뀌었다**(§18.3). 따라서 그 두 줄의 수치(2·1)는 **4라운드 코드와
+4라운드 테스트 이름에 대한 측정**이며, 지금 그 이름으로는 재측정할 수 없다. 5라운드의 같은 자리
+측정(수정 전 4건 실패 · 부분 되돌림 1/1/4)은 §18.4에 있다. 같은 이유로 위 실행 결과의
+"19 classes, 155 tests"도 **4라운드 시점의 값**이고, 5라운드의 값은 159다.
 
 ### 17.5 실행하지 않은 검증
 
@@ -1407,3 +1432,200 @@ running=true`를 **먼저** 세우고 그 뒤 `initializeConsumers()`(581행)와
    않았다. `ContestScoreboardStreamLifecycleContextTests`의 javadoc이 mock이 이 순서를 재현하지
    않는다는 사실을 적어 둔다 — 그 테스트의 `verify(container).stop(...)`은 "종료가 이 lifecycle에
    도달했다"를 고정할 뿐 "실물 컨테이너가 내려갔다"를 고정하지 않는다.
+
+## 18. 5라운드 (`aa979d2..`) — 반쯤 실패한 start는 재시도할 수 있는 상태가 아니었다
+
+4라운드가 §17.6에서 `start()` 반환을 시작됨으로 오판하는 것을 고쳤지만, **그때 근거로 든 "다음
+주기 재시도가 복구한다"는 반쯤 실패한 컨테이너에서는 성립하지 않았다.** 이번 라운드는 그 한 결함만
+고쳤다. 성능 실험·분산 실행권·F6 잔여 위험·종료 순서 창·무관한 리팩터는 이번에도 범위가 아니다.
+
+### 18.1 [정정] "다음 주기 재시도로 복구된다"는 성립하지 않았다
+
+**정정 대상.** §17.1의 "**재시도 트리거가 실재한다.** redis-seq에서는 역사를 덮는 주기 check이
+매번 경계를 보고하므로 일시적 실패 뒤 한 주기 뒤에 다시 시도된다", 그리고 같은 취지를 담은
+`ARCHITECTURE.md` §3.3과 `ContestScoreboardRecoveryCutover`의 javadoc.
+
+**무엇이 맞고 무엇이 틀렸는가.** 트리거는 실재했다 — 실패한 동작은 대기 목록에 남고, redis-seq의
+주기 check은 매 주기 경계를 다시 보고하며, start 자체도 예외를 던져 실패를 알렸다. 틀린 것은
+**그 재시도가 만나는 컨테이너가 재시도할 수 있는 상태라는 가정**이다. spring-rabbit 3.2.3
+바이트코드(`javap -p -c`)로 확인한 사실:
+
+- `AbstractMessageListenerContainer.start()`의 첫 두 줄이 `if (isRunning()) return;`이다. 예외는
+  `catch (Exception) { throw convertRabbitAccessException(...) }`로 감싸 던질 뿐이고, `finally`는
+  `lazyLoad=false`만 쓴다 — **`setNotRunning()`을 부르지 않는다.**
+- `SimpleMessageListenerContainer.doStart()`는 `super.doStart()`로 `active=true; running=true`를
+  **먼저** 세우고, 그 **뒤에** `initializeConsumers()`와 (실패 시
+  `AmqpIllegalStateException("Fatal exception on listener startup")`를 던지는)
+  `waitForConsumersToStart()`를 부른다.
+
+즉 start가 반쯤 실패하면 컨테이너는 **running 플래그가 올라간 채 consumer는 0건**으로 남는다. 그
+상태에서 다음 `container.start()`는 **첫 줄에서 반환하며 아무것도 시작하지 않는다.** consumer 수는
+계속 0이므로 `startAt`은 같은 실패를 다시 내고, cutover는 동작을 다시 보관하며, 그 다음 주기도
+같은 일이 반복된다. **재시도는 JVM 수명 동안 형식뿐이었다** — 컨테이너가 영영 올라오지 않는다.
+
+### 18.2 수정 — 실패를 보고하기 **전에** 컨테이너를 되돌린다
+
+실패한 start를 하나의 정상화 경로로 모았다.
+
+- start가 `RuntimeException`을 던지든, 예외 없이 돌아왔는데 `getActiveConsumerCount() <= 0`이든
+  **둘 다 같은 경로**를 탄다: `container.stop()`으로 실제 컨테이너의 running 플래그를 내린 **뒤에**
+  그 실패를 호출자에게 보고한다. 보고가 정상화보다 먼저 오면 재시도는 정상화되지 않은 컨테이너를
+  다시 만나므로 순서가 곧 결함이다.
+- `container.stop()`(인자 없는 동기 변형)을 고른 근거는 **그 호출만이 확실히 되돌리기 때문**이다.
+  `AbstractMessageListenerContainer.stop()`은 `doStop(); setNotRunning();`이고, 예외가 나면
+  `setNotRunning()`을 부른 뒤 다시 던지는 catch-all 핸들러가 있으므로 **stop 자체가 던져도 플래그는
+  내려간다.** 또
+  `SimpleMessageListenerContainer.shutdownAndWaitOrCallback`은 `consumers == null`이면
+  "Shutdown ignored - container is already stopped"를 남기고 돌아오므로 **플래그를 올린 적 없는
+  컨테이너에 대한 stop도 안전**하다. `stop(Runnable)`이 아니라 `stop()`인 이유는 동기가 필요해서다 —
+  재시도가 내려가는 중인 컨테이너와 경주하면 안 된다. **[정정 — 검토 A1]** start는 두 자리에서
+  실패하고, **되돌리기가 필요한 것은 두 번째뿐**이다. 플래그가 올라가기 **전**의 실패 —
+  `afterPropertiesSet()`과 그 주변 검사, 즉 브로커가 아직 안 떠 있을 때 실제로 실패하는 자리 — 는
+  플래그를 내린 채 끝나므로 되돌릴 것이 없고, 이때 stop은 **no-op**이다(실제 컨테이너는 "Shutdown
+  ignored - container is already stopped"를 남기고 돌아온다). 처음에 이 문서와 javadoc이 "start가
+  실패하면 항상 플래그가 올라간 채 남는다"고 쓴 것은 **조건부 사실을 무조건으로 적은 것**이었다.
+- **정리 과정의 예외는 최초 실패를 대체하지 않는다.** stop이 던지면 최초 예외에 `addSuppressed`로
+  붙이고 WARN을 남긴다. start가 왜 실패했는지가 stop이 왜 실패했는지보다 중요하다.
+- **정상 start는 건드리지 않는다.** 살아 있는 consumer가 있으면 stop을 부르지 않는다. 읽고 있는
+  consumer를 내리는 것은 stream을 소유하지 않은 모드가 회수 경로에서 해서는 안 되는 일이다.
+- **`consuming` 필드만 뒤집지 않는다.** 그 필드는 이 lifecycle의 근사일 뿐이고, 재시도를 막고 있던
+  것은 컨테이너의 실제 `isRunning()`이다.
+
+기존 의미는 그대로다: 실패 시 `consuming()`은 false, cutover 동작은 대기에 남고 다음 보고가 재시도,
+full-replay startup에서는 실패가 `ApplicationRunner` 밖으로 전파되어 **기동 실패**, 저장 checkpoint
+**포함** 재개 규칙 불변, failed batch는 재구독 **성공 뒤에만** handled, 모드별 복구 의미 불변.
+
+**막혀 있던 경로는 해제 경로 하나였다.** 컨테이너를 멈추지 않고 start하는 곳은
+`startAfterHistoryRecovery`(cutover가 부르는 경로)뿐이고, 되감기와 재구독 경로는 이미 `startAt`
+**전에** `container.stop()`을 부르므로 플래그가 내려가 있다. 그래서 이 결함의 실제 발생 경로는
+"해제가 실패한 뒤의 재시도"다.
+
+### 18.3 상태 기반 테스트가 `0 → 1` 순차 스텁과 다른 점
+
+4라운드의 두 테스트는 `when(container.getActiveConsumerCount()).thenReturn(0, 1)`로 "첫 start는 0,
+재시도는 1"을 **호출 순번으로** 흉내 냈다. 그것으로는 이 결함을 볼 수 없다. 실제 컨테이너는 플래그가
+올라가 있으면 **두 번째 start를 조기 반환으로 삼키므로**, 그 스텁은 **정상화하지 않은 구현도
+통과시킨다** — 재시도가 실제로 시도됐는지 조기 반환으로 건너뛰었는지를 구분하지 못한다. 순번은
+스텁이 원하는 대로 답하지만 컨테이너는 자기 상태로 답한다.
+
+그래서 두 테스트(그리고 신규 4건)는 컨테이너를 **상태로** 모델링한 `StatefulListenerContainer` 위에서
+돈다. `SimpleMessageListenerContainer`를 상속해 `start()`/`stop()`/`getActiveConsumerCount()`/
+`setConsumerArguments()`를 오버라이드하고 다음 상태를 들고 있다.
+
+| 상태 | 뜻 |
+|---|---|
+| running 플래그 | 실제 컨테이너가 `isRunning()`으로 답하는 그 플래그. `start()`가 **consumer를 세우기 전에** 올린다 |
+| `consumers` | `getActiveConsumerCount()`가 답하는 값 |
+| 다음 start의 결과 | consumer를 세운다 / 플래그만 올리고 consumer 0 / 플래그를 올린 뒤 던진다 |
+| 다음 stop의 결과 | 정상 / 던진다(그래도 플래그는 내려간다) |
+
+`start()`는 **호출 순번이 아니라 자기 상태**를 읽는다: 플래그가 올라가 있으면 조기 반환하고
+`skippedStarts`를 센다. `stop()`은 던지도록 설정돼 있어도 플래그를 내린다(실제 컨테이너가 `finally`
+에서 내리는 것과 같다). 그래서 `skippedStarts() == 0`은 "재시도가 실제로 **시도**됐다"는 진술이고,
+`reportsItselfRunning() == false`는 "정상화가 실제로 일어났다"는 진술이다. 순번 기반 스텁으로는
+앞의 것을 단언할 수 없다 — 스텁은 시작이 조기 반환으로 삼켜졌는지 알 방법이 없다.
+
+**double이 재현하지 않는 것**(javadoc에 명시): 브로커, consumer 자신, 실제 `stop(Runnable)`의 순서
+(실제 컨테이너는 대기를 task executor에 넘긴다), `waitForConsumersToStart()`의 대기와 그 타임아웃
+(`consumerStartTimeout`, 이 라이브러리 기본 60초). 독립 검토(A2)가 지적한 두 구멍도 javadoc에 적었다:
+double에는 `consumers` 필드가 없어 **`doStart()`가 `"A stopped container should not have consumers"`를
+던지는 상태**(production javadoc이 stop의 근거 중 하나로 드는 위험)를 만들 수 없고,
+`willFailToStop`은 던진 예외를 그대로 돌려주지만 실제 `stop()`은 비-AMQP 실패를
+`convertRabbitAccessException`으로 감싸 `UncategorizedAmqpException`(cause만 든다)으로 바꾸므로
+suppressed 예외의 **정확한 메시지 단언은 double의 성질**이다. 그리고 Spring의 `isRunning()`은
+`public final`이고 private 필드를 읽으므로 하위 클래스가 그 값을 세울 수 없다 — double은 같은 플래그를
+**자기 필드로** 복제하며 `isRunning()`이라는 이름을 쓰지 않는다(모든 인스턴스가 그 이름에는 false로
+답한다). 서술할 때 `reportsItselfRunning()`을 `isRunning()`이라고 부르지 않는 이유가 이것이다.
+
+### 18.4 실행 결과와 판별력 실측
+
+```
+.\gradlew.bat test --offline  --tests <4라운드와 같은 명시적 19개 클래스>
+  → BUILD SUCCESSFUL, 19 classes, 159 tests, failures 0, errors 0, skipped 0
+```
+
+`ContestScoreboardStreamLifecycleTests`가 27 → 31(+4)이고 나머지 18클래스는 4라운드와 같은 수다
+(155 → 159). 실행 뒤 JUnit XML 전체에 `HikariPool|jdbc:mysql|Flyway`가 없음을 확인했다 — DB 활동
+0건. `git diff --check`는 통과했고, 작업 트리에는 소스 2 files만 있다.
+
+**수정 전 실측.** 새 상태 기반 테스트 4건을 **고치지 않은 구현**에 먼저 돌려 **31건 중 4건 실패**를
+확인했다. 실패 메시지가 정확히 이 결함을 가리킨다 — `reportsItselfRunning()`이 true로 남아
+(`Expecting value to be false but was true`) 있고, 정상화 stop이 없어 suppressed 예외가 비어 있다
+(`Expected size: 1 but was: 0`). 고친 뒤 같은 31건이 초록이다. 신규 테스트는 4건이고 그중 셋이
+여기서 걸린다 — `aConsumerThatCameUpIsNotStopped`는 **수정 전에도 통과한다**(그때도 정상 start를
+멈추지 않았으므로). 그 테스트는 결함의 증거가 아니라 "수정된 코드가 무조건 stop으로 자라지 않게"
+하는 guard이고, 위 4건에 세지 않았다(검토 A3도 같은 판정).
+
+**부분 되돌림 실측.** 어느 수정이 어느 테스트를 잡는지 확인하려고 구현의 **일부만** 되돌려 측정했다
+(매 회차 `ContestScoreboardStreamLifecycleTests` 31건).
+
+| 되돌린 것 | 실패한 테스트 | 개수 |
+|---|---|---|
+| 던진 start를 정상화 없이 그대로 보고하게 | `aStartThatThrewIsStillRetriedAfterTheContainerIsTakenBackOut` | 1 |
+| 정상화 중 실패한 stop이 최초 예외를 **대체**하게 | `aStopThatCouldNotTakeTheContainerBackOutDoesNotReplaceTheStartFailure` | 1 |
+| 정상화를 **아예 하지 않게** | 위 둘 + `aStartThatLeftNoConsumerIsTakenBackOutAndTheRetryReallyStartsOne`, `aFailedBatchIsAskedAboutAgainWhenTheResubscribeCouldNotStart` | 4 |
+
+각 회차에서 나머지 30·30·27건은 통과했다. 되돌린 파일은 저장소 밖 사본
+(`AppData\Local\Temp\scoreboard-round5\backup\`)에서 원복했고 SHA-1이 커밋된 HEAD와 일치함을
+확인했으며, 패치는 모두 `MEASUREMENT ONLY` 표식을 달았고 작업 트리에는 남기지 않았다
+(`git grep -c 'MEASUREMENT ONLY' -- src/` = 0).
+
+**되돌림이 판별하지 못하는 것(정직하게).** `aFailedBatchIsAskedAboutAgainWhenTheResubscribeCouldNotStart`
+는 정상화가 없어도 **재시도 자체는 성공한다** — 재구독 경로가 `startAt` **전에** `container.stop()`을
+부르므로 플래그가 이미 내려가기 때문이다(§18.2). 이 테스트가 잡는 것은 그 경로가 남기는 상태
+(`reportsItselfRunning()` 단언)다. 반대로 **이번 수정이 실제로 푸는 것은 해제 경로 하나**이며, 그
+경로를 고정하는 테스트가 `aStartThatLeftNoConsumerIsTakenBackOutAndTheRetryReallyStartsOne`다.
+
+### 18.5 실행하지 않은 검증
+
+§17.5와 같다. **MySQL·Redis·Rabbit 실물 통합 테스트는 이번에도 실행하지 않았다** — 검증에 쓸 수
+있는 안전한 MySQL 환경이 없다(`oj-test-mysql`은 침해된 컨테이너이고 `localhost:3306`도 같은
+대상이다). **"보안상 실행 중단"** 이며 skip으로 세지 않았다. 이번 라운드의 변경은 실물 브로커가
+필요한 계층을 건드리지 않지만, 따라서 **반쯤 실패한 실물 컨테이너**(예: 실제로
+`waitForConsumersToStart()`가 던지는 경우)에서 이 정상화가 동작하는지는 **미검증**이다 — 근거는
+spring-rabbit 3.2.3 바이트코드와 그 상태를 모델링한 double뿐이다. 성능·복구 시간 비교도 이번에도
+하지 않았고, RDB fault injection과 장시간 부하 테스트도 범위 밖이다.
+
+### 18.6 독립 검토 결과 (읽기 전용)
+
+수정을 마친 뒤 **별도 에이전트에게 이번 라운드의 diff(소스 2 files)를 읽기 전용으로
+검토**시켰다 — 검토자가 본 것은 `+408/−34`이고, 지적을 반영한 최종 commit(`04ab46b`)은 `+441/−34`다
+(차이는 검토 지적 반영분과 javadoc뿐이며 동작은 같다). 검토자는 spring-rabbit 3.2.3 / spring-amqp
+3.2.3 jar를 `javap -p -c`로 직접 열어
+모든 라이브러리 주장을 확인했고, 스스로 "추측에 그친 것"과 "확인한 것"을 구분해 보고했다. 이번
+라운드는 **동작 결함을 만들지 않았고**, 지적은 전부 문서 수준 3건이었다(A1·A2·A4) — 셋 다 고쳤다.
+
+**고친 지적.**
+
+| 지적 | 수정 |
+|---|---|
+| **A1** — `normaliseAfterAFailedStart`의 javadoc이 "start에서 실패할 수 있는 모든 것은 플래그가 올라간 뒤에 온다"고 **무조건** 적었다. `afterPropertiesSet()`과 그 주변 검사는 플래그보다 **앞**에서 돌고 try/catch **밖**이라, 브로커가 안 떠 있을 때의 실패는 오히려 플래그가 내려간 채 끝난다 | 두 실패 자리를 구분하도록 다시 씀: 플래그 전 실패는 되돌릴 것이 없고 stop은 **no-op**, 되돌리기가 필요한 것은 `doStart()`가 super를 부른 뒤의 실패뿐. `startAfterHistoryRecovery`의 javadoc도 같은 조건부로 고침(§18.2 [정정 — 검토 A1]) |
+| **A2** — double의 "재현하지 않는 것" 목록에 실제로는 없는 두 성질이 빠졌다: ① `consumers` 필드가 없어 `doStart()`가 `"A stopped container should not have consumers"`를 던지는 상태(production javadoc이 stop의 근거로 드는 위험)를 만들 수 없다 ② `willFailToStop`은 예외를 그대로 돌려주지만 실제 `stop()`은 비-AMQP 실패를 `convertRabbitAccessException` → `UncategorizedAmqpException`(cause만)으로 바꾸므로 **정확한 메시지 단언은 double의 성질**이다. 또 실제 stop은 cancellation loop 안에서 실패해 `consumers`를 null로 만들기 **전에** 빠져나갈 수 있다(= 실패한 stop 뒤 재시도가 성공한다는 단언이 그 경우를 증명하지 못한다) | 두 항목을 double javadoc에 추가하고, 해당 단언 옆에도 주석으로 명시. 실제로 실패 지점을 찾아내지는 못했으므로 **결함이 아니라 서술의 구멍**으로만 적었다(§18.3 갱신) |
+| **A4** — 이 보고서 §18.3이 double javadoc이 "`waitForConsumersToStart()`의 60초 대기"를 언급한다고 적었는데 javadoc에는 없었다 | javadoc에 그 항목을 실제로 추가해 문서와 코드를 맞춤 |
+| **A3**(정보) — `aConsumerThatCameUpIsNotStopped`는 수정 전에도 통과하므로 결함의 증거가 아니다 | 위 4건에 세지 않았음을 명시하고, 그 테스트의 javadoc에 "무조건 stop으로 자라지 않게 하는 guard"임을 적음 |
+
+**확인된 것(검토자가 소스로 검증).** 조기 반환·플래그를 consumer보다 먼저 세우는 순서·`finally`의
+`setNotRunning()`·플래그가 내려간 컨테이너에 대한 stop의 무해함은 **바이트코드로 확인**됐다. 그리고
+**정상 consumer를 멈추지 않는다**는 이 수정의 핵심도 확인됐다: 정상 start는 각 consumer의 start
+latch를 기다린 뒤에야 돌아오고 그 latch는 `BlockingQueueConsumer.start()`가 `activeObjectCounter`에
+등록된 **뒤에** 세워지므로, 정상 반환은 `getActiveConsumerCount() >= 1`을 함의한다 — 즉 0건 판정은
+"아무것도 소비하지 않는" 두 경우와 정확히 겹친다. 교착 없음(이 경로는 container worker 스레드에서
+돌지 않는다), `stop()` 선택이 옳음(`stop(Runnable)`은 `consumers`가 아직 non-null인 채 돌아올 수
+있다), 그리고 **재시도가 실제로 기능함**도 확인됐다 — stop이 `consumers`를 null로 만들고 다음
+`initializeConsumers()`가 `cancellationLock.reset()` → `ActiveObjectCounter.reset()`으로 카운터를
+다시 활성화하므로, 다음 start는 consumer를 정말 등록할 수 있다. 보존 의미 5가지(실패 시
+`consuming` false, cutover 대기 유지와 재시도, full-replay 기동 실패 전파, 포함 재개 규칙, handled
+기록 순서)도 각각 확인됐다. diff 위생(측정용 잔여 코드·TODO·미사용 import 없음)도 clean 판정.
+
+**검토자가 판별력을 독립적으로 재도출했다.** 수정 전 코드에서 실패할 4건을 스스로 추론해(§18.4와
+같은 4건) 일치함을 보고했다. 다만 "19 classes, 159 tests"는 **허용된 범위 밖 실행이 필요해 검증하지
+않았고**, 실물 브로커에 대한 동작은 검토자도 **주장하지 않는다** — 근거는 바이트코드와 모델링된
+상태까지다(§18.5와 같다).
+
+**고치지 않고 보고만 하는 지적(기존 동작, §17.6과 같은 방침).** 검토자가 함께 보고한 것들은 이번
+diff가 만든 것이 아니므로 **보고만 한다**: ① 실패한 재구독 뒤 `consuming`이 true로 남는 것(그것이
+supervisor 재시도를 만든다) ② `recordFailureRestart()`가 start **시도 전**에 기록되는 것 ③ `startAt`
+이 `repairPending()`·`consumerRestarted()`·`initializeOffset()`을 start 전에 부르는 것 ④ 0-consumer
+모양에는 실제로 두 변종이 있고(`consumerStartTimeout` 만료, 동시 stop으로 consumer가 비워진 경우)
+후자는 이 lifecycle에서 도달 불가 ⑤ `stop(Runnable)`이 callback 전에 돌아올 수 있는 창(그래서 동기
+`stop()`을 고른 것이 옳다). 이들은 §16.7·§17.6과 같은 이유로 **이번 범위에서 고치지 않았다.**

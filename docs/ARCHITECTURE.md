@@ -215,6 +215,22 @@ stop하지 않았다"를 뜻하고, 컨테이너가 실제로 떠 있는지는 �
 start는 `isRunning()==true`인데 소비자가 0건이다. `consuming`은 컨테이너에 **살아 있는 consumer 수**를
 물어 0이면 실패로 처리한 뒤에만 선다 — 누구든 그 start를 요청한 쪽은 계속 기다렸다가 다시 요청한다.
 
+**실패한 start는 컨테이너를 되돌려 놓은 뒤에 보고된다 (5라운드).** 위 문단의 "계속 기다렸다가 다시
+요청한다"는 **그 자체로는 성립하지 않았다.** running 플래그가 올라간 채 남은 컨테이너는 다음
+`start()`를 첫 줄(`if (isRunning()) return;`)에서 삼키므로, 재시도는 아무것도 시작하지 않고 같은
+실패를 다시 낸다 — 트리거는 실재했지만 재시도가 만난 컨테이너가 재시도 가능한 상태가 아니었다.
+그래서 보고의 **순서**가 계약의 일부다: start가 던지든 consumer 0건으로 돌아오든, 먼저
+`container.stop()`으로 실제 컨테이너의 플래그를 내리고 **그 다음에** 실패를 호출자에게 보고한다.
+(플래그가 올라가기 **전**에 실패한 경우 — `afterPropertiesSet()`과 그 주변 검사, 즉 브로커가 아직 안
+떠 있을 때 실제로 실패하는 자리 — 는 되돌릴 것이 없고 이 stop은 no-op이다. 되돌리기가 필요한 것은
+`doStart()`가 super를 부른 뒤의 실패뿐이다.)
+`stop()`(인자 없는 동기 변형)을 쓰는 이유는 `AbstractMessageListenerContainer.stop()`이
+`setNotRunning()`을 `finally`에서 부르므로 **stop 자체가 던져도 플래그가 내려가기** 때문이고,
+`shutdownAndWaitOrCallback`이 `consumers == null`을 "already stopped"로 무시하므로 플래그를 올린 적
+없는 컨테이너에도 안전하기 때문이다. 정리 중 예외는 최초 실패에 `addSuppressed`로 붙여 **최초
+실패를 대체하지 않고**, 살아 있는 consumer가 실제로 떴으면 stop을 부르지 않는다. `consuming` 필드만
+뒤집는 것은 이 계약이 아니다 — 재시도를 막고 있던 것은 컨테이너의 실제 상태다.
+
 #### 모드에게 주는 질문은 구간이다 — 그리고 그 구간은 양끝으로 말한다
 
 `rebuildHistory`에 넘기는 것은 checkpoint 한 점이 아니라 **잃어버린 구간**(`LostRange`)이다.
