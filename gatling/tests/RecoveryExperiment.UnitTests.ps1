@@ -571,6 +571,33 @@ Test-Case "every SQL reader normalizes the cell it hands a caller" {
     }
 }
 
+Test-Case "no parameter is mandatory and given a default at the same time" {
+    # A default says the argument may be omitted; `Mandatory = $true` says it may not. PowerShell resolves
+    # that contradiction in favour of Mandatory, so `Assert-ClockFramesAligned` - written to be called as
+    # `Assert-ClockFramesAligned` with its own 60s tolerance - failed to bind at both call sites, and the
+    # run that reached it stopped before any load. A parameter is one or the other, never both.
+    #
+    # The pattern is proved against the shape it forbids before it is used, so that a scan which matches
+    # nothing is evidence about the sources rather than about the regex.
+    #
+    # Scoped to these libraries, for the same reason as the reader check above.
+    $pattern = '\[Parameter\(Mandatory\s*=\s*\$true\)\]\[[^\]]+\]\$(\w+)\s*='
+    $sample = '[Parameter(Mandatory = $true)][int]$ToleranceSeconds = 60'
+    Assert-True ([regex]::Matches($sample, $pattern).Count -eq 1) "the scan recognises the shape it forbids"
+    $checked = 0
+    foreach ($source in @(Get-HarnessSourceFiles)) {
+        if ($source.Name -notlike "RecoveryExperiment.*") { continue }
+        $text = Get-Content -LiteralPath $source.FullName -Raw
+        foreach ($match in [regex]::Matches($text, $pattern)) {
+            $checked++
+            $line = ($text.Substring(0, $match.Index) -split "`n").Count
+            Assert-True $false `
+                "$($source.Name):$line declares `$$($match.Groups[1].Value) mandatory and gives it a default, so the default can never take effect"
+        }
+    }
+    Assert-True ($checked -eq 0) "the scan found $checked parameter(s) declared both ways"
+}
+
 # --- report -------------------------------------------------------------------------------------
 
 Write-TestSummary -Suite "RecoveryExperiment unit tests"

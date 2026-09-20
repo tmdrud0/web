@@ -797,7 +797,10 @@ SELECT @@global.time_zone, @@session.time_zone, NOW(6), UTC_TIMESTAMP(6),
 # within a minute of the database's own clock reading then the writer and the database are not in the
 # same frame and no latency figure from these columns means anything.
 function Assert-ClockFramesAligned {
-    param([Parameter(Mandatory = $true)][int]$ToleranceSeconds = 60)
+    # Not `Mandatory`: the default is the intended tolerance, and PowerShell treats a mandatory parameter
+    # as one the caller must supply even when it declares a default, so `Mandatory` here made both call
+    # sites - which pass nothing - fail to bind at all. The tolerance is documented by the default.
+    param([int]$ToleranceSeconds = 60)
 
     $row = @(Invoke-SqlRows -Sql @"
 SELECT IFNULL(TIMESTAMPDIFF(SECOND, MAX(scoreboard_applied_at), NOW(6)), 0)
