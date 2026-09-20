@@ -172,18 +172,19 @@ run 1은 시스템이 아니라 하네스 때문에 죽었고, 그 실패가 남
   중단한다. 측정 phase의 인자 순서는 처음부터 맞았기 때문에 이 결함은 normal-timeout 모드에서만
   드러났다.
 - **오해.** 중단되면서 하네스가 stack을 내렸고, 그 시점에 warm-up Gatling JVM은 아직 살아 있었다.
-  죽은 주소를 향해 계속 요청을 보낸 그 JVM의 `simulation.log`(실패 run의 결과 트리 밖,
-  `gatling/build/reports/gatling/contestsubmissionsteploadsimulation-20260920010358037/`)에는
-  `j.i.IOException: Premature close` KO가 **정확히 881건**, 그 외 다른 오류 종류 없이 남았다.
-  구성은 `api-login-once` 857건 + `api-contest-submit` 24건이고, 폭이 0.63초인 한 구간에 몰려
-  있다. 그 구간은 run 시작 3.53초 뒤에 시작하는데, **실패 run의 `runEndedAt`보다 291ms 뒤다.**
-  즉 로드는 run이 이미 끝난 뒤에야 무너졌다 — teardown이 살아 있는 JVM과 경쟁한 것이지 앱이
-  로그인을 거부한 것이 아니다. 로그인 실패 → `exitHereIfFailed` → closed model이 사용자를 즉시
-  대체 → feeder(1000개, 비순환) 소진 → 엔진 중단 순서로 읽히지만, **그 마지막 두 단계
-  (`Feeder in-memory is now empty, stopping engine`과 Gatling의 `Unknown option
-  -Dperf.stageTraceFile=...` 경고)는 그때 콘솔에서 관측했을 뿐 보존되지 않았다.** 실패 run의
-  디렉터리에는 Gatling 콘솔 로그가 없고 `simulation.log`만 남았으므로, 아카이브로 확인되는 것은
-  881건의 teardown 경쟁과 그 시각까지다.
+  죽은 주소를 향해 계속 요청을 보낸 그 JVM의 `simulation.log`에는 `j.i.IOException: Premature
+  close` KO가 **정확히 881건**, 그 외 다른 오류 종류 없이 남았다. 구성은 `api-login-once` 857건 +
+  `api-contest-submit` 24건이고, 폭이 0.63초인 한 구간에 몰려 있다. 그 구간은 run 시작 3.53초
+  뒤에 시작하는데, **실패 run의 `runEndedAt`보다 291ms 뒤다.** 즉 로드는 run이 이미 끝난 뒤에야
+  무너졌다 — teardown이 살아 있는 JVM과 경쟁한 것이지 앱이 로그인을 거부한 것이 아니다.
+  로그인 실패 → `exitHereIfFailed` → closed model이 사용자를 즉시 대체 → feeder(1000개, 비순환)
+  소진 → 엔진 중단 순서로 읽히지만, **그 마지막 두 단계는 보존된 아티팩트로 확인되지 않는다.**
+  보존된 `simulation.log`에는 `Feeder in-memory is now empty`가 0건이고, Gatling 콘솔 출력은
+  보관되지 않았다. 아카이브로 확인되는 것은 881건의 teardown 경쟁과 그 시각까지다.
+
+  그 `simulation.log`는 원래 빌드 출력인 `gatling/build/reports/gatling/contestsubmissionsteploadsimulation-20260920010358037/`에
+  있었으므로 `gradlew clean` 한 번에 사라질 위치였다. 실패 run 디렉터리에
+  `gatling-warmup-simulation.log`로 복사해 보존했다(이 문서의 수치 검증은 그 파일로 했다).
 
 수정은 둘이다. 인자 순서를 측정 phase와 같게 맞추고(`-D` 프로퍼티를 `-cp` 앞으로), 실패 경로의
 `finally`에서 아직 살아 있는 Gatling 프로세스를 먼저 종료한 뒤 stack을 내린다. 뒤의 수정이 없으면
