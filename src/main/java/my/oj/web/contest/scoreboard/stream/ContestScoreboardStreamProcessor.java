@@ -1,6 +1,7 @@
 package my.oj.web.contest.scoreboard.stream;
 
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import org.springframework.stereotype.Component;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 
@@ -15,24 +16,24 @@ class ContestScoreboardStreamProcessor {
     private final ContestScoreboardAppliedAtCompletion completion;
     private final ContestScoreboardStreamRecoveryService recoveryService;
     private final ContestScoreboardStreamMetrics metrics;
-    private final ContestScoreboardStreamProcessingLock processingLock;
+    private final ContestScoreboardApplyLock applyLock;
 
     ContestScoreboardStreamProcessor(
             ContestScoreboardApplier applier,
             ContestScoreboardAppliedAtCompletion completion,
             ContestScoreboardStreamRecoveryService recoveryService,
             ContestScoreboardStreamMetrics metrics,
-            ContestScoreboardStreamProcessingLock processingLock
+            ContestScoreboardApplyLock applyLock
     ) {
         this.applier = applier;
         this.completion = completion;
         this.recoveryService = recoveryService;
         this.metrics = metrics;
-        this.processingLock = processingLock;
+        this.applyLock = applyLock;
     }
 
     long process(List<ContestScoreboardStreamEvent> events) {
-        return processingLock.withLock(() -> processLocked(events));
+        return applyLock.withLock(() -> processLocked(events));
     }
 
     private long processLocked(List<ContestScoreboardStreamEvent> events) {

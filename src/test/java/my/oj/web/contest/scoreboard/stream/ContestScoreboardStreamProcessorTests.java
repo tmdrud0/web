@@ -2,6 +2,7 @@ package my.oj.web.contest.scoreboard.stream;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.submission.messaging.ContestJudgeResultStreamMessage;
 import my.oj.web.submission.SubmissionResult;
 import org.junit.jupiter.api.BeforeEach;
@@ -47,7 +48,7 @@ class ContestScoreboardStreamProcessorTests {
                 completion,
                 recoveryService,
                 metrics,
-                new ContestScoreboardStreamProcessingLock()
+                new ContestScoreboardApplyLock()
         );
     }
 

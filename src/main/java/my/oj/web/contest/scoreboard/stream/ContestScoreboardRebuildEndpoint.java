@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.stream;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.rebuild.ContestScoreboardRebuildService;
 import org.springframework.boot.actuate.endpoint.annotation.Endpoint;
 import org.springframework.boot.actuate.endpoint.annotation.WriteOperation;
@@ -18,19 +19,19 @@ import java.util.Map;
 class ContestScoreboardRebuildEndpoint {
 
     private final ContestScoreboardRebuildService rebuildService;
-    private final ContestScoreboardStreamProcessingLock processingLock;
+    private final ContestScoreboardApplyLock applyLock;
 
     ContestScoreboardRebuildEndpoint(
             ContestScoreboardRebuildService rebuildService,
-            ContestScoreboardStreamProcessingLock processingLock
+            ContestScoreboardApplyLock applyLock
     ) {
         this.rebuildService = rebuildService;
-        this.processingLock = processingLock;
+        this.applyLock = applyLock;
     }
 
     @WriteOperation
     Map<String, Object> rebuild(long contestId) {
-        processingLock.withLock(() -> rebuildService.rebuildFromContestResults(contestId));
+        applyLock.withLock(() -> rebuildService.rebuildFromContestResults(contestId));
         return Map.of("contestId", contestId, "status", "rebuilt");
     }
 }
