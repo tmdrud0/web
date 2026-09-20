@@ -9,6 +9,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# The measurement workload's deterministic judge profile: 95% of submissions are judged in 50ms and
+# 5% in 2000ms, keyed on the code. A discarded execution was one or the other, so these bracket the
+# judge time a duplicate execution cost. They are constants of this workload, not of the run, and the
+# harness passes the same profile in every run.
+$DuplicateJudgeMillisFloor = 50
+$DuplicateJudgeMillisCeiling = 2000
+
 $runPath = (Resolve-Path $RunDirectory).Path
 $latencyPath = Join-Path $runPath "latency.csv"
 $eventsPath = Join-Path $runPath "events.json"
@@ -566,8 +574,16 @@ if (Test-Path $stagesPath) {
 
         $reclaimInStage = @($reclaimMillis | Where-Object { $_ -ge $mStart -and $_ -lt $mEnd }).Count
         $staleCompletions = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_completion_total" 'outcome="stale"'
-        $duplicateLowerMs = if ($null -eq $staleCompletions) { $null } else { [math]::Round($staleCompletions * 50, 3) }
-        $duplicateUpperMs = if ($null -eq $staleCompletions) { $null } else { [math]::Round($staleCompletions * 2000, 3) }
+        # Priced on the duplicate count, not on stale: a reclaimed row's original execution is fenced
+        # too, so stale carries one non-duplicate completion per reclaimed row. Same derivation as the
+        # run-level pair, from this window's own counters.
+        $stageRepublishes = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_stored_result_republish_total"
+        $stageFailures = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_completion_total" 'outcome="failure"'
+        $stageDuplicateJudgements = if (@($staleCompletions, $stageRepublishes, $stageFailures) -contains $null) { $null } else {
+            $staleCompletions - $stageRepublishes - $stageFailures
+        }
+        $duplicateLowerMs = if ($null -eq $stageDuplicateJudgements) { $null } else { [math]::Round($stageDuplicateJudgements * $DuplicateJudgeMillisFloor, 3) }
+        $duplicateUpperMs = if ($null -eq $stageDuplicateJudgements) { $null } else { [math]::Round($stageDuplicateJudgements * $DuplicateJudgeMillisCeiling, 3) }
 
         $accepted = Get-ColumnStats $windowRows "acceptedTotal"
         $results = Get-ColumnStats $windowRows "resultsTotal"
@@ -762,20 +778,24 @@ if (Test-Path $stagesPath) {
                 questionsPerSecond = if ($mSeconds -gt 0 -and $null -ne (Get-ColumnStats $windowRows "questions").delta) { [math]::Round((Get-ColumnStats $windowRows "questions").delta / $mSeconds, 4) } else { $null }
             }
             claim = [ordered]@{
-                windowBasis = "staleReclaimRowsInWindow counts rows whose outbox updated_at falls in the measurement window; the prometheus deltas run between the hold's own start and end scrapes, which are $($windowSeconds)s apart rather than $($mSeconds)s, because snapshots are only taken at segment boundaries"
+                windowBasis = "staleReclaimRowsInWindow counts rows whose outbox updated_at falls in the measurement window; updated_at is the row's last write, so it is when the reclaim finished, not when it happened, which is why the prometheus claim-stale counter is reported beside it. The prometheus deltas run between the hold's own start and end scrapes, which are $($windowSeconds)s apart rather than $($mSeconds)s, because snapshots are only taken at segment boundaries"
                 staleReclaimRowsInWindow = $reclaimInStage
+                staleReclaimRowsInWindowBasis = "a timestamp proxy, not a reclaim count: updated_at moves again when the row is finally published or failed, so a reclaim that was answered during the drain is attributed to no window and one that happened earlier can land in a later window. Read claimStaleDelta for the counter"
                 claimStaleDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_claim_stale_total"
                 staleCompletionDelta = $staleCompletions
+                duplicateJudgementCount = $stageDuplicateJudgements
+                duplicateJudgementCountBasis = "stale completions in this window minus the reclaims answered from the stored result minus the failures: the number of judgeSubmission calls beyond one per submission"
                 judgeInvocationDelta = $invocationDelta
                 judgeDurationSecondsDelta = $durationSumDelta
                 judgeDurationCountDelta = $durationCountDelta
                 claimCallsDelta = $claimCallsDelta
                 claimRowsDelta = $claimRowsDelta
                 executorRejectionsDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_executor_rejections_total"
-                storedResultRepublishDelta = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_stored_result_republish_total"
+                storedResultRepublishDelta = $stageRepublishes
+                completionFailureDelta = $stageFailures
                 duplicateJudgementMillisLowerBound = $duplicateLowerMs
                 duplicateJudgementMillisUpperBound = $duplicateUpperMs
-                duplicateJudgementBasis = "stale-token completions in this window priced at the deterministic profile's 50ms floor and 2000ms ceiling; the lease cannot say how long a reclaimed attempt actually ran"
+                duplicateJudgementBasis = "duplicate judge executions in this window priced at the deterministic profile's 50ms floor and 2000ms ceiling; the lease cannot say how long a discarded attempt actually ran"
             }
             # Drain happens once, after every stage, so there is no per-stage drain to report.
             drain = [ordered]@{ available = $false; reason = "the pipeline is drained once per run after the last stage, so drain is only defined at run level" }
@@ -984,11 +1004,52 @@ if (Test-Path $stagesPath) {
         $claimStaleRows = $workCost.staleReclaims
         $invocations = $workCost.judgeInvocations
         $invocationMinusResults = if ($null -eq $invocations -or $null -eq $resultRows) { $null } else { $invocations - $resultRows }
-        $accountedCompletions = if (@($republishes, $failedExecutions, $staleExecutions) -contains $null) { $null } else {
-            $republishes + $failedExecutions + $staleExecutions
+
+        # The duplicate judgement count, derived two independent ways.
+        #
+        # A submission is judged twice when more than one judgeSubmission call ran for it, i.e. when
+        # there were more invocations than result rows. That is NOT the stale counter. A reclaimed
+        # row is one whose lease expired, and its ORIGINAL execution is fenced too: the reclaim is
+        # answered from the stored result and wins the publish race, so the original execution's own
+        # completion matches no row. stale therefore also counts one non-duplicate execution per
+        # reclaimed row. The measured relation, exact in every normal-timeout run:
+        #   stale = (invocations - results) + republishes + failure
+        # so pricing the duplicate count at stale alone overstates it by exactly the reclaim count.
+        #
+        # Both routes are reported. They agree whenever every submission produced exactly one result
+        # row; a disagreement means a submission was judged but wrote no result (or wrote more than
+        # one), which is a finding rather than something to average away.
+        $duplicateJudgementsFromStale = if (@($staleExecutions, $republishes, $failedExecutions) -contains $null) { $null } else {
+            $staleExecutions - $republishes - $failedExecutions
         }
-        $accountingResidual = if ($null -eq $invocationMinusResults -or $null -eq $accountedCompletions) { $null } else {
-            $invocationMinusResults - $accountedCompletions
+        $duplicateJudgementsFromInvocations = if ($null -eq $invocationMinusResults -or $null -eq $failedExecutions) { $null } else {
+            $invocationMinusResults - $failedExecutions
+        }
+
+        # Accounting, checked rather than assumed. Every claim ends in exactly one completion, and a
+        # claim either invokes the judge or is answered from the stored result without invoking:
+        #   invocations + republishes = completions
+        # A completion is success, stale or failure, and exactly one success per result row publishes
+        # it, so success = results:
+        #   invocations + republishes = results + stale + failure
+        # The residual is that difference and is 0 whenever every counter recorded. The earlier form
+        # of this check subtracted the republishes from the wrong side and was therefore identically
+        # -2*republishes, i.e. it could never reach 0 in any run that reclaimed a row.
+        $accountedCompletions = if (@($republishes, $failedExecutions, $staleExecutions) -contains $null) { $null } else {
+            $resultRows + $staleExecutions + $failedExecutions
+        }
+        $accountingResidual = if (@($invocations, $republishes, $resultRows, $staleExecutions, $failedExecutions) -contains $null) { $null } else {
+            ($invocations + $republishes) - ($resultRows + $staleExecutions + $failedExecutions)
+        }
+
+        # Duplicate judge time, priced on the duplicate count above and not on stale. The profile is
+        # deterministic, so a discarded execution cost 50ms or 2000ms and the two bounds bracket it;
+        # recomputed here because the harness recorded its own bounds from the invocation excess.
+        $duplicateJudgeMillisLowerBound = if ($null -eq $duplicateJudgementsFromStale) { $null } else {
+            $duplicateJudgementsFromStale * $DuplicateJudgeMillisFloor
+        }
+        $duplicateJudgeMillisUpperBound = if ($null -eq $duplicateJudgementsFromStale) { $null } else {
+            $duplicateJudgementsFromStale * $DuplicateJudgeMillisCeiling
         }
 
         # Everything below decides whether the six-run comparison may read this run as a steady
@@ -1045,32 +1106,43 @@ if (Test-Path $stagesPath) {
                 attemptsHistogram = $attemptHistogram
                 attemptDistributionFile = "claim-attempts.tsv"
                 reclaimRowsFile = "stale-reclaims.csv"
-                ratePerAccepted = Get-RatioOrNull $duplicateClaims $acceptedCount
-                per10kAccepted = Get-RatioOrNull ($duplicateClaims * 10000) $acceptedCount 3
+                ratePerAccepted = if ($null -eq $duplicateClaims) { $null } else { Get-RatioOrNull $duplicateClaims $acceptedCount }
+                # Guarded because $null * 10000 is 0 in PowerShell: multiplying first would turn a
+                # missing count into a published "0 per 10k", which reads as "none happened" next to a
+                # rate that says "unavailable". Get-RatioOrNull's own null guard cannot fire after the
+                # multiplication has already produced a number.
+                per10kAccepted = if ($null -eq $duplicateClaims) { $null } else { Get-RatioOrNull ($duplicateClaims * 10000) $acceptedCount 3 }
                 staleReclaimsObservedAtClaimTime = $claimStaleRows
                 staleReclaimRowsInMeasurementWindow = if ($null -ne $primaryStage) { $primaryStage.claim.staleReclaimRowsInWindow } else { $null }
                 staleReclaimWindowBasis = if ($null -ne $primaryStage) { $primaryStage.claim.windowBasis } else { $null }
             }
-            # 2. Actual duplicate judge execution. stale completions are the executions whose result
-            # was discarded by the fence, which is what "the submission was judged twice" means.
+            # 2. Actual duplicate judge execution: how many submissions were judged more than once.
+            # This is the invocation excess, NOT the stale counter. stale is reported beside it so the
+            # difference is visible, and the difference has a name: it is the republish count plus the
+            # failures, i.e. the reclaims that were answered from the stored result without judging.
             actualDuplicateJudgement = [ordered]@{
-                duplicateJudgeExecutions = $staleExecutions
-                duplicateJudgeExecutionsBasis = "completion{outcome=stale}: judgeSubmission ran and its fenced completion UPDATE matched no row because another attempt had already published under a newer token, so this execution's result was thrown away"
+                duplicateJudgeExecutions = $duplicateJudgementsFromStale
+                duplicateJudgeExecutionsBasis = "judgeSubmission ran more times than there are result rows: stale completions minus the reclaims answered from the stored result and minus the failed executions. A reclaimed row's ORIGINAL execution is fenced as well, so stale on its own counts one non-duplicate execution per reclaimed row and overstates the duplicates by exactly that count"
+                duplicateJudgeExecutionsFromInvocations = $duplicateJudgementsFromInvocations
+                duplicateJudgeExecutionsFromInvocationsBasis = "the same quantity derived independently as judgeInvocations - uniqueResults - failedExecutions; the two routes agree whenever every submission produced exactly one result row"
+                duplicateJudgeExecutionsRoutesAgree = if ($null -eq $duplicateJudgementsFromStale -or $null -eq $duplicateJudgementsFromInvocations) { $null } else { $duplicateJudgementsFromStale -eq $duplicateJudgementsFromInvocations }
+                staleTokenCompletions = $staleExecutions
+                staleTokenCompletionsBasis = "completion{outcome=stale}: the fenced completion UPDATE matched no row. Each reclaimed row contributes one of these for its original execution, which is not a duplicate judgement, so this value is larger than the duplicate count by republishes + failures"
                 uniqueResults = $resultRows
                 judgeInvocations = $invocations
                 judgeInvocationsMinusResults = $invocationMinusResults
-                judgeInvocationsMinusResultsBasis = "an upper bound on duplicate plus failed executions, not a duplicate count: it also contains the executions that threw and the reclaims answered from the stored result without re-judging"
+                judgeInvocationsMinusResultsBasis = "judgeInvocations - uniqueResults: the duplicate judgeings plus the failed executions, since a successful submission accounts for exactly one invocation and one result row. Not an upper bound and not an overcount - it is the duplicate count plus failures, which is why failures are subtracted in the derivation above"
                 failedExecutions = $failedExecutions
                 storedResultRepublishes = $republishes
                 accountedCompletions = $accountedCompletions
                 accountingResidual = $accountingResidual
-                accountingIdentity = "invocations - results = republish + failure + stale; a nonzero residual means a counter path did not record, and is reported rather than folded into the duplicate count"
-                ratePerAccepted = Get-RatioOrNull $staleExecutions $acceptedCount
-                per10kAccepted = Get-RatioOrNull ($staleExecutions * 10000) $acceptedCount 3
-                duplicateJudgeMillisLowerBound = $workCost.duplicateJudgeMillisLowerBound
-                duplicateJudgeMillisUpperBound = $workCost.duplicateJudgeMillisUpperBound
-                duplicateJudgeMillisLowerBoundBasis = "stale completions priced at the deterministic profile's 50ms floor; the lease cannot say how long a discarded attempt actually ran"
-                duplicateJudgeMillisUpperBoundBasis = "the same count priced at the profile's 2000ms ceiling; the true cost lies between the two bounds and the profile, not the elapsed time, decides where"
+                accountingIdentity = "invocations + republishes = results + stale + failure, because every claim ends in exactly one completion and a claim either invokes the judge or is answered from the stored result; success = results because exactly one success publishes each result row. A nonzero residual means a counter path did not record, and is reported rather than folded into the duplicate count"
+                ratePerAccepted = if ($null -eq $duplicateJudgementsFromStale) { $null } else { Get-RatioOrNull $duplicateJudgementsFromStale $acceptedCount }
+                per10kAccepted = if ($null -eq $duplicateJudgementsFromStale) { $null } else { Get-RatioOrNull ($duplicateJudgementsFromStale * 10000) $acceptedCount 3 }
+                duplicateJudgeMillisLowerBound = $duplicateJudgeMillisLowerBound
+                duplicateJudgeMillisUpperBound = $duplicateJudgeMillisUpperBound
+                duplicateJudgeMillisLowerBoundBasis = "the duplicate judgement count above priced at the deterministic profile's 50ms floor; the lease cannot say how long a discarded attempt actually ran"
+                duplicateJudgeMillisUpperBoundBasis = "the same count priced at the profile's 2000ms ceiling; the true cost lies between the two bounds and the profile, not the elapsed time, decides where. The harness records its own bounds from the invocation excess rather than from this count, so the two differ by republishes + failures"
             }
             # 3. Token fencing: what stopped a duplicate execution from writing a second result.
             tokenFencing = [ordered]@{
@@ -1079,7 +1151,7 @@ if (Test-Path $stagesPath) {
                 storedResultRepublishes = $republishes
                 storedResultRepublishesBasis = "a reclaimed row whose result already existed is answered from the stored result: the short-circuit returns before the timed judge call, so it costs a republish and not a second execution"
                 completionSuccess = $workCost.completionSuccess
-                completionSuccessIdentity = "success = results + republish, because every published result row is published once and a republish publishes no new result row"
+                completionSuccessIdentity = "success = results, because exactly one success publishes each result row and a republish publishes an already-published result rather than a new one. Measured in every run; the earlier claim that success = results + republish was false and would have implied that the republishes went unrecorded"
             }
             # The warm-up phase, recorded so the exclusion is checkable rather than asserted.
             warmupExclusion = [ordered]@{
@@ -1113,7 +1185,11 @@ if (Test-Path $stagesPath) {
         stageHoldSeconds = $stagesDoc.stageHoldSeconds
         steadyGuardSeconds = $stagesDoc.steadyGuardSeconds
         overloadThresholdRowsPerSec = $threshold
-        latencyCohortCaveat = "the run-level cohorts (all, pre-fault-normal, fault-window, post-fault-arrivals) cover the whole run - warm-up, every transition, the overload stages and the drain - so their p95/p99 include queueing and are not service-time readings. measurement-steady restricts the same three latencies to the measurement windows of the stages that held steady with no API refusals, and is unavailable when no stage qualified."
+        latencyCohortCaveat = if ($stagesDoc.mode -eq "normal-timeout") {
+            "the run-level cohorts are read from the measurement contest alone, so the warm-up phase - a different contest - is outside every one of them. What they do span is the measured phase's ramp, its hold and its guard, so their p95/p99 include the ramp and are not service-time readings. measurement-steady restricts the same three latencies to the measured window of the measured stage and is unavailable when that stage did not hold steady. The fault cohorts (fault-window, post-fault-arrivals, killed-node-claimed) do not apply to a run with no fault injected, and pre-fault-normal is simply the whole measurement contest here."
+        } else {
+            "the run-level cohorts (all, pre-fault-normal, fault-window, post-fault-arrivals) cover the whole run - warm-up, every transition, the overload stages and the drain - so their p95/p99 include queueing and are not service-time readings. measurement-steady restricts the same three latencies to the measurement windows of the stages that held steady with no API refusals, and is unavailable when no stage qualified."
+        }
         traceAlignment = $stagesDoc.traceAlignment
         traceAlignmentErrorSeconds = $stagesDoc.traceAlignmentErrorSeconds
         traceAnchorUtc = $stagesDoc.traceAnchorUtc
@@ -1148,6 +1224,38 @@ if (Test-Path $stagesPath) {
     }
 }
 
+# The Executor capacity table sits above the measured throughput and is read next to it, so for a
+# normal-timeout run it is taken over the measured phase only. The warm-up is a separate contest at
+# the same rate, and folding its ticks into the same average would describe neither phase; the
+# whole-run maximum is kept in the scope line, because a cap exceeded at any point is worth seeing
+# even though it is the measured window's occupancy that explains the measured rate. Staircase and
+# fault runs are untouched: their capacity.csv has no warm-up phase to separate out.
+$capacityScope = "every sampled tick of the run"
+if ($null -ne $staircase -and $staircase.mode -eq "normal-timeout" -and (Test-Path $capacityPath)) {
+    $measuredPhaseRows = @(Import-Csv $capacityPath | Where-Object { $_.phase -eq "load" })
+    if ($measuredPhaseRows.Count -gt 0) {
+        $wholeRunReserved = @(
+            @($capacity["judge-1"].reserved.max, $capacity["judge-2"].reserved.max) |
+                Where-Object { $null -ne $_ } | Measure-Object -Maximum
+        )
+        $scoped = [ordered]@{}
+        foreach ($node in @("judge-1", "judge-2")) {
+            $nodeRows = @($measuredPhaseRows | Where-Object node -eq $node)
+            $scoped[$node] = [ordered]@{}
+            foreach ($metric in @("running", "localWaiting", "reserved")) {
+                $values = @($nodeRows | ForEach-Object { if ([string]$_.$metric -ne "") { [double]$_.$metric } })
+                $scoped[$node][$metric] = [ordered]@{
+                    samples = $values.Count
+                    max = if ($values.Count) { ($values | Measure-Object -Maximum).Maximum } else { $null }
+                    average = if ($values.Count) { [math]::Round(($values | Measure-Object -Average).Average, 3) } else { $null }
+                }
+            }
+        }
+        $capacity = $scoped
+        $capacityScope = "the measured phase only (the ticks the sampler labelled phase=load); the whole run's reserved maximum, warm-up included, was $(if ($wholeRunReserved.Count -and $null -ne $wholeRunReserved[0].Maximum) { $wholeRunReserved[0].Maximum } else { 'unavailable' })"
+    }
+}
+
 $summary = [ordered]@{
     runId = $parameters.runId
     gitCommit = $parameters.gitCommit
@@ -1162,6 +1270,7 @@ $summary = [ordered]@{
     }
     workCost = $verification.workCost
     capacity = $capacity
+    capacityScope = $capacityScope
     mysql = $verification.mysql
     unavailable = @($verification.unavailable)
 }
@@ -1174,13 +1283,26 @@ if ($null -ne $duplication) {
 }
 $summary | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $runPath "summary.json") -Encoding utf8
 
+$isNormalTimeout = ($null -ne $staircase -and $staircase.mode -eq "normal-timeout")
 $lines = @(
     "# MySQL judge tradeoff run $($parameters.runId)", "",
     "- Dispatch: $($parameters.dispatchMode)",
     "- Git commit: $($parameters.gitCommit)",
-    "- Completed HTTP / accepted / unique / results / scoreboard: $($verification.counts.completedHttpRequests) / $($verification.counts.accepted) / $($verification.counts.uniqueSubmissions) / $($verification.counts.results) / $($verification.counts.scoreboardApplied)",
-    "- First stale reclaim after fault: $(if ($null -eq $firstStaleReclaimSeconds) { 'unavailable' } else { [string]$firstStaleReclaimSeconds + 's' })",
-    "- Backlog normalization after fault: $(if ($null -eq $backlogRecoverySeconds) { 'unavailable' } else { [string]$backlogRecoverySeconds + 's' })", "",
+    "- Completed HTTP / accepted / unique / results / scoreboard: $($verification.counts.completedHttpRequests) / $($verification.counts.accepted) / $($verification.counts.uniqueSubmissions) / $($verification.counts.results) / $($verification.counts.scoreboardApplied)"
+)
+if ($isNormalTimeout) {
+    # A fault-free run has no fault window, so the two recovery lines would report "unavailable"
+    # measurements of something that was never attempted; the counts above are the measurement
+    # contest's, and the warm-up wrote to a different one.
+    $lines += @("- Fault injection: none, by design; the counts above are the measurement contest's whole run, and the warm-up wrote to a separate contest.")
+} else {
+    $lines += @(
+        "- First stale reclaim after fault: $(if ($null -eq $firstStaleReclaimSeconds) { 'unavailable' } else { [string]$firstStaleReclaimSeconds + 's' })",
+        "- Backlog normalization after fault: $(if ($null -eq $backlogRecoverySeconds) { 'unavailable' } else { [string]$backlogRecoverySeconds + 's' })"
+    )
+}
+$lines += @(
+    "",
     "| Cohort | Metric | count | p50 ms | p95 ms | p99 ms | max ms |",
     "|---|---|---:|---:|---:|---:|---:|"
 )
@@ -1205,6 +1327,7 @@ foreach ($node in @("judge-1", "judge-2")) {
         $lines += "| $node | $metricName | $($metric.samples) | $($metric.max) | $($metric.average) |"
     }
 }
+if ($isNormalTimeout) { $lines += @("", "Executor scope: $capacityScope.") }
 if ($null -ne $staircase) {
     # Without this, the run-level cohort tail and the per-stage tail look like the same kind of
     # number, and the run-level one is a mixture.
@@ -1239,11 +1362,13 @@ if ($null -ne $staircase) {
                 "| Quantity | Value | per accepted | per 10k accepted |",
                 "|---|---:|---:|---:|",
                 "| Durable duplicate claim (attempts > 1) | $(if ($null -eq $dc.count) { 'unavailable' } else { $dc.count }) | $(if ($null -eq $dc.ratePerAccepted) { 'unavailable' } else { $dc.ratePerAccepted }) | $(if ($null -eq $dc.per10kAccepted) { 'unavailable' } else { $dc.per10kAccepted }) |",
-                "| Actual duplicate judge execution (stale completions) | $(if ($null -eq $dj.duplicateJudgeExecutions) { 'unavailable' } else { $dj.duplicateJudgeExecutions }) | $(if ($null -eq $dj.ratePerAccepted) { 'unavailable' } else { $dj.ratePerAccepted }) | $(if ($null -eq $dj.per10kAccepted) { 'unavailable' } else { $dj.per10kAccepted }) |",
+                "| Actual duplicate judge execution (invocation excess) | $(if ($null -eq $dj.duplicateJudgeExecutions) { 'unavailable' } else { $dj.duplicateJudgeExecutions }) | $(if ($null -eq $dj.ratePerAccepted) { 'unavailable' } else { $dj.ratePerAccepted }) | $(if ($null -eq $dj.per10kAccepted) { 'unavailable' } else { $dj.per10kAccepted }) |",
+                "| Stale token completions (not the duplicate count) | $(if ($null -eq $tf.staleTokenCompletions) { 'unavailable' } else { $tf.staleTokenCompletions }) | | |",
                 "",
                 "- Accepted submissions: $(if ($null -eq $duplication.acceptedSubmissions) { 'unavailable' } else { $duplication.acceptedSubmissions }) (unique $(if ($null -eq $duplication.uniqueSubmissions) { 'unavailable' } else { $duplication.uniqueSubmissions })); unique results $(if ($null -eq $dj.uniqueResults) { 'unavailable' } else { $dj.uniqueResults }); judge invocations $(if ($null -eq $dj.judgeInvocations) { 'unavailable' } else { $dj.judgeInvocations }).",
-                "- Judge invocations minus unique results: $(if ($null -eq $dj.judgeInvocationsMinusResults) { 'unavailable' } else { $dj.judgeInvocationsMinusResults }) = republishes $(if ($null -eq $tf.storedResultRepublishes) { 'unavailable' } else { $tf.storedResultRepublishes }) + failures $(if ($null -eq $dj.failedExecutions) { 'unavailable' } else { $dj.failedExecutions }) + stale $(if ($null -eq $tf.staleTokenCompletions) { 'unavailable' } else { $tf.staleTokenCompletions }); residual $(if ($null -eq $dj.accountingResidual) { 'unavailable' } else { $dj.accountingResidual }).",
-                "- Discarded judge work, priced at the deterministic profile: $(if ($null -eq $dj.duplicateJudgeMillisLowerBound) { 'unavailable' } else { "$($dj.duplicateJudgeMillisLowerBound)-$($dj.duplicateJudgeMillisUpperBound) ms" }).",
+                "- Duplicate judge executions, two independent routes: stale - republishes - failures = $(if ($null -eq $dj.duplicateJudgeExecutions) { 'unavailable' } else { $dj.duplicateJudgeExecutions }); invocations - results - failures = $(if ($null -eq $dj.duplicateJudgeExecutionsFromInvocations) { 'unavailable' } else { $dj.duplicateJudgeExecutionsFromInvocations }); agree = $(if ($null -eq $dj.duplicateJudgeExecutionsRoutesAgree) { 'unavailable' } elseif ($dj.duplicateJudgeExecutionsRoutesAgree) { 'yes' } else { 'NO' }). Stale alone ($(if ($null -eq $tf.staleTokenCompletions) { 'unavailable' } else { $tf.staleTokenCompletions })) is larger because a reclaimed row's original execution is fenced too.",
+                "- Accounting: invocations $(if ($null -eq $dj.judgeInvocations) { 'unavailable' } else { $dj.judgeInvocations }) + republishes $(if ($null -eq $tf.storedResultRepublishes) { 'unavailable' } else { $tf.storedResultRepublishes }) = results $(if ($null -eq $dj.uniqueResults) { 'unavailable' } else { $dj.uniqueResults }) + stale $(if ($null -eq $tf.staleTokenCompletions) { 'unavailable' } else { $tf.staleTokenCompletions }) + failures $(if ($null -eq $dj.failedExecutions) { 'unavailable' } else { $dj.failedExecutions }); residual $(if ($null -eq $dj.accountingResidual) { 'unavailable' } else { $dj.accountingResidual }).",
+                "- Discarded judge work, priced at the deterministic profile from the duplicate count: $(if ($null -eq $dj.duplicateJudgeMillisLowerBound) { 'unavailable' } else { "$($dj.duplicateJudgeMillisLowerBound)-$($dj.duplicateJudgeMillisUpperBound) ms" }).",
                 # Read the keys, not PSObject.Properties: on an OrderedDictionary the latter yields the
                 # dictionary's own members (Count, Keys, Values...), which would print a property dump
                 # in place of the histogram.
@@ -1303,12 +1428,13 @@ if ($null -ne $staircase) {
         }
     }
     $lines += @("", "### Per-stage duplicate and stale work", "",
-        "| Stage | stale reclaim rows (timestamps) | claim_stale delta | stale completions | judge invocations | claim calls | claim rows | rejected | duplicate judge ms (lower-upper) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---|")
+        "| Stage | stale reclaim rows (updated_at proxy) | claim_stale delta | stale completions | duplicate judgeings | judge invocations | claim calls | claim rows | rejected | duplicate judge ms (lower-upper) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
     foreach ($stage in $staircase.stages) {
         $claim = $stage.claim
         $lines += "| $($stage.label) | $($claim.staleReclaimRowsInWindow) | $(if ($null -eq $claim.claimStaleDelta) { 'unavailable' } else { $claim.claimStaleDelta }) | " +
             "$(if ($null -eq $claim.staleCompletionDelta) { 'unavailable' } else { $claim.staleCompletionDelta }) | " +
+            "$(if ($null -eq $claim.duplicateJudgementCount) { 'unavailable' } else { $claim.duplicateJudgementCount }) | " +
             "$(if ($null -eq $claim.judgeInvocationDelta) { 'unavailable' } else { $claim.judgeInvocationDelta }) | " +
             "$(if ($null -eq $claim.claimCallsDelta) { 'unavailable' } else { $claim.claimCallsDelta }) | " +
             "$(if ($null -eq $claim.claimRowsDelta) { 'unavailable' } else { $claim.claimRowsDelta }) | " +
