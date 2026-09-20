@@ -1,6 +1,7 @@
 package my.oj.web.contest.scoreboard.redis;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import my.oj.web.contest.scoreboard.CheckpointAdvance;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.submission.SubmissionResult;
@@ -89,18 +90,38 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
         assertThat(applier.currentStreamOffset()).isEqualTo(1L);
     }
 
+    /**
+     * Offsets are not consecutive integers, and the script must not require them to be. A stream
+     * hands over the offsets that exist, so a step from {@code 0} to {@code 2} is an ordinary one and
+     * the checkpoint moves to the offset that actually arrived - never to a computed successor.
+     */
     @Test
-    void nonContiguousOffsetIsRejectedWithoutMutatingScoreboardOrCheckpoint() {
+    void sparseForwardOffsetIsAppliedBecauseOffsetsAreNotConsecutiveIntegers() {
         applier.apply(stream(0L, 1001L, SubmissionResult.WRONG_ANSWER, 2));
 
-        assertThatThrownBy(() -> applier.apply(stream(2L, 1002L, SubmissionResult.ACCEPTED, 10)))
-                .isInstanceOf(RuntimeException.class)
-                .cause()
-                .hasMessageContaining("Non-contiguous scoreboard stream offset");
+        assertThat(applier.apply(stream(2L, 1002L, SubmissionResult.ACCEPTED, 10))).isEqualTo(2L);
 
-        assertThat(applier.currentStreamOffset()).isZero();
-        assertThat(redisTemplate.opsForSet().members(processedKey())).containsExactly("1001");
-        assertThat(redisTemplate.opsForHash().get(summaryKey(), "solved")).isEqualTo("0");
+        assertThat(applier.currentStreamOffset()).isEqualTo(2L);
+        assertThat(redisTemplate.opsForHash().get(summaryKey(), "solved")).isEqualTo("1");
+        assertThat(redisTemplate.opsForSet().members(processedKey()))
+                .containsExactlyInAnyOrder("1001", "1002");
+    }
+
+    /**
+     * The other half of the same contract: a resubscribe re-reads from the checkpoint inclusive, so
+     * the first delivery is normally an offset the standings already hold. It anchors the position and
+     * changes nothing - including for a submission that never arrived before.
+     */
+    @Test
+    void anOffsetAtOrBelowTheCheckpointIsAbsorbedWithoutTouchingTheStandings() {
+        applier.apply(stream(0L, 1001L, SubmissionResult.ACCEPTED, 10));
+        applier.apply(stream(2L, 1002L, SubmissionResult.WRONG_ANSWER, 20));
+
+        assertThat(applier.apply(stream(2L, 1003L, SubmissionResult.ACCEPTED, 5))).isEqualTo(2L);
+
+        assertThat(applier.currentStreamOffset()).isEqualTo(2L);
+        assertThat(redisTemplate.opsForHash().get(summaryKey(), "solved")).isEqualTo("1");
+        assertThat(redisTemplate.opsForSet().members(processedKey())).doesNotContain("1003");
     }
 
     @Test
@@ -112,8 +133,13 @@ class RedisContestScoreboardApplierRedisIntegrationTests {
                 1002L, payload(1002L, PROBLEM_ID, SubmissionResult.ACCEPTED, 10)))).isZero();
         assertThat(applier.currentStreamOffset()).isZero();
 
-        assertThat(applier.apply(ContestScoreboardApplier.ApplyRequest.streamAfterRebuild(
-                10L, payload(1010L, PROBLEM_ID + 1, SubmissionResult.ACCEPTED, 20)))).isEqualTo(10L);
+        // An anchor: the caller verified that the range below this offset was rebuilt, which is the
+        // only way a checkpoint may cross offsets the stream never handed over.
+        assertThat(applier.apply(ContestScoreboardApplier.ApplyRequest.stream(
+                10L,
+                payload(1010L, PROBLEM_ID + 1, SubmissionResult.ACCEPTED, 20),
+                CheckpointAdvance.ANCHOR
+        ))).isEqualTo(10L);
         assertThat(applier.currentStreamOffset()).isEqualTo(10L);
         assertThat(redisTemplate.opsForHash().get(summaryKey(), "solved")).isEqualTo("2");
     }

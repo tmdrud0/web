@@ -1,6 +1,5 @@
 package my.oj.web.contest.scoreboard.stream;
 
-import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardFullReplayService;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryMode;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryProperties;
@@ -31,12 +30,10 @@ import static org.mockito.Mockito.when;
 class ContestScoreboardStreamRecoveryServiceTests {
 
     private ContestScoreboardFullReplayService fullReplayService;
-    private SimpleMeterRegistry registry;
 
     @BeforeEach
     void setUp() {
         fullReplayService = mock(ContestScoreboardFullReplayService.class);
-        registry = new SimpleMeterRegistry();
     }
 
     @Test
@@ -47,9 +44,6 @@ class ContestScoreboardStreamRecoveryServiceTests {
 
         assertThat(bridged).isTrue();
         verify(fullReplayService).replayAllContests();
-        // The gap is the operator's to see whether or not it is repaired, so the count is recorded
-        // before the fallback is chosen.
-        assertThat(registry.get("contest.scoreboard.stream.offset.gaps").counter().count()).isEqualTo(1.0);
     }
 
     @Test
@@ -58,15 +52,10 @@ class ContestScoreboardStreamRecoveryServiceTests {
 
         assertThat(bridged).isFalse();
         verifyNoInteractions(fullReplayService);
-        assertThat(registry.get("contest.scoreboard.stream.offset.gaps").counter().count()).isEqualTo(1.0);
     }
 
     private ContestScoreboardStreamRecoveryService service(RetentionGapFallback fallback) {
-        return new ContestScoreboardStreamRecoveryService(
-                fullReplayService,
-                properties(fallback),
-                new ContestScoreboardStreamMetrics(registry)
-        );
+        return new ContestScoreboardStreamRecoveryService(fullReplayService, properties(fallback));
     }
 
     private static ContestScoreboardRecoveryProperties properties(RetentionGapFallback fallback) {

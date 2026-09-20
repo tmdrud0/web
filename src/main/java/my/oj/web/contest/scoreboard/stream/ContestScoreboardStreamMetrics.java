@@ -28,6 +28,7 @@ public class ContestScoreboardStreamMetrics {
     private volatile Counter failures;
     private volatile Counter offsetGaps;
     private volatile Counter rollbackRestarts;
+    private volatile Counter rollbackObserved;
     private volatile Counter failureRestarts;
     private volatile Counter tailProbeFailures;
 
@@ -59,6 +60,10 @@ public class ContestScoreboardStreamMetrics {
                 .register(registry);
         this.rollbackRestarts = Counter.builder("contest.scoreboard.stream.rollback.restarts")
                 .description("Consumer restarts after the Redis offset rolled back")
+                .register(registry);
+        this.rollbackObserved = Counter.builder("contest.scoreboard.stream.rollback.observed")
+                .description("Redis offset rollbacks a mode rebuilt from its own history basis instead"
+                        + " of by rewinding the stream")
                 .register(registry);
         this.failureRestarts = Counter.builder("contest.scoreboard.stream.failure.restarts")
                 .description("Consumer restarts to re-read a failed stream batch the broker does not redeliver")
@@ -109,6 +114,10 @@ public class ContestScoreboardStreamMetrics {
 
     void recordRollbackRestart() {
         rollbackRestarts.increment();
+    }
+
+    void recordRollbackObserved() {
+        rollbackObserved.increment();
     }
 
     void recordFailureRestart() {

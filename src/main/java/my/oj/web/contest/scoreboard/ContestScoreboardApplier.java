@@ -56,32 +56,51 @@ public interface ContestScoreboardApplier {
         return cause.getClass().getSimpleName() + (message == null ? "" : ": " + message);
     }
 
+    /**
+     * One scoreboard write, and the checkpoint claim that goes with it.
+     *
+     * <p>The claim is not optional for a stream request. A caller that has an offset to store must
+     * say what it verified about the step it is asking for, and the script refuses the request when
+     * it does not - see {@link CheckpointAdvance}.</p>
+     */
     record ApplyRequest(long correlationId,
                         Long streamOffset,
-                        boolean allowOffsetGap,
+                        CheckpointAdvance advance,
                         ContestScoreboardUpdate update) {
         public ApplyRequest {
             if (update == null) {
                 throw new IllegalArgumentException("Scoreboard update is required");
             }
+            if (advance == null) {
+                throw new IllegalArgumentException("Scoreboard checkpoint advance is required");
+            }
             if (streamOffset != null && streamOffset < 0) {
                 throw new IllegalArgumentException("Scoreboard stream offset must not be negative");
             }
-            if (allowOffsetGap && streamOffset == null) {
-                throw new IllegalArgumentException("Only a stream request can allow an offset gap");
+            if (streamOffset == null && advance != CheckpointAdvance.NONE) {
+                throw new IllegalArgumentException(
+                        "A request that carries no stream offset cannot advance the checkpoint");
+            }
+            if (streamOffset != null && advance == CheckpointAdvance.NONE) {
+                throw new IllegalArgumentException(
+                        "A stream request must classify the checkpoint advance it asks for");
             }
         }
 
+        /** An ordinary forward step in a stream whose position the consumer has already verified. */
         public static ApplyRequest stream(long offset, ContestScoreboardUpdate update) {
-            return new ApplyRequest(offset, offset, false, update);
+            return stream(offset, update, CheckpointAdvance.CONTINUE);
         }
 
-        public static ApplyRequest streamAfterRebuild(long offset, ContestScoreboardUpdate update) {
-            return new ApplyRequest(offset, offset, true, update);
+        /** A forward step whose classification the caller decided, which is how a gap is crossed. */
+        public static ApplyRequest stream(long offset,
+                                          ContestScoreboardUpdate update,
+                                          CheckpointAdvance advance) {
+            return new ApplyRequest(offset, offset, advance, update);
         }
 
         public static ApplyRequest rebuild(long correlationId, ContestScoreboardUpdate update) {
-            return new ApplyRequest(correlationId, null, false, update);
+            return new ApplyRequest(correlationId, null, CheckpointAdvance.NONE, update);
         }
     }
 

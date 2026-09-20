@@ -12,7 +12,6 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
 @Component
@@ -24,19 +23,20 @@ class ContestScoreboardStreamListener implements BatchMessageListener {
 
     private final MessageConverter messageConverter;
     private final ContestScoreboardStreamProcessor processor;
+    private final ContestScoreboardStreamPosition position;
     private final ContestScoreboardStreamMetrics metrics;
     private final long retryBackoffNanos;
-    private final AtomicLong highestAppliedOffset = new AtomicLong(-1L);
-    private final AtomicLong failedBatches = new AtomicLong();
 
     ContestScoreboardStreamListener(
             @Qualifier("contestJudgeMessageConverter") MessageConverter messageConverter,
             ContestScoreboardStreamProcessor processor,
+            ContestScoreboardStreamPosition position,
             ContestScoreboardStreamMetrics metrics,
             ContestScoreboardStreamConsumerProperties properties
     ) {
         this.messageConverter = messageConverter;
         this.processor = processor;
+        this.position = position;
         this.metrics = metrics;
         this.retryBackoffNanos = Math.max(1L, properties.retryBackoff().toNanos());
     }
@@ -52,35 +52,23 @@ class ContestScoreboardStreamListener implements BatchMessageListener {
                     .map(event -> event.message().judgedAt())
                     .min(java.time.LocalDateTime::compareTo)
                     .orElse(null));
-            highestAppliedOffset.set(processor.process(events));
+            position.recordAppliedOffset(processor.process(events));
         } catch (RuntimeException failure) {
             metrics.recordFailure();
-            failedBatches.incrementAndGet();
+            position.recordFailedBatch();
             // Not "at the head for retry": a stream queue accepts a requeueing rejection without
             // complaint and does not hand the message back to the running consumer, so the retry comes
             // from ContestScoreboardStreamLifecycle resubscribing at the stored checkpoint. Measured
             // against a real broker in StreamQueueRequeueRabbitIntegrationTests.
             log.error("Scoreboard stream batch failed and was left unapplied; the scoreboard stays at offset {} "
-                    + "and the batch is re-read when the consumer resubscribes", highestAppliedOffset.get(), failure);
+                    + "and the batch is re-read when the consumer resubscribes",
+                    position.highestAppliedOffset(), failure);
             LockSupport.parkNanos(retryBackoffNanos);
             if (Thread.interrupted()) {
                 Thread.currentThread().interrupt();
             }
             throw new ImmediateRequeueAmqpException("Retry scoreboard stream batch", failure);
         }
-    }
-
-    long highestAppliedOffset() {
-        return highestAppliedOffset.get();
-    }
-
-    /** How many batches have failed, so the supervisor can tell a new failure from one it has handled. */
-    long failedBatches() {
-        return failedBatches.get();
-    }
-
-    void initializeOffset(long offset) {
-        highestAppliedOffset.set(offset);
     }
 
     private List<ContestScoreboardStreamEvent> decode(List<Message> messages) {

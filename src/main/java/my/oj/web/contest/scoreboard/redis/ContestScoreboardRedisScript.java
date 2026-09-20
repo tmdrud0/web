@@ -10,6 +10,12 @@ import org.springframework.data.redis.core.script.RedisScript;
  * broker offset reflected in the scoreboard. A live event mutates both in this script, so a Redis
  * snapshot rollback rewinds the derived state and its replay position together.
  *
+ * <p>{@code ARGV[2]} is the checkpoint claim the caller verified, as one of the tokens on
+ * {@link my.oj.web.contest.scoreboard.CheckpointAdvance}. It is empty for a rebuild, and a forward
+ * step carrying neither claim is refused: the script has no continuity arithmetic of its own, because
+ * stream offsets are not consecutive numbers and treating them as one rejects a sparse stream. What
+ * decides whether a range was skipped is the recovery mode, not this script.
+ *
  * <p>KEYS[6] remains a per-contest processed-submission set. The commutative problem state is the
  * correctness rule; this set only avoids recalculating duplicate stream entries. A contest reset
  * clears it so a DB rebuild can repopulate empty standings without advancing KEYS[1].
@@ -125,17 +131,23 @@ final class ContestScoreboardRedisScript {
                         if streamOffset < 0 then
                             return redis.error_reply('Invalid negative incoming scoreboard stream offset')
                         end
+                        -- At or below the checkpoint: a retained anchor re-delivered on a resubscribe,
+                        -- or an event a rollback already rewound past. Neither changes the standings.
                         if streamOffset <= currentOffset then
                             return currentOffset
                         end
-                        if ARGV[2] ~= '1' and streamOffset ~= currentOffset + 1 then
+                        -- A forward step must carry the claim its caller verified. Offsets are not
+                        -- contiguous, so the script cannot tell a legitimate sparse step from a jump
+                        -- over results nobody rebuilt; what it can do is refuse a caller that did not
+                        -- say which one it meant.
+                        if ARGV[2] ~= 'continue' and ARGV[2] ~= 'anchor' then
                             return redis.error_reply(
-                                    'Non-contiguous scoreboard stream offset: expected '
-                                    .. tostring(currentOffset + 1) .. ' but received '
-                                    .. tostring(streamOffset))
+                                    'Unauthorized scoreboard stream offset advance: '
+                                    .. 'a forward step must declare the checkpoint claim it verified, '
+                                    .. 'but received "' .. tostring(ARGV[2]) .. '"')
                         end
-                    elseif ARGV[2] == '1' then
-                        return redis.error_reply('Rebuild request cannot allow a scoreboard stream offset gap')
+                    elseif ARGV[2] ~= '' then
+                        return redis.error_reply('A rebuild request cannot carry a checkpoint claim')
                     end
 
                     local alreadyProcessed = redis.call('sismember', KEYS[6], submissionId)

@@ -155,7 +155,7 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
         ContestScoreboardUpdate update = request.update();
         return new String[]{
                 request.streamOffset() == null ? "" : Long.toString(request.streamOffset()),
-                request.allowOffsetGap() ? "1" : "0",
+                request.advance().token(),
                 Long.toString(update.contestSubmissionId()),
                 update.result().name(),
                 Long.toString(ContestScoreboardPolicy.computeContestMinutes(

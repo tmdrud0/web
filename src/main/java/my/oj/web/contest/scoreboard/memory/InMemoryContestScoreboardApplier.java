@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.memory;
 
+import my.oj.web.contest.scoreboard.CheckpointAdvance;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardSequenceSource;
 import my.oj.web.contest.scoreboard.ContestScoreboardSequenceTracking;
@@ -48,11 +49,12 @@ public class InMemoryContestScoreboardApplier implements ContestScoreboardApplie
             if (streamOffset <= currentStreamOffset) {
                 return currentStreamOffset;
             }
-            if (!request.allowOffsetGap() && streamOffset != currentStreamOffset + 1L) {
+            // Mirrors the script's refusal. Offsets are not contiguous, so there is nothing to check
+            // arithmetically; what the store owes is to reject a caller that did not say what it
+            // verified, so an unclassified jump cannot pass here and fail against Redis.
+            if (request.advance() == CheckpointAdvance.NONE) {
                 throw new IllegalStateException(
-                        "Non-contiguous scoreboard stream offset: expected "
-                                + (currentStreamOffset + 1L) + " but received " + streamOffset
-                );
+                        "A stream request must classify the checkpoint advance it asks for");
             }
         }
 
