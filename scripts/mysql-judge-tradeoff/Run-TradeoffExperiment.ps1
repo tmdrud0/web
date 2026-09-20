@@ -406,6 +406,17 @@ if ($openBurst) {
     if ($BurstAuthRps * $BurstAuthSeconds -lt $burstPlannedStarts) {
         throw "-BurstAuthSeconds at -BurstAuthRps offers $([long][math]::Round($BurstAuthRps * $BurstAuthSeconds)) logins against a schedule of $burstPlannedStarts arrivals; the preparation has to cover every arrival."
     }
+    # ... and the schedule has to fit inside the pool it is fed from. The preparation takes one account
+    # per login - a recycled account would be a second live session sharing its rate-limit and dedup
+    # state, which is the exhausted-feeder failure the closed runs hit - so a schedule larger than
+    # -UserCount cannot be fed at all. AuthPrepSimulation refuses it too, in the JVM, and that refusal
+    # arrives as a JVM that dies without writing its artifact; checked here as well so the run does not
+    # spend a stack build and a warm-up finding out. The rounding is the JVM's own: math.round is
+    # floor(x + 0.5), not this PowerShell's half-to-even.
+    $burstPrepLogins = [long][math]::Floor($BurstAuthRps * $BurstAuthSeconds + 0.5)
+    if ($burstPrepLogins -gt $UserCount) {
+        throw "-BurstAuthRps x -BurstAuthSeconds schedules $burstPrepLogins logins but only $UserCount accounts are seeded. Raise -UserCount to at least $burstPrepLogins, or shorten the preparation."
+    }
     if ($BurstAuthCookieName.Trim().Length -eq 0) { throw "-BurstAuthCookieName must name the session cookie the burst replays." }
     if ($DrainTimeoutSeconds -lt 300) { throw "Open-burst runs require -DrainTimeoutSeconds of at least 300." }
     # The warm-up is the closed model's 100 RPS hold in a contest of its own, drained to quiescence
@@ -3139,7 +3150,12 @@ try {
         Copy-GatlingArtifacts -StartedAt $authPrepHolder.startedAt -NamePrefix "authprep-" | Out-Null
         $authPrep = Read-OpenBurstJson -Path $burstAuthPrepPath
         if ($null -eq $authPrep) {
-            throw "The session preparation phase wrote no $burstAuthPrepPath, so the burst has no sessions to replay."
+            # The artifact is written by the JVM's shutdown hook, so its absence means the JVM never
+            # got that far - a simulation that refused its own parameters, most often. The exit code
+            # and the JVM's own last words are what say which; without them this reads as "the
+            # preparation produced nothing", which names no layer. Its stderr goes to this console
+            # (Start-GatlingProcess does not redirect it), so the reason is on the run's log.
+            throw "The session preparation phase wrote no $burstAuthPrepPath, so the burst has no sessions to replay. The JVM exited with code $($authPrepHolder.process.ExitCode); its output, including any refusal of its own parameters, is in this run's console log."
         }
         $events.authPrepContextsPrepared = ConvertTo-OpenBurstLong (Get-OpenBurstField $authPrep "contextsPrepared")
         $events.authPrepLoginFailures = ConvertTo-OpenBurstLong (Get-OpenBurstField $authPrep "loginFailures")
