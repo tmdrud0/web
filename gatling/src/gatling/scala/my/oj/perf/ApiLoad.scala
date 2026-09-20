@@ -67,6 +67,41 @@ object ApiLoad {
     }
 
   /**
+   * Whether a submission's payload is derived from the session instead of drawn at random.
+   *
+   * Off unless `perf.deterministic` is true, so every existing scenario keeps the payloads - and
+   * therefore the baselines recorded from them - that it had. See `DeterministicPayload` for what
+   * turning it on buys and why a recovery measurement needs it.
+   */
+  val deterministic: Boolean = java.lang.Boolean.getBoolean("perf.deterministic")
+
+  /**
+   * The payload builder every submission scenario should use, so that `perf.deterministic` means the
+   * same thing whichever scenario is run.
+   */
+  def submissionData(problemIdStart: Long, problemIdEnd: Long, tag: String): ChainBuilder =
+    if (deterministic) deterministicSubmissionData(problemIdStart, problemIdEnd, tag)
+    else randomSubmissionData(problemIdStart, problemIdEnd, tag)
+
+  /**
+   * Carries the submission index on the session, which is what makes the payload a function of
+   * something the session knows rather than of when the request happened to run. Nothing else writes
+   * it, so it counts one user's submissions and resets with the session.
+   *
+   * The payload itself is {@link DeterministicPayload}, which has no Gatling dependency and is
+   * therefore checkable outside a run.
+   */
+  def deterministicSubmissionData(problemIdStart: Long, problemIdEnd: Long, tag: String): ChainBuilder =
+    exec { session =>
+      val userName = session("userName").as[String]
+      val submissionIndex = session("submissionIndex").asOption[Int].getOrElse(0) + 1
+      session
+        .set("submissionIndex", submissionIndex)
+        .set("problemId", DeterministicPayload.problemId(problemIdStart, problemIdEnd, userName, submissionIndex))
+        .set("code", DeterministicPayload.code(tag, userName, submissionIndex))
+    }
+
+  /**
    * 202 is the accept; 503 is the admission limiter refusing work it cannot queue, which is
    * backpressure rather than a fault and is counted separately by the harness.
    */

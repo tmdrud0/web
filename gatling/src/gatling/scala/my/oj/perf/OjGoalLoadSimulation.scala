@@ -101,7 +101,7 @@ class OjGoalLoadSimulation extends Simulation {
     .exec(ApiLoad.initialJitter(initialJitterMs))
     .forever {
       pace(submitIntervalMs.millis)
-        .exec(ApiLoad.randomSubmissionData(problemIdStart, problemIdEnd, "oj"))
+        .exec(ApiLoad.submissionData(problemIdStart, problemIdEnd, "oj"))
         .exec(ApiLoad.submit)
     }
 

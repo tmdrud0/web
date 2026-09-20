@@ -57,7 +57,7 @@ class ContestSubmissionSimulation extends Simulation {
     .exec(ApiLoad.initialJitter(intervalMs))
     .forever {
       pace(intervalMs.millis)
-        .exec(ApiLoad.randomSubmissionData(problemIdStart, problemIdEnd, "oj"))
+        .exec(ApiLoad.submissionData(problemIdStart, problemIdEnd, "oj"))
         .exec(ApiLoad.submit)
     }
 
