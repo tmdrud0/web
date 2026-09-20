@@ -72,6 +72,582 @@ function Get-LatencyClassSummary {
     return $result
 }
 
+# --- fault recovery (SIGKILL) helpers -------------------------------------------------------------
+
+function ConvertTo-LongOrNull {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $parsed = 0L
+    if (-not [long]::TryParse($text, [ref]$parsed)) { return $null }
+    return $parsed
+}
+
+function ConvertTo-DateTimeOrNull {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $parsed = [datetimeoffset]::MinValue
+    if (-not [datetimeoffset]::TryParse($text, [ref]$parsed)) { return $null }
+    return $parsed
+}
+
+# The timestamps that came out of MySQL are UTC written without an offset, so parsing them as they
+# stand would read them in the machine's own zone - nine hours away here, which turns a reclaimed
+# submission's latency into a large negative number rather than an error. This is the same convention
+# Get-EpochMillis applies to submittedAt.
+function ConvertTo-UtcNaiveOrNull {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $parsed = [datetimeoffset]::MinValue
+    if (-not [datetimeoffset]::TryParse($text + "Z", [ref]$parsed)) { return $null }
+    return $parsed
+}
+
+# One shape for the two readers of the recovery series: recovery-samples.csv when the fault phase wrote
+# it, otherwise the 1s timeseries the sampler was writing all along. A run that died mid-phase has the
+# second and not the first, and what it does have is worth computing rather than discarding. The field
+# names are the harness's own (unfinished/unapplied) so the derivation below is the same rule.
+#
+# The recovery series stops when the fault phase stops, and the backlog is allowed to normalise inside
+# the drain that follows: the spec's own failure condition is "not normalised within 600s", not "not
+# normalised before the load stopped". So any drain sample the recovery series does not already cover is
+# appended. Without that, a run whose backlog crossed its baseline a few seconds into the drain is
+# reported as never having normalised - a failure invented by the reader rather than measured. The
+# consequence of reading a normalisation there is carried by cohort E, which reports itself unavailable
+# when too little measured load remained, so the late instant cannot pass as recovered steady state.
+function Get-RecoverySamples {
+    $samples = New-Object System.Collections.Generic.List[object]
+    $samplesPath = Join-Path $runPath "recovery-samples.csv"
+    if (Test-Path $samplesPath) {
+        foreach ($row in @(Import-Csv $samplesPath)) {
+            $at = ConvertTo-DateTimeOrNull $row.at
+            if ($null -eq $at) { continue }
+            $samples.Add([pscustomobject]@{
+                at = $at
+                unfinished = ConvertTo-LongOrNull $row.judgeBacklog
+                unapplied = ConvertTo-LongOrNull $row.scoreboardPending
+                accepted = ConvertTo-LongOrNull $row.accepted
+                results = ConvertTo-LongOrNull $row.results
+            })
+        }
+        if ($samples.Count -gt 0) {
+            $lastAt = $samples[0].at
+            foreach ($sample in $samples) { if ($sample.at -gt $lastAt) { $lastAt = $sample.at } }
+            $appended = 0
+            foreach ($row in $timeseries) {
+                if ($row.phase -eq "warmup") { continue }
+                $at = ConvertTo-DateTimeOrNull $row.timestamp
+                if ($null -eq $at -or $at -le $lastAt) { continue }
+                $samples.Add([pscustomobject]@{
+                    at = $at
+                    unfinished = ConvertTo-LongOrNull $row.unfinishedOutbox
+                    unapplied = ConvertTo-LongOrNull $row.unappliedScoreboard
+                    accepted = ConvertTo-LongOrNull $row.acceptedTotal
+                    results = ConvertTo-LongOrNull $row.resultsTotal
+                })
+                $appended++
+            }
+            $sorted = @($samples | Sort-Object -Property at)
+            $script:recoverySamplesAppended = $appended
+            # No comma-wrapped return here: the caller wraps the result in @(), and the two together turn
+            # the series into a one-element array holding the array, which reads downstream as one sample.
+            return $sorted
+        }
+    }
+    foreach ($row in $timeseries) {
+        # The warm-up wrote to a separate contest, so its backlog belongs to neither this baseline nor
+        # this normalisation; leaving those rows in would lift the baseline out of the run under test.
+        if ($row.phase -eq "warmup") { continue }
+        $at = ConvertTo-DateTimeOrNull $row.timestamp
+        if ($null -eq $at) { continue }
+        $samples.Add([pscustomobject]@{
+            at = $at
+            unfinished = ConvertTo-LongOrNull $row.unfinishedOutbox
+            unapplied = ConvertTo-LongOrNull $row.unappliedScoreboard
+            accepted = ConvertTo-LongOrNull $row.acceptedTotal
+            results = ConvertTo-LongOrNull $row.resultsTotal
+        })
+    }
+    return $samples.ToArray()
+}
+
+# A window's rows, selected on submission time. The indexed row's own timestamp is read into a local
+# before the inner comparison: inside a nested filter `$_` is the other object, and the failure is
+# silent - no submission matches and the cohort reports zero samples as if none had been submitted.
+function Get-SubmissionWindow {
+    param([object[]]$LatencyIndexed, $From, $To)
+    if ($null -eq $From) { return @() }
+    $fromMillis = ([datetimeoffset]$From).ToUnixTimeMilliseconds()
+    $toMillis = if ($null -eq $To) { [long]::MaxValue } else { ([datetimeoffset]$To).ToUnixTimeMilliseconds() }
+    return @($LatencyIndexed | Where-Object {
+        if ($null -eq $_.millis) { return $false }
+        $atMillis = [long]$_.millis
+        return ($atMillis -ge $fromMillis -and $atMillis -lt $toMillis)
+    } | ForEach-Object { $_.row })
+}
+
+function Get-CohortLatency {
+    param([object[]]$Rows)
+    $summary = Get-LatencySummary $Rows
+    $totals = @($Rows | ForEach-Object {
+        $value = 0.0
+        if ([double]::TryParse([string]$_.L_total_ms, [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$value)) { $value }
+    })
+    $over5s = @($totals | Where-Object { $_ -gt 5000 }).Count
+    $over10s = @($totals | Where-Object { $_ -gt 10000 }).Count
+    $summary["submissionCount"] = $Rows.Count
+    $summary["over5sCount"] = $over5s
+    $summary["over10sCount"] = $over10s
+    # The ratios are absent rather than zero for an empty cohort: a cohort with no sample has no share,
+    # and a published 0.0 would read as "none of them were slow".
+    $summary["over5sRatio"] = Get-RatioOrNull $over5s $Rows.Count
+    $summary["over10sRatio"] = Get-RatioOrNull $over10s $Rows.Count
+    $summary["byLatencyClass"] = Get-LatencyClassSummary $Rows
+    $summary["available"] = ($Rows.Count -gt 0)
+    return $summary
+}
+
+function Get-SustainStreak {
+    param(
+        [object[]]$Samples,
+        [string]$Field,
+        $Ceiling,
+        [int]$SustainSeconds = 5,
+        [double]$MaxSampleGapSeconds = 2.5
+    )
+    # Deliberately the same shape as the harness's own search, for the same reason: both recompute one
+    # instant from one sample series, and a disagreement is then a finding rather than a rounding
+    # difference. "Held for N seconds" is grown over wall clock rather than counted in samples - N
+    # samples 1s apart span N-1 seconds, so a sample count with a span floor excluded the well-behaved
+    # series it was written for and fired only on series with a hole. The gap bound keeps the streak
+    # honest: one missed tick is tolerated, a stalled sampler is not, and the widest covered gap comes
+    # back with the answer so its resolution is reportable.
+    for ($i = 0; $i -lt $Samples.Count; $i++) {
+        $maxGap = 0.0
+        for ($j = $i; $j -lt $Samples.Count; $j++) {
+            $value = $Samples[$j].$Field
+            if ($null -eq $value -or $value -gt $Ceiling) { break }
+            if ($j -gt $i) {
+                $gap = ($Samples[$j].at - $Samples[$j - 1].at).TotalSeconds
+                if ($gap -gt $MaxSampleGapSeconds) { break }
+                if ($gap -gt $maxGap) { $maxGap = $gap }
+            }
+            $span = ($Samples[$j].at - $Samples[$i].at).TotalSeconds
+            if ($span -ge $SustainSeconds) {
+                return [pscustomobject]@{
+                    at = $Samples[$i].at
+                    spanSeconds = [math]::Round($span, 3)
+                    maxGapSeconds = [math]::Round($maxGap, 3)
+                    sampleCount = $j - $i + 1
+                }
+            }
+        }
+    }
+    return $null
+}
+
+function Get-BacklogNormalizationFrom {
+    param(
+        [object[]]$Samples,
+        $From,
+        $JudgeP95,
+        $ScoreboardP95,
+        [int]$SustainSeconds = 5,
+        [double]$MaxSampleGapSeconds = 2.5
+    )
+    $result = [pscustomobject]@{
+        judgeNormalizedAt = $null; scoreboardNormalizedAt = $null
+        combinedNormalizedAt = $null; sustainSpanSeconds = $null
+        maxSampleGapSeconds = $null; sustainSampleCount = $null
+    }
+    if ($null -eq $From) { return $result }
+    $window = @($Samples | Where-Object { $_.at -ge $From })
+    if ($null -eq $JudgeP95 -or $null -eq $ScoreboardP95 -or $window.Count -lt 2) { return $result }
+    $judge = Get-SustainStreak -Samples $window -Field "unfinished" -Ceiling $JudgeP95 `
+        -SustainSeconds $SustainSeconds -MaxSampleGapSeconds $MaxSampleGapSeconds
+    $scoreboard = Get-SustainStreak -Samples $window -Field "unapplied" -Ceiling $ScoreboardP95 `
+        -SustainSeconds $SustainSeconds -MaxSampleGapSeconds $MaxSampleGapSeconds
+    if ($null -ne $judge) {
+        $result.judgeNormalizedAt = $judge.at
+        $result.sustainSpanSeconds = $judge.spanSeconds
+        $result.maxSampleGapSeconds = $judge.maxGapSeconds
+        $result.sustainSampleCount = $judge.sampleCount
+    }
+    if ($null -ne $scoreboard) { $result.scoreboardNormalizedAt = $scoreboard.at }
+    if ($null -ne $result.judgeNormalizedAt -and $null -ne $result.scoreboardNormalizedAt) {
+        $result.combinedNormalizedAt = if ($result.judgeNormalizedAt -gt $result.scoreboardNormalizedAt) {
+            $result.judgeNormalizedAt
+        } else { $result.scoreboardNormalizedAt }
+    }
+    return $result
+}
+
+function Get-FaultRecoveryAnalysis {
+    param([object[]]$LatencyIndexed)
+
+    $unavailableFault = New-Object System.Collections.Generic.List[string]
+    $unavailableFault.Add("the killed node's in-process Prometheus counters are lower bounds: SIGKILL took the JVM, so every invocation, duration and claim increment between the pre-fault scrape and the kill died with the process, and a lost counter is not a zero. The durable evidence is the outbox attempts column and the final row state.")
+    $unavailableFault.Add("attempts > 1 counts recovery re-claims after the static lease expired, not concurrent duplicate CPU execution: the process holding the claim was SIGKILLed, so it did not keep judging. Testing true concurrent duplicate execution and fencing needs a separate docker pause -> wait past the claim timeout -> unpause experiment, which this round does not run.")
+
+    $faultAt = ConvertTo-DateTimeOrNull $events.faultInjectedAt
+    $restartRequestedAt = ConvertTo-DateTimeOrNull $events.restartRequestedAt
+    $nodeReadyAt = ConvertTo-DateTimeOrNull $events.nodeReadyAt
+    # The run's own during-run reading of the same instant. Kept only to be compared against the
+    # recomputation: nothing below is gated on it, because it stops with the fault phase and cannot
+    # contain a normalisation that landed in the drain.
+    $harnessNormalizedAt = ConvertTo-DateTimeOrNull $events.backlogNormalizedAt
+
+    $samples = @(Get-RecoverySamples)
+    if ($null -eq $recoverySamplesAppended) { $recoverySamplesAppended = 0 }
+    $baselineFrom = if ($null -eq $faultAt) { $null } else { $faultAt.AddSeconds(-30) }
+    $baselineTo = if ($null -eq $faultAt) { $null } else { $faultAt.AddSeconds(-5) }
+    $baseline = if ($null -eq $baselineFrom) { @() } else { @($samples | Where-Object { $_.at -ge $baselineFrom -and $_.at -lt $baselineTo }) }
+    # Filtered before the percentile call: a [double[]] parameter coerces a $null element to 0, which
+    # would put a zero row into the baseline of a backlog that never was zero.
+    $judgeValues = @($baseline | Where-Object { $null -ne $_.unfinished } | ForEach-Object { [double]$_.unfinished })
+    $scoreboardValues = @($baseline | Where-Object { $null -ne $_.unapplied } | ForEach-Object { [double]$_.unapplied })
+    $judgeP95 = Get-Percentile $judgeValues 0.95
+    $scoreboardP95 = Get-Percentile $scoreboardValues 0.95
+
+    $preFaultResultRps = $null
+    if ($judgeValues.Count -ge 2) {
+        $first = $baseline[0]; $last = $baseline[-1]
+        $span = ($last.at - $first.at).TotalSeconds
+        if ($span -gt 0 -and $null -ne $first.results -and $null -ne $last.results) {
+            $preFaultResultRps = [math]::Round(($last.results - $first.results) / $span, 6)
+        }
+    }
+
+    # The harness derived both of these during the run so it could decide when to stop. They are
+    # recomputed here from the samples, which is what makes them reproducible after the fact, and the
+    # harness's own value is kept beside the recomputed one so a disagreement is visible rather than
+    # resolved by preferring whichever was written last.
+    $sustainSeconds = 5
+    $maxSampleGapSeconds = 2.5
+    $maxWindowSpanSeconds = 10
+    # The reported instants are searched from max(faultInjectedAt, nodeReadyAt): cohort D is defined as
+    # nodeReadyAt -> backlogNormalizedAt, and nothing before the replacement node was serving can be
+    # the end of the outage. The ungated search is run as well and reported when it lands earlier, since
+    # a surviving node draining the backlog alone is a finding about the lease rather than an artefact.
+    $searchFromAt = $faultAt
+    if ($null -ne $faultAt -and $null -ne $nodeReadyAt -and $nodeReadyAt -gt $faultAt) { $searchFromAt = $nodeReadyAt }
+    $gated = Get-BacklogNormalizationFrom -Samples $samples -From $searchFromAt -JudgeP95 $judgeP95 `
+        -ScoreboardP95 $scoreboardP95 -SustainSeconds $sustainSeconds -MaxSampleGapSeconds $maxSampleGapSeconds
+    $ungated = Get-BacklogNormalizationFrom -Samples $samples -From $faultAt -JudgeP95 $judgeP95 `
+        -ScoreboardP95 $scoreboardP95 -SustainSeconds $sustainSeconds -MaxSampleGapSeconds $maxSampleGapSeconds
+    $judgeNormalizedAt = $gated.judgeNormalizedAt
+    $scoreboardNormalizedAt = $gated.scoreboardNormalizedAt
+    $recomputedNormalizedAt = $gated.combinedNormalizedAt
+    $earliestNormalizedAt = $null
+    if ($null -ne $ungated.combinedNormalizedAt -and
+        ($null -eq $recomputedNormalizedAt -or $ungated.combinedNormalizedAt -lt $recomputedNormalizedAt)) {
+        $earliestNormalizedAt = $ungated.combinedNormalizedAt
+    }
+
+    $rolling = New-Object System.Collections.Generic.List[object]
+    $recomputedRecoveredAt = $null
+    $rollingSpanMaxSeconds = $null
+    if ($null -ne $preFaultResultRps -and $preFaultResultRps -gt 0) {
+        $thresholdRps = 0.90 * $preFaultResultRps
+        for ($i = 1; $i -lt $samples.Count; $i++) {
+            if ($null -eq $samples[$i].results) { continue }
+            $j = $i - 1
+            while ($j -gt 0 -and ($samples[$i].at - $samples[$j].at).TotalSeconds -lt 5) { $j-- }
+            $span = ($samples[$i].at - $samples[$j].at).TotalSeconds
+            # Bounded above as well as below: walking back only to "at least 5s earlier" lets a sampling
+            # hole pass as one long five second rate, and the recovery instant read off it would then be
+            # an artefact of the hole.
+            if ($span -lt 5 -or $span -gt $maxWindowSpanSeconds) { continue }
+            if ($null -eq $samples[$j].results) { continue }
+            $rolling.Add([pscustomobject]@{
+                at = $samples[$i].at
+                rps = ($samples[$i].results - $samples[$j].results) / $span
+                span = $span
+            })
+        }
+        $rollingSpanMaxSeconds = $null
+        if ($rolling.Count -gt 0) {
+            $rollingSpanMaxSeconds = [math]::Round((($rolling | Measure-Object -Property span -Maximum).Maximum), 3)
+        }
+        for ($i = 0; $i -le ($rolling.Count - 3); $i++) {
+            if ($null -ne $searchFromAt -and $rolling[$i].at -lt $searchFromAt) { continue }
+            $held = $true
+            for ($j = $i; $j -lt ($i + 3); $j++) { if ($rolling[$j].rps -lt $thresholdRps) { $held = $false } }
+            if ($held) { $recomputedRecoveredAt = $rolling[$i].at; break }
+        }
+    }
+
+    # Cohort C is built from the durable attempts column, not from the kill snapshot. The snapshot has
+    # no claim owner, so its submission list holds every node's in-flight rows and using it here would
+    # put the surviving node's ordinary work into the killed node's cohort; the snapshot count is kept
+    # beside this one as an upper bound instead.
+    $reclaimed = @($LatencyIndexed | Where-Object {
+        if ($null -eq $_.millis) { return $false }
+        $attempts = ConvertTo-LongOrNull $_.row.attempts
+        if ($null -eq $attempts -or $attempts -le 1) { return $false }
+        if ($null -eq $faultAt) { return $false }
+        return ([long]$_.millis -ge $faultAt.ToUnixTimeMilliseconds())
+    } | ForEach-Object { $_.row })
+
+    $cohortsFault = [ordered]@{}
+    # A. pre-fault steady, B. fault/down arrivals, C. reclaimed, D. post-restart recovery,
+    # E. post-recovery steady. F is the whole measurement contest and is reported as `all` above; it is
+    # kept out of this table so its queueing tail cannot be read as any of A-E.
+    $steadyFrom = if ($null -eq $faultAt) { $null } else { $faultAt.AddSeconds(-30) }
+    $steadyTo = if ($null -eq $faultAt) { $null } else { $faultAt.AddSeconds(-5) }
+    $cohortsFault["pre-fault-steady"] = Get-CohortLatency (Get-SubmissionWindow $LatencyIndexed $steadyFrom $steadyTo)
+    $cohortsFault["fault-down-arrivals"] = Get-CohortLatency (Get-SubmissionWindow $LatencyIndexed $faultAt $nodeReadyAt)
+    $cohortsFault["reclaimed-after-fault"] = Get-CohortLatency $reclaimed
+    # Cohort D ends at the recomputed instant, not the run's own reading: a run whose reading is null
+    # because the normalisation landed in the drain would otherwise make cohort D the whole tail of the
+    # run rather than the recovery interval it is defined as.
+    $cohortsFault["post-restart-recovery"] = Get-CohortLatency (Get-SubmissionWindow $LatencyIndexed $nodeReadyAt $recomputedNormalizedAt)
+    # The post-recovery window is recomputed here rather than read from the run. The run decided it while
+    # the measurement was still going, from a normalisation it could only have seen before the load
+    # stopped; a normalisation that lands in the drain is therefore reported by the run as "never", which
+    # would hand cohort E a reason ("no normalisation was observed") that the recomputed series contradicts.
+    # The floor is what actually applies: too little measured load remained after the window opened for the
+    # window to be a steady state at all. The run's own reading is kept beside it.
+    $postRecoveryDelaySeconds = if ($null -ne $events.postRecoveryWindow -and $null -ne $events.postRecoveryWindow.preWindowDelaySeconds) { [double]$events.postRecoveryWindow.preWindowDelaySeconds } else { 10 }
+    $postRecoveryMinSeconds = if ($null -ne $events.postRecoveryWindow -and $null -ne $events.postRecoveryWindow.minimumWindowSeconds) { [double]$events.postRecoveryWindow.minimumWindowSeconds } else { 20 }
+    $postRecovery = [ordered]@{
+        available = $false
+        preWindowDelaySeconds = $postRecoveryDelaySeconds
+        minimumWindowSeconds = $postRecoveryMinSeconds
+        actualSeconds = $null
+        sampleSpanSeconds = $null
+        sampleCount = 0
+        secondsOverdueAtLastSample = $null
+        reason = "no backlog normalisation was observed, so there is no post-recovery window to measure"
+        basis = "backlogNormalizedAt + preWindowDelaySeconds to the end of the measured load; reported only when at least minimumWindowSeconds of measured load remained. Two separate numbers: the delay before the window opens and the minimum length it must reach. Recomputed from the whole sample series, so a normalisation seen in the drain is reasoned about instead of being reported as absent"
+        harnessReportedAvailable = if ($null -eq $events.postRecoveryWindow) { $null } else { $events.postRecoveryWindow.available }
+        harnessReportedReason = if ($null -eq $events.postRecoveryWindow) { $null } else { $events.postRecoveryWindow.reason }
+    }
+    if ($null -ne $recomputedNormalizedAt -and $samples.Count -gt 0) {
+        $from = $recomputedNormalizedAt.AddSeconds($postRecoveryDelaySeconds)
+        $remaining = $samples[-1].at - $from
+        $window = @($samples | Where-Object { $_.at -ge $from })
+        $postRecovery.actualSeconds = [math]::Round($remaining.TotalSeconds, 3)
+        $postRecovery.sampleCount = $window.Count
+        if ($window.Count -gt 0) {
+            $postRecovery.sampleSpanSeconds = [math]::Round(($window[-1].at - $window[0].at).TotalSeconds, 3)
+        }
+        if ($remaining.TotalSeconds -lt $postRecoveryMinSeconds) {
+            # A negative remainder is not a short window, it is no window: the gate opens after the last
+            # sample, so the load had already stopped. Said that way rather than as "-4s remained", which
+            # reads like a measurement that went wrong instead of a window that does not exist.
+            $postRecovery.reason = if ($remaining.TotalSeconds -lt 0) {
+                "no measured load remained at all: backlogNormalizedAt + ${postRecoveryDelaySeconds}s falls $([math]::Round(-$remaining.TotalSeconds, 3))s after the last sample, so no part of the measured load is available as a post-recovery steady state"
+            } else {
+                "only $([math]::Round($remaining.TotalSeconds, 3))s of measured load remained after backlogNormalizedAt + ${postRecoveryDelaySeconds}s, below the ${postRecoveryMinSeconds}s floor; a shorter window is not a steady state"
+            }
+        } else {
+            $postRecovery.available = $true
+            $postRecovery.reason = "at least ${postRecoveryMinSeconds}s of measured load remained after backlogNormalizedAt + ${postRecoveryDelaySeconds}s"
+        }
+    }
+    if ($postRecovery.available) {
+        $from = $recomputedNormalizedAt.AddSeconds($postRecoveryDelaySeconds)
+        $window = Get-SubmissionWindow $LatencyIndexed $from $null
+        $cohortsFault["post-recovery-steady"] = Get-CohortLatency $window
+        $cohortsFault["post-recovery-steady"]["window"] = [ordered]@{
+            from = $from.ToString("o")
+            to = if ($samples.Count -gt 0) { $samples[-1].at.ToString("o") } else { $null }
+            preWindowDelaySeconds = $postRecoveryDelaySeconds
+            minimumWindowSeconds = $postRecoveryMinSeconds
+            actualSeconds = $postRecovery.actualSeconds
+            sampleSpanSeconds = $postRecovery.sampleSpanSeconds
+            sampleCount = $postRecovery.sampleCount
+            basis = "backlogNormalizedAt + preWindowDelaySeconds to the end of the measured load; reported only when at least minimumWindowSeconds of measured load remained. Two separate numbers: the delay before the window opens and the minimum length it must reach"
+        }
+    } else {
+        $cohortsFault["post-recovery-steady"] = [ordered]@{ available = $false; reason = $postRecovery.reason }
+    }
+
+    # The claimed_at age at the kill, recomputed here from the preserved rows so it does not depend on
+    # the harness having had time to compute it before the kill.
+    $claimAges = [ordered]@{ count = $null; p50 = $null; p95 = $null; max = $null; basis = "killed-node-claims.csv holds every node's PUBLISHING rows and the outbox has no claimed_by column, so this describes the cluster-wide claimed-unfinished upper bound, not the killed node's own claims" }
+    $claimsPath = Join-Path $runPath "killed-node-claims.csv"
+    $killSnapshotPath = Join-Path $runPath "kill-snapshot.json"
+    if ((Test-Path $claimsPath) -and (Test-Path $killSnapshotPath)) {
+        $killDoc = Get-Content $killSnapshotPath -Raw | ConvertFrom-Json
+        $dbNow = ConvertTo-UtcNaiveOrNull $killDoc.dbNow
+        if ($null -ne $dbNow) {
+            $ages = @()
+            foreach ($row in @(Import-Csv $claimsPath)) {
+                $claimedAt = ConvertTo-UtcNaiveOrNull $row.claimedAt
+                if ($null -eq $claimedAt) { continue }
+                $age = ($dbNow - $claimedAt).TotalSeconds
+                if ($age -ge 0) { $ages += $age }
+            }
+            $claimAges.count = $ages.Count
+            $claimAges.p50 = Get-Percentile $ages 0.50
+            $claimAges.p95 = Get-Percentile $ages 0.95
+            $claimAges.max = if ($ages.Count -gt 0) { [math]::Round(($ages | Measure-Object -Maximum).Maximum, 3) } else { $null }
+            $claimAges.dbNow = $dbNow.ToString("o")
+        } else {
+            $claimAges.basis = "kill-snapshot.json carries no readable dbNow, so claimed_at age at the kill is unavailable rather than zero"
+        }
+    } else {
+        $claimAges.basis = "no kill snapshot or claim rows were preserved for this run, so claimed_at age at the kill is unavailable"
+    }
+
+    # The first result written after the fault, and the last one belonging to a reclaimed submission.
+    $firstPostFaultResultAt = $null
+    foreach ($indexed in $LatencyIndexed) {
+        $saved = ConvertTo-UtcNaiveOrNull $indexed.row.resultSavedAt
+        if ($null -eq $saved -or $null -eq $faultAt) { continue }
+        if ($saved -lt $faultAt) { continue }
+        if ($null -eq $firstPostFaultResultAt -or $saved -lt $firstPostFaultResultAt) { $firstPostFaultResultAt = $saved }
+    }
+    $lastReclaimedResultAt = $null
+    $lastReclaimedScoreboardAt = $null
+    foreach ($row in $reclaimed) {
+        $saved = ConvertTo-UtcNaiveOrNull $row.resultSavedAt
+        if ($null -ne $saved -and ($null -eq $lastReclaimedResultAt -or $saved -gt $lastReclaimedResultAt)) { $lastReclaimedResultAt = $saved }
+        $applied = ConvertTo-UtcNaiveOrNull $row.scoreboardAppliedAt
+        if ($null -ne $applied -and ($null -eq $lastReclaimedScoreboardAt -or $applied -gt $lastReclaimedScoreboardAt)) { $lastReclaimedScoreboardAt = $applied }
+    }
+
+    $anchorSpecs = @(
+        [pscustomobject]@{ name="measurementStartedAt"; value=(ConvertTo-DateTimeOrNull $events.measurementStartedAt); source="harness"; basis="start of the measured window, derived from the JVM trace segment start plus the steady guard" }
+        [pscustomobject]@{ name="faultScheduledAt"; value=(ConvertTo-DateTimeOrNull $events.faultScheduledAt); source="harness"; basis="the instant the trigger window opened (measurementStartedAt + minSteadySeconds). It is not a kill deadline: the kill waits for observed work" }
+        [pscustomobject]@{ name="faultInjectedAt"; value=$faultAt; source="harness"; basis="the instant docker compose kill returned for the target node" }
+        [pscustomobject]@{ name="restartScheduledAt"; value=(ConvertTo-DateTimeOrNull $events.restartScheduledAt); source="harness"; basis="faultInjectedAt + downDurationSeconds, computed at the injection so a slow pre-kill snapshot moves both ends together" }
+        [pscustomobject]@{ name="restartRequestedAt"; value=$restartRequestedAt; source="harness"; basis="recorded before docker compose start was invoked" }
+        [pscustomobject]@{ name="containerRunningAt"; value=(ConvertTo-DateTimeOrNull $events.containerRunningAt); source="harness"; basis="docker inspect read State.Running as true" }
+        [pscustomobject]@{ name="nodeReadyAt"; value=$nodeReadyAt; source="harness"; basis="container running AND /actuator/health/readiness UP AND /actuator/prometheus scrapable AND contest_judge_claim_calls_total observed to advance" }
+        [pscustomobject]@{ name="firstStaleObservedAt"; value=(ConvertTo-DateTimeOrNull $events.firstStaleReclaimObservedAt); source="harness"; basis="durable SUM(attempts - 1) above its pre-fault value; polled about once a second, so this is bounded by the poll interval and is not the instant the lease was acquired" }
+        [pscustomobject]@{ name="firstPostFaultResultAt"; value=$firstPostFaultResultAt; source="analyzer"; basis="minimum result_saved_at at or after faultInjectedAt, read from latency.csv" }
+        [pscustomobject]@{ name="throughputRecoveredAt"; value=$recomputedRecoveredAt; source="analyzer"; basis="first 5s rolling result-RPS window at or after nodeReadyAt whose value and the next two consecutive windows are all at or above 90% of the pre-fault result RPS" }
+        [pscustomobject]@{ name="backlogNormalizedAt"; value=$recomputedNormalizedAt; source="analyzer"; basis="the first sample after which judge backlog and scoreboard pending each stayed at or below their own pre-fault p95 for 5s of wall clock, with no gap inside the holding streak wider than 2.5s; the later of the two" }
+        [pscustomobject]@{ name="lastReclaimedSubmissionResultAt"; value=$lastReclaimedResultAt; source="analyzer"; basis="maximum result_saved_at over submissions whose outbox attempts exceeded 1 after the fault" }
+        [pscustomobject]@{ name="lastReclaimedSubmissionScoreboardAt"; value=$lastReclaimedScoreboardAt; source="analyzer"; basis="maximum scoreboard_applied_at over the same reclaimed submissions" }
+        [pscustomobject]@{ name="drainCompletedAt"; value=(ConvertTo-DateTimeOrNull $events.drainEndedAt); source="harness"; basis="the drain loop's backlog reading reached zero" }
+    )
+    $anchors = [ordered]@{}
+    foreach ($spec in $anchorSpecs) {
+        $anchors[$spec.name] = [ordered]@{
+            value = if ($null -eq $spec.value) { $null } else { $spec.value.ToString("o") }
+            source = $spec.source
+            secondsAfterFault = if ($null -eq $spec.value -or $null -eq $faultAt) { $null } else { [math]::Round(($spec.value - $faultAt).TotalSeconds, 3) }
+            secondsAfterRestartRequested = if ($null -eq $spec.value -or $null -eq $restartRequestedAt) { $null } else { [math]::Round(($spec.value - $restartRequestedAt).TotalSeconds, 3) }
+            basis = $spec.basis
+        }
+    }
+
+    $recoveryTimes = [ordered]@{
+        T_staleSeconds = $anchors["firstStaleObservedAt"].secondsAfterFault
+        T_staleBasis = "firstStaleObservedAt - faultInjectedAt. T_stale is NOT assumed to equal the configured claim timeout: the lease expires on claimed_at + timeout, and claimed_at is earlier than the injection by however long the row had been held, so the two can differ in either direction"
+        T_restartRequestedSeconds = $anchors["restartRequestedAt"].secondsAfterFault
+        T_containerRunningSeconds = $anchors["containerRunningAt"].secondsAfterRestartRequested
+        T_nodeReadySeconds = $anchors["nodeReadyAt"].secondsAfterRestartRequested
+        T_throughputRecoverySeconds = $anchors["throughputRecoveredAt"].secondsAfterFault
+        T_backlogNormalizationSeconds = $anchors["backlogNormalizedAt"].secondsAfterFault
+        T_lastReclaimedResultSeconds = $anchors["lastReclaimedSubmissionResultAt"].secondsAfterFault
+        T_lastReclaimedScoreboardSeconds = $anchors["lastReclaimedSubmissionScoreboardAt"].secondsAfterFault
+        downDurationSeconds = if ($null -eq $faultAt -or $null -eq $restartRequestedAt) { $null } else { [math]::Round(($restartRequestedAt - $faultAt).TotalSeconds, 3) }
+        downDurationConfiguredSeconds = $parameters.downDurationSeconds
+        drainSeconds = $events.drainSeconds
+    }
+
+    return [ordered]@{
+        source = [ordered]@{
+            mode = "fault-recovery"
+            killedNode = $parameters.killedNode
+            signal = "SIGKILL"
+            downDurationBasis = "restartRequestedAt - faultInjectedAt"
+            sampleSource = if (Test-Path (Join-Path $runPath "recovery-samples.csv")) { "recovery-samples.csv" } else { "timeseries.csv (the fault phase wrote no recovery-samples.csv)" }
+            sampleCount = $samples.Count
+            # The recovery series stops with the fault phase; the drain samples appended to it are what let
+            # a normalisation that lands after the load stopped be seen at all. Counted rather than assumed,
+            # because a run whose answer rests on drain samples reads differently from one that does not.
+            drainSamplesAppended = $recoverySamplesAppended
+            sampleSourceBasis = "recovery-samples.csv is the fault phase's own denser series and is preferred; the drain samples the sampler wrote to timeseries.csv after that series ended are appended, and the count is reported as drainSamplesAppended"
+        }
+        trigger = $verification.faultRecovery.trigger
+        runValidForRecovery = $verification.faultRecovery.runValidForRecovery
+        faultNotInjectedWithActiveWork = $events.faultNotInjectedWithActiveWork
+        # The harness derived this during the run from the series it had then, which stops with the fault
+        # phase and therefore cannot contain a normalisation that landed in the drain. The value reported
+        # here is the analyzer's recomputation over the whole series; the harness's own reading is kept
+        # beside it so a difference is visible instead of being resolved by preferring one of them.
+        recoveryTimeout = ($null -eq $recomputedNormalizedAt)
+        recoveryTimeoutBasis = "true when no backlog normalisation was found within the measured load and the drain that follows it; recomputed here from the whole sample series rather than taken from the run, because the run's own reading cannot see the drain"
+        harnessRecoveryTimeout = $events.recoveryTimeout
+        anchors = $anchors
+        recoveryTimes = $recoveryTimes
+        preFault = [ordered]@{
+            windowFrom = if ($null -eq $baselineFrom) { $null } else { $baselineFrom.ToString("o") }
+            windowTo = if ($null -eq $baselineTo) { $null } else { $baselineTo.ToString("o") }
+            sampleCount = $baseline.Count
+            judgeBacklogP95 = $judgeP95
+            judgeBacklogSamples = $judgeValues.Count
+            scoreboardPendingP95 = $scoreboardP95
+            scoreboardPendingSamples = $scoreboardValues.Count
+            resultRps = $preFaultResultRps
+            basis = "faultInjectedAt - 30s to faultInjectedAt - 5s, the same window for the throughput baseline and both backlog baselines; the excluded 5s tail keeps arrivals that landed while the trigger was being polled out of the baseline"
+        }
+        normalization = [ordered]@{
+            judgeBacklogNormalizedAt = if ($null -eq $judgeNormalizedAt) { $null } else { $judgeNormalizedAt.ToString("o") }
+            scoreboardBacklogNormalizedAt = if ($null -eq $scoreboardNormalizedAt) { $null } else { $scoreboardNormalizedAt.ToString("o") }
+            backlogNormalizedAt = if ($null -eq $recomputedNormalizedAt) { $null } else { $recomputedNormalizedAt.ToString("o") }
+            earliestNormalizedAt = if ($null -eq $earliestNormalizedAt) { $null } else { $earliestNormalizedAt.ToString("o") }
+            earliestNormalizedBasis = "the same search run from faultInjectedAt instead, so it can precede nodeReadyAt: the surviving node alone can drain the backlog while the killed node is still down"
+            searchFromAt = if ($null -eq $searchFromAt) { $null } else { $searchFromAt.ToString("o") }
+            sustainSeconds = $sustainSeconds
+            sustainSpanSeconds = $gated.sustainSpanSeconds
+            maxSampleGapSeconds = $gated.maxSampleGapSeconds
+            sustainSampleCount = $gated.sustainSampleCount
+            maxSampleGapLimitSeconds = $maxSampleGapSeconds
+            judgeSecondsAfterFault = if ($null -eq $judgeNormalizedAt -or $null -eq $faultAt) { $null } else { [math]::Round(($judgeNormalizedAt - $faultAt).TotalSeconds, 3) }
+            scoreboardSecondsAfterFault = if ($null -eq $scoreboardNormalizedAt -or $null -eq $faultAt) { $null } else { [math]::Round(($scoreboardNormalizedAt - $faultAt).TotalSeconds, 3) }
+            harnessReportedAt = $events.backlogNormalizedAt
+            harnessAndAnalyzerAgree = ($events.backlogNormalizedAt -eq $(if ($null -eq $recomputedNormalizedAt) { $null } else { $recomputedNormalizedAt.ToString("o") }))
+            basis = "the first sample after which each backlog stayed at or below its own pre-fault p95 for 5s of wall clock, searched from max(faultInjectedAt, nodeReadyAt); the streak is grown until it covers 5s with every sample at or below the baseline and no gap inside it wider than ${maxSampleGapSeconds}s, so a well-observed 1s series satisfies it and a sampling hole does not. The two are reported separately and the combined instant is the later of them. A sample whose count did not arrive breaks the streak instead of counting as zero"
+        }
+        throughput = [ordered]@{
+            preFaultResultRps = $preFaultResultRps
+            thresholdRps = if ($null -eq $preFaultResultRps) { $null } else { [math]::Round(0.90 * $preFaultResultRps, 6) }
+            ratio = 0.90
+            windowSeconds = 5
+            maxWindowSpanSeconds = $maxWindowSpanSeconds
+            consecutiveWindows = 3
+            rollingWindowCount = $rolling.Count
+            rollingSpanMaxSeconds = $rollingSpanMaxSeconds
+            recoveredAt = if ($null -eq $recomputedRecoveredAt) { $null } else { $recomputedRecoveredAt.ToString("o") }
+            secondsAfterFault = if ($null -eq $recomputedRecoveredAt -or $null -eq $faultAt) { $null } else { [math]::Round(($recomputedRecoveredAt - $faultAt).TotalSeconds, 3) }
+            secondsAfterNodeReady = if ($null -eq $recomputedRecoveredAt -or $null -eq $nodeReadyAt) { $null } else { [math]::Round(($recomputedRecoveredAt - $nodeReadyAt).TotalSeconds, 3) }
+            harnessReportedAt = $events.throughputRecoveredAt
+            harnessAndAnalyzerAgree = ($events.throughputRecoveredAt -eq $(if ($null -eq $recomputedRecoveredAt) { $null } else { $recomputedRecoveredAt.ToString("o") }))
+            basis = "5s rolling result RPS from the cumulative results column, each window spanning between 5s and ${maxWindowSpanSeconds}s so a sampling hole cannot pass as a rate, at or above 90% of the pre-fault result RPS for 3 consecutive windows, at or after max(faultInjectedAt, nodeReadyAt)"
+        }
+        postRecoveryWindow = $postRecovery
+        claimedUnfinishedAtKill = [ordered]@{
+            clusterWideUpperBound = $verification.faultRecovery.killSnapshot.clusterWideClaimedUnfinishedUpperBound
+            attributionExact = $verification.faultRecovery.reclaimAccounting.killedNodeClaimAttributionExact
+            ageSecondsAtKill = $claimAges
+            strandedShareOfMaxInFlight = Get-RatioOrNull $verification.faultRecovery.killSnapshot.clusterWideClaimedUnfinishedUpperBound ([int]$parameters.mysqlMaxInFlightPerNode * 2)
+            basis = "the outbox has no claimed_by column, so this is a cluster-wide claimed-unfinished upper bound over every node's PUBLISHING rows at kill time and is never reported as the killed node's active claims"
+        }
+        reclaimAccounting = [ordered]@{
+            reclaimedRowsAfterFault = $reclaimed.Count
+            reclaimedRowsHarnessEstimate = $verification.faultRecovery.reclaimAccounting.reclaimedRowsAfterFault
+            label = "attempts > 1 = recovery re-claims after the lease expired, NOT concurrent duplicate CPU execution"
+            sigkillCounterLoss = $verification.faultRecovery.reclaimAccounting.sigkillCounterLoss
+            followUpCandidate = $verification.faultRecovery.reclaimAccounting.followUpCandidate
+        }
+        cohorts = $cohortsFault
+        unavailable = [object[]]$unavailableFault
+    }
+}
+
 # --- staircase helpers, used only when stages.json exists -----------------------------------------
 
 function Get-EpochMillis {
@@ -429,6 +1005,7 @@ if ($events.faultInjectedAt -and $events.firstStaleReclaimObservedAt) {
 # shape it had before the staircase harness existed, so an older run directory still analyzes.
 $staircase = $null
 $duplication = $null
+$faultRecovery = $null
 $stagesPath = Join-Path $runPath "stages.json"
 if (Test-Path $stagesPath) {
     $stagesDoc = Get-Content $stagesPath -Raw | ConvertFrom-Json
@@ -1024,7 +1601,15 @@ if (Test-Path $stagesPath) {
     # Assigned inside the branches rather than from an if-expression: PowerShell unrolls an if
     # statement's output, and an OrderedDictionary is enumerable, so the branch value would arrive as
     # a list of its entries instead of the dictionary itself.
-    if ($steadyWindows.Count -eq 0) {
+    if ($stagesDoc.mode -eq "fault-recovery") {
+        # A fault-recovery run's measured window contains the kill, so no part of it is service time.
+        # The recovery cohorts A-E are the readings this run can vouch for, and a stage-level steady
+        # window would either be empty or describe the queueing around the outage.
+        $cohorts["measurement-steady"] = [ordered]@{
+            available = $false
+            reason = "this run has a fault inside its measured window, so no window in it is service time; the fault-recovery cohorts (pre-fault-steady, fault-down-arrivals, reclaimed-after-fault, post-restart-recovery, post-recovery-steady) are this run's latency readings"
+        }
+    } elseif ($steadyWindows.Count -eq 0) {
         $cohorts["measurement-steady"] = [ordered]@{
             available = $false
             reason = "no measured stage was both steady and free of API refusals, so no window in this run can be read as service time"
@@ -1340,6 +1925,21 @@ if (Test-Path $stagesPath) {
         }
     }
 
+    # --- fault recovery (SIGKILL) -----------------------------------------------------------------
+    # Derived here rather than from the harness's own numbers: the phase function computes the same
+    # values so it can decide when to stop, and recomputing them from the preserved samples is what
+    # makes them reproducible after the fact. Both are kept, so a disagreement shows.
+    if ($stagesDoc.mode -eq "fault-recovery") {
+        $faultRecovery = Get-FaultRecoveryAnalysis -LatencyIndexed $latencyIndexed
+        if ($null -ne $faultRecovery) {
+            foreach ($name in @($faultRecovery.cohorts.Keys)) {
+                if ($cohorts.Contains($name)) { continue }
+                $cohortNames += $name
+                $cohorts[$name] = $faultRecovery.cohorts[$name]
+            }
+        }
+    }
+
     $staircase = [ordered]@{
         mode = $stagesDoc.mode
         mysqlMaxInFlightPerNode = $parameters.mysqlMaxInFlightPerNode
@@ -1352,7 +1952,9 @@ if (Test-Path $stagesPath) {
         stageHoldSeconds = $stagesDoc.stageHoldSeconds
         steadyGuardSeconds = $stagesDoc.steadyGuardSeconds
         overloadThresholdRowsPerSec = $threshold
-        latencyCohortCaveat = if ($stagesDoc.mode -eq "normal-timeout") {
+        latencyCohortCaveat = if ($stagesDoc.mode -eq "fault-recovery") {
+            "the run-level cohorts are read from the measurement contest alone, so the warm-up phase - a different contest - is outside every one of them. A fault was injected inside the measured window, so the all cohort spans the pre-fault steady state, the outage, the recovery and the drain together and its p95/p99 are queueing rather than service time. The fault-recovery cohorts partition that same contest: pre-fault-steady is the 25s of steady state before injection, fault-down-arrivals are submissions that arrived between the kill and the node confirming an active dispatcher, reclaimed-after-fault are the submissions whose outbox row was handed out again after the lease expired, post-restart-recovery runs from that confirmation to backlog normalisation, and post-recovery-steady is the load after normalisation. measurement-steady is unavailable by design here. killed-node-claimed stays unavailable because the outbox stores no claim owner."
+        } elseif ($stagesDoc.mode -eq "normal-timeout") {
             "the run-level cohorts are read from the measurement contest alone, so the warm-up phase - a different contest - is outside every one of them. What they do span is the measured phase's ramp, its hold and its guard, so their p95/p99 include the ramp and are not service-time readings. measurement-steady restricts the same three latencies to the measured window of the measured stage and is unavailable when that stage did not hold steady. The fault cohorts (fault-window, post-fault-arrivals, killed-node-claimed) do not apply to a run with no fault injected, and pre-fault-normal is simply the whole measurement contest here."
         } else {
             "the run-level cohorts (all, pre-fault-normal, fault-window, post-fault-arrivals) cover the whole run - warm-up, every transition, the overload stages and the drain - so their p95/p99 include queueing and are not service-time readings. measurement-steady restricts the same three latencies to the measurement windows of the stages that held steady with no API refusals, and is unavailable when no stage qualified."
@@ -1398,7 +2000,7 @@ if (Test-Path $stagesPath) {
 # even though it is the measured window's occupancy that explains the measured rate. Staircase and
 # fault runs are untouched: their capacity.csv has no warm-up phase to separate out.
 $capacityScope = "every sampled tick of the run"
-if ($null -ne $staircase -and $staircase.mode -eq "normal-timeout" -and (Test-Path $capacityPath)) {
+if ($null -ne $staircase -and @("normal-timeout", "fault-recovery") -contains $staircase.mode -and (Test-Path $capacityPath)) {
     $measuredPhaseRows = @(Import-Csv $capacityPath | Where-Object { $_.phase -eq "load" })
     if ($measuredPhaseRows.Count -gt 0) {
         $wholeRunReserved = @(
@@ -1433,7 +2035,17 @@ $summary = [ordered]@{
     cohorts = $cohorts
     recovery = [ordered]@{
         firstStaleReclaimSeconds = $firstStaleReclaimSeconds
+        # Kept under its original name so the normal-timeout comparison and every earlier reader keep
+        # working. The definition changed for a fault run, so the definition is named alongside it.
         backlogNormalizedSeconds = $backlogRecoverySeconds
+        backlogNormalizedDefinition = "the instant the unfinished backlog first reached zero after the fault"
+        faultInjectedAt = $events.faultInjectedAt
+        restartRequestedAt = $events.restartRequestedAt
+        nodeReadyAt = $events.nodeReadyAt
+        throughputRecoveredAt = $events.throughputRecoveredAt
+        backlogNormalizedAt = $events.backlogNormalizedAt
+        recoveryTimeout = $events.recoveryTimeout
+        faultRecoveryReader = "this block is the run's own during-run reading and is kept for the readers that predate the fault-recovery mode. For a fault run read faultRecovery.normalization and faultRecovery.recoveryTimeout instead: those are recomputed over the whole sample series, including the drain, which the run's own reading cannot see"
     }
     workCost = $verification.workCost
     capacity = $capacity
@@ -1448,9 +2060,14 @@ if ($null -ne $staircase) {
 if ($null -ne $duplication) {
     $summary.duplication = $duplication
 }
+if ($null -ne $faultRecovery) {
+    $summary.faultRecovery = $faultRecovery
+    $summary.unavailable = @($verification.unavailable) + @($staircase.unavailable) + @($faultRecovery.unavailable)
+}
 $summary | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $runPath "summary.json") -Encoding utf8
 
 $isNormalTimeout = ($null -ne $staircase -and $staircase.mode -eq "normal-timeout")
+$isFaultRecovery = ($null -ne $faultRecovery)
 $lines = @(
     "# MySQL judge tradeoff run $($parameters.runId)", "",
     "- Dispatch: $($parameters.dispatchMode)",
@@ -1462,6 +2079,14 @@ if ($isNormalTimeout) {
     # measurements of something that was never attempted; the counts above are the measurement
     # contest's, and the warm-up wrote to a different one.
     $lines += @("- Fault injection: none, by design; the counts above are the measurement contest's whole run, and the warm-up wrote to a separate contest.")
+} elseif ($isFaultRecovery) {
+    $lines += @(
+        "- Fault: SIGKILL on $($parameters.killedNode), injected once the trigger window was open and the node was observed to hold work; down for $($faultRecovery.recoveryTimes.downDurationSeconds)s measured as restartRequestedAt - faultInjectedAt against a configured $($faultRecovery.recoveryTimes.downDurationConfiguredSeconds)s",
+        "- First stale reclaim observed after fault: $(if ($null -eq $faultRecovery.recoveryTimes.T_staleSeconds) { 'unavailable' } else { [string]$faultRecovery.recoveryTimes.T_staleSeconds + 's' })",
+        "- Node ready after the restart request: $(if ($null -eq $faultRecovery.recoveryTimes.T_nodeReadySeconds) { 'unavailable' } else { [string]$faultRecovery.recoveryTimes.T_nodeReadySeconds + 's' })",
+        "- Backlog normalization after fault: $(if ($null -eq $faultRecovery.recoveryTimes.T_backlogNormalizationSeconds) { 'unavailable' } else { [string]$faultRecovery.recoveryTimes.T_backlogNormalizationSeconds + 's' })",
+        "- Run valid for recovery comparison: $($faultRecovery.runValidForRecovery)"
+    )
 } else {
     $lines += @(
         "- First stale reclaim after fault: $(if ($null -eq $firstStaleReclaimSeconds) { 'unavailable' } else { [string]$firstStaleReclaimSeconds + 's' })",
@@ -1482,6 +2107,88 @@ foreach ($cohortName in $cohortNames) {
         $metric = $cohorts[$cohortName][$metricName]
         $lines += "| $cohortName | $metricName | $($metric.count) | $($metric.p50) | $($metric.p95) | $($metric.p99) | $($metric.max) |"
     }
+}
+if ($isFaultRecovery) {
+    $lines += @("", "## Fault recovery", "")
+    $trigger = $faultRecovery.trigger
+    $lines += @("### Trigger and the work in flight at the kill", "")
+    if ($null -ne $trigger) {
+        $lines += @(
+            "- Trigger window opened at $($faultRecovery.anchors.faultScheduledAt.value), target $($parameters.killedNode)",
+            "- Primary condition: $($trigger.primaryMinRunning) running and $($trigger.primaryMinReserved) reserved; waited $($trigger.waitedSeconds)s",
+            "- Escalation: $($trigger.escalation); active work seen: $($trigger.activeWorkSeen); fault injected with active work: $(-not [bool]$trigger.faultNotInjectedWithActiveWork)",
+            "- judge-1 running/reserved/queued at the decision: $($trigger.judge1.running) / $($trigger.judge1.reserved) / $($trigger.judge1.queued); judge-2: $($trigger.judge2.running) / $($trigger.judge2.reserved) / $($trigger.judge2.queued)"
+        )
+    } else {
+        $lines += @("- No trigger record was preserved for this run")
+    }
+    $kill = $faultRecovery.claimedUnfinishedAtKill
+    $lines += @(
+        "- Kill-time unfinished outbox (contest): $($verification.faultRecovery.killSnapshot.unfinishedOutboxContest); scoreboard pending: $($verification.faultRecovery.killSnapshot.scoreboardPending)",
+        "- Cluster-wide claimed unfinished upper bound: $($kill.clusterWideUpperBound) rows (attribution exact: $($kill.attributionExact)); claimed_at age at kill p50/p95/max: $($kill.ageSecondsAtKill.p50) / $($kill.ageSecondsAtKill.p95) / $($kill.ageSecondsAtKill.max) s",
+        "",
+        "### Recovery anchors",
+        "",
+        "| Anchor | Value | After fault s | After restart request s | Source |",
+        "|---|---|---:|---:|---|"
+    )
+    foreach ($anchorName in @($faultRecovery.anchors.Keys)) {
+        $anchor = $faultRecovery.anchors[$anchorName]
+        $lines += "| $anchorName | $($anchor.value) | $($anchor.secondsAfterFault) | $($anchor.secondsAfterRestartRequested) | $($anchor.source) |"
+    }
+    # throughputRecoveredAt and backlogNormalizedAt are recomputed here from the samples rather than
+    # read from events.json, and the harness derived its own copies while the run was live. Both are
+    # kept, so this states whether the run's own live derivation and the post-hoc one landed on the
+    # same instant; a NO means the two boundaries below are the analyzer's, not the harness's.
+    $lines += @(
+        "",
+        "Harness and analyzer agree on the derived instants: throughput recovery $($faultRecovery.throughput.harnessAndAnalyzerAgree) (harness $($faultRecovery.throughput.harnessReportedAt), analyzer $($faultRecovery.throughput.recoveredAt)), backlog normalization $($faultRecovery.normalization.harnessAndAnalyzerAgree) (harness $($faultRecovery.normalization.harnessReportedAt), analyzer $($faultRecovery.normalization.backlogNormalizedAt)). A False is not automatically an error: the run decided its own value during the run from the fault phase's series, which stops before the drain, so a normalisation seen in the drain is reported as absent by the run and found by the recomputation"
+    )
+    if ($null -ne $faultRecovery.postRecoveryWindow) {
+        $lines += @(
+            "",
+            "Post-recovery window available: $($faultRecovery.postRecoveryWindow.available) ($($faultRecovery.postRecoveryWindow.reason)); actual $($faultRecovery.postRecoveryWindow.actualSeconds)s of load, $($faultRecovery.postRecoveryWindow.sampleCount) samples"
+        )
+    }
+    $lines += @(
+        "",
+        "### Pre-fault baselines",
+        "",
+        "| Quantity | Value | Samples |",
+        "|---|---:|---:|",
+        "| judge backlog p95 | $($faultRecovery.preFault.judgeBacklogP95) | $($faultRecovery.preFault.judgeBacklogSamples) |",
+        "| scoreboard pending p95 | $($faultRecovery.preFault.scoreboardPendingP95) | $($faultRecovery.preFault.scoreboardPendingSamples) |",
+        "| result RPS | $($faultRecovery.preFault.resultRps) | |",
+        "",
+        "Backlog normalization: judge backlog at $($faultRecovery.normalization.judgeSecondsAfterFault)s, scoreboard pending at $($faultRecovery.normalization.scoreboardSecondsAfterFault)s, combined at $($faultRecovery.recoveryTimes.T_backlogNormalizationSeconds)s after the fault.",
+        "Throughput recovery: $($faultRecovery.recoveryTimes.T_throughputRecoverySeconds)s after the fault, threshold $($faultRecovery.throughput.thresholdRps) RPS over $($faultRecovery.throughput.windowSeconds)s rolling windows.",
+        "Reclaimed rows: $($faultRecovery.reclaimAccounting.reclaimedRowsAfterFault) ($($faultRecovery.reclaimAccounting.label)); last reclaimed result at $($faultRecovery.recoveryTimes.T_lastReclaimedResultSeconds)s and its scoreboard at $($faultRecovery.recoveryTimes.T_lastReclaimedScoreboardSeconds)s after the fault.",
+        "",
+        "### Cohort detail",
+        "",
+        "| Cohort | n | fast / slow | L_total p50 | p95 | p99 | max | over-5s share | over-10s share | available |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|---|"
+    )
+    foreach ($cohortName in @($faultRecovery.cohorts.Keys)) {
+        $cohort = $faultRecovery.cohorts[$cohortName]
+        if ($cohort.available -eq $false) {
+            $lines += "| $cohortName | 0 | | | | | | | | no: $($cohort.reason) |"
+            continue
+        }
+        $total = $cohort.L_total_ms
+        $lines += "| $cohortName | $($cohort.submissionCount) | $($cohort.byLatencyClass.fast.submissionCount) / $($cohort.byLatencyClass.slow.submissionCount) | $($total.p50) | $($total.p95) | $($total.p99) | $($total.max) | $($cohort.over5sRatio) | $($cohort.over10sRatio) | yes |"
+    }
+    foreach ($latencyClass in @("fast", "slow")) {
+        $lines += @("", "#### $latencyClass split", "", "| Cohort | n | L_result p50 | p95 | p99 | L_total p50 | p95 | p99 | max |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        foreach ($cohortName in @($faultRecovery.cohorts.Keys)) {
+            $cohort = $faultRecovery.cohorts[$cohortName]
+            if ($cohort.available -eq $false) { continue }
+            $class = $cohort.byLatencyClass[$latencyClass]
+            $lines += "| $cohortName | $($class.submissionCount) | $($class.L_result_ms.p50) | $($class.L_result_ms.p95) | $($class.L_result_ms.p99) | $($class.L_total_ms.p50) | $($class.L_total_ms.p95) | $($class.L_total_ms.p99) | $($class.L_total_ms.max) |"
+        }
+    }
+    $lines += @("", "### Limits recorded for this fault run", "")
+    foreach ($note in @($faultRecovery.unavailable)) { $lines += "- $note" }
 }
 $lines += @("", "## Executor capacity", "", "| Node | Metric | samples | max | average |", "|---|---|---:|---:|---:|")
 foreach ($node in @("judge-1", "judge-2")) {

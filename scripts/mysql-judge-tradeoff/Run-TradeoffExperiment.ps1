@@ -38,7 +38,25 @@ param(
     # test; -Staircase and -NormalTimeout are separate experiments and are not combined.
     [switch]$NormalTimeout,
     [int]$WarmupSeconds = 30,
-    [int]$MeasurementSeconds = 60
+    [int]$MeasurementSeconds = 60,
+    # Fail-stop recovery comparison. Same two-phase machinery as -NormalTimeout - a warm-up contest,
+    # a full drain to quiescence, then a measured contest - but the measured phase SIGKILLs one judge
+    # node once that node actually holds work, keeps the load running through the outage, restarts the
+    # node with identical settings and observes the pipeline until it has recovered. This is not the
+    # legacy -FaultEnabled path: that one kills at a fixed second and needs no active work to exist,
+    # which is exactly the confound this mode removes. -FaultEnabled and -FaultRecovery are separate
+    # switches and are never combined.
+    [switch]$FaultRecovery,
+    # The trigger is a condition on the target node, not a clock. The window opens this many seconds
+    # after the measured window starts - the experiment needs a pre-fault steady stretch longer than
+    # the fault's own observation window - and then waits up to FaultTriggerWaitSeconds for the
+    # primary condition. Failing that it accepts the fallback condition; failing that it injects
+    # anyway and marks the run so it cannot be reported as a recovery measurement.
+    [int]$FaultMinSteadySeconds = 30,
+    [int]$FaultTriggerWaitSeconds = 15,
+    [int]$FaultMinRunning = 1,
+    [int]$FaultMinReserved = 4,
+    [int]$FaultFallbackMinReserved = 1
 )
 
 $ErrorActionPreference = "Stop"
@@ -137,25 +155,30 @@ if ($Staircase) {
     if ($DrainTimeoutSeconds -lt 300) { throw "Staircase runs require -DrainTimeoutSeconds of at least 300." }
 }
 
-# The two staged experiments share the machinery - a traced hold analysed per window, one stack for
-# the whole run - but not their parameters: the staircase sweeps a ladder of rates in one run, while
-# the normal-timeout run holds a single rate so that the claim timeout is the only thing that changes
-# between runs. They are kept apart rather than merged into one mode because the staircase's ladder
-# is what defines its stage labels.
-$stagedLoad = [bool]$Staircase -or [bool]$NormalTimeout
+# The three staged experiments share the machinery - a traced hold analysed per window, one stack for
+# the whole run - but not their parameters: the staircase sweeps a ladder of rates in one run, the
+# normal-timeout run holds a single rate so that the claim timeout is the only thing that changes
+# between runs, and the fault-recovery run holds a single rate and then removes a judge node from the
+# cluster. They are kept apart rather than merged into one mode because the staircase's ladder is what
+# defines its stage labels and the other two differ in what they do to the cluster mid-hold.
+$phasedLoad = [bool]$NormalTimeout -or [bool]$FaultRecovery
+$stagedLoad = [bool]$Staircase -or $phasedLoad
 if ($Staircase -and $NormalTimeout) { throw "-Staircase and -NormalTimeout are different experiments; pass one of them." }
+if ($Staircase -and $FaultRecovery) { throw "-Staircase and -FaultRecovery are different experiments; pass one of them." }
+if ($NormalTimeout -and $FaultRecovery) { throw "-NormalTimeout and -FaultRecovery are different experiments; pass one of them." }
+if ($FaultEnabled -and $FaultRecovery) { throw "-FaultEnabled kills at a fixed second and -FaultRecovery triggers on active work; pass one of them." }
 $warmupPrefix = ""
 $measurementPrefix = ""
 $measurementHoldSeconds = 0
-if ($NormalTimeout) {
-    if ($DispatchMode -ne "mysql") { throw "-NormalTimeout measures MySQL claim dispatch, so -DispatchMode must be mysql." }
-    if ($FaultEnabled) { throw "-NormalTimeout measures the fault-free steady state and does not inject faults." }
-    if (-not $PSBoundParameters.ContainsKey("TargetRps")) { throw "-NormalTimeout requires an explicit -TargetRps: the offered rate is an input to the comparison across timeouts, not a default." }
+if ($phasedLoad) {
+    if ($DispatchMode -ne "mysql") { throw "A phased-load run measures MySQL claim dispatch, so -DispatchMode must be mysql." }
+    if ($FaultEnabled) { throw "A phased-load run drives the fault from its own trigger, so -FaultEnabled does not apply to it." }
+    if (-not $PSBoundParameters.ContainsKey("TargetRps")) { throw "A phased-load run requires an explicit -TargetRps: the offered rate is an input to the comparison, not a default." }
     if ($WarmupSeconds -lt 12) { throw "-WarmupSeconds must be at least 12, or the warm-up phase is not long enough to reach a steady state." }
     if ($MeasurementSeconds -lt 12) { throw "-MeasurementSeconds must be at least 12 so a measured window has enough samples to classify." }
     if ($SteadyGuardSeconds -lt 0) { throw "-SteadyGuardSeconds must not be negative." }
-    if ($UserCount -lt 1000) { throw "Normal-timeout runs require -UserCount of at least 1000." }
-    if ($DrainTimeoutSeconds -lt 300) { throw "Normal-timeout runs require -DrainTimeoutSeconds of at least 300." }
+    if ($UserCount -lt 1000) { throw "Phased-load runs require -UserCount of at least 1000." }
+    if ($DrainTimeoutSeconds -lt 300) { throw "Phased-load runs require -DrainTimeoutSeconds of at least 300." }
     # Each phase is its own Gatling invocation with one stage, so warmupStageCount is 0: the phase
     # boundary is the harness draining the pipeline between the two runs, not a warm-up stage inside
     # one schedule. The hold carries the steady guard on top of the measured window, so the window
@@ -163,14 +186,47 @@ if ($NormalTimeout) {
     $stageRpsList = @([double]$TargetRps)
     $WarmupStageCount = 0
     $measurementHoldSeconds = $MeasurementSeconds + $SteadyGuardSeconds
-    # Both contests are seeded from the seed alone, so a rerun of the same timeout reseeds the same
+    # Both contests are seeded from the seed alone, so a rerun of the same setting reseeds the same
     # users and therefore the same code strings: the 5% slow-job split is keyed on the code, and an
-    # identical code set is what makes the synthetic judge work reproducible across the six runs.
-    $warmupPrefix = "norm_warm_$LatencySeed"
-    $measurementPrefix = "norm_meas_$LatencySeed"
+    # identical code set is what makes the synthetic judge work reproducible across runs. The prefixes
+    # keep the two rounds' contests apart even when a rerun lands in the same database.
+    if ($FaultRecovery) {
+        $warmupPrefix = "fault_warm_$LatencySeed"
+        $measurementPrefix = "fault_meas_$LatencySeed"
+    } else {
+        $warmupPrefix = "norm_warm_$LatencySeed"
+        $measurementPrefix = "norm_meas_$LatencySeed"
+    }
 }
-$effectiveHoldSeconds = if ($NormalTimeout) { $measurementHoldSeconds } else { $StageHoldSeconds }
-$workloadPrefix = if ($NormalTimeout) { $measurementPrefix } else { "tradeoff_seed_$LatencySeed" }
+if ($FaultRecovery) {
+    if ($DownDurationSeconds -le 0) { throw "-FaultRecovery requires a positive -DownDurationSeconds: it is the outage the recovery is measured across." }
+    # 30s, not 12: the pre-fault steady baseline this experiment reports is fixed at faultInjectedAt -
+    # 30s to faultInjectedAt - 5s, and the analyzer baselines that same window. A shorter trigger window
+    # would leave the fault landing before the baseline it is compared against exists.
+    if ($FaultMinSteadySeconds -lt 30) { throw "-FaultMinSteadySeconds must be at least 30: the pre-fault steady baseline is the 30s before the fault, and the analyzer baselines the same window." }
+    if ($FaultTriggerWaitSeconds -lt 1) { throw "-FaultTriggerWaitSeconds must be positive." }
+    if ($FaultMinRunning -lt 1 -or $FaultMinReserved -lt 1) { throw "The fault trigger needs active work, so -FaultMinRunning and -FaultMinReserved must be at least 1." }
+    if ($FaultFallbackMinReserved -lt 1 -or $FaultFallbackMinReserved -ge $FaultMinReserved) {
+        throw "-FaultFallbackMinReserved must be at least 1 and strictly below -FaultMinReserved, or it is not a fallback."
+    }
+    # The measured hold has to outlast the fault, the outage and the recovery it is measuring. A hold
+    # that ends first truncates the post-recovery observation, and a truncated window is not a
+    # recovery measurement - so it is refused here rather than discovered in the analysis.
+    $faultWorstCaseSeconds = $FaultMinSteadySeconds + $FaultTriggerWaitSeconds + $DownDurationSeconds
+    if ($MeasurementSeconds -lt ($faultWorstCaseSeconds + 45)) {
+        throw "-MeasurementSeconds must be at least $($faultWorstCaseSeconds + 45) for this trigger: the window opens at ${FaultMinSteadySeconds}s, waits up to ${FaultTriggerWaitSeconds}s, the outage lasts ${DownDurationSeconds}s, and at least 45s must remain for readiness plus the post-recovery steady window."
+    }
+}
+$effectiveHoldSeconds = if ($phasedLoad) { $measurementHoldSeconds } else { $StageHoldSeconds }
+$workloadPrefix = if ($phasedLoad) { $measurementPrefix } else { "tradeoff_seed_$LatencySeed" }
+
+# Whether a fault was actually injected, as opposed to merely requested. This is not the same as the
+# mode: a recovery run can reach the end of its trigger window and be marked as injected without
+# active work, and it can in principle fail before injecting at all. The counter recombination in
+# Get-PromMetricDelta needs a "pre-fault" snapshot to exist, so it keys on this flag; a mode-keyed
+# test would subtract a baseline that was never taken and silently drop the killed node's whole
+# pre-kill contribution.
+$faultWasInjected = [bool]$FaultEnabled
 
 # The staircase drives the stack into overload on purpose, where the API rate limiter refuses
 # requests the judge never saw. Those refusals are part of the measurement, not a fault, so the
@@ -178,9 +234,11 @@ $workloadPrefix = if ($NormalTimeout) { $measurementPrefix } else { "tradeoff_se
 # Gatling exiting 2 over it is recorded rather than treated as a failed run.
 $assertMinSuccess = if ($Staircase) {
     if ($PSBoundParameters.ContainsKey("AssertMinSuccessPercent")) { $AssertMinSuccessPercent } else { 80 }
-} elseif ($NormalTimeout) {
-    # A normal-timeout run is offered about 70% of the measured knee, so it stays well inside the
-    # rate limiter and the staircase's looser bound is not needed; an explicit value still wins.
+} elseif ($phasedLoad) {
+    # A phased-load run is offered about 70% of the measured knee, so it stays well inside the
+    # rate limiter and the staircase's looser bound is not needed; an explicit value still wins. A
+    # judge outage never reaches the client as an API failure - the web node persists the submission
+    # and answers 202 - so losing one judge node must not move this bound.
     if ($PSBoundParameters.ContainsKey("AssertMinSuccessPercent")) { $AssertMinSuccessPercent } else { 95 }
 } else { 95 }
 
@@ -204,7 +262,7 @@ if ($Staircase) {
         totalSeconds = ($RampSeconds + $StageHoldSeconds) * $stageRpsList.Count
         measuredStageCount = $stageRpsList.Count - $WarmupStageCount
     }
-} elseif ($NormalTimeout) {
+} elseif ($phasedLoad) {
     $population = [int][math]::Max(1, [math]::Ceiling($TargetRps * 3100 / 1000))
     $expectedPlan = [ordered]@{
         targetRps = $TargetRps
@@ -219,6 +277,22 @@ if ($Staircase) {
             measuredWindowSeconds = $MeasurementSeconds; seconds = $RampSeconds + $measurementHoldSeconds
         }
         totalSeconds = 2 * $RampSeconds + $WarmupSeconds + $measurementHoldSeconds
+    }
+    if ($FaultRecovery) {
+        # There is no kill deadline: the trigger window opens after the pre-fault steady stretch and
+        # the kill happens the moment the target node is observed to hold work. Worst case is the whole
+        # window elapsing, which is what the measurement hold has to cover with room to spare.
+        $expectedPlan.faultRecovery = [ordered]@{
+            killedNode = $KilledNode
+            triggerWindowOpensSecondsAfterMeasurementStart = $FaultMinSteadySeconds
+            triggerWaitSeconds = $FaultTriggerWaitSeconds
+            primaryCondition = "running >= $FaultMinRunning and reserved >= $FaultMinReserved"
+            fallbackCondition = "running >= $FaultMinRunning and reserved >= $FaultFallbackMinReserved after the window elapses"
+            downDurationSeconds = $DownDurationSeconds
+            worstCaseFaultInjectedSeconds = $FaultMinSteadySeconds + $FaultTriggerWaitSeconds
+            worstCaseRestartRequestedSeconds = $FaultMinSteadySeconds + $FaultTriggerWaitSeconds + $DownDurationSeconds
+            secondsLeftAfterWorstCaseRestart = $MeasurementSeconds - ($FaultMinSteadySeconds + $FaultTriggerWaitSeconds + $DownDurationSeconds)
+        }
     }
 }
 
@@ -253,7 +327,12 @@ $parameters = [ordered]@{
     mysqlPollInterval = $MySqlPollInterval; rabbitPrefetch = $RabbitPrefetch
     rabbitReservedPerNode = $WorkerCount * $RabbitPrefetch
     deterministicLatencySeed = $LatencySeed; latency = @{ baseMillis = 50; slowMillis = 2000; slowRatio = 0.05; keySource = "code" }
+    # Three different things can put a run's fault fields in play, and they are not interchangeable:
+    # the legacy fixed-time fault kills at a scheduled second, the recovery mode kills when the target
+    # node is observed to hold work, and a run with neither has no fault at all. Downstream readers key
+    # on this rather than on faultEnabled, which is true for both of the first two.
     faultEnabled = [bool]$FaultEnabled; faultAtSeconds = $FaultAtSeconds
+    faultMode = if ($FaultEnabled) { "fixed-time" } elseif ($FaultRecovery) { "conditional-recovery" } else { "none" }
     killedNode = $KilledNode; downDurationSeconds = $DownDurationSeconds
     userCount = $UserCount; drainTimeoutSeconds = $DrainTimeoutSeconds
     judgeNodeCount = 2; generatedAt = [datetimeoffset]::UtcNow.ToString("o")
@@ -288,6 +367,39 @@ if ($NormalTimeout) {
         simulationClass = "my.oj.perf.ContestSubmissionStepLoadSimulation"
         # One stage per Gatling invocation, so the measured window is labelled stage-0 in
         # timeseries.csv and stages.json rather than "measurement".
+        measuredStageLabel = "stage-0"
+        measurementWindowBasis = "the hold minus steadyGuardSeconds; the preceding ramp is part of the schedule but outside every measured window"
+        expectedPlan = $expectedPlan
+    }
+}
+if ($FaultRecovery) {
+    $parameters.faultRecovery = [ordered]@{
+        enabled = $true
+        targetRps = $TargetRps
+        warmupSeconds = $WarmupSeconds
+        measurementSeconds = $MeasurementSeconds
+        measurementHoldSeconds = $measurementHoldSeconds
+        steadyGuardSeconds = $SteadyGuardSeconds
+        warmupPrefix = $warmupPrefix
+        measurementPrefix = $measurementPrefix
+        killedNode = $KilledNode
+        signal = "SIGKILL"
+        # The trigger is a condition on the target node, not an instant. faultScheduledAt therefore
+        # means "the moment the trigger window opened", which is measurementStartedAt + this value -
+        # it is not a kill deadline, and nothing is killed at it.
+        minSteadySecondsBeforeTriggerWindow = $FaultMinSteadySeconds
+        triggerWaitSeconds = $FaultTriggerWaitSeconds
+        triggerPrimaryMinRunning = $FaultMinRunning
+        triggerPrimaryMinReserved = $FaultMinReserved
+        triggerFallbackMinReserved = $FaultFallbackMinReserved
+        triggerBasis = "poll the target node's executor gauges once the window is open; inject on the primary condition, else on the fallback when the window elapses, else inject anyway and mark the run faultNotInjectedWithActiveWork"
+        downDurationSeconds = $DownDurationSeconds
+        downDurationBasis = "restartRequestedAt - faultInjectedAt; the restart is scheduled at faultInjectedAt + downDurationSeconds, so a slow pre-kill snapshot shifts the window rather than shrinking it"
+        restartSettingsIdentical = $true
+        nodeReadyBasis = "container running AND /actuator/health/readiness UP AND /actuator/prometheus scrapable AND contest_judge_claim_calls_total observed to advance; a judge container's own healthcheck is process liveness only and is not used"
+        claimedUnfinishedBasis = "the judge schema has no claimed_by column, so the claimed unfinished row count at kill time is a cluster-wide upper bound, not the killed node's active claims"
+        attemptsAboveOneBasis = "recovery re-claims, not concurrent duplicate CPU execution; the process that held the claim was SIGKILLed, so it did not keep judging"
+        simulationClass = "my.oj.perf.ContestSubmissionStepLoadSimulation"
         measuredStageLabel = "stage-0"
         measurementWindowBasis = "the hold minus steadyGuardSeconds; the preceding ramp is part of the schedule but outside every measured window"
         expectedPlan = $expectedPlan
@@ -355,6 +467,33 @@ function ConvertTo-Int64OrNull {
     return $parsed
 }
 
+function ConvertTo-DoubleOrNull {
+    param($Value)
+    # Micrometer renders an executor gauge as "16.0": a decimal point on an integer-valued metric.
+    # Parsing that with Integer styles returns null, and a null gauge means "this node could not be
+    # read" everywhere below - so an integer-only parse silently turns a busy node into an
+    # unreachable one. Float styles accept both spellings and keep the absent-is-not-zero rule.
+    if ($null -eq $Value) { return $null }
+    $parsed = 0.0
+    if (-not [double]::TryParse([string]$Value, [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) { return $null }
+    return $parsed
+}
+
+function Get-ResponseText {
+    param([Parameter(Mandatory = $true)]$Response)
+    # Windows PowerShell 5.1 hands back Invoke-WebRequest's Content as a byte array whenever the
+    # response media type is not text/*, and Spring's actuator media type
+    # (application/vnd.spring-boot.actuator.v3+json) is one of those. ConvertFrom-Json over those
+    # bytes yields a document with no properties instead of throwing, so a readiness probe reads
+    # "answered, but the document has no status" on every attempt and burns its entire timeout while
+    # the endpoint is answering 200 UP. /actuator/prometheus escaped this only because it is
+    # text/plain. Decoding here makes the gate independent of the media type the server chose.
+    if ($null -eq $Response) { return "" }
+    if ($Response.Content -is [byte[]]) { return [System.Text.Encoding]::UTF8.GetString($Response.Content) }
+    return [string]$Response.Content
+}
+
 function Wait-Healthy {
     param([switch]$ObserveRecovery)
     $deadline = (Get-Date).AddMinutes(5)
@@ -373,11 +512,16 @@ function Wait-Healthy {
 function Wait-JudgeMetrics {
     param(
         [Parameter(Mandatory = $true)][string]$Node,
-        [switch]$ObserveRecovery
+        [switch]$ObserveRecovery,
+        [scriptblock]$OnPoll = $null
     )
     $port = if ($Node -eq "judge-1") { 19001 } else { 19002 }
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline) {
+        # Observation is offered to the caller on every poll rather than owning the wait. A fault run
+        # needs its 1s series to continue across the restart, and the deadline this loop answers to is
+        # checked before the poll, so a slow sample can only delay the next check, never move the clock.
+        if ($null -ne $OnPoll) { & $OnPoll }
         if ($ObserveRecovery) {
             Observe-FaultRecovery "restart-wait"
         }
@@ -396,8 +540,8 @@ function Save-MetricsSnapshot {
     foreach ($entry in @(@("batch-1", 19000), @("judge-1", 19001), @("judge-2", 19002))) {
         $path = Join-Path $runDirectory "metrics\$Label-$($entry[0]).prom"
         try {
-            (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri "http://127.0.0.1:$($entry[1])/actuator/prometheus").Content |
-                Set-Content $path -Encoding utf8
+            $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri "http://127.0.0.1:$($entry[1])/actuator/prometheus"
+            Get-ResponseText -Response $response | Set-Content $path -Encoding utf8
         } catch {
             "# unavailable: $($_.Exception.Message)" | Set-Content $path -Encoding utf8
         }
@@ -422,6 +566,40 @@ function Get-JudgeGauges {
     return $values
 }
 
+function Add-SampleRow {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Row,
+        [int]$Attempts = 12,
+        [int]$RetryMilliseconds = 250
+    )
+    # The samplers append one row a second for the whole measured hold, and a single failed append used
+    # to end the run. A measurement is minutes long, so losing one to a transient reader that holds the
+    # file for a moment is the wrong trade: the second smoke run died at its 28th sample with
+    # "being used by another process" on this exact call, and the reader was the operator's own
+    # diagnostic read of the live file, not anything in the system under test.
+    #
+    # Retrying does not hide a failure. The wait is bounded, every retry is counted, the count is
+    # reported in events.json, and exhausting the attempts still throws with the last error - so a row
+    # that could not be written is a failed run exactly as before, and a row that was written a quarter
+    # of a second late is visible as a retry rather than silently absorbed.
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Add-Content -Path $Path -Value $Row -Encoding utf8 -ErrorAction Stop
+            if ($attempt -gt 1) {
+                $script:sampleWriteRetries++
+                # A hashtable member, so the write lands on the object the run serializes and not on a
+                # copy of it in this function's scope.
+                $events.sampleWriteRetries = $script:sampleWriteRetries
+            }
+            return
+        } catch {
+            if ($attempt -eq $Attempts) { throw }
+            Start-Sleep -Milliseconds $RetryMilliseconds
+        }
+    }
+}
+
 function Save-CapacitySample {
     param([Parameter(Mandatory = $true)][string]$Phase)
     $path = Join-Path $runDirectory "capacity.csv"
@@ -430,8 +608,7 @@ function Save-CapacitySample {
     }
     foreach ($entry in @(@("judge-1", 19001), @("judge-2", 19002))) {
         $values = Get-JudgeGauges -Port $entry[1]
-        "$([datetimeoffset]::UtcNow.ToString('o')),$Phase,$($entry[0]),$($values.running),$($values.queued),$($values.reserved)" |
-            Add-Content $path -Encoding utf8
+        Add-SampleRow -Path $path -Row "$([datetimeoffset]::UtcNow.ToString('o')),$Phase,$($entry[0]),$($values.running),$($values.queued),$($values.reserved)"
     }
 }
 
@@ -445,7 +622,7 @@ function Save-BacklogSample {
     # null so a caller cannot read "0" as a drained pipeline.
     $pendingText = if ($null -eq $pending) { "" } else { [string]$pending }
     $unappliedText = if ($null -eq $unapplied) { "" } else { [string]$unapplied }
-    "$( [datetimeoffset]::UtcNow.ToString('o')),$Phase,$pendingText,$unappliedText" | Add-Content $path -Encoding utf8
+    Add-SampleRow -Path $path -Row "$( [datetimeoffset]::UtcNow.ToString('o')),$Phase,$pendingText,$unappliedText"
     if ($null -eq $pending -or $null -eq $unapplied) { return $null }
     return ($pending + $unapplied)
 }
@@ -482,6 +659,9 @@ function Save-ClaimSnapshot {
         # Never label the all-active upper bound as the killed node's exact cohort.
         ids = if ($hasClaimedBy) { @($objects.submissionId) } else { @() }
         observedActiveClaimCount = @($objects).Count
+        # The raw rows are handed back so the kill snapshot can report claimed_at ages without a
+        # second query against a table that is only frozen after the kill.
+        rows = $objects
     }
 }
 
@@ -899,7 +1079,7 @@ UNION ALL SELECT 'questions', VARIABLE_VALUE FROM performance_schema.global_stat
         "$($judge2.running),$($judge2.queued),$($judge2.reserved)," +
         "$($values.threadsConnected),$($values.threadsRunning),$($values.rowLockCurrentWaits)," +
         "$($values.rowLockWaits),$($values.questions)"
-    $row | Add-Content $path -Encoding utf8
+    Add-SampleRow -Path $path -Row $row
 
     # capacity.csv keeps the run-level executor aggregate the analyzer already reports.
     $capacityPath = Join-Path $runDirectory "capacity.csv"
@@ -907,14 +1087,18 @@ UNION ALL SELECT 'questions', VARIABLE_VALUE FROM performance_schema.global_stat
         "timestamp,phase,node,running,localWaiting,reserved" | Set-Content $capacityPath -Encoding utf8
     }
     foreach ($entry in @(@("judge-1", $judge1), @("judge-2", $judge2))) {
-        "$($tickStart.ToString('o')),$Phase,$($entry[0]),$($entry[1].running),$($entry[1].queued),$($entry[1].reserved)" |
-            Add-Content $capacityPath -Encoding utf8
+        Add-SampleRow -Path $capacityPath -Row "$($tickStart.ToString('o')),$Phase,$($entry[0]),$($entry[1].running),$($entry[1].queued),$($entry[1].reserved)"
     }
 
     return [pscustomobject]@{
         unfinishedContest = ConvertTo-Int64OrNull $values.unfinishedContest
         unfinishedGlobal = ConvertTo-Int64OrNull $values.unfinishedGlobal
         unappliedContest = ConvertTo-Int64OrNull $values.unappliedContest
+        # Carried for the fault-recovery loop, which derives its rolling result throughput from the
+        # same tick it places its backlog samples on. The staircase's own consumers read the three
+        # fields above and are unaffected by the two extra ones.
+        accepted = ConvertTo-Int64OrNull $values.accepted
+        results = ConvertTo-Int64OrNull $values.results
     }
 }
 
@@ -981,18 +1165,865 @@ function Get-PromMetricDelta {
         if ($null -eq $end) { return $null }
         # Lazy Micrometer meters do not exist in the startup scrape until first use.
         if ($null -eq $start) { $start = 0.0 }
-        if ($FaultEnabled -and $node -eq $KilledNode) {
+        # The recombination is only valid when a fault was actually injected: it needs the "pre-fault"
+        # scrape, and it is only correct for a node whose JVM was replaced. Keying on the requested
+        # mode rather than the injection would silently drop the killed node's whole pre-kill
+        # contribution in a recovery run that never fired, by subtracting a baseline that was never
+        # taken. So the flag is set at the injection, not from the parameters.
+        if ($faultWasInjected -and $node -eq $KilledNode) {
             $beforeKill = Get-PromMetricSum "pre-fault" $Metric $RequiredTag $node
             if ($null -eq $beforeKill) { $beforeKill = 0.0 }
             # The killed JVM contributes start..pre-fault. Its replacement JVM
             # starts counters at zero, so its complete end value is the recovery
             # contribution; subtracting a post-restart scrape would drop work.
+            # The sum is invariant to when "pre-fault" was taken, so taking it as
+            # late as possible only shrinks the window whose increments are lost.
             $total += [math]::Max(0, $beforeKill - $start) + [math]::Max(0, $end)
         } else {
             $total += [math]::Max(0, $end - $start)
         }
     }
     return $total
+}
+
+function Get-PercentileValue {
+    param([object[]]$Values, [double]$Percentile)
+    # Nearest rank, the same rule as the analyzer's Get-Percentile, so a baseline computed here and
+    # the same baseline recomputed from timeseries.csv cannot disagree about the same sample set.
+    $clean = @($Values | Where-Object { $null -ne $_ } | Sort-Object)
+    if ($clean.Count -eq 0) { return $null }
+    $index = [int][math]::Max(0, [math]::Ceiling($clean.Count * $Percentile) - 1)
+    if ($index -ge $clean.Count) { $index = $clean.Count - 1 }
+    return [double]$clean[$index]
+}
+
+function Wait-UntilDeadline {
+    param(
+        [Parameter(Mandatory = $true)][datetimeoffset]$Deadline,
+        [int]$QuantumMilliseconds = 200
+    )
+    # The only clock authority for a deadline this experiment has to hit. It performs no I/O, takes no
+    # sample and runs no analysis, so nothing observed elsewhere in the loop can move the deadline it
+    # waits for. The overshoot is bounded by the final slice and is reported by the caller as an
+    # explicit error rather than absorbed silently.
+    while ($true) {
+        $remaining = ($Deadline - [datetimeoffset]::UtcNow).TotalMilliseconds
+        if ($remaining -le 0) { return }
+        $slice = [int][math]::Min($QuantumMilliseconds, [math]::Ceiling($remaining))
+        if ($slice -lt 1) { $slice = 1 }
+        Start-Sleep -Milliseconds $slice
+    }
+}
+
+function Get-DockerField {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    # A single-value docker read whose stdout is parsed. Same stderr-to-file discipline as
+    # Invoke-Compose: under $ErrorActionPreference = "Stop" a native command's stderr becomes a
+    # terminating ErrorRecord, which would turn a benign inspect warning into a failed run.
+    $stderrFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $output = & docker @Arguments 2>$stderrFile
+        } finally { $ErrorActionPreference = $previousPreference }
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return ((@($output | ForEach-Object { [string]$_ }) -join "`n").Trim())
+    } finally {
+        Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Wait-ContainerRunning {
+    param(
+        [Parameter(Mandatory = $true)][string]$Node,
+        [int]$TimeoutSeconds = 180,
+        [scriptblock]$OnPoll = $null
+    )
+    # Deliberately not Wait-Healthy. That gate requires all nine containers at once and calls
+    # docker inspect on every one of them, so it cannot pass while a node is down and its two second
+    # poll would hold the restart window open. This asks about one container and returns the instant
+    # it first reads running.
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $containerId = ""
+    while ((Get-Date) -lt $deadline) {
+        if (-not $containerId) {
+            $candidates = @(Invoke-Compose -Arguments @("ps", "-q", $Node) | Where-Object { $_ })
+            if ($candidates.Count -gt 0) { $containerId = $candidates[0] }
+        }
+        if ($containerId) {
+            $running = Get-DockerField -Arguments @("inspect", "--format", "{{.State.Running}}", $containerId)
+            if ("$running" -eq "true") { return [datetimeoffset]::UtcNow }
+        }
+        if ($null -ne $OnPoll) { & $OnPoll }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "$Node did not report a running container within $TimeoutSeconds seconds."
+}
+
+function Test-NodeReadiness {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$Port/actuator/health/readiness"
+        $httpStatus = [int]$response.StatusCode
+        $text = Get-ResponseText -Response $response
+        # Every path returns a status string that says something. An empty status in the timeout
+        # message is what made the first smoke run's readiness failure unreadable, so a body that
+        # cannot be interpreted is reported as its own observation rather than as silence.
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            return [pscustomobject]@{ up = $false; httpStatus = $httpStatus; status = "empty body (HTTP $httpStatus)" }
+        }
+        $document = $text | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $document.status) {
+            $excerpt = $text.Substring(0, [math]::Min(120, $text.Length))
+            return [pscustomobject]@{
+                up = $false; httpStatus = $httpStatus
+                status = "no status field (HTTP $httpStatus): $excerpt"
+            }
+        }
+        return [pscustomobject]@{ up = ("$($document.status)" -eq "UP"); httpStatus = $httpStatus; status = [string]$document.status }
+    } catch {
+        # Spring answers 503 while the readiness group is DOWN, and 503 is an exception here, so the
+        # transition to UP is the observable event rather than a status string that was read.
+        return [pscustomobject]@{ up = $false; httpStatus = $null; status = "unreachable-or-down: $($_.Exception.Message)" }
+    }
+}
+
+function Get-ClaimCallsTotal {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    try {
+        $content = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$Port/actuator/prometheus").Content
+        $match = [regex]::Match($content, "(?m)^contest_judge_claim_calls_total(?:\{[^}]*\})?\s+([^\s]+)$")
+        if (-not $match.Success) { return $null }
+        $value = 0.0
+        if (-not [double]::TryParse($match.Groups[1].Value, [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$value)) { return $null }
+        return $value
+    } catch { return $null }
+}
+
+function Wait-JudgeNodeReady {
+    param(
+        [Parameter(Mandatory = $true)][string]$Node,
+        [Parameter(Mandatory = $true)][int]$Port,
+        [int]$ReadinessTimeoutSeconds = 180,
+        [int]$DispatcherTimeoutSeconds = 90,
+        [scriptblock]$OnPoll = $null,
+        $Progress = $null
+    )
+    # Four gates in order, because each one's evidence only means something once the previous holds.
+    # gate 1: the container is running. gate 2: Spring's readiness group is UP. gate 3: the judge's
+    # metrics endpoint can be scraped. gate 4: the dispatcher has actually claimed since it started.
+    # Gate 4 is the only one that distinguishes "a JVM is up" from "the judge is serving": the judge
+    # container's own healthcheck is `grep -aq java /proc/1/cmdline`, so docker calls it healthy as
+    # soon as PID 1 is Java. The replacement JVM's counters start at zero, which makes the first
+    # scrape a floor rather than a baseline - a strictly larger later value is what proves polling.
+    #
+    # $Progress is a sink the caller keeps. Each gate's instant is written into it the moment that
+    # gate passes, so a later gate's timeout leaves the earlier evidence intact: the first smoke run
+    # lost containerRunningAt and readinessAt entirely because they were only assigned on the success
+    # path, which made "readiness never came up" indistinguishable from "the container never started".
+    # $OnPoll is the caller's observation tick. A fault run needs its 1s series to keep running across
+    # the restart; every gate below checks its own deadline before polling, so a slow tick can delay
+    # the next check but cannot move a deadline.
+    $containerRunningAt = Wait-ContainerRunning -Node $Node -TimeoutSeconds $ReadinessTimeoutSeconds -OnPoll $OnPoll
+    if ($null -ne $Progress) { $Progress.containerRunningAt = $containerRunningAt }
+    $readinessDeadline = (Get-Date).AddSeconds($ReadinessTimeoutSeconds)
+    $readinessAt = $null
+    $lastReadiness = ""
+    $lastHttpStatus = $null
+    $readinessAttempts = 0
+    while ((Get-Date) -lt $readinessDeadline) {
+        $probe = Test-NodeReadiness -Port $Port
+        $readinessAttempts++
+        $lastReadiness = $probe.status
+        $lastHttpStatus = $probe.httpStatus
+        if ($probe.up) { $readinessAt = [datetimeoffset]::UtcNow; break }
+        if ($null -ne $OnPoll) { & $OnPoll }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($null -eq $readinessAt) {
+        throw ("$Node readiness probe never reported UP within $ReadinessTimeoutSeconds seconds " +
+            "($readinessAttempts attempts, last status: $lastReadiness | last HTTP: " +
+            "$(if ($null -eq $lastHttpStatus) { 'none' } else { $lastHttpStatus })). " +
+            "The container has been running since $($containerRunningAt.ToString('o')), so this is a " +
+            "readiness-group or endpoint failure rather than a restart failure.")
+    }
+    if ($null -ne $Progress) { $Progress.readinessAt = $readinessAt }
+    Wait-JudgeMetrics -Node $Node -OnPoll $OnPoll
+    $metricsAt = [datetimeoffset]::UtcNow
+    if ($null -ne $Progress) { $Progress.metricsAt = $metricsAt }
+    $claimCallsAtFirstScrape = Get-ClaimCallsTotal -Port $Port
+    $dispatcherDeadline = (Get-Date).AddSeconds($DispatcherTimeoutSeconds)
+    $dispatcherActiveAt = $null
+    $claimCallsLast = $claimCallsAtFirstScrape
+    while ((Get-Date) -lt $dispatcherDeadline) {
+        if ($null -ne $OnPoll) { & $OnPoll }
+        Start-Sleep -Milliseconds 500
+        $claimCallsLast = Get-ClaimCallsTotal -Port $Port
+        if ($null -ne $claimCallsLast -and ($null -eq $claimCallsAtFirstScrape -or $claimCallsLast -gt $claimCallsAtFirstScrape)) {
+            $dispatcherActiveAt = [datetimeoffset]::UtcNow
+            break
+        }
+    }
+    if ($null -eq $dispatcherActiveAt) {
+        throw ("$Node never showed contest_judge_claim_calls_total advancing within " +
+            "$DispatcherTimeoutSeconds seconds (first scrape $(if ($null -eq $claimCallsAtFirstScrape) { 'unavailable' } else { $claimCallsAtFirstScrape }), " +
+            "last $(if ($null -eq $claimCallsLast) { 'unavailable' } else { $claimCallsLast })), so its " +
+            "dispatcher is not confirmed active. Readiness was reached at $($readinessAt.ToString('o')).")
+    }
+    if ($null -ne $Progress) { $Progress.dispatcherActiveAt = $dispatcherActiveAt }
+    return [pscustomobject]@{
+        containerRunningAt = $containerRunningAt
+        readinessAt = $readinessAt
+        metricsAt = $metricsAt
+        dispatcherActiveAt = $dispatcherActiveAt
+        nodeReadyAt = $dispatcherActiveAt
+        containerToReadinessSeconds = [math]::Round(($readinessAt - $containerRunningAt).TotalSeconds, 3)
+        readinessToMetricsSeconds = [math]::Round(($metricsAt - $readinessAt).TotalSeconds, 3)
+        metricsToDispatcherSeconds = [math]::Round(($dispatcherActiveAt - $metricsAt).TotalSeconds, 3)
+        readinessProbeAttempts = $readinessAttempts
+        lastReadinessStatus = $lastReadiness
+        claimCallsAtFirstScrape = $claimCallsAtFirstScrape
+        claimCallsWhenActive = $claimCallsLast
+    }
+}
+
+function ConvertFrom-DbTimestamp {
+    param([string]$Value)
+    # Both sides of a claimed_at age come from MySQL in the same text form, so they are parsed with
+    # the same rule and the difference is not polluted by a client-side clock.
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $parsed = [datetime]::MinValue
+    $styles = [Globalization.DateTimeStyles]::AllowWhiteSpaces
+    if (-not [datetime]::TryParse($Value.Trim(), [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) { return $null }
+    return $parsed
+}
+
+function Save-FaultSnapshot {
+    param($Trigger, $ClaimSnapshot)
+    # Everything here is captured as close to one instant as the round trips allow, and each part's own
+    # cost is recorded so the offset from faultInjectedAt is auditable rather than assumed. The claimed
+    # rows come from Save-ClaimSnapshot, which is a cluster-wide upper bound: the schema has no
+    # claimed_by column, so rows held by the node that is about to die cannot be separated from the
+    # other node's. That is why nothing here is named after the killed node's claims.
+    $startedAt = [datetimeoffset]::UtcNow
+    $dbNowRows = @(Invoke-SqlRows "SELECT DATE_FORMAT(CURRENT_TIMESTAMP(6), '%Y-%m-%d %H:%i:%s.%f')")
+    $dbNowText = if ($dbNowRows.Count -gt 0) { [string]$dbNowRows[0] } else { "" }
+    $unfinishedGlobal = Get-SqlScalar "SELECT COUNT(*) FROM contest_judge_outbox WHERE status <> 'PUBLISHED'"
+    $unfinishedContest = Get-SqlScalar "SELECT COUNT(*) FROM contest_judge_outbox o JOIN contest_submission s ON s.id = o.submission_id WHERE s.contest_id=$($events.contestId) AND o.status <> 'PUBLISHED'"
+    $scoreboardPending = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($events.contestId) AND scoreboard_applied_at IS NULL"
+
+    $dbNow = ConvertFrom-DbTimestamp $dbNowText
+    $ages = @()
+    if ($null -ne $dbNow -and $null -ne $ClaimSnapshot -and $ClaimSnapshot.rows) {
+        foreach ($claimRow in $ClaimSnapshot.rows) {
+            $claimedAt = ConvertFrom-DbTimestamp $claimRow.claimedAt
+            if ($null -ne $claimedAt) { $ages += [math]::Round(($dbNow - $claimedAt).TotalSeconds, 3) }
+        }
+    }
+    $document = [ordered]@{
+        capturedAt = [datetimeoffset]::UtcNow.ToString("o")
+        dbNow = $dbNowText
+        signal = "SIGKILL"
+        command = "docker compose -p oj-loadtest ... kill $KilledNode"
+        trigger = $Trigger
+        atKill = [ordered]@{
+            # The gauges are the values the trigger itself read, taken immediately before the kill and
+            # time stamped: after the kill the endpoint is gone, so these are the only kill-time
+            # executor readings that can exist.
+            judge1 = $Trigger.judge1
+            judge2 = $Trigger.judge2
+            # The trigger's own gauge instant, under the name the trigger record actually uses. This
+            # read a field that does not exist on that record, so the timestamp the comment above
+            # promises was silently null in every run.
+            judge1GaugeObservedAt = $Trigger.observedAt
+            unfinishedOutboxGlobal = $unfinishedGlobal
+            unfinishedOutboxContest = $unfinishedContest
+            scoreboardPending = $scoreboardPending
+            unfinishedOutboxBasis = "one COUNT(*) per reading; a missing reading is null, never 0"
+            readSeconds = [math]::Round(([datetimeoffset]::UtcNow - $startedAt).TotalSeconds, 3)
+        }
+        claims = [ordered]@{
+            clusterWideClaimedUnfinishedUpperBound = if ($null -eq $ClaimSnapshot) { $null } else { $ClaimSnapshot.observedActiveClaimCount }
+            exact = if ($null -eq $ClaimSnapshot) { $null } else { [bool]$ClaimSnapshot.exact }
+            basis = "status='PUBLISHING' across every judge node at kill time; the outbox has no claimed_by column, so this is a cluster-wide upper bound and NOT the killed node's active claims"
+            ageSeconds = [ordered]@{
+                count = $ages.Count
+                p50 = Get-PercentileValue -Values $ages -Percentile 0.50
+                p95 = Get-PercentileValue -Values $ages -Percentile 0.95
+                max = if ($ages.Count -gt 0) { ($ages | Measure-Object -Maximum).Maximum } else { $null }
+                basis = "dbNow - claimed_at for the rows above; a claim's lease starts at its own claimed_at, so the earliest possible reclaim after the kill is the configured timeout minus this age"
+            }
+            rows = "killed-node-claims.csv"
+        }
+    }
+    $document | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDirectory "kill-snapshot.json") -Encoding utf8
+    return [pscustomobject]@{ document = $document; ages = $ages; seconds = $document.atKill.readSeconds }
+}
+
+function Get-SustainStreak {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Samples,
+        [Parameter(Mandatory = $true)][string]$Field,
+        $Ceiling,
+        [int]$SustainSeconds = 5,
+        [double]$MaxSampleGapSeconds = 2.5
+    )
+    # "Held for N consecutive seconds" is a statement about the wall clock, so the streak is grown
+    # until it covers N seconds with every sample inside it at or below the ceiling. Counting N
+    # samples and requiring their span to reach N seconds is not the same rule: five samples 1s apart
+    # span 4s, so that version excluded precisely the well-behaved series it was written for and could
+    # only ever fire on a series with a hole in it - the opposite of its intent. Growing the streak
+    # keeps the intent (a hold nobody observed does not count) while making the design case the case
+    # that passes.
+    #
+    # The gap bound is what keeps "consecutive" honest. The sampler ticks at 1s, so one missed tick is
+    # tolerated and a stalled sampler is not: a gap wider than 2.5s breaks the streak rather than
+    # bridging it, and the widest gap actually covered is returned so the resolution of the answer
+    # travels with the answer.
+    for ($i = 0; $i -lt $Samples.Count; $i++) {
+        $maxGap = 0.0
+        for ($j = $i; $j -lt $Samples.Count; $j++) {
+            $value = $Samples[$j].$Field
+            # A sample whose count did not arrive breaks the streak rather than counting as zero.
+            if ($null -eq $value -or $value -gt $Ceiling) { break }
+            if ($j -gt $i) {
+                $gap = ($Samples[$j].at - $Samples[$j - 1].at).TotalSeconds
+                if ($gap -gt $MaxSampleGapSeconds) { break }
+                if ($gap -gt $maxGap) { $maxGap = $gap }
+            }
+            $span = ($Samples[$j].at - $Samples[$i].at).TotalSeconds
+            if ($span -ge $SustainSeconds) {
+                return [pscustomobject]@{
+                    at = $Samples[$i].at
+                    spanSeconds = [math]::Round($span, 3)
+                    maxGapSeconds = [math]::Round($maxGap, 3)
+                    sampleCount = $j - $i + 1
+                }
+            }
+        }
+    }
+    return $null
+}
+
+function Get-BacklogNormalization {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Samples,
+        [Parameter(Mandatory = $true)][datetimeoffset]$From,
+        $JudgeP95,
+        $ScoreboardP95,
+        [int]$SustainSeconds = 5,
+        [double]$MaxSampleGapSeconds = 2.5
+    )
+    $result = [pscustomobject]@{
+        judgeNormalizedAt = $null; scoreboardNormalizedAt = $null
+        combinedNormalizedAt = $null; sustainSpanSeconds = $null
+        maxSampleGapSeconds = $null; sustainSampleCount = $null
+    }
+    $afterFrom = @($Samples | Where-Object { $_.at -ge $From })
+    if ($null -eq $JudgeP95 -or $null -eq $ScoreboardP95 -or $afterFrom.Count -lt 2) { return $result }
+    $judge = Get-SustainStreak -Samples $afterFrom -Field "unfinished" -Ceiling $JudgeP95 `
+        -SustainSeconds $SustainSeconds -MaxSampleGapSeconds $MaxSampleGapSeconds
+    $scoreboard = Get-SustainStreak -Samples $afterFrom -Field "unapplied" -Ceiling $ScoreboardP95 `
+        -SustainSeconds $SustainSeconds -MaxSampleGapSeconds $MaxSampleGapSeconds
+    if ($null -ne $judge) {
+        $result.judgeNormalizedAt = $judge.at
+        $result.sustainSpanSeconds = $judge.spanSeconds
+        $result.maxSampleGapSeconds = $judge.maxGapSeconds
+        $result.sustainSampleCount = $judge.sampleCount
+    }
+    if ($null -ne $scoreboard) { $result.scoreboardNormalizedAt = $scoreboard.at }
+    if ($null -ne $result.judgeNormalizedAt -and $null -ne $result.scoreboardNormalizedAt) {
+        $result.combinedNormalizedAt = if ($result.judgeNormalizedAt -gt $result.scoreboardNormalizedAt) {
+            $result.judgeNormalizedAt
+        } else { $result.scoreboardNormalizedAt }
+    }
+    return $result
+}
+
+function Get-FaultRecoveryDerived {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Samples,
+        [Parameter(Mandatory = $true)][datetimeoffset]$FaultAt,
+        $NodeReadyAt,
+        [int]$PreFaultSeconds = 30,
+        [int]$PreFaultTailExclusionSeconds = 5,
+        [int]$SustainSeconds = 5,
+        [double]$MaxSampleGapSeconds = 2.5,
+        [int]$PostRecoveryDelaySeconds = 10,
+        [int]$MinPostRecoverySeconds = 20,
+        [double]$ThroughputRecoveryRatio = 0.90,
+        [int]$ThroughputWindowSeconds = 5,
+        [int]$MaxWindowSpanSeconds = 10,
+        [int]$ThroughputConsecutiveWindows = 3
+    )
+    # Every number here is derived from this run's own 1s samples rather than from a clock, so a
+    # sampler that fell behind changes the resolution of the answer and never the answer itself.
+    # The judge backlog and the scoreboard backlog are baselined, tested and reported separately:
+    # their sum can sit at its usual value while one of the two carries all of the recovery, and a
+    # single combined baseline would hide exactly that.
+    $baselineFrom = $FaultAt.AddSeconds(-$PreFaultSeconds)
+    $baselineTo = $FaultAt.AddSeconds(-$PreFaultTailExclusionSeconds)
+    $baseline = @($Samples | Where-Object { $_.at -ge $baselineFrom -and $_.at -lt $baselineTo })
+    $judgeBaseline = @($baseline | Where-Object { $null -ne $_.unfinished })
+    $scoreboardBaseline = @($baseline | Where-Object { $null -ne $_.unapplied })
+    $judgeP95 = Get-PercentileValue -Values @($judgeBaseline | ForEach-Object { $_.unfinished }) -Percentile 0.95
+    $scoreboardP95 = Get-PercentileValue -Values @($scoreboardBaseline | ForEach-Object { $_.unapplied }) -Percentile 0.95
+
+    # A single sample below the baseline is not a normalisation: the surviving node drains the backlog
+    # while the killed one is still being restarted, so one dip proves nothing about a recovered
+    # pipeline. Both conditions must hold together, for the whole sustain window, and a sample whose
+    # count did not arrive breaks the streak rather than counting as zero.
+    #
+    # The reported instant is searched from max(faultInjectedAt, nodeReadyAt) because cohort D is
+    # defined as nodeReadyAt -> backlogNormalizedAt, and an instant before the replacement node was
+    # serving cannot be the end of that cohort. The same search is also run from faultInjectedAt and
+    # reported beside it when it lands earlier, because a surviving node draining the backlog alone is
+    # a finding about the lease rather than a rounding error.
+    $searchFromAt = $FaultAt
+    if ($null -ne $NodeReadyAt -and $NodeReadyAt -gt $FaultAt) { $searchFromAt = $NodeReadyAt }
+    $gated = Get-BacklogNormalization -Samples $Samples -From $searchFromAt -JudgeP95 $judgeP95 `
+        -ScoreboardP95 $scoreboardP95 -SustainSeconds $SustainSeconds -MaxSampleGapSeconds $MaxSampleGapSeconds
+    $ungated = Get-BacklogNormalization -Samples $Samples -From $FaultAt -JudgeP95 $judgeP95 `
+        -ScoreboardP95 $scoreboardP95 -SustainSeconds $SustainSeconds -MaxSampleGapSeconds $MaxSampleGapSeconds
+    $judgeNormalizedAt = $gated.judgeNormalizedAt
+    $scoreboardNormalizedAt = $gated.scoreboardNormalizedAt
+    $normalizedAt = $gated.combinedNormalizedAt
+    $earliestNormalizedAt = $null
+    if ($null -ne $ungated.combinedNormalizedAt -and
+        ($null -eq $normalizedAt -or $ungated.combinedNormalizedAt -lt $normalizedAt)) {
+        $earliestNormalizedAt = $ungated.combinedNormalizedAt
+    }
+
+    # Pre-fault result throughput is measured over the same window the backlog baseline uses, so the
+    # two describe one steady state rather than two.
+    $preFaultRps = $null
+    if ($judgeBaseline.Count -ge 2 -and $null -ne $judgeBaseline[0].results -and $null -ne $judgeBaseline[-1].results) {
+        $span = ($judgeBaseline[-1].at - $judgeBaseline[0].at).TotalSeconds
+        if ($span -gt 0) { $preFaultRps = ($judgeBaseline[-1].results - $judgeBaseline[0].results) / $span }
+    }
+    $recoveredAt = $null
+    $rolling = @()
+    $rollingSpanMaxSeconds = $null
+    if ($null -ne $preFaultRps -and $preFaultRps -gt 0) {
+        $threshold = $ThroughputRecoveryRatio * $preFaultRps
+        for ($i = 1; $i -lt $Samples.Count; $i++) {
+            if ($null -eq $Samples[$i].results) { continue }
+            $j = $i - 1
+            while ($j -gt 0 -and ($Samples[$i].at - $Samples[$j].at).TotalSeconds -lt $ThroughputWindowSeconds) { $j-- }
+            $span = ($Samples[$i].at - $Samples[$j].at).TotalSeconds
+            # A window spanning much more than its nominal length is not a five second rate: walking
+            # back only to "at least 5s earlier" turns a sampling hole into one long average, and the
+            # recovery instant read off it would be an artefact of the hole rather than of recovery.
+            if ($span -lt $ThroughputWindowSeconds -or $span -gt $MaxWindowSpanSeconds) { continue }
+            if ($null -eq $Samples[$j].results) { continue }
+            $rolling += [pscustomobject]@{
+                at = $Samples[$i].at
+                rps = ($Samples[$i].results - $Samples[$j].results) / $span
+                span = $span
+            }
+        }
+        if ($rolling.Count -gt 0) {
+            $rollingSpanMaxSeconds = [math]::Round((($rolling | Measure-Object -Property span -Maximum).Maximum), 3)
+        }
+        for ($i = 0; $i -le ($rolling.Count - $ThroughputConsecutiveWindows); $i++) {
+            # Neither an instant before the fault nor one before the replacement node was serving can
+            # be the throughput recovery. The first is the steady state itself - which is how a smoke
+            # run reported a recovery 24s before its own kill - and the second is the outage.
+            if ($rolling[$i].at -lt $searchFromAt) { continue }
+            $held = $true
+            for ($j = $i; $j -lt ($i + $ThroughputConsecutiveWindows); $j++) {
+                if ($rolling[$j].rps -lt $threshold) { $held = $false }
+            }
+            if ($held) { $recoveredAt = $rolling[$i].at; break }
+        }
+    }
+
+    # The post-recovery steady window is only meaningful if the load was still arriving when it began.
+    # A normalisation that lands after the last arrival would otherwise be reported as recovered steady
+    # state when it is really an empty pipeline.
+    $postRecovery = [ordered]@{
+        available = $false
+        # The delay before the window opens and the minimum length the window must have are two
+        # different numbers. The analyzer's own block used "requestedSeconds" for the second while this
+        # one used it for the first, so the two documents disagreed on paper while agreeing on the
+        # instant they computed. Both are named explicitly here.
+        preWindowDelaySeconds = $PostRecoveryDelaySeconds
+        minimumWindowSeconds = $MinPostRecoverySeconds
+        actualSeconds = $null
+        sampleSpanSeconds = $null
+        sampleCount = 0
+        reason = "no normalisation was observed"
+    }
+    if ($null -ne $normalizedAt -and $Samples.Count -gt 0) {
+        $from = $normalizedAt.AddSeconds($PostRecoveryDelaySeconds)
+        $remaining = $Samples[-1].at - $from
+        $window = @($Samples | Where-Object { $_.at -ge $from })
+        $postRecovery.actualSeconds = [math]::Round($remaining.TotalSeconds, 3)
+        $postRecovery.sampleCount = $window.Count
+        if ($window.Count -gt 0) {
+            $postRecovery.sampleSpanSeconds = [math]::Round(($window[-1].at - $window[0].at).TotalSeconds, 3)
+        }
+        if ($remaining.TotalSeconds -lt $MinPostRecoverySeconds) {
+            $postRecovery.reason = "only $([math]::Round($remaining.TotalSeconds, 3))s of measured load remained after backlogNormalizedAt + ${PostRecoveryDelaySeconds}s, below the ${MinPostRecoverySeconds}s floor; a shorter window is not a steady state"
+        } else {
+            $postRecovery.available = $true
+            $postRecovery.reason = "held from backlogNormalizedAt + ${PostRecoveryDelaySeconds}s to the end of the measured load"
+        }
+    }
+    return [pscustomobject]@{
+        preFaultWindow = [ordered]@{
+            from = $baselineFrom.ToString("o"); to = $baselineTo.ToString("o")
+            sampleCount = $baseline.Count
+            basis = "faultInjectedAt - ${PreFaultSeconds}s to faultInjectedAt - ${PreFaultTailExclusionSeconds}s; the excluded tail keeps arrivals that landed while the trigger was being polled out of the baseline"
+        }
+        baselines = [ordered]@{
+            judgeBacklogP95 = $judgeP95; judgeBacklogSamples = $judgeBaseline.Count
+            scoreboardPendingP95 = $scoreboardP95; scoreboardPendingSamples = $scoreboardBaseline.Count
+        }
+        normalization = [ordered]@{
+            judgeBacklogNormalizedAt = if ($null -eq $judgeNormalizedAt) { $null } else { $judgeNormalizedAt.ToString("o") }
+            scoreboardBacklogNormalizedAt = if ($null -eq $scoreboardNormalizedAt) { $null } else { $scoreboardNormalizedAt.ToString("o") }
+            backlogNormalizedAt = if ($null -eq $normalizedAt) { $null } else { $normalizedAt.ToString("o") }
+            # The same search run from faultInjectedAt instead of from max(fault, nodeReadyAt). Reported
+            # only when it lands earlier, which is the surviving node draining the backlog alone.
+            earliestNormalizedAt = if ($null -eq $earliestNormalizedAt) { $null } else { $earliestNormalizedAt.ToString("o") }
+            earliestNormalizedBasis = "searched from faultInjectedAt, so it can precede nodeReadyAt: the surviving node alone can drain the backlog while the killed node is still down"
+            searchFromAt = $searchFromAt.ToString("o")
+            sustainSeconds = $SustainSeconds
+            sustainSpanSeconds = $gated.sustainSpanSeconds
+            # How much of the hold rests on samples that were actually taken. maxSampleGapSeconds is the
+            # widest gap inside the accepted streak, so a hold confirmed by a 1s series and one confirmed
+            # by three samples across a 2.5s gap are told apart here instead of looking identical.
+            maxSampleGapSeconds = $gated.maxSampleGapSeconds
+            sustainSampleCount = $gated.sustainSampleCount
+            maxSampleGapLimitSeconds = $MaxSampleGapSeconds
+            basis = "the first sample after which each backlog stayed at or below its own pre-fault p95 for ${SustainSeconds}s of wall clock, searched from max(faultInjectedAt, nodeReadyAt); the streak is grown until it covers ${SustainSeconds}s with every sample at or below the baseline and no gap inside it wider than ${MaxSampleGapSeconds}s, so a well-observed 1s series satisfies it and a sampling hole does not. The combined instant is the later of the two, and the two are reported separately"
+            judgeSecondsAfterFault = if ($null -eq $judgeNormalizedAt) { $null } else { [math]::Round(($judgeNormalizedAt - $FaultAt).TotalSeconds, 3) }
+            scoreboardSecondsAfterFault = if ($null -eq $scoreboardNormalizedAt) { $null } else { [math]::Round(($scoreboardNormalizedAt - $FaultAt).TotalSeconds, 3) }
+            combinedSecondsAfterFault = if ($null -eq $normalizedAt) { $null } else { [math]::Round(($normalizedAt - $FaultAt).TotalSeconds, 3) }
+            combinedSecondsAfterNodeReady = if ($null -eq $normalizedAt -or $null -eq $NodeReadyAt) { $null } else { [math]::Round(($normalizedAt - $NodeReadyAt).TotalSeconds, 3) }
+        }
+        throughput = [ordered]@{
+            preFaultResultRps = $preFaultRps
+            thresholdRps = if ($null -eq $preFaultRps) { $null } else { $ThroughputRecoveryRatio * $preFaultRps }
+            ratio = $ThroughputRecoveryRatio
+            windowSeconds = $ThroughputWindowSeconds
+            consecutiveWindows = $ThroughputConsecutiveWindows
+            rollingSampleCount = $rolling.Count
+            rollingSpanMaxSeconds = $rollingSpanMaxSeconds
+            recoveredAt = if ($null -eq $recoveredAt) { $null } else { $recoveredAt.ToString("o") }
+            secondsAfterFault = if ($null -eq $recoveredAt) { $null } else { [math]::Round(($recoveredAt - $FaultAt).TotalSeconds, 3) }
+            secondsAfterNodeReady = if ($null -eq $recoveredAt -or $null -eq $NodeReadyAt) { $null } else { [math]::Round(($recoveredAt - $NodeReadyAt).TotalSeconds, 3) }
+            basis = "5s rolling result RPS from the same 1s samples, each window spanning between ${ThroughputWindowSeconds}s and ${MaxWindowSpanSeconds}s so a sampling hole cannot pass as a rate, held at or above ${ThroughputRecoveryRatio} of the pre-fault value for ${ThroughputConsecutiveWindows} consecutive windows after max(faultInjectedAt, nodeReadyAt)"
+        }
+        postRecoveryWindow = $postRecovery
+        recoveryTimeout = ($null -eq $normalizedAt)
+    }
+}
+
+function Step-FaultRecoverySample {
+    # The measured phase's single sampling tick, reachable from inside a wait as well as from the main
+    # loop. A fault run's backlog peak, its normalisation instant and its throughput recovery are all
+    # read off this series, so it has to keep running while the loop is waiting on a restart or on a
+    # readiness gate. A wait that owns the clock outright is a wait that leaves a hole exactly where
+    # the recovery is: the first smoke run sampled until 3s before its kill and then not again for 140
+    # seconds, which is why its backlog peak and normalisation could not be computed at all.
+    $state = $script:faultSampling
+    if ($null -eq $state) { return }
+    $now = [datetimeoffset]::UtcNow
+    if ($now -lt $state.nextTick) { return }
+    Save-StaircaseBoundarySnapshots -Trace $state.trace -NowMillis $now.ToUnixTimeMilliseconds() -Captured $state.captured
+    $sample = Save-StaircaseSample -Phase "load" -Trace $state.trace -ContestId $state.contestId
+    $state.samples.Add([pscustomobject]@{
+        at = $now; unfinished = $sample.unfinishedContest
+        unapplied = $sample.unappliedContest; accepted = $sample.accepted; results = $sample.results
+    })
+    $state.nextTick = $state.nextTick.AddSeconds(1)
+    if (([datetimeoffset]::UtcNow - $state.nextTick).TotalMilliseconds -gt 1000) { $state.nextTick = [datetimeoffset]::UtcNow }
+}
+
+function Invoke-FaultRecoveryPhase {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [Parameter(Mandatory = $true)]$Trace,
+        [Parameter(Mandatory = $true)][long]$ContestId,
+        $CapturedBoundaries
+    )
+    # The measured phase of a fault-recovery run. Everything the experiment reports afterwards is
+    # derived from this loop's own samples, so the loop is written deadline-first: the trigger, the
+    # restart deadline and the readiness gates are all evaluated before the sampler is allowed to run,
+    # and the wait for the restart deadline performs no I/O of any kind. A sampler tick costs most of
+    # a second, and letting one sit between the clock and a deadline is exactly how a measured 15s
+    # outage becomes an unmeasured 17s one.
+    $killedPort = if ($KilledNode -eq "judge-1") { 19001 } else { 19002 }
+    $measurementStartedAt = [datetimeoffset]::Parse($events.measurementStartedAt)
+    # The window opens on a clock; the kill does not. faultScheduledAt therefore means "the trigger
+    # window opened", which is why it can be recorded before any sample exists.
+    $windowOpenAt = $measurementStartedAt.AddSeconds($FaultMinSteadySeconds)
+    $triggerWaitEndsAt = $windowOpenAt.AddSeconds($FaultTriggerWaitSeconds)
+    $events.faultScheduledAt = $windowOpenAt.ToString("o")
+
+    $samples = New-Object System.Collections.Generic.List[object]
+    $injected = $false
+    $escalation = $null
+    $triggerRecord = $null
+    $activeWorkSeen = $false
+    $restartRequested = $false
+    $restartScheduledAt = $null
+    $downObserveUntil = $null
+    $nodeReadyChecked = $false
+    $nodeReadyDetail = $null
+    $nodeReadyFailure = $null
+    $killSnapshot = $null
+    $downWindowObservationCount = 0
+    $nextTick = [datetimeoffset]::UtcNow
+    $script:staircaseLastTickUtc = $null
+    # The sampling tick is published to script scope so the waiting helpers can keep the series alive
+    # while they wait. The list is the same object this function reads at the end, so a sample taken
+    # inside a wait is in this function's series afterwards. nextTick lives here rather than in a local
+    # so the loop and the waits cannot drift apart on when the next tick is due.
+    $script:faultSampling = [ordered]@{
+        samples = $samples
+        nextTick = $nextTick
+        trace = $Trace
+        contestId = $ContestId
+        captured = $CapturedBoundaries
+    }
+    Write-Host ("[fault] measurement started $($events.measurementStartedAt); the trigger window opens at " +
+        "$($windowOpenAt.ToString('o')) (measurement + ${FaultMinSteadySeconds}s) and is polled until $($triggerWaitEndsAt.ToString('o'))")
+
+    while (-not $Process.HasExited) {
+        $now = [datetimeoffset]::UtcNow
+
+        # ---- A. trigger evaluation, before any sampling ----
+        if (-not $injected -and $null -eq $escalation -and $now -ge $windowOpenAt) {
+            $gaugeAt = [datetimeoffset]::UtcNow
+            $judge1 = Get-JudgeGauges -Port 19001
+            $judge2 = Get-JudgeGauges -Port 19002
+            # Float styles, because Micrometer prints these gauges as "16.0": a decimal point on a
+            # value that is always an integer. Parsing them with Integer styles returns null for every
+            # reading, and null is defined here to mean "this node could not be read", so an
+            # integer-only parse turned a node with six in-flight judgements into no active work - the
+            # trigger recorded escalation "no-active-work" while its own snapshot showed running 6.0 and
+            # reserved 6.0, and every run would have been refused as faulted without active work.
+            $running1 = ConvertTo-DoubleOrNull $judge1.running
+            $reserved1 = ConvertTo-DoubleOrNull $judge1.reserved
+            $running2 = ConvertTo-DoubleOrNull $judge2.running
+            $reserved2 = ConvertTo-DoubleOrNull $judge2.reserved
+            # An unreachable node's gauge is absent, not zero, so it cannot be read as "no work".
+            $values = @(@($running1, $reserved1, $running2, $reserved2) | Where-Object { $null -ne $_ -and $_ -ge 1 })
+            if ($values.Count -gt 0) { $activeWorkSeen = $true }
+            $onTarget = ($null -ne $running1 -and $running1 -ge $FaultMinRunning -and $null -ne $reserved1 -and $reserved1 -ge $FaultMinReserved)
+            $fallback = ($null -ne $running1 -and $running1 -ge $FaultMinRunning -and $null -ne $reserved1 -and $reserved1 -ge $FaultFallbackMinReserved)
+            if ($onTarget) {
+                $escalation = "reserved>=$FaultMinReserved"
+            } elseif ($now -ge $triggerWaitEndsAt) {
+                $escalation = if ($fallback) { "reserved>=$FaultFallbackMinReserved-fallback" }
+                    elseif (-not $activeWorkSeen) { "no-active-work" }
+                    else { "window-elapsed-below-primary-threshold" }
+            }
+            if ($null -ne $escalation) {
+                $triggerRecord = [ordered]@{
+                    windowOpenedAt = $windowOpenAt.ToString("o")
+                    observedAt = $gaugeAt.ToString("o")
+                    escalation = $escalation
+                    waitedSeconds = [math]::Round(($gaugeAt - $windowOpenAt).TotalSeconds, 3)
+                    primaryCondition = "running >= $FaultMinRunning and reserved >= $FaultMinReserved"
+                    fallbackCondition = "running >= $FaultMinRunning and reserved >= $FaultFallbackMinReserved once the window elapses"
+                    primaryMinRunning = $FaultMinRunning
+                    primaryMinReserved = $FaultMinReserved
+                    fallbackMinReserved = $FaultFallbackMinReserved
+                    judge1 = @{ running = $judge1.running; reserved = $judge1.reserved; queued = $judge1.queued }
+                    judge2 = @{ running = $judge2.running; reserved = $judge2.reserved; queued = $judge2.queued }
+                    # The raw gauge text above is the evidence; these are the numbers the decision was
+                    # actually made from, so the escalation can be re-checked against them.
+                    thresholdReadings = [ordered]@{
+                        judge1Running = $running1; judge1Reserved = $reserved1
+                        judge2Running = $running2; judge2Reserved = $reserved2
+                        basis = "parsed from the raw gauge text with Float styles; an unreadable gauge is null, never 0"
+                    }
+                    activeWorkSeen = $activeWorkSeen
+                    faultNotInjectedWithActiveWork = (-not $activeWorkSeen)
+                }
+                Write-Host ("[fault] trigger fired at $($gaugeAt.ToString('o')): escalation=$escalation " +
+                    "judge1 running=$running1 reserved=$reserved1 queued=$($judge1.queued) " +
+                    "judge2 running=$running2 reserved=$reserved2 (waited $($triggerRecord.waitedSeconds)s)")
+            }
+        }
+
+        # ---- B. injection, once, still before any sampling ----
+        if (-not $injected -and $null -ne $escalation) {
+            $preFaultStartedAt = [datetimeoffset]::UtcNow
+            Save-MetricsSnapshot "pre-fault"
+            $events.preFaultSnapshotSeconds = [math]::Round(([datetimeoffset]::UtcNow - $preFaultStartedAt).TotalSeconds, 3)
+            $staleBefore = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(o.attempts - 1, 0)), 0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.contestId)"
+            $events.staleAttemptsBeforeFault = if ($null -eq $staleBefore) { 0 } else { $staleBefore }
+            Invoke-Compose -Arguments @("kill", $KilledNode)
+            $events.faultInjectedAt = [datetimeoffset]::UtcNow.ToString("o")
+            $script:faultWasInjected = $true
+            $injected = $true
+            # Scheduled from the injection itself, not from the trigger's clock position, so a slow
+            # pre-kill snapshot moves the whole outage rather than shortening it.
+            $restartScheduledAt = [datetimeoffset]::Parse($events.faultInjectedAt).AddSeconds($DownDurationSeconds)
+            $events.restartScheduledAt = $restartScheduledAt.ToString("o")
+            $events.faultInjectionLagSeconds = [math]::Round(([datetimeoffset]::Parse($events.faultInjectedAt) - [datetimeoffset]::Parse($triggerRecord.observedAt)).TotalSeconds, 3)
+            $events.faultNotInjectedWithActiveWork = (-not $activeWorkSeen)
+            $events.killSnapshotAt = [datetimeoffset]::UtcNow.ToString("o")
+            # The last two seconds before the restart belong to the clock alone, so any observation
+            # that could cost more than that is kept out of them by construction.
+            $downObserveUntil = $restartScheduledAt.AddSeconds(-2)
+            # Taken after the kill: the cluster's state is frozen, so no query here can race the kill,
+            # and the rows that are still PUBLISHING are exactly the ones the dead node was holding
+            # or waiting on - which the schema cannot attribute to a node.
+            $script:claimSnapshot = Save-ClaimSnapshot
+            $killSnapshot = Save-FaultSnapshot -Trigger $triggerRecord -ClaimSnapshot $script:claimSnapshot
+            # Positive means the kill snapshot started after the kill, which is the only order the
+            # schema allows - the snapshot describes the post-kill cluster. The previous expression
+            # subtracted the other way round, so a snapshot that started 0.68s after the kill was
+            # reported as -0.68 seconds and read as if it had preceded it.
+            $events.killToSnapshotStartSeconds = [math]::Round(
+                (([datetimeoffset]::UtcNow.AddSeconds(-$killSnapshot.seconds)) - [datetimeoffset]::Parse($events.faultInjectedAt)).TotalSeconds, 3)
+            Observe-FaultRecovery "fault"
+            Write-Host ("[fault] SIGKILL $KilledNode at $($events.faultInjectedAt); kill snapshot started " +
+                "$($events.killToSnapshotStartSeconds)s after the kill and took $($killSnapshot.seconds)s; " +
+                "restart scheduled for $($restartScheduledAt.ToString('o'))")
+        }
+
+        # ---- C. down window: the deadline owns the clock, the sampler keeps recording ----
+        if ($injected -and -not $restartRequested) {
+            if ($now -lt $downObserveUntil) {
+                # The outage is where the backlog peak is, so the 1s series continues across it. Only
+                # the last two seconds belong to the clock alone: past downObserveUntil this branch takes
+                # no sample and no reading, and waits on the deadline with no I/O of any kind.
+                Step-FaultRecoverySample
+                Observe-FaultRecovery "node-down"
+                $downWindowObservationCount++
+                $sliceEnd = $now.AddSeconds(1)
+                if ($sliceEnd -gt $downObserveUntil) { $sliceEnd = $downObserveUntil }
+                Wait-UntilDeadline -Deadline $sliceEnd
+            } else {
+                Wait-UntilDeadline -Deadline $restartScheduledAt
+                $restartRequestedAt = [datetimeoffset]::UtcNow
+                # Recorded before the docker CLI is invoked, so the CLI's own latency stays inside the
+                # outage instead of inflating the measured down duration.
+                $events.restartRequestedAt = $restartRequestedAt.ToString("o")
+                $events.restartTimingErrorSeconds = [math]::Round(($restartRequestedAt - $restartScheduledAt).TotalSeconds, 3)
+                $restartRequested = $true
+                Invoke-Compose -Arguments @("start", $KilledNode)
+                # Kept under the name the shared cohort labels already read.
+                $events.nodeRestartedAt = [datetimeoffset]::UtcNow.ToString("o")
+                Write-Host ("[fault] down window ended: restart requested at $($events.restartRequestedAt) " +
+                    "($($events.restartTimingErrorSeconds)s from schedule), container started at $($events.nodeRestartedAt), " +
+                    "observations during the down window: $downWindowObservationCount")
+            }
+            continue
+        }
+
+        # ---- D. the four readiness gates ----
+        if ($restartRequested -and -not $nodeReadyChecked) {
+            # These gates wait up to three minutes between them, and that wait is inside the recovery
+            # window the recovery metrics are read from. The sampler is handed to them rather than left
+            # behind: every gate checks its own deadline before polling, so a tick can delay the next
+            # check but cannot move a deadline.
+            Write-Host "[fault] waiting for $KilledNode to reach ready at $([datetimeoffset]::UtcNow.ToString('o'))"
+            $gateProgress = [ordered]@{}
+            try {
+                $nodeReadyDetail = Wait-JudgeNodeReady -Node $KilledNode -Port $killedPort `
+                    -ReadinessTimeoutSeconds 120 -DispatcherTimeoutSeconds 60 `
+                    -OnPoll { Step-FaultRecoverySample } -Progress $gateProgress
+                $events.containerRunningAt = $nodeReadyDetail.containerRunningAt.ToString("o")
+                $events.nodeReadyAt = $nodeReadyDetail.nodeReadyAt.ToString("o")
+                Save-MetricsSnapshot "post-restart"
+                Write-Host ("[fault] $KilledNode ready at $($events.nodeReadyAt): container " +
+                    "$($nodeReadyDetail.containerRunningAt.ToString('o')), readiness " +
+                    "$($nodeReadyDetail.readinessAt.ToString('o')) after $($nodeReadyDetail.readinessProbeAttempts) probes, " +
+                    "metrics $($nodeReadyDetail.metricsAt.ToString('o')), dispatcher " +
+                    "$($nodeReadyDetail.dispatcherActiveAt.ToString('o'))")
+            } catch {
+                # A judge that never confirms its dispatcher is a finding, not a crash: the run keeps
+                # sampling so its evidence survives, the anchors stay null, and the run is refused as a
+                # recovery measurement at the end rather than being thrown away here. Whatever gates did
+                # pass are kept, because they are the difference between "the container came back but
+                # never served" and "the container never came back at all".
+                $nodeReadyFailure = $_.Exception.Message
+                $events.nodeReadyAt = $null
+                if ($gateProgress.Contains("containerRunningAt")) {
+                    $events.containerRunningAt = $gateProgress.containerRunningAt.ToString("o")
+                }
+                Write-Host "[fault] $KilledNode did not reach ready: $nodeReadyFailure"
+            }
+            $gateProgressText = [ordered]@{}
+            foreach ($key in $gateProgress.Keys) { $gateProgressText[$key] = $gateProgress[$key].ToString("o") }
+            $events.nodeReadyGateProgress = $gateProgressText
+            $nodeReadyChecked = $true
+            continue
+        }
+
+        # ---- E. sampling ----
+        Step-FaultRecoverySample
+
+        # ---- F. sleep to the earliest thing the loop is waiting for ----
+        $wakeAt = $script:faultSampling.nextTick
+        if (-not $injected -and $null -eq $escalation -and $wakeAt -gt $windowOpenAt) { $wakeAt = $windowOpenAt }
+        if ($injected -and -not $restartRequested -and $wakeAt -gt $restartScheduledAt) { $wakeAt = $restartScheduledAt }
+        $remaining = ($wakeAt - [datetimeoffset]::UtcNow).TotalMilliseconds
+        if ($remaining -gt 0) {
+            $slice = [int][math]::Min(200, [math]::Ceiling($remaining))
+            if ($slice -lt 1) { $slice = 1 }
+            Start-Sleep -Milliseconds $slice
+        }
+    }
+
+    $events.downWindowObservationCount = $downWindowObservationCount
+    $events.nodeReadyGateSatisfied = if ($null -eq $events.nodeReadyAt) { $false } else { $true }
+    $events.nodeReadyFailure = $nodeReadyFailure
+    # The state object dies with the phase, so a later mode cannot sample against a finished run.
+    $script:faultSampling = $null
+
+    $recovery = $null
+    if ($injected) {
+        $faultAt = [datetimeoffset]::Parse($events.faultInjectedAt)
+        $nodeReadyAt = if ($null -eq $events.nodeReadyAt) { $null } else { [datetimeoffset]::Parse($events.nodeReadyAt) }
+        # The pre-fault steady window is fixed at 30s before the fault wherever the trigger window was
+        # allowed to open, because the analyzer baselines the same 30s. Keying this on the parameter
+        # instead made the harness and the analyzer disagree on the window - and so on the derived
+        # instant - in any run whose trigger window was not 30s.
+        $recovery = Get-FaultRecoveryDerived -Samples ($samples.ToArray()) -FaultAt $faultAt -NodeReadyAt $nodeReadyAt `
+            -PreFaultSeconds 30
+        $events.throughputRecoveredAt = $recovery.throughput.recoveredAt
+        $events.backlogNormalizedAt = $recovery.normalization.backlogNormalizedAt
+        $events.judgeBacklogNormalizedAt = $recovery.normalization.judgeBacklogNormalizedAt
+        $events.scoreboardBacklogNormalizedAt = $recovery.normalization.scoreboardBacklogNormalizedAt
+        $events.recoveryTimeout = $recovery.recoveryTimeout
+        $events.postRecoveryWindow = $recovery.postRecoveryWindow
+        Write-Host ("[fault] phase ended: $($samples.Count) samples, backlog peak observed, judge " +
+            "normalised $(if ($null -eq $recovery.normalization.judgeBacklogNormalizedAt) { 'never' } else { $recovery.normalization.judgeBacklogNormalizedAt }), " +
+            "scoreboard $(if ($null -eq $recovery.normalization.scoreboardBacklogNormalizedAt) { 'never' } else { $recovery.normalization.scoreboardBacklogNormalizedAt }), " +
+            "throughput $(if ($null -eq $recovery.throughput.recoveredAt) { 'never' } else { $recovery.throughput.recoveredAt }), " +
+            "recoveryTimeout=$($recovery.recoveryTimeout)")
+    } else {
+        $events.recoveryTimeout = $null
+    }
+    ($samples | ForEach-Object {
+        [pscustomobject]@{
+            at = $_.at.ToString("o"); judgeBacklog = $_.unfinished
+            scoreboardPending = $_.unapplied; accepted = $_.accepted; results = $_.results
+        }
+    }) | Export-Csv (Join-Path $runDirectory "recovery-samples.csv") -NoTypeInformation -Encoding utf8
+
+    return [pscustomobject]@{
+        injected = $injected
+        escalation = $escalation
+        trigger = $triggerRecord
+        killSnapshot = $killSnapshot
+        nodeReady = $nodeReadyDetail
+        nodeReadyFailure = $nodeReadyFailure
+        recovery = $recovery
+        downWindowObservationCount = $downWindowObservationCount
+        sampleCount = $samples.Count
+    }
 }
 
 $env:CONTEST_JUDGE_DISPATCH_MODE = $DispatchMode
@@ -1026,6 +2057,20 @@ if ($DryRun) {
         $expectedPlan | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDirectory "expected-plan.json") -Encoding utf8
         if ($NormalTimeout) {
             Write-Host "Normal timeout: warm-up at $TargetRps RPS for ${WarmupSeconds}s in '$warmupPrefix', full drain, then measurement at $TargetRps RPS for ${MeasurementSeconds}s in '$measurementPrefix' (hold ${effectiveHoldSeconds}s = measurement + ${SteadyGuardSeconds}s guard), claim timeout $MySqlClaimTimeout, total $($expectedPlan.totalSeconds)s, population $($expectedPlan.population)."
+        } elseif ($FaultRecovery) {
+            # One contiguous string rather than a `+` join: the earlier split landed the operator inside
+            # the first fragment's quotes, so the message printed the window as "from 30 + s" instead of
+            # "from 30s". The plan a reader is checking before the stack is built is exactly where a
+            # mangled number is least affordable.
+            Write-Host ("Fault recovery: warm-up at $TargetRps RPS for ${WarmupSeconds}s in '$warmupPrefix', full drain, " +
+                "then measurement at $TargetRps RPS for ${MeasurementSeconds}s in '$measurementPrefix' (hold ${effectiveHoldSeconds}s). " +
+                "SIGKILL $KilledNode once it holds running >= $FaultMinRunning and reserved >= $FaultMinReserved, " +
+                "from ${FaultMinSteadySeconds}s into the measured window and at the latest " +
+                "$($FaultMinSteadySeconds + $FaultTriggerWaitSeconds)s into it (fallback reserved >= $FaultFallbackMinReserved). " +
+                "Down for exactly ${DownDurationSeconds}s, then restart with identical settings and observe. " +
+                "Claim timeout $MySqlClaimTimeout, max-in-flight $MySqlMaxInFlight, total $($expectedPlan.totalSeconds)s, " +
+                "population $($expectedPlan.population), seconds left after a worst-case restart " +
+                "$($expectedPlan.faultRecovery.secondsLeftAfterWorstCaseRestart).")
         } else {
             Write-Host "Staircase: $($stageRpsList -join ',') RPS, warm-up stages $WarmupStageCount, hold ${StageHoldSeconds}s, guard ${SteadyGuardSeconds}s, total $($expectedPlan.totalSeconds)s, top population $($expectedPlan.maxConcurrentUsers)."
         }
@@ -1041,9 +2086,28 @@ $events.traceAnchorUtc = $null; $events.tracePlanEndUtc = $null; $events.stageWi
 $events.stageWindowAlignmentErrorSeconds = $null; $events.gatlingExitCode = $null; $events.gatlingAssertionFailed = $false
 $events.warmupContestId = $null; $events.warmupPhaseStartedAt = $null; $events.warmupPhaseEndedAt = $null
 $events.warmupQuiescedAt = $null; $events.warmupQuiescenceSeconds = $null; $events.warmupGatlingExitCode = $null
+# Fault-recovery anchors. faultScheduledAt above is reused for the instant the trigger window opened,
+# which is not a kill deadline; the kill happens when the target node is observed to hold work. These
+# stay null in every other mode, where recoveryTimeout and the recovery block are not applicable.
+$events.preFaultSnapshotSeconds = $null; $events.faultInjectionLagSeconds = $null
+$events.faultNotInjectedWithActiveWork = $null; $events.killSnapshotAt = $null
+$events.killToSnapshotStartSeconds = $null; $events.restartScheduledAt = $null
+$events.restartTimingErrorSeconds = $null; $events.containerRunningAt = $null
+$events.downWindowObservationCount = $null; $events.nodeReadyGateSatisfied = $null
+$events.nodeReadyFailure = $null; $events.throughputRecoveredAt = $null
+$events.backlogNormalizedAt = $null; $events.judgeBacklogNormalizedAt = $null
+$events.scoreboardBacklogNormalizedAt = $null; $events.recoveryTimeout = $null
+$events.postRecoveryWindow = $null
+# How many sampler rows needed a retry before they were written. Counted rather than assumed to be
+# zero: a run whose series was written a quarter of a second late reads differently from one that
+# was written on the tick, and the count is the only way to tell them apart afterwards.
+$events.sampleWriteRetries = 0
+$script:sampleWriteRetries = 0
 $staircaseTrace = $null; $staircaseStages = @(); $capturedBoundaries = @{}
 $warmupSeed = $null; $warmupTrace = $null; $warmupStages = @(); $warmupQuiescence = $null
 $warmupAcceptedAtBaseline = $null
+$recoveryPhase = $null
+$staircaseLastTickUtc = $null
 $started = $false
 $claimSnapshot = [pscustomobject]@{ exact=$false; ids=@(); observedActiveClaimCount=0 }
 try {
@@ -1059,7 +2123,7 @@ try {
     Wait-Healthy
     Invoke-Compose -Arguments @("restart", "nginx")
     Wait-Healthy
-    if ($NormalTimeout) {
+    if ($stagedLoad) {
         # Two contests inside one stack lifetime. The warm-up writes to one and the measurement to
         # the other, so no warm-up row can be counted inside a measured window. The duplicate
         # registry is keyed by (contestId, problemId, userId, codeHash), so the identical
@@ -1082,9 +2146,9 @@ try {
     }
     $events.contestId = [long]$seed.contestId
     $contestId = [long]$seed.contestId
-    # In a normal-timeout run this first snapshot is the warm-up phase's starting point; the baseline
+    # In a phased-load run this first snapshot is the warm-up phase's starting point; the baseline
     # the measured window is read against is taken again once the warm-up has drained.
-    Save-MetricsSnapshot $(if ($NormalTimeout) { "warmup-start" } else { "start" })
+    Save-MetricsSnapshot $(if ($stagedLoad) { "warmup-start" } else { "start" })
 
     if ($stagedLoad) {
         # The per-second sampler reads these in the same statement as the backlog counts; prove
@@ -1101,7 +2165,7 @@ try {
     $resultsFolder = Join-Path $repoRoot "gatling\build\reports\gatling"
     $tracePath = (Join-Path $runDirectory "stage-trace.csv") -replace '\\', '/'
 
-    if ($NormalTimeout) {
+    if ($stagedLoad) {
         # Warm-up phase. It is offered the same rate and the same workload as the measurement and
         # differs only in which contest it writes to, so the measurement starts against a stack that
         # has already been through the same code paths (JIT, connection pool, buffer pool). Its
@@ -1255,6 +2319,14 @@ try {
         $events.tracePlanEndUtc = [datetimeoffset]::FromUnixTimeMilliseconds($staircaseTrace.planEndMillis).ToString("o")
 
         $script:staircaseLastTickUtc = $null
+        if ($FaultRecovery) {
+            # The measured phase's tick loop is replaced wholesale: it has to interleave deadline work
+            # with sampling, and the staged loop's "sleep only up to the next tick" rule has no notion
+            # of a deadline that must not be overshot. Both loops write the same timeseries.csv columns
+            # through Save-StaircaseSample, so the analyzer's windows and deltas are unaffected.
+            $recoveryPhase = Invoke-FaultRecoveryPhase -Process $gatling -Trace $staircaseTrace `
+                -ContestId $contestId -CapturedBoundaries $capturedBoundaries
+        } else {
         $nextTick = [datetimeoffset]::UtcNow
         while (-not $gatling.HasExited) {
             $nextTick = $nextTick.AddSeconds(1)
@@ -1268,6 +2340,7 @@ try {
                 # A whole period behind: re-anchor instead of firing a burst of catch-up samples.
                 $nextTick = [datetimeoffset]::UtcNow
             }
+        }
         }
     } else {
         while (-not $gatling.HasExited) {
@@ -1332,7 +2405,7 @@ try {
     if ($backlog -ne 0) { throw "Pipeline did not drain within $DrainTimeoutSeconds seconds." }
     Save-MetricsSnapshot "end"
     $events.measurementEndSnapshotAt = [datetimeoffset]::UtcNow.ToString("o")
-    if ($NormalTimeout) {
+    if ($stagedLoad) {
         # The measured window's judge-invocation delta is end minus start, so warm-up work that ran
         # after the baseline would be charged to the measurement. The baseline was taken at
         # quiescence and the warm-up contest's own submissions are the observable part of that work:
@@ -1392,7 +2465,7 @@ try {
             }
         })
         $warmupDocument = $null
-        if ($NormalTimeout) {
+        if ($stagedLoad) {
             $warmupDocument = [ordered]@{
                 contestId = $events.warmupContestId
                 contestPrefix = $warmupPrefix
@@ -1422,7 +2495,7 @@ try {
             }
         }
         [ordered]@{
-            mode = if ($NormalTimeout) { "normal-timeout" } else { "staircase" }
+            mode = if ($FaultRecovery) { "fault-recovery" } elseif ($NormalTimeout) { "normal-timeout" } else { "staircase" }
             stageRps = $stageRpsList
             warmupStageCount = $WarmupStageCount
             transitionRampSeconds = $RampSeconds
@@ -1476,13 +2549,14 @@ try {
     $storedRepublishes = Get-PromMetricDelta "contest_judge_stored_result_republish_total"
     $unavailable = New-Object System.Collections.Generic.List[string]
     if ($null -eq $judgeInvocations) { $unavailable.Add("judge invocation count: contest_judge_invocations_total was not exposed") }
-    if ($FaultEnabled -and $null -ne $judgeInvocations) {
-        $unavailable.Add("judge invocation and completion counters are lower bounds in SIGKILL runs because increments after the pre-fault scrape can be lost with the killed JVM")
+    if ($faultWasInjected -and $null -ne $judgeInvocations) {
+        $unavailable.Add("judge invocation, duration and claim counters are lower bounds in a SIGKILL run: the killed JVM's process-local increments after the pre-fault scrape died with it, and a lost counter is not a zero. The durable evidence is the outbox attempts column and the final row state.")
     }
     $unavailable.Add("duplicate judge time is bounded by the deterministic 50ms/2000ms profile; exact per-claim attribution is unavailable")
     if ($DispatchMode -eq "rabbit") { $unavailable.Add("Rabbit per-node running/local-waiting/reserved gauges are unavailable; worker-count x prefetch is recorded only as the configured normalized ceiling") }
     $unavailable.Add("MySQL CPU is not exposed by the stock mysql:8.0 container; connection and InnoDB lock counters are captured instead")
-    if (-not $claimSnapshot.exact -and $FaultEnabled) { $unavailable.Add("killed-node claim attribution: schema has no claimed_by column; killed-node-claims.csv contains all active claims at kill time") }
+    if (-not $claimSnapshot.exact -and $faultWasInjected) { $unavailable.Add("killed-node claim attribution: the outbox has no claimed_by column, so killed-node-claims.csv holds every node's PUBLISHING rows at kill time; the count is a cluster-wide claimed-unfinished upper bound and is never reported as the killed node's active claims") }
+    if ($faultWasInjected) { $unavailable.Add("attempts > 1 counts recovery re-claims after the lease expired, not concurrent duplicate CPU execution: the process holding the claim was SIGKILLed, so it did not keep judging. Testing true concurrent duplicate execution and fencing needs a separate docker pause -> timeout -> unpause experiment, which this round does not run.") }
     if ($null -eq $completedHttpRequests) {
         $unavailable.Add("completed HTTP submission count: Gatling simulation.log was not found")
     }
@@ -1490,11 +2564,14 @@ try {
         $unavailable.Add("integrity: at least one of the accepted/unique/result/scoreboard counts returned no row, so integrity is undecidable for this run and it must not be treated as passed")
     }
     $unavailable.Add("total HTTP submission attempts are unavailable because requests still in flight at Gatling maxDuration can persist after the client log closes; completedHttpRequests is reported separately")
-    $duplicateJudgements = if ($null -eq $judgeInvocations -or $null -eq $resultCount -or $FaultEnabled) { $null } else { [math]::Max(0, $judgeInvocations - $resultCount) }
+    # A re-claim is not a duplicate execution: the process that owned the claim is gone. In a SIGKILL
+    # run this identity would compare a lower-bound invocation count against a durable result count, so
+    # it is reported as unavailable rather than as a small or negative number.
+    $duplicateJudgements = if ($null -eq $judgeInvocations -or $null -eq $resultCount -or $faultWasInjected) { $null } else { [math]::Max(0, $judgeInvocations - $resultCount) }
     $duplicateJudgeMillisLowerBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 50 }
     $duplicateJudgeMillisUpperBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 2000 }
     $warmupVerification = $null
-    if ($NormalTimeout) {
+    if ($stagedLoad) {
         $warmupAcceptedAtEndRead = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id=$($events.warmupContestId)"
         $warmupResults = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($events.warmupContestId)"
         $warmupDuplicateClaims = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(attempts - 1, 0)),0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.warmupContestId)"
@@ -1524,6 +2601,125 @@ try {
             gatlingLog = "warmup-gatling-simulation.log"
         }
     }
+    # The harness records what it observed and when; the derived comparison numbers belong to the
+    # analyzer, which recomputes them from timeseries.csv so they survive a re-analysis. What is kept
+    # here is the evidence the analyzer cannot reconstruct: which gate each anchor came from, how long
+    # each step cost, and whether the deadlines were met.
+    $faultRecoveryVerification = $null
+    if ($FaultRecovery) {
+        $downSeconds = $null
+        if ($null -ne $events.restartRequestedAt -and $null -ne $events.faultInjectedAt) {
+            $downSeconds = [math]::Round(([datetimeoffset]::Parse($events.restartRequestedAt) - [datetimeoffset]::Parse($events.faultInjectedAt)).TotalSeconds, 3)
+        }
+        $containerSeconds = $null
+        if ($null -ne $events.containerRunningAt -and $null -ne $events.restartRequestedAt) {
+            $containerSeconds = [math]::Round(([datetimeoffset]::Parse($events.containerRunningAt) - [datetimeoffset]::Parse($events.restartRequestedAt)).TotalSeconds, 3)
+        }
+        $nodeReadySeconds = $null
+        if ($null -ne $events.nodeReadyAt -and $null -ne $events.restartRequestedAt) {
+            $nodeReadySeconds = [math]::Round(([datetimeoffset]::Parse($events.nodeReadyAt) - [datetimeoffset]::Parse($events.restartRequestedAt)).TotalSeconds, 3)
+        }
+        $readyGapSeconds = $null
+        if ($null -ne $events.nodeReadyAt -and $null -ne $events.containerRunningAt) {
+            $readyGapSeconds = [math]::Round(([datetimeoffset]::Parse($events.nodeReadyAt) - [datetimeoffset]::Parse($events.containerRunningAt)).TotalSeconds, 3)
+        }
+        $staleSeconds = $null
+        if ($null -ne $events.firstStaleReclaimObservedAt -and $null -ne $events.faultInjectedAt) {
+            $staleSeconds = [math]::Round(([datetimeoffset]::Parse($events.firstStaleReclaimObservedAt) - [datetimeoffset]::Parse($events.faultInjectedAt)).TotalSeconds, 3)
+        }
+        $triggerWaitedSeconds = $null
+        if ($null -ne $recoveryPhase -and $null -ne $recoveryPhase.trigger) { $triggerWaitedSeconds = $recoveryPhase.trigger.waitedSeconds }
+        $faultRecoveryVerification = [ordered]@{
+            injected = if ($null -eq $recoveryPhase) { $null } else { [bool]$recoveryPhase.injected }
+            trigger = if ($null -eq $recoveryPhase) { $null } else { $recoveryPhase.trigger }
+            # Every anchor with the gate it came from. A null is a fact about the run, not a zero.
+            anchors = [ordered]@{
+                measurementStartedAt = @{ value = $events.measurementStartedAt; gate = "trace-derived start of the measured window (segment start + steadyGuardSeconds)" }
+                faultScheduledAt = @{ value = $events.faultScheduledAt; gate = "measurementStartedAt + $FaultMinSteadySeconds; the instant the trigger window opened, NOT a kill deadline" }
+                faultInjectedAt = @{ value = $events.faultInjectedAt; gate = "immediately after docker compose kill $KilledNode returned" }
+                restartScheduledAt = @{ value = $events.restartScheduledAt; gate = "faultInjectedAt + ${DownDurationSeconds}s, computed at the injection" }
+                restartRequestedAt = @{ value = $events.restartRequestedAt; gate = "recorded before docker compose start was invoked" }
+                containerRunningAt = @{ value = $events.containerRunningAt; gate = "docker inspect {{.State.Running}} == true for the single container, not the nine-container health gate" }
+                nodeReadyAt = @{ value = $events.nodeReadyAt; gate = "container running AND /actuator/health/readiness UP AND /actuator/prometheus scrapable AND contest_judge_claim_calls_total observed to advance" }
+                firstStaleObservedAt = @{ value = $events.firstStaleReclaimObservedAt; gate = "durable SUM(attempts - 1) above its pre-fault value, polled at about 1s so the observation error is bounded rather than exact" }
+                firstPostFaultResultAt = @{ value = $null; gate = "analyzer-only: MIN(result_saved_at) at or after faultInjectedAt, read from latency.csv" }
+                throughputRecoveredAt = @{ value = $events.throughputRecoveredAt; gate = "5s rolling result RPS at or above 90% of the pre-fault value for 3 consecutive windows" }
+                # This is the run's own during-run reading, and it is a lower bound on what the series
+                # supports: the series it reads stops with this phase, so a normalisation that lands in
+                # the drain is not visible here and the analyzer recomputes the instant over the drain too.
+                backlogNormalizedAt = @{ value = $events.backlogNormalizedAt; gate = "judge backlog and scoreboard pending each at or below their own pre-fault p95 for 5s of wall clock with no gap inside the streak wider than ${MaxSampleGapSeconds}s; the later of the two. Read here from the fault phase's series only, so the analyzer's recomputation over the drain can be later or non-null where this is null" }
+                lastReclaimedSubmissionResultAt = @{ value = $null; gate = "analyzer-only: MAX(result_saved_at) over the reclaimed cohort in latency.csv" }
+                lastReclaimedSubmissionScoreboardAt = @{ value = $null; gate = "analyzer-only: MAX(scoreboard_applied_at) over the reclaimed cohort in latency.csv" }
+                drainCompletedAt = @{ value = $events.drainEndedAt; gate = "the drain loop's backlog reading reached 0" }
+            }
+            timingErrors = [ordered]@{
+                triggerWaitedSeconds = $triggerWaitedSeconds
+                faultInjectionLagSeconds = $events.faultInjectionLagSeconds
+                preFaultSnapshotSeconds = $events.preFaultSnapshotSeconds
+                killSnapshotSeconds = if ($null -eq $recoveryPhase -or $null -eq $recoveryPhase.killSnapshot) { $null } else { $recoveryPhase.killSnapshot.seconds }
+                downDurationSeconds = $downSeconds
+                downDurationConfiguredSeconds = $DownDurationSeconds
+                downDurationErrorSeconds = if ($null -eq $downSeconds) { $null } else { [math]::Round($downSeconds - $DownDurationSeconds, 3) }
+                restartTimingErrorSeconds = $events.restartTimingErrorSeconds
+                containerRunningSecondsAfterRestartRequest = $containerSeconds
+                nodeReadySecondsAfterRestartRequest = $nodeReadySeconds
+                nodeReadyMinusContainerRunningSeconds = $readyGapSeconds
+                firstStaleSecondsAfterFault = $staleSeconds
+                downWindowObservationCount = $recoveryPhase.downWindowObservationCount
+                downWindowObservationBasis = "the sampler is stopped between faultInjectedAt and restartScheduledAt; only the two-count backlog observation runs, and only while more than 2s remain, so the restart deadline is never behind an observation"
+            }
+            # The down window is 15s because restartRequestedAt is anchored to faultInjectedAt rather
+            # than to a pre-scheduled instant: a slow pre-kill snapshot moves both ends together.
+            timingAssertions = [ordered]@{
+                downDurationWithinHalfSecond = if ($null -eq $downSeconds) { $false } else { [math]::Abs($downSeconds - $DownDurationSeconds) -le 0.5 }
+                nodeReadyAfterContainerRunning = if ($null -eq $readyGapSeconds) { $false } else { $readyGapSeconds -gt 0 }
+                containerRunningAndNodeReadyDistinct = if ($null -eq $events.containerRunningAt -or $null -eq $events.nodeReadyAt) { $false } else { $events.containerRunningAt -ne $events.nodeReadyAt }
+                faultInjectionLagUnder3Seconds = if ($null -eq $events.faultInjectionLagSeconds) { $false } else { $events.faultInjectionLagSeconds -le 3 }
+                preFaultSnapshotUnder6Seconds = if ($null -eq $events.preFaultSnapshotSeconds) { $false } else { $events.preFaultSnapshotSeconds -le 6 }
+            }
+            nodeReadyGate = if ($null -eq $recoveryPhase -or $null -eq $recoveryPhase.nodeReady) { $null } else {
+                [ordered]@{
+                    containerRunningAt = $recoveryPhase.nodeReady.containerRunningAt.ToString("o")
+                    readinessAt = $recoveryPhase.nodeReady.readinessAt.ToString("o")
+                    metricsAt = $recoveryPhase.nodeReady.metricsAt.ToString("o")
+                    dispatcherActiveAt = $recoveryPhase.nodeReady.dispatcherActiveAt.ToString("o")
+                    containerToReadinessSeconds = $recoveryPhase.nodeReady.containerToReadinessSeconds
+                    readinessToMetricsSeconds = $recoveryPhase.nodeReady.readinessToMetricsSeconds
+                    metricsToDispatcherSeconds = $recoveryPhase.nodeReady.metricsToDispatcherSeconds
+                    claimCallsAtFirstScrape = $recoveryPhase.nodeReady.claimCallsAtFirstScrape
+                    claimCallsWhenActive = $recoveryPhase.nodeReady.claimCallsWhenActive
+                    satisfied = $true
+                }
+            }
+            nodeReadyFailure = $events.nodeReadyFailure
+            recoveryTimeout = $events.recoveryTimeout
+            recoveryBasis = "backlogNormalizedAt is derived by the harness from this run's own 1s samples and recomputed by the analyzer from timeseries.csv with the same p95-and-5-consecutive-sample rule"
+            postRecoveryWindow = $events.postRecoveryWindow
+            faultNotInjectedWithActiveWork = $events.faultNotInjectedWithActiveWork
+            runValidForRecovery = (-not $events.faultNotInjectedWithActiveWork) -and ($null -ne $events.nodeReadyAt) -and (-not $events.recoveryTimeout)
+            killSnapshot = if ($null -eq $recoveryPhase -or $null -eq $recoveryPhase.killSnapshot) { $null } else {
+                [ordered]@{
+                    file = "kill-snapshot.json"
+                    unfinishedOutboxGlobal = $recoveryPhase.killSnapshot.document.atKill.unfinishedOutboxGlobal
+                    unfinishedOutboxContest = $recoveryPhase.killSnapshot.document.atKill.unfinishedOutboxContest
+                    scoreboardPending = $recoveryPhase.killSnapshot.document.atKill.scoreboardPending
+                    clusterWideClaimedUnfinishedUpperBound = $recoveryPhase.killSnapshot.document.claims.clusterWideClaimedUnfinishedUpperBound
+                    claimedUnfinishedAgeSeconds = $recoveryPhase.killSnapshot.document.claims.ageSeconds
+                    basis = "the outbox has no claimed_by column, so this is a cluster-wide upper bound over every node's PUBLISHING rows at kill time"
+                }
+            }
+            # attempts is durable after the fact, unlike claimed_at/updated_at, so the re-claim count is
+            # exact while the instant it was first observed is not.
+            reclaimAccounting = [ordered]@{
+                reclaimedRowsAfterFault = $duplicateEstimate
+                reclaimedRowsInKillSnapshot = $script:claimSnapshot.observedActiveClaimCount
+                killedNodeClaimAttributionExact = [bool]$script:claimSnapshot.exact
+                label = "attempts > 1 = recovery re-claims after the lease expired, NOT concurrent duplicate CPU execution"
+                sigkillCounterLoss = "the killed JVM's invocation, duration and claim counters are lower bounds; the increments between the pre-fault scrape and the kill died with it, and a lost counter is not a zero"
+                followUpCandidate = "docker pause -> wait past the claim timeout -> unpause, to test true concurrent duplicate execution and fencing; not run in this round"
+            }
+        }
+    }
     $verification = [ordered]@{
         counts = @{ requests=$null; completedHttpRequests=$completedHttpRequests; accepted=$submissionCount; uniqueSubmissions=$uniqueCount; results=$resultCount; scoreboardApplied=$scoreboardCount }
         integrity = @{
@@ -1535,10 +2731,11 @@ try {
             } else { $false }
             reason = if ($countsAvailable) { $null } else { "one or more of the four verification counts returned no row, so this run's integrity is undecided rather than passed" }
         }
-        workCost = @{ duplicateClaimEstimate=$duplicateEstimate; duplicateJudgementEstimate=$duplicateJudgements; judgeInvocations=$judgeInvocations; judgeInvocationsLowerBound=[bool]$FaultEnabled; totalJudgeMillis=if ($null -eq $judgeDurationSeconds) {$null} else {[math]::Round($judgeDurationSeconds*1000,3)}; duplicateJudgeMillisLowerBound=$duplicateJudgeMillisLowerBound; duplicateJudgeMillisUpperBound=$duplicateJudgeMillisUpperBound; claimCalls=$claimCalls; claimedRows=$claimRows; staleReclaims=$staleReclaims; completionSuccess=$completionSuccess; completionFailure=$completionFailure; staleTokenCompletions=$staleCompletions; storedResultRepublishes=$storedRepublishes; claimAttemptsFile="claim-attempts.tsv"; killedNodeClaimCount=if ($claimSnapshot.exact) {@($claimSnapshot.ids).Count} else {$null}; allActiveClaimsAtKill=$claimSnapshot.observedActiveClaimCount }
+        workCost = @{ duplicateClaimEstimate=$duplicateEstimate; duplicateJudgementEstimate=$duplicateJudgements; judgeInvocations=$judgeInvocations; judgeInvocationsLowerBound=[bool]$faultWasInjected; totalJudgeMillis=if ($null -eq $judgeDurationSeconds) {$null} else {[math]::Round($judgeDurationSeconds*1000,3)}; duplicateJudgeMillisLowerBound=$duplicateJudgeMillisLowerBound; duplicateJudgeMillisUpperBound=$duplicateJudgeMillisUpperBound; claimCalls=$claimCalls; claimedRows=$claimRows; staleReclaims=$staleReclaims; completionSuccess=$completionSuccess; completionFailure=$completionFailure; staleTokenCompletions=$staleCompletions; storedResultRepublishes=$storedRepublishes; claimAttemptsFile="claim-attempts.tsv"; killedNodeClaimCount=if ($claimSnapshot.exact) {@($claimSnapshot.ids).Count} else {$null}; clusterWideClaimedUnfinishedUpperBound=$claimSnapshot.observedActiveClaimCount; claimedUnfinishedExact=[bool]$claimSnapshot.exact }
         cohortAvailability = @{ killedNodeClaimed=[bool]$claimSnapshot.exact }
         mysql = @{ statusSnapshots="metrics/*-mysql-status.tsv"; cpu=$null; lockAndConnectionCounters="captured" }
         warmup = $warmupVerification
+        faultRecovery = $faultRecoveryVerification
         unavailable = @($unavailable)
     }
     $verification | ConvertTo-Json -Depth 7 | Set-Content (Join-Path $runDirectory "db-verification.json") -Encoding utf8
@@ -1549,9 +2746,15 @@ try {
     $_ | Out-String | Set-Content (Join-Path $runDirectory "failure.txt") -Encoding utf8
     # A failed run keeps what it already collected so the reason can be read against the numbers,
     # and stays out of the capacity comparison either way.
-    foreach ($artifact in @("timeseries.csv", "stage-trace.csv", "warmup-stage-trace.csv", "capacity.csv", "backlog.csv")) {
+    foreach ($artifact in @("timeseries.csv", "stage-trace.csv", "warmup-stage-trace.csv", "capacity.csv", "backlog.csv", "kill-snapshot.json", "recovery-samples.csv", "latency.csv", "stale-reclaims.csv")) {
         $candidate = Join-Path $runDirectory $artifact
         if (Test-Path $candidate) { Write-Host "Preserved for diagnosis: $candidate" }
+    }
+    # A fault run dies after the kill often enough that latency.csv is still missing when the failure
+    # path runs. The raw rows are in the database and the export is read-only, so reconstruct the file
+    # rather than losing the one artifact the cohorts are computed from.
+    if (-not (Test-Path (Join-Path $runDirectory "latency.csv"))) {
+        try { Export-Latencies $events $claimSnapshot } catch { Write-Warning "latency export on the failure path failed: $_" }
     }
     if ($null -ne $gatlingStarted) {
         try { Copy-GatlingArtifacts -StartedAt $gatlingStarted | Out-Null } catch { Write-Warning $_ }
