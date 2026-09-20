@@ -277,14 +277,26 @@ SELECT MIN(user_id), MAX(user_id), COUNT(DISTINCT user_id) FROM (
        AND r.scoreboard_applied_at IS NOT NULL
 ) participants;
 "@ -Description "participant id spread")
-    $minimum = ConvertTo-RequiredInt64 -Value $spread[0][0] -Description "minimum participant id"
-    $maximum = ConvertTo-RequiredInt64 -Value $spread[0][1] -Description "maximum participant id"
-    $observed["participantIdMin"] = $minimum
-    $observed["participantIdMax"] = $maximum
-    if (($maximum - $minimum) -ge 1000) {
-        throw "Participant ids span $minimum..$maximum, which is a spread of $($maximum - $minimum) - not less " +
-        "than the penalty weight of 1000. Two participants could then tie on ZSET score and the standings " +
-        "order would depend on the member string instead of the data (phase $Phase)."
+    # A contest with nothing applied yet has no participants, and that is the honest state before the
+    # load rather than a fault: `MIN` over no rows is NULL, and the injectivity question this check asks
+    # cannot be violated by an empty set. Checked the same way as the submission-id width below, which
+    # is empty at the same moment and was already written to tolerate it. The check still runs for real
+    # at the end of the run, when the participants exist and the answer can be wrong.
+    $participants = ConvertTo-RequiredInt64 -Value $spread[0][2] -Description "participant count"
+    $observed["participantCount"] = $participants
+    if ($participants -eq 0) {
+        $observed["participantIdSpread"] = "no results applied yet"
+    }
+    else {
+        $minimum = ConvertTo-RequiredInt64 -Value $spread[0][0] -Description "minimum participant id"
+        $maximum = ConvertTo-RequiredInt64 -Value $spread[0][1] -Description "maximum participant id"
+        $observed["participantIdMin"] = $minimum
+        $observed["participantIdMax"] = $maximum
+        if (($maximum - $minimum) -ge 1000) {
+            throw "Participant ids span $minimum..$maximum, which is a spread of $($maximum - $minimum) - not less " +
+            "than the penalty weight of 1000. Two participants could then tie on ZSET score and the standings " +
+            "order would depend on the member string instead of the data (phase $Phase)."
+        }
     }
 
     # The scoreboard's own tie-break compares submission ids as decimal strings, so it orders them the
