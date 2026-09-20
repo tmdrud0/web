@@ -101,21 +101,31 @@ class ContestSubmissionOpenBurstSimulation extends Simulation {
    * One arrival, one submission, one prepared session - and the arrival recorded before the request
    * is dispatched, not after it is answered.
    *
-   * The workload data is drawn first so that the recorded instant is as close to the dispatch as it
-   * can be: everything between the record and the request being built is the cookie being attached.
+   * The session is resolved first because it is where `userName` comes from, and the workload data
+   * cannot be drawn without it: the deterministic payload is derived from the account that submits
+   * it (`perf.workloadSeed` mixes in the user name), so drawing the data before the session is known
+   * leaves `problemId` unset and every request fails to build - 10,500 arrivals injected, none sent,
+   * and a load generator that looks like a stack refusal. The recorded instant is still the last
+   * thing before the dispatch, with nothing between it and the request but the cookie being attached.
    */
   private val burstScenario = scenario("Contest submissions (open arrival burst)")
-    .exec(ApiLoad.randomSubmissionData(problemIdStart, problemIdEnd, "oj-burst"))
     .exec { session =>
       val context = pool.next()
-      val arrival = RequestStartRecorder.recordArrival(context.id)
       session
-        .set("attemptId", arrival.attemptId)
-        .set("authContextId", context.id)
         .set("userName", context.userName)
         .set("authCookieName", context.cookieName)
         .set("authCookieValue", context.cookieValue)
-        .set("arrival", arrival)
+        .set("authContext", context)
+    }
+    .exec(ApiLoad.randomSubmissionData(problemIdStart, problemIdEnd, "oj-burst"))
+    .exec { session =>
+      // The context is looked up by type for the same reason the arrival is: it decides which
+      // prepared session the submission is sent with, and a cast that guessed wrong would send an
+      // arrival as another account - or as nobody, which the server answers 401.
+      val context = session.attributes.get("authContext").collect { case context: AuthContext => context }
+        .getOrElse(throw new IllegalStateException("the arrival was not given a prepared session"))
+      val arrival = RequestStartRecorder.recordArrival(context.id)
+      session.set("attemptId", arrival.attemptId).set("arrival", arrival)
     }
     .exec(addCookie(Cookie("#{authCookieName}", "#{authCookieValue}")))
     .exec(ApiLoad.submitCapturingOutcome)

@@ -102,10 +102,19 @@ object ApiLoad {
 
   def randomSubmissionData(problemIdStart: Long, problemIdEnd: Long, tag: String): ChainBuilder =
     exec { session =>
+      // The payload is derived from the account that submits it in both branches below, so a session
+      // with no user name cannot draw one - and without this the failure is misleading: `problemId`
+      // is never set, and every request then fails to build with "No attribute named 'problemId' is
+      // defined". A simulation that drew its data before it knew which session it was submitting as
+      // (the open-arrival burst did, until a run showed it) therefore read as a stack refusing work
+      // when the truth was that nothing was ever sent. The ordering mistake is named here instead.
+      val userName = session("userName").asOption[String].getOrElse {
+        throw new IllegalStateException(
+          s"a '$tag' payload is derived from the account that submits it, and this session has no userName yet")
+      }
       workloadSeed match {
         case Some(seed) =>
           val sequence = session("workloadSequence").asOption[Long].getOrElse(0L) + 1L
-          val userName = session("userName").as[String]
           val key = mix(seed, s"$tag:$userName", sequence)
           val problemCount = problemIdEnd - problemIdStart + 1L
           val problemId = problemIdStart + Math.floorMod(key, problemCount)
@@ -113,7 +122,7 @@ object ApiLoad {
           session.set("workloadSequence", sequence).set("problemId", problemId).set("code", code)
         case None =>
           val problemId = Random.between(problemIdStart, problemIdEnd + 1)
-          val code = s"// $tag-${session("userName").as[String]}-${java.util.UUID.randomUUID()}%0Aint main(){return 0;}"
+          val code = s"// $tag-$userName-${java.util.UUID.randomUUID()}%0Aint main(){return 0;}"
           session.set("problemId", problemId).set("code", code)
       }
     }
