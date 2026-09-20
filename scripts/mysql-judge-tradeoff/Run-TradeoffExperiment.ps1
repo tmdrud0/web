@@ -53,18 +53,20 @@ param(
     # the measured window is derived from. 0 leaves the model exactly as every earlier run used it -
     # log in as you start, submit as soon as you are logged in.
     [int]$AuthPrepSeconds = 0,
-    # Ingress preflight, run against the fresh stack before the warm-up: repeat the readiness probe
-    # through the published port, establish the measurement's own session population over the same
-    # preparation window the measurement will use, submit briefly, and probe login-plus-submit once.
-    # Its contest and user pool are separate, so nothing it writes can land in a measured window. A
-    # refusal here stops the run before either condition is spent on an ingress that cannot carry it.
+    # Ingress preflight, run against the fresh stack before the warm-up: repeat the worker nodes'
+    # readiness probes, establish the measurement's own session population over the same preparation
+    # window the measurement will use, submit briefly, and probe login-plus-submit once through the
+    # published port. Its contest and user pool are separate, so nothing it writes can land in a
+    # measured window. A refusal here stops the run before either condition is spent on an ingress
+    # that cannot carry it.
     [switch]$IngressPreflight,
     [int]$PreflightHoldSeconds = 2,
-    # How long the preflight waits for readiness through the published port to report UP before it
-    # calls the ingress down. A freshly started stack can answer 5xx on the readiness endpoint for a
-    # while - the endpoint's first call initializes its indicators - so this is a wait with a
-    # deadline, not a sample: "readiness succeeds repeatedly" is a claim about a state, and a state
-    # has to be observed rather than assumed from one instant.
+    # How long the preflight waits, per node, for a readiness group to report UP before it calls the
+    # stack down. A freshly started node can answer 503 on the readiness endpoint while its indicators
+    # initialize, so this is a wait with a deadline, not a sample: "readiness succeeds repeatedly" is
+    # a claim about a state, and a state has to be observed rather than assumed from one instant. The
+    # endpoint lives on Spring's management port, which the web nodes do not publish - see
+    # Invoke-IngressPreflight for where readiness is read and why.
     [int]$PreflightReadinessTimeoutSeconds = 180,
     # Which preflight user the single login-plus-submit probe uses. Any of them proves the same
     # thing; fixing it makes the probe reproducible.
@@ -1028,6 +1030,7 @@ function Invoke-IngressPreflight {
         readiness = @()
         readinessPolls = $null
         readinessUp = $null
+        ingressReadiness = $null
         gatlingStartedAt = $null
         gatlingExitedAt = $null
         gatlingExitCode = $null
@@ -1051,43 +1054,80 @@ function Invoke-IngressPreflight {
 
     $report.containers = @(Get-ContainerStates)
 
-    # Through the published port, which is the only ingress the load may use. Section 3 asks that
-    # readiness succeed repeatedly, and "repeatedly" is two claims: that it comes UP at all, and that
-    # it stays UP. Sampling three times inside one second answers neither - it cannot tell a stack
-    # still settling apart from one that is down, and it calls a single moment a state. So the
-    # endpoint is polled until it reports UP, and only then re-probed three times to confirm. On the
-    # 2026-09-20 comparison's first attempt the three-sample version stopped the run on three 500s
-    # taken 16 seconds after the stack came up, while the same ingress carried 3,100 logins with no
-    # refusal four seconds later.
-    $readiness = New-Object System.Collections.Generic.List[object]
-    $readinessDeadline = (Get-Date).AddSeconds($PreflightReadinessTimeoutSeconds)
-    $readinessUp = $false
-    while ((Get-Date) -lt $readinessDeadline) {
-        $state = Test-NodeReadiness -Port 18080
-        $readiness.Add([pscustomobject]@{
-            phase = "wait"; attempt = $readiness.Count + 1
-            at = [datetimeoffset]::UtcNow.ToString("o")
-            up = $state.up; httpStatus = $state.httpStatus; status = $state.status
-        })
-        if ($state.up) { $readinessUp = $true; break }
-        Start-Sleep -Seconds 2
-    }
-    if ($readinessUp) {
-        foreach ($confirm in 1..3) {
-            Start-Sleep -Milliseconds 400
-            $state = Test-NodeReadiness -Port 18080
+    # Readiness is read where it is served. `management.server.port=${MANAGEMENT_PORT:9000}` puts
+    # Spring's actuator on port 9000, and the load-test overlay publishes that port for the three
+    # worker nodes (batch-1 19000, judge-1 19001, judge-2 19002) but not for the web nodes, which
+    # publish 8080 alone - and nginx routes only to 8080. So `/actuator/health/readiness` through the
+    # published ingress is not a slow endpoint, it is an unmapped one: it is handled by Spring MVC's
+    # static-resource path and answers `NoResourceFoundException` with a 500 on every poll, for as
+    # long as the process lives. A probe there cannot tell a settling stack from a healthy one, and on
+    # this experiment's first two attempts it stopped the run on a stack that was carrying 3,100
+    # logins with no refusal seconds later. The readiness groups are therefore polled on the nodes
+    # that publish them, and the ingress is judged by what it actually has to do: the port mapping,
+    # the preflight's own arrival pattern with no refusal, and the login-plus-submit round trip below.
+    #
+    # "Repeatedly" is two claims - that readiness comes UP at all, and that it stays UP - so each node
+    # is polled until it reports UP and only then confirmed three more times. The deadline is per
+    # node: a shared one would let a slow first node spend the whole budget and turn a node that was
+    # never given its own wait into a failure.
+    $readinessTargets = @(
+        [pscustomobject]@{ name = "batch-1"; port = 19000 },
+        [pscustomobject]@{ name = "judge-1"; port = 19001 },
+        [pscustomobject]@{ name = "judge-2"; port = 19002 }
+    )
+    # `New-Object System.Collections.Generic.List[object]` cannot be wrapped in `@()` on this
+    # PowerShell 5.1: `@($list)` throws `System.ArgumentException: Argument types do not match`, and
+    # the throw names the *caller* of this function, not the statement, so it reads as an unexplained
+    # failure of the whole preflight. Measured on this host: the same construction via `::new()`
+    # passes, `$list.ToArray()` passes, and `List[string]` (used for $problems below) is unaffected.
+    # Hence the constructor call here and the `.ToArray()` at the assignment.
+    $readiness = [System.Collections.Generic.List[object]]::new()
+    $readinessUpByNode = [ordered]@{}
+    foreach ($target in $readinessTargets) {
+        $readinessDeadline = (Get-Date).AddSeconds($PreflightReadinessTimeoutSeconds)
+        $up = $false
+        while ((Get-Date) -lt $readinessDeadline) {
+            $state = Test-NodeReadiness -Port $target.port
             $readiness.Add([pscustomobject]@{
-                phase = "confirm"; attempt = $readiness.Count + 1
+                phase = "wait"; node = $target.name; attempt = $readiness.Count + 1
                 at = [datetimeoffset]::UtcNow.ToString("o")
                 up = $state.up; httpStatus = $state.httpStatus; status = $state.status
             })
+            if ($state.up) { $up = $true; break }
+            Start-Sleep -Seconds 2
         }
+        if ($up) {
+            foreach ($confirm in 1..3) {
+                Start-Sleep -Milliseconds 400
+                $state = Test-NodeReadiness -Port $target.port
+                $readiness.Add([pscustomobject]@{
+                    phase = "confirm"; node = $target.name; attempt = $readiness.Count + 1
+                    at = [datetimeoffset]::UtcNow.ToString("o")
+                    up = $state.up; httpStatus = $state.httpStatus; status = $state.status
+                })
+            }
+        }
+        $readinessUpByNode[$target.name] = $up
     }
-    $report.readiness = @($readiness)
+    $report.readiness = $readiness.ToArray()
     $report.readinessPolls = $readiness.Count
+    $readinessUp = -not (@($readinessUpByNode.Values) -contains $false)
     $report.readinessUp = $readinessUp
     $readinessConfirmations = @($readiness | Where-Object { $_.phase -eq "confirm" })
     $readinessFailedConfirmations = @($readinessConfirmations | Where-Object { -not $_.up })
+
+    # The ingress's own readiness endpoint, recorded rather than gated, so the report carries the
+    # observation that the probe moved instead of an assertion that it did not need to. Under the
+    # current overlay this reads as an unmapped path on a live application; the note says which.
+    $ingressReadiness = Test-NodeReadiness -Port 18080
+    $report.ingressReadiness = [ordered]@{
+        at = [datetimeoffset]::UtcNow.ToString("o")
+        endpoint = "http://127.0.0.1:18080/actuator/health/readiness"
+        up = $ingressReadiness.up
+        httpStatus = $ingressReadiness.httpStatus
+        status = $ingressReadiness.status
+        note = "the web nodes publish 8080 only, so no readiness endpoint is reachable through the ingress; recorded, not gated. The ingress is gated by the port mapping, the refusal count, and the login-plus-submit probe."
+    }
 
     $report.gatlingStartedAt = [datetimeoffset]::UtcNow.ToString("o")
     $phase = Start-GatlingLoadPhase -PhaseName "preflight" -Seed $Seed -UserPrefix $preflightPrefix `
@@ -1205,11 +1245,14 @@ function Invoke-IngressPreflight {
         $problems.Add("the published port for nginx:80 is '$portMapping' rather than a mapping onto 18080, so the load would not reach the ingress this experiment measures")
     }
     $down = @($readinessFailedConfirmations)
-    if (-not $readinessUp) {
+    $neverUp = @($readinessTargets | Where-Object { -not $readinessUpByNode[$_.name] })
+    if ($neverUp.Count -gt 0) {
+        $names = (@($neverUp | ForEach-Object { $_.name }) -join ", ")
         $last = if ($readiness.Count -gt 0) { $readiness[$readiness.Count - 1].status } else { "no reading was taken" }
-        $problems.Add("readiness through the published port never reported UP within ${PreflightReadinessTimeoutSeconds}s ($($readiness.Count) polls, last: $last)")
-    } elseif ($down.Count -gt 0) {
-        $problems.Add("readiness did not stay UP through the published port: $($down.Count) of $($readinessConfirmations.Count) confirmation probes answered otherwise (last: $($down[-1].status))")
+        $problems.Add("readiness never reported UP within ${PreflightReadinessTimeoutSeconds}s on $names ($($readiness.Count) polls, last: $last)")
+    }
+    if ($down.Count -gt 0) {
+        $problems.Add("readiness did not stay UP: $($down.Count) of $($readinessConfirmations.Count) confirmation probes answered otherwise (last: $($down[-1].status))")
     }
     $badContainers = @($report.containers | Where-Object { $_ -notmatch '\|running\|exit=0\|oom=false\|restarts=0\|' })
     if ($badContainers.Count -gt 0) {
@@ -3402,7 +3445,17 @@ try {
 } catch {
     $events.runEndedAt = [datetimeoffset]::UtcNow.ToString("o")
     $events | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDirectory "events.json") -Encoding utf8
-    $_ | Out-String | Set-Content (Join-Path $runDirectory "failure.txt") -Encoding utf8
+    # The stack trace as well as the error: a throw inside a helper is reported against this `catch`
+    # block, so without it a failed run names only the outermost call and the statement that actually
+    # failed has to be found by hand.
+    $failureText = @(
+        ($_ | Out-String)
+        "--- ScriptStackTrace ---"
+        $_.ScriptStackTrace
+        "--- InvocationInfo ---"
+        $_.InvocationInfo.PositionMessage
+    ) -join [Environment]::NewLine
+    $failureText | Set-Content (Join-Path $runDirectory "failure.txt") -Encoding utf8
     # A failed run keeps what it already collected so the reason can be read against the numbers,
     # and stays out of the capacity comparison either way. The preflight's own artifacts are in the
     # list because a preflight refusal is the one failure whose evidence is the ingress rather than
