@@ -60,6 +60,12 @@ param(
     # refusal here stops the run before either condition is spent on an ingress that cannot carry it.
     [switch]$IngressPreflight,
     [int]$PreflightHoldSeconds = 2,
+    # How long the preflight waits for readiness through the published port to report UP before it
+    # calls the ingress down. A freshly started stack can answer 5xx on the readiness endpoint for a
+    # while - the endpoint's first call initializes its indicators - so this is a wait with a
+    # deadline, not a sample: "readiness succeeds repeatedly" is a claim about a state, and a state
+    # has to be observed rather than assumed from one instant.
+    [int]$PreflightReadinessTimeoutSeconds = 180,
     # Which preflight user the single login-plus-submit probe uses. Any of them proves the same
     # thing; fixing it makes the probe reproducible.
     [int]$PreflightProbeUserIndex = 1,
@@ -261,6 +267,7 @@ if ($phasedLoad) {
     if ($IngressPreflight) {
         if ($AuthPrepSeconds -le 0) { throw "-IngressPreflight exists to rule out a login storm at the measurement start, so it requires -AuthPrepSeconds." }
         if ($PreflightHoldSeconds -lt 1) { throw "-PreflightHoldSeconds must be at least 1." }
+        if ($PreflightReadinessTimeoutSeconds -lt 1) { throw "-PreflightReadinessTimeoutSeconds must be at least 1." }
         if ($PreflightProbeUserIndex -lt 1 -or $PreflightProbeUserIndex -gt $UserCount) { throw "-PreflightProbeUserIndex must name a seeded user (1..$UserCount)." }
     }
     # Each phase is its own Gatling invocation with one stage, so warmupStageCount is 0: the phase
@@ -976,7 +983,10 @@ function Save-ContainerLog {
     try {
         $id = @(Invoke-Compose -Arguments @("ps", "-q", $Service) | Where-Object { $_ })
         if ($id.Count -eq 0) { "no container for $Service" | Set-Content $Path -Encoding utf8; return }
-        $arguments = @("logs", "--no-color")
+        # `docker logs` has no --no-color on this engine, and the run that first needed this log
+        # learned it the hard way: the capture wrote "unknown flag: --no-color" into the file it was
+        # supposed to fill, so the nginx evidence for the refusal it was recorded beside was lost.
+        $arguments = @("logs")
         if ($Since) { $arguments += @("--since", $Since) }
         $arguments += $id[0]
         & docker @arguments 2>&1 | ForEach-Object { [string]$_ } | Set-Content $Path -Encoding utf8
@@ -1016,6 +1026,8 @@ function Invoke-IngressPreflight {
         publishedPort = $null
         containers = @()
         readiness = @()
+        readinessPolls = $null
+        readinessUp = $null
         gatlingStartedAt = $null
         gatlingExitedAt = $null
         gatlingExitCode = $null
@@ -1039,18 +1051,43 @@ function Invoke-IngressPreflight {
 
     $report.containers = @(Get-ContainerStates)
 
-    # Through the published port, which is the only ingress the load may use, and repeated because a
-    # single UP is a moment rather than a state.
-    $readiness = foreach ($attempt in 1..3) {
+    # Through the published port, which is the only ingress the load may use. Section 3 asks that
+    # readiness succeed repeatedly, and "repeatedly" is two claims: that it comes UP at all, and that
+    # it stays UP. Sampling three times inside one second answers neither - it cannot tell a stack
+    # still settling apart from one that is down, and it calls a single moment a state. So the
+    # endpoint is polled until it reports UP, and only then re-probed three times to confirm. On the
+    # 2026-09-20 comparison's first attempt the three-sample version stopped the run on three 500s
+    # taken 16 seconds after the stack came up, while the same ingress carried 3,100 logins with no
+    # refusal four seconds later.
+    $readiness = New-Object System.Collections.Generic.List[object]
+    $readinessDeadline = (Get-Date).AddSeconds($PreflightReadinessTimeoutSeconds)
+    $readinessUp = $false
+    while ((Get-Date) -lt $readinessDeadline) {
         $state = Test-NodeReadiness -Port 18080
-        $observation = [pscustomobject]@{
-            attempt = $attempt; at = [datetimeoffset]::UtcNow.ToString("o")
+        $readiness.Add([pscustomobject]@{
+            phase = "wait"; attempt = $readiness.Count + 1
+            at = [datetimeoffset]::UtcNow.ToString("o")
             up = $state.up; httpStatus = $state.httpStatus; status = $state.status
+        })
+        if ($state.up) { $readinessUp = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if ($readinessUp) {
+        foreach ($confirm in 1..3) {
+            Start-Sleep -Milliseconds 400
+            $state = Test-NodeReadiness -Port 18080
+            $readiness.Add([pscustomobject]@{
+                phase = "confirm"; attempt = $readiness.Count + 1
+                at = [datetimeoffset]::UtcNow.ToString("o")
+                up = $state.up; httpStatus = $state.httpStatus; status = $state.status
+            })
         }
-        Start-Sleep -Milliseconds 400
-        $observation
     }
     $report.readiness = @($readiness)
+    $report.readinessPolls = $readiness.Count
+    $report.readinessUp = $readinessUp
+    $readinessConfirmations = @($readiness | Where-Object { $_.phase -eq "confirm" })
+    $readinessFailedConfirmations = @($readinessConfirmations | Where-Object { -not $_.up })
 
     $report.gatlingStartedAt = [datetimeoffset]::UtcNow.ToString("o")
     $phase = Start-GatlingLoadPhase -PhaseName "preflight" -Seed $Seed -UserPrefix $preflightPrefix `
@@ -1167,9 +1204,12 @@ function Invoke-IngressPreflight {
     if ($portMapping -notmatch "18080") {
         $problems.Add("the published port for nginx:80 is '$portMapping' rather than a mapping onto 18080, so the load would not reach the ingress this experiment measures")
     }
-    $down = @($report.readiness | Where-Object { -not $_.up })
-    if ($down.Count -gt 0) {
-        $problems.Add("$($down.Count) of 3 readiness probes through the published port did not report UP (last: $($down[-1].status))")
+    $down = @($readinessFailedConfirmations)
+    if (-not $readinessUp) {
+        $last = if ($readiness.Count -gt 0) { $readiness[$readiness.Count - 1].status } else { "no reading was taken" }
+        $problems.Add("readiness through the published port never reported UP within ${PreflightReadinessTimeoutSeconds}s ($($readiness.Count) polls, last: $last)")
+    } elseif ($down.Count -gt 0) {
+        $problems.Add("readiness did not stay UP through the published port: $($down.Count) of $($readinessConfirmations.Count) confirmation probes answered otherwise (last: $($down[-1].status))")
     }
     $badContainers = @($report.containers | Where-Object { $_ -notmatch '\|running\|exit=0\|oom=false\|restarts=0\|' })
     if ($badContainers.Count -gt 0) {
@@ -1768,7 +1808,29 @@ function Test-NodeReadiness {
     } catch {
         # Spring answers 503 while the readiness group is DOWN, and 503 is an exception here, so the
         # transition to UP is the observable event rather than a status string that was read.
-        return [pscustomobject]@{ up = $false; httpStatus = $null; status = "unreachable-or-down: $($_.Exception.Message)" }
+        #
+        # The response body is read back when there is one, because a 5xx is the only answer that
+        # cannot be interpreted from its status: Spring's health endpoint returns a document naming
+        # the indicators that failed, and a 500 there carries the exception that threw. Without it a
+        # readiness failure reads as "it said 500", which is an observation and not a diagnosis.
+        $excerpt = ""
+        $response = $null
+        if ($null -ne $_.Exception.Response) {
+            $response = $_.Exception.Response
+        } elseif ($null -ne $_.Exception.InnerException -and $null -ne $_.Exception.InnerException.Response) {
+            $response = $_.Exception.InnerException.Response
+        }
+        if ($null -ne $response) {
+            try {
+                $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+                $body = $reader.ReadToEnd()
+                $reader.Close()
+                if (-not [string]::IsNullOrWhiteSpace($body)) {
+                    $excerpt = " body: " + ($body -replace "\s+", " ").Substring(0, [math]::Min(200, ($body -replace "\s+", " ").Length))
+                }
+            } catch { }
+        }
+        return [pscustomobject]@{ up = $false; httpStatus = $null; status = "unreachable-or-down: $($_.Exception.Message)$excerpt" }
     }
 }
 
