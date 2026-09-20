@@ -2,8 +2,8 @@ package my.oj.web.contest.scoreboard.rebuild;
 
 import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
-import my.oj.web.contest.scoreboard.stream.JdbcContestScoreboardAppliedAtWriter;
 import my.oj.web.contest.submission.core.ContestSubmission;
 import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
@@ -30,7 +30,7 @@ public class ContestScoreboardRebuildService {
     private final ContestSubmissionResultRepository resultRepository;
     private final ContestSubmissionService contestSubmissionService;
     private final ContestSubmissionBatchExecutor batchExecutor;
-    private final JdbcContestScoreboardAppliedAtWriter appliedAtWriter;
+    private final ContestScoreboardAppliedMarker appliedMarker;
 
     public int rebuildAllFromContestResults() {
         List<Long> contestIds = resultRepository.findDistinctContestIds();
@@ -107,7 +107,7 @@ public class ContestScoreboardRebuildService {
                     "Failed to replay contest " + contestId + " onto the scoreboard: " + failure
             );
         }
-        appliedAtWriter.markApplied(requests.stream()
+        appliedMarker.markApplied(requests.stream()
                 .map(request -> request.update().contestSubmissionId())
                 .toList());
     }

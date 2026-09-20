@@ -32,15 +32,18 @@ public class InMemoryContestScoreboard {
      * Records one attempt and rewrites what its problem contributes to the user totals.
      * Recomputing from every attempt seen for the problem makes the result independent of
      * judgement arrival order.
+     *
+     * @return whether this call changed the standings: a duplicate submission or an unjudged one is
+     *         recorded for nothing, which is what the sequence issue hangs off
      */
-    public void apply(ContestScoreboardUpdate update) {
+    public boolean apply(ContestScoreboardUpdate update) {
         long submissionId = update.contestSubmissionId();
         ContestState state = getContestState(update.contestId(), update.contestStart());
         if (!state.appliedSubmissions.add(submissionId)) {
-            return;
+            return false;
         }
         if (update.result() == SubmissionResult.PENDING) {
-            return;
+            return false;
         }
 
         UserState userState = state.users.computeIfAbsent(update.userId(), id -> new UserState());
@@ -66,6 +69,7 @@ public class InMemoryContestScoreboard {
         }
 
         state.updateUserScore(update.userId(), userState);
+        return true;
     }
 
     public void reset(long contestId) {

@@ -40,6 +40,17 @@ public class ContestSubmissionResult {
     @Column(name = "final_judged_at")
     private LocalDateTime finalJudgedAt;
 
+    /**
+     * The sequence the scoreboard held for this result at the moment it was applied, or null when
+     * the scoreboard does not issue sequences.
+     *
+     * <p>Deliberately not named {@code redis_seq}: that name already belongs to
+     * {@code contest_submission_outbox.redis_seq}, a table whose rows are purged when a contest is
+     * finalized, so a checkpoint kept there would disappear exactly when a recovery needs it.</p>
+     */
+    @Column(name = "scoreboard_applied_seq")
+    private Long scoreboardAppliedSeq;
+
     public static ContestSubmissionResult pending(ContestSubmission submission) {
         ContestSubmissionResult result = new ContestSubmissionResult();
         result.submission = submission;

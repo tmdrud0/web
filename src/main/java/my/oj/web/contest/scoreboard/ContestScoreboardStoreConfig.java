@@ -6,6 +6,10 @@ import my.oj.web.contest.scoreboard.memory.InMemoryContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.redis.ContestRedisKeyValueClient;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplyMetrics;
+import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardSequenceSource;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryMode;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryProperties;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -22,6 +26,19 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 @Configuration
 public class ContestScoreboardStoreConfig {
 
+    /**
+     * Whether the scoreboard issues a recovery sequence, read from the mode as bound rather than as
+     * written. One unconditional bean, so a context that never loads the recovery properties - a
+     * slice test, or a profile that does not use the feature - gets the documented default of no
+     * sequence rather than failing to start.
+     */
+    @Bean
+    ContestScoreboardSequenceTracking contestScoreboardSequenceTracking(
+            ObjectProvider<ContestScoreboardRecoveryProperties> recoveryProperties) {
+        ContestScoreboardRecoveryProperties properties = recoveryProperties.getIfAvailable();
+        return () -> properties != null && properties.mode() == ContestScoreboardRecoveryMode.REDIS_SEQ;
+    }
+
     @Bean
     @ConditionalOnProperty(prefix = "contest.scoreboard", name = "store", havingValue = "memory", matchIfMissing = true)
     InMemoryContestScoreboard inMemoryContestScoreboard() {
@@ -30,8 +47,10 @@ public class ContestScoreboardStoreConfig {
 
     @Bean
     @ConditionalOnProperty(prefix = "contest.scoreboard", name = "store", havingValue = "memory", matchIfMissing = true)
-    ContestScoreboardApplier inMemoryContestScoreboardApplier(InMemoryContestScoreboard scoreboard) {
-        return new InMemoryContestScoreboardApplier(scoreboard);
+    InMemoryContestScoreboardApplier inMemoryContestScoreboardApplier(
+            InMemoryContestScoreboard scoreboard,
+            ContestScoreboardSequenceTracking sequenceTracking) {
+        return new InMemoryContestScoreboardApplier(scoreboard, sequenceTracking);
     }
 
     @Bean
@@ -44,7 +63,14 @@ public class ContestScoreboardStoreConfig {
     @ConditionalOnProperty(prefix = "contest.scoreboard", name = "store", havingValue = "redis")
     ContestScoreboardApplier redisContestScoreboardApplier(StringRedisTemplate redisTemplate,
                                                            ContestRedisKeyValueClient redisClient,
-                                                           RedisContestScoreboardApplyMetrics metrics) {
-        return new RedisContestScoreboardApplier(redisTemplate, redisClient, metrics);
+                                                           RedisContestScoreboardApplyMetrics metrics,
+                                                           ContestScoreboardSequenceTracking sequenceTracking) {
+        return new RedisContestScoreboardApplier(redisTemplate, redisClient, metrics, sequenceTracking);
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "contest.scoreboard", name = "store", havingValue = "redis")
+    ContestScoreboardSequenceSource redisContestScoreboardSequenceSource(StringRedisTemplate redisTemplate) {
+        return new RedisContestScoreboardSequenceSource(redisTemplate);
     }
 }

@@ -2,9 +2,9 @@ package my.oj.web.contest.scoreboard.recovery;
 
 import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
-import my.oj.web.contest.scoreboard.stream.JdbcContestScoreboardAppliedAtWriter;
 import my.oj.web.contest.submission.core.ContestScoreboardReplayRow;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
@@ -31,7 +31,7 @@ public class ContestScoreboardFullReplayService {
     private final ContestScoreboardApplier scoreboardApplier;
     private final ContestSubmissionResultRepository resultRepository;
     private final ContestSubmissionBatchExecutor batchExecutor;
-    private final JdbcContestScoreboardAppliedAtWriter appliedAtWriter;
+    private final ContestScoreboardAppliedMarker appliedMarker;
     private final ContestScoreboardApplyLock applyLock;
     private final ContestScoreboardRecoveryProperties properties;
 
@@ -96,7 +96,7 @@ public class ContestScoreboardFullReplayService {
                         + " onto the scoreboard: "
                         + (failure == null ? "batch stopped before every result was applied" : failure));
             }
-            appliedAtWriter.markApplied(requests.stream()
+            appliedMarker.markApplied(requests.stream()
                     .map(request -> request.update().contestSubmissionId())
                     .toList());
         });

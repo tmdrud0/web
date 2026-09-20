@@ -8,7 +8,7 @@ import my.oj.web.contest.submission.core.ContestSubmissionResult;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.core.ContestSubmissionService;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
-import my.oj.web.contest.scoreboard.stream.JdbcContestScoreboardAppliedAtWriter;
+import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.problem.Problem;
 import my.oj.web.submission.SubmissionResult;
 import my.oj.web.user.Streak;
@@ -55,7 +55,7 @@ class ContestScoreboardRebuildServiceTests {
     @Mock
     private ContestSubmissionService contestSubmissionService;
     @Mock
-    private JdbcContestScoreboardAppliedAtWriter appliedAtWriter;
+    private ContestScoreboardAppliedMarker appliedMarker;
 
     private ContestScoreboardRebuildService rebuildService;
 
@@ -72,7 +72,7 @@ class ContestScoreboardRebuildServiceTests {
                 resultRepository,
                 contestSubmissionService,
                 new ContestSubmissionBatchExecutor(new NoOpTransactionManager()),
-                appliedAtWriter
+                appliedMarker
         );
 
         contest = new Contest("Contest");
@@ -123,7 +123,7 @@ class ContestScoreboardRebuildServiceTests {
                                 submission3.getSubmittedTime(), SubmissionResult.WRONG_ANSWER)
                 );
         assertThat(captor.getValue()).allMatch(request -> request.streamOffset() == null);
-        verify(appliedAtWriter).markApplied(List.of(5L, 3L));
+        verify(appliedMarker).markApplied(List.of(5L, 3L));
     }
 
     /**
@@ -145,7 +145,7 @@ class ContestScoreboardRebuildServiceTests {
         assertThat(captor.getValue())
                 .extracting(request -> request.update().contestSubmissionId())
                 .containsExactly(5L);
-        verify(appliedAtWriter).markApplied(List.of(5L));
+        verify(appliedMarker).markApplied(List.of(5L));
     }
 
     /**
@@ -164,7 +164,7 @@ class ContestScoreboardRebuildServiceTests {
 
         verify(scoreboardApplier).reset(CONTEST_ID);
         verify(scoreboardApplier, never()).applyAll(anyList());
-        verify(appliedAtWriter, never()).markApplied(anyList());
+        verify(appliedMarker, never()).markApplied(anyList());
     }
 
     @Test
@@ -192,7 +192,7 @@ class ContestScoreboardRebuildServiceTests {
 
         verify(scoreboardApplier).reset(CONTEST_ID);
         verify(scoreboardApplier, never()).applyAll(anyList());
-        verify(appliedAtWriter, never()).markApplied(anyList());
+        verify(appliedMarker, never()).markApplied(anyList());
     }
 
     private void stubBatches(Map<Long, ContestSubmissionResult> resultMap) {

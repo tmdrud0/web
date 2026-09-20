@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.stream;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -25,7 +26,7 @@ class ContestScoreboardAppliedAtCompletionTests {
     @Mock
     private SetOperations<String, String> setOperations;
     @Mock
-    private JdbcContestScoreboardAppliedAtWriter writer;
+    private ContestScoreboardAppliedMarker appliedMarker;
 
     @Test
     void removesRepairIdsOnlyAfterMysqlBatchSucceeds() {
@@ -34,8 +35,8 @@ class ContestScoreboardAppliedAtCompletionTests {
 
         completion.complete(List.of(3L, 1L, 3L));
 
-        InOrder order = inOrder(writer, setOperations);
-        order.verify(writer).markApplied(List.of(3L, 1L));
+        InOrder order = inOrder(appliedMarker, setOperations);
+        order.verify(appliedMarker).markApplied(List.of(3L, 1L));
         order.verify(setOperations).remove(
                 RedisContestScoreboardApplier.STREAM_DB_PENDING_KEY, "3", "1");
     }
@@ -49,11 +50,11 @@ class ContestScoreboardAppliedAtCompletionTests {
 
         completion.repairPending();
 
-        InOrder order = inOrder(writer, setOperations);
-        order.verify(writer).markApplied(List.of(1L, 2L));
+        InOrder order = inOrder(appliedMarker, setOperations);
+        order.verify(appliedMarker).markApplied(List.of(1L, 2L));
         order.verify(setOperations).remove(
                 RedisContestScoreboardApplier.STREAM_DB_PENDING_KEY, "1", "2");
-        order.verify(writer).markApplied(List.of(3L));
+        order.verify(appliedMarker).markApplied(List.of(3L));
         order.verify(setOperations).remove(
                 RedisContestScoreboardApplier.STREAM_DB_PENDING_KEY, "3");
         verify(setOperations).members(RedisContestScoreboardApplier.STREAM_DB_PENDING_KEY);
@@ -62,7 +63,7 @@ class ContestScoreboardAppliedAtCompletionTests {
     private ContestScoreboardAppliedAtCompletion completion(int batchSize) {
         return new ContestScoreboardAppliedAtCompletion(
                 redisTemplate,
-                writer,
+                appliedMarker,
                 new ContestScoreboardStreamConsumerProperties(
                         batchSize, batchSize, Duration.ofMillis(50), Duration.ofSeconds(1), Duration.ofSeconds(1),
                         Duration.ofSeconds(5), Duration.ofMillis(50), Duration.ofSeconds(2), 4096)

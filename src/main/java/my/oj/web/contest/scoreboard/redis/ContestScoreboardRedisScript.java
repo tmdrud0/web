@@ -13,6 +13,14 @@ import org.springframework.data.redis.core.script.RedisScript;
  * <p>KEYS[6] remains a per-contest processed-submission set. The commutative problem state is the
  * correctness rule; this set only avoids recalculating duplicate stream entries. A contest reset
  * clears it so a DB rebuild can repopulate empty standings without advancing KEYS[1].
+ *
+ * <p>When {@code ARGV[10]} is {@code 1} the script also issues a recovery sequence: {@code INCR}
+ * on KEYS[7] plus {@code HSET} of {@code submissionId -> sequence} in KEYS[8]. The sequence is
+ * issued inside this one invocation precisely so that it cannot diverge from the scoreboard it
+ * describes - a snapshot that rolls the standings back rolls the allocator and the mapping back
+ * with them. The reply is unchanged (the same stream offset as before), so the caller reads the
+ * issued sequence back from KEYS[8] rather than from a second round trip. With {@code ARGV[10]}
+ * at {@code 0} the script does no sequence work at all and behaves exactly as it did before.
  */
 final class ContestScoreboardRedisScript {
 
@@ -82,6 +90,10 @@ final class ContestScoreboardRedisScript {
                         return redis.error_reply('Invalid scoreboard submission id argument')
                     end
                     local submissionId = ARGV[3]
+                    if ARGV[10] ~= '0' and ARGV[10] ~= '1' then
+                        return redis.error_reply('Invalid scoreboard sequence tracking flag')
+                    end
+                    local trackSequence = ARGV[10] == '1'
 
                     assertKeyType(KEYS[1], 'string')
                     assertKeyType(KEYS[2], 'set')
@@ -89,6 +101,10 @@ final class ContestScoreboardRedisScript {
                     assertKeyType(KEYS[4], 'hash')
                     assertKeyType(KEYS[5], 'hash')
                     assertKeyType(KEYS[6], 'set')
+                    if trackSequence then
+                        assertKeyType(KEYS[7], 'string')
+                        assertKeyType(KEYS[8], 'hash')
+                    end
 
                     local currentOffsetValue = redis.call('get', KEYS[1])
                     local currentOffset = -1
@@ -166,6 +182,35 @@ final class ContestScoreboardRedisScript {
                     end
 
                     if ARGV[4] ~= 'PENDING' then
+                        -- Resolved before the first write: a script that returns an error reply does
+                        -- not roll back the writes it already made, so a corrupt sequence state has
+                        -- to fail this event before the standings move rather than after.
+                        local sequenceToIssue = nil
+                        if trackSequence then
+                            local allocator = parseInteger(
+                                    redis.call('get', KEYS[7]),
+                                    'allocatorSequence')
+                            if allocator < 0 then
+                                return redis.error_reply('Invalid negative scoreboard allocator sequence')
+                            end
+                            local mappedSequence = nil
+                            local mapped = redis.call('hget', KEYS[8], submissionId)
+                            if mapped then
+                                if not string.match(mapped, '^%d+$') then
+                                    return redis.error_reply('Invalid scoreboard submission sequence')
+                                end
+                                mappedSequence = tonumber(mapped)
+                            end
+                            -- A mapping at or above the next allocator value means the allocator was
+                            -- rewound past a mapping the snapshot kept; stepping over it keeps the
+                            -- sequence strictly increasing, which is what lets a lost-tail check
+                            -- terminate instead of re-issuing a sequence a mapping already holds.
+                            sequenceToIssue = allocator + 1
+                            if mappedSequence and mappedSequence >= sequenceToIssue then
+                                sequenceToIssue = mappedSequence + 1
+                            end
+                        end
+
                         if not initialized then
                             redis.call('hset', KEYS[4],
                                     'solved', '0',
@@ -222,6 +267,11 @@ final class ContestScoreboardRedisScript {
 
                         local score = solved * solvedWeight - penalty * penaltyWeight - userId
                         redis.call('zadd', KEYS[3], score, ARGV[9])
+
+                        if sequenceToIssue then
+                            redis.call('set', KEYS[7], tostring(sequenceToIssue))
+                            redis.call('hset', KEYS[8], submissionId, tostring(sequenceToIssue))
+                        end
                     end
 
                     redis.call('sadd', KEYS[6], submissionId)

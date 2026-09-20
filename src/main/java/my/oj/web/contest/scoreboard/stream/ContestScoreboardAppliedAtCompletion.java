@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.stream;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplier;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
@@ -15,16 +16,16 @@ import java.util.Set;
 class ContestScoreboardAppliedAtCompletion {
 
     private final StringRedisTemplate redisTemplate;
-    private final JdbcContestScoreboardAppliedAtWriter writer;
+    private final ContestScoreboardAppliedMarker appliedMarker;
     private final int batchSize;
 
     ContestScoreboardAppliedAtCompletion(
             StringRedisTemplate redisTemplate,
-            JdbcContestScoreboardAppliedAtWriter writer,
+            ContestScoreboardAppliedMarker appliedMarker,
             ContestScoreboardStreamConsumerProperties properties
     ) {
         this.redisTemplate = redisTemplate;
-        this.writer = writer;
+        this.appliedMarker = appliedMarker;
         this.batchSize = properties.effectiveBatchSize();
     }
 
@@ -36,7 +37,7 @@ class ContestScoreboardAppliedAtCompletion {
         if (ids.isEmpty()) {
             return;
         }
-        writer.markApplied(ids);
+        appliedMarker.markApplied(ids);
         redisTemplate.opsForSet().remove(
                 RedisContestScoreboardApplier.STREAM_DB_PENDING_KEY,
                 ids.stream().map(String::valueOf).toArray()

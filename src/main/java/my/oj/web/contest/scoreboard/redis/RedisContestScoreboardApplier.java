@@ -4,6 +4,7 @@ import io.lettuce.core.RedisCommandExecutionException;
 import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardPolicy;
+import my.oj.web.contest.scoreboard.ContestScoreboardSequenceTracking;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import org.springframework.data.redis.connection.lettuce.LettuceConnection;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
@@ -18,10 +19,13 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
 
     public static final String STREAM_OFFSET_KEY = ContestScoreboardRedisKeys.STREAM_OFFSET;
     public static final String STREAM_DB_PENDING_KEY = ContestScoreboardRedisKeys.STREAM_DB_PENDING;
+    public static final String SEQUENCE_KEY = ContestScoreboardRedisKeys.SEQUENCE;
+    public static final String SUBMISSION_SEQUENCE_KEY = ContestScoreboardRedisKeys.SUBMISSION_SEQUENCE;
 
     private final StringRedisTemplate redisTemplate;
     private final ContestRedisKeyValueClient redisClient;
     private final RedisContestScoreboardApplyMetrics metrics;
+    private final ContestScoreboardSequenceTracking sequenceTracking;
 
     public RedisContestScoreboardApplier(StringRedisTemplate redisTemplate,
                                          ContestRedisKeyValueClient redisClient) {
@@ -32,9 +36,19 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
     public RedisContestScoreboardApplier(StringRedisTemplate redisTemplate,
                                          ContestRedisKeyValueClient redisClient,
                                          RedisContestScoreboardApplyMetrics metrics) {
+        this(redisTemplate, redisClient, metrics, ContestScoreboardSequenceTracking.DISABLED);
+    }
+
+    public RedisContestScoreboardApplier(StringRedisTemplate redisTemplate,
+                                         ContestRedisKeyValueClient redisClient,
+                                         RedisContestScoreboardApplyMetrics metrics,
+                                         ContestScoreboardSequenceTracking sequenceTracking) {
         this.redisTemplate = redisTemplate;
         this.redisClient = redisClient;
         this.metrics = metrics;
+        this.sequenceTracking = sequenceTracking == null
+                ? ContestScoreboardSequenceTracking.DISABLED
+                : sequenceTracking;
         if (redisTemplate.getConnectionFactory() instanceof LettuceConnectionFactory connectionFactory) {
             connectionFactory.setPipeliningFlushPolicy(
                     LettuceConnection.PipeliningFlushPolicy.flushOnClose()
@@ -50,7 +64,7 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
             appliedOffset = redisTemplate.execute(
                     ContestScoreboardRedisScript.APPLY,
                     keys(request.update()),
-                    (Object[]) arguments(request)
+                    (Object[]) arguments(request, sequenceTracking.enabled())
             );
         } catch (RuntimeException failure) {
             if (hasCommandExecutionFailure(failure)) {
@@ -131,11 +145,13 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
                 ContestScoreboardRedisKeys.ranking(update.contestId()),
                 ContestScoreboardRedisKeys.summary(update.contestId(), update.userId()),
                 ContestScoreboardRedisKeys.problem(update.contestId(), update.userId(), update.problemId()),
-                ContestScoreboardRedisKeys.processed(update.contestId())
+                ContestScoreboardRedisKeys.processed(update.contestId()),
+                SEQUENCE_KEY,
+                SUBMISSION_SEQUENCE_KEY
         );
     }
 
-    private static String[] arguments(ApplyRequest request) {
+    private static String[] arguments(ApplyRequest request, boolean trackSequence) {
         ContestScoreboardUpdate update = request.update();
         return new String[]{
                 request.streamOffset() == null ? "" : Long.toString(request.streamOffset()),
@@ -149,7 +165,8 @@ public class RedisContestScoreboardApplier implements ContestScoreboardApplier {
                 Long.toString(ContestScoreboardPolicy.PENALTY_PER_WRONG_MINUTES),
                 Long.toString(ContestScoreboardPolicy.SCORE_SOLVED_WEIGHT),
                 Long.toString(ContestScoreboardPolicy.SCORE_PENALTY_WEIGHT),
-                Long.toString(update.userId())
+                Long.toString(update.userId()),
+                trackSequence ? "1" : "0"
         };
     }
 }

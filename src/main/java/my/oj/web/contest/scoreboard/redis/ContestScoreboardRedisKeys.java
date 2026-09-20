@@ -5,6 +5,16 @@ final class ContestScoreboardRedisKeys {
     static final String STREAM_OFFSET = "contest:scoreboard:stream:offset";
     static final String STREAM_DB_PENDING = "contest:scoreboard:stream:db-pending";
 
+    /**
+     * Allocator for the recovery sequence. Global rather than per contest: the mapping below is a
+     * single global hash, so a global allocator is the only scope at which "has this sequence been
+     * handed out twice" can be answered exactly.
+     */
+    static final String SEQUENCE = "contest:scoreboard:seq";
+
+    /** submissionId to the sequence the scoreboard last applied it under. */
+    static final String SUBMISSION_SEQUENCE = "contest:scoreboard:submission-seq";
+
     private static final String PREFIX = "contest:scoreboard:";
 
     private ContestScoreboardRedisKeys() {

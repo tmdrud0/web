@@ -3,7 +3,7 @@ package my.oj.web.contest.scoreboard.recovery;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
-import my.oj.web.contest.scoreboard.stream.JdbcContestScoreboardAppliedAtWriter;
+import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.contest.submission.core.ContestScoreboardReplayRow;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
@@ -50,7 +50,7 @@ class ContestScoreboardFullReplayServiceTests {
     @Mock
     private ContestSubmissionResultRepository resultRepository;
     @Mock
-    private JdbcContestScoreboardAppliedAtWriter appliedAtWriter;
+    private ContestScoreboardAppliedMarker appliedMarker;
 
     private ContestScoreboardFullReplayService replayService;
 
@@ -60,7 +60,7 @@ class ContestScoreboardFullReplayServiceTests {
                 scoreboardApplier,
                 resultRepository,
                 new ContestSubmissionBatchExecutor(new NoOpTransactionManager()),
-                appliedAtWriter,
+                appliedMarker,
                 new ContestScoreboardApplyLock(),
                 properties(2, 2)
         );
@@ -97,7 +97,7 @@ class ContestScoreboardFullReplayServiceTests {
                 );
         // A rebuild request carries no offset, so a replay cannot move the stream checkpoint.
         assertThat(requests.getValue()).allMatch(request -> request.streamOffset() == null);
-        verify(appliedAtWriter).markApplied(List.of(3L, 5L));
+        verify(appliedMarker).markApplied(List.of(3L, 5L));
     }
 
     /** Unjudged rows must never reach the scoreboard, or the real judgement is skipped for good. */
@@ -134,7 +134,7 @@ class ContestScoreboardFullReplayServiceTests {
                 scoreboardApplier,
                 resultRepository,
                 new ContestSubmissionBatchExecutor(new NoOpTransactionManager()),
-                appliedAtWriter,
+                appliedMarker,
                 new ContestScoreboardApplyLock(),
                 properties(4, 2)
         );
@@ -154,8 +154,8 @@ class ContestScoreboardFullReplayServiceTests {
                         .map(request -> request.update().contestSubmissionId())
                         .toList())
                 .containsExactly(List.of(1L, 2L), List.of(3L, 4L));
-        verify(appliedAtWriter).markApplied(List.of(1L, 2L));
-        verify(appliedAtWriter).markApplied(List.of(3L, 4L));
+        verify(appliedMarker).markApplied(List.of(1L, 2L));
+        verify(appliedMarker).markApplied(List.of(3L, 4L));
     }
 
     @Test
@@ -172,7 +172,7 @@ class ContestScoreboardFullReplayServiceTests {
         assertThatThrownBy(() -> replayService.replayContest(CONTEST_ID))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("wrong Redis key type");
-        verify(appliedAtWriter, never()).markApplied(anyList());
+        verify(appliedMarker, never()).markApplied(anyList());
     }
 
     @Test
@@ -181,7 +181,7 @@ class ContestScoreboardFullReplayServiceTests {
 
         assertThat(replayService.replayContest(CONTEST_ID)).isZero();
 
-        verifyNoInteractions(scoreboardApplier, appliedAtWriter);
+        verifyNoInteractions(scoreboardApplier, appliedMarker);
     }
 
     @Test
