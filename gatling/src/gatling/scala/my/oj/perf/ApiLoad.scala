@@ -81,6 +81,25 @@ object ApiLoad {
       delay.millis
     }))
 
+  /**
+   * Holds a session until an absolute instant, then releases it.
+   *
+   * Measured from the wall clock rather than from the schedule, because the session-preparation
+   * window is the injector's ramp: a fixed pause after each user's own start would smear the
+   * submission load across the whole ramp, and the point of separating login from submission is that
+   * every session is ready before the load begins. A user whose login finished after the gate waits
+   * zero and joins late rather than being held back, so the gate can never deadlock a run; the
+   * count of sessions that started before it is readable from the run's own log afterwards.
+   *
+   * The wait is a Gatling pause, so the user is rescheduled rather than occupying a thread - the
+   * population this is used at (thousands) would otherwise block the whole actor pool.
+   */
+  def waitUntil(gateMillis: Long): ChainBuilder =
+    exec(pause(session => {
+      val remaining = gateMillis - System.currentTimeMillis()
+      if (remaining > 0L) remaining.millis else 0.millis
+    }))
+
   def randomSubmissionData(problemIdStart: Long, problemIdEnd: Long, tag: String): ChainBuilder =
     exec { session =>
       workloadSeed match {

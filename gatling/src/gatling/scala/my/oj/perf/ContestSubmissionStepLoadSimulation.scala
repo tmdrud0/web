@@ -41,6 +41,21 @@ import scala.concurrent.duration._
  * `submitIntervalMillis` by `initialJitter`, which is a third of a 30 second stage. Predicting the
  * boundaries from a single anchor costs whatever delay sits between `before()` and the injector
  * start (a constant, recorded alongside the run), and it removes the sampling error.
+ *
+ * `perf.authPrepSeconds` separates session preparation from the measured submission load. Left
+ * absent, the model is exactly what every earlier run was measured with: users arrive on the ramp,
+ * each logs in as it starts, and each begins submitting immediately, so the logins are spread only
+ * as widely as the ramp is long. Set equal to `perf.rampSeconds`, the same ramp becomes the window
+ * over which the population establishes its sessions and nothing is submitted until it closes.
+ *
+ * That separation is not cosmetic. A 1000 RPS step with a 3100ms per-user pace needs 3,100 sessions,
+ * and creating them on a one second ramp is 3,100 simultaneous connections through the published
+ * port - which the run on 2026-09-20 measured as 2,289 `Connection refused` answers. Every refused
+ * login then trips `exitHereIfFailed`, the closed model replaces the session, the replacement takes
+ * the next record from the non-circular login feeder, and the feeder emptied before the engine had
+ * persisted a single submission. Spreading the same 3,100 connections over a 30 second preparation
+ * window is about 103 a second, well inside the 310 a second the warm-up phase had already been
+ * measured doing without a single refusal.
  */
 class ContestSubmissionStepLoadSimulation extends Simulation {
 
@@ -71,6 +86,25 @@ class ContestSubmissionStepLoadSimulation extends Simulation {
   private val warmupStageCount = propInt("perf.warmupStageCount", 0)
   private val stageTraceFile   = Option(System.getProperty("perf.stageTraceFile")).filter(_.nonEmpty)
 
+  /**
+   * The length of the session-preparation window, or 0 for the model that submits as it logs in.
+   * See the class comment: this is the injector's ramp, and it is validated against it below.
+   */
+  private val authPrepSeconds = propInt("perf.authPrepSeconds", 0)
+
+  /**
+   * One clock for the whole schedule, taken before anything else in this class is built.
+   *
+   * The gate below and the trace's `anchor` line are the same instant rather than two calls to
+   * `System.currentTimeMillis()` a few milliseconds apart. Submissions are released at
+   * `anchor + authPrepSeconds`, which is exactly where the trace puts the end of the ramp and the
+   * start of the hold, so the measured window the harness derives from the trace and the instant
+   * the offered load actually begins are the same boundary.
+   */
+  private val planAnchorMillis = System.currentTimeMillis()
+  private val authGateMillis   = planAnchorMillis + authPrepSeconds.toLong * 1000L
+  private val deferSubmissions = authPrepSeconds > 0
+
   private val availableUsers = userIndexEnd - userIndexStart + 1
   private val arithmeticTargets = staircaseTargets()
   private val targets = explicitStageRps.getOrElse(arithmeticTargets)
@@ -92,19 +126,35 @@ class ContestSubmissionStepLoadSimulation extends Simulation {
     s"perf.warmupStageCount must leave at least one measured stage (got $warmupStageCount of ${targets.size})")
   require(stageTraceFile.isEmpty || explicitStageRps.isDefined,
     "perf.stageTraceFile describes the explicit stage list, so it requires perf.stageRps")
+  require(authPrepSeconds == 0 || (explicitStageRps.isDefined && authPrepSeconds == rampSeconds),
+    s"perf.authPrepSeconds ($authPrepSeconds) is the window that prepares the population's sessions, and it is the " +
+      s"ramp that precedes the first hold: set it equal to perf.rampSeconds ($rampSeconds) on an explicit single-stage " +
+      "plan, or leave it absent for the model that submits as it logs in")
 
   private val httpProtocol = ApiLoad.jsonProtocol(baseUrl)
 
-  private val submitScenario = scenario("Contest submissions (API step load)")
-    .feed(ApiLoad.loginFeeder(userPrefix, userIndexStart, userIndexEnd))
-    .exec(ApiLoad.login)
-    .exitHereIfFailed
-    .exec(ApiLoad.initialJitter(intervalMs))
-    .forever {
-      pace(intervalMs.millis)
-        .exec(ApiLoad.randomSubmissionData(problemIdStart, problemIdEnd, "oj-step"))
-        .exec(ApiLoad.submit)
-    }
+  /**
+   * Login, then wait for the preparation window to close, then submit.
+   *
+   * With `perf.authPrepSeconds` absent the two chains are identical, which is what keeps this an
+   * added property rather than a changed model for the runs that already exist.
+   */
+  private val submitScenario = {
+    val afterLogin = scenario("Contest submissions (API step load)")
+      .feed(ApiLoad.loginFeeder(userPrefix, userIndexStart, userIndexEnd))
+      .exec(ApiLoad.login)
+      .exitHereIfFailed
+    val prepared =
+      if (deferSubmissions) afterLogin.exec(ApiLoad.waitUntil(authGateMillis))
+      else afterLogin
+    prepared
+      .exec(ApiLoad.initialJitter(intervalMs))
+      .forever {
+        pace(intervalMs.millis)
+          .exec(ApiLoad.randomSubmissionData(problemIdStart, problemIdEnd, "oj-step"))
+          .exec(ApiLoad.submit)
+      }
+  }
 
   private val totalDuration =
     if (explicitStageRps.isDefined) explicitPlan().map(_.seconds).sum.seconds
@@ -177,7 +227,10 @@ class ContestSubmissionStepLoadSimulation extends Simulation {
 
   private def writeStageTrace(path: String): Unit = {
     val steps = explicitPlan()
-    val anchorMillis = System.currentTimeMillis()
+    // The class's own clock, not a second reading: `perf.authPrepSeconds` releases the submission
+    // load at this instant plus the ramp, so the trace must describe that same instant rather than
+    // one a few milliseconds later.
+    val anchorMillis = planAnchorMillis
     val lines = ListBuffer.empty[String]
 
     def boundary(event: String, index: Int, step: PlannedStep, offsetMillis: Long): String = {

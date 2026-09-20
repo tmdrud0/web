@@ -45,6 +45,24 @@ param(
     # backlog the measurement exists to observe, and the quiescence gate would then have to drain it
     # before the baseline could be taken.
     [double]$WarmupTargetRps = 0,
+    # Session preparation, separated from the measured submission load. This is the window over which
+    # each phase's population establishes its sessions: it is the injector's ramp, so the logins are
+    # spread over it at population/AuthPrepSeconds per second instead of arriving together, and every
+    # user's first submission is held until it closes. It must equal -RampSeconds, because the ramp's
+    # end is the instant the submissions are released at and the hold's traced start is the boundary
+    # the measured window is derived from. 0 leaves the model exactly as every earlier run used it -
+    # log in as you start, submit as soon as you are logged in.
+    [int]$AuthPrepSeconds = 0,
+    # Ingress preflight, run against the fresh stack before the warm-up: repeat the readiness probe
+    # through the published port, establish the measurement's own session population over the same
+    # preparation window the measurement will use, submit briefly, and probe login-plus-submit once.
+    # Its contest and user pool are separate, so nothing it writes can land in a measured window. A
+    # refusal here stops the run before either condition is spent on an ingress that cannot carry it.
+    [switch]$IngressPreflight,
+    [int]$PreflightHoldSeconds = 2,
+    # Which preflight user the single login-plus-submit probe uses. Any of them proves the same
+    # thing; fixing it makes the probe reproducible.
+    [int]$PreflightProbeUserIndex = 1,
     # Fail-stop recovery comparison. Same two-phase machinery as -NormalTimeout - a warm-up contest,
     # a full drain to quiescence, then a measured contest - but the measured phase SIGKILLs one judge
     # node once that node actually holds work, keeps the load running through the outage, restarts the
@@ -175,7 +193,16 @@ if ($NormalTimeout -and $FaultRecovery) { throw "-NormalTimeout and -FaultRecove
 if ($FaultEnabled -and $FaultRecovery) { throw "-FaultEnabled kills at a fixed second and -FaultRecovery triggers on active work; pass one of them." }
 $warmupPrefix = ""
 $measurementPrefix = ""
+$preflightPrefix = ""
 $measurementHoldSeconds = 0
+# Session preparation is a phased-run concept: the gate is the end of the injector's ramp, and the
+# phased path is the one that traces its ramp. Refused rather than ignored, because a run that asked
+# for the separation and silently did not get it would measure the login storm it means to remove.
+if ($AuthPrepSeconds -gt 0 -and -not $phasedLoad) {
+    throw "-AuthPrepSeconds separates session preparation from the measured load in a phased (-NormalTimeout/-FaultRecovery) run; it does not apply to this one."
+}
+if ($AuthPrepSeconds -lt 0) { throw "-AuthPrepSeconds must not be negative; 0 is the model that submits as it logs in." }
+if ($IngressPreflight -and -not $phasedLoad) { throw "-IngressPreflight establishes a phased run's session population before its warm-up; it does not apply to this one." }
 if ($phasedLoad) {
     # The fault-recovery run is still mysql-only: its whole subject is what a killed claim lease
     # does to the rows it held, and rabbit has no claim lease to lose. The normal-timeout run holds
@@ -212,6 +239,30 @@ if ($phasedLoad) {
     # warm-up phase that quietly offers less than its rate.
     $warmupPopulation = [int][math]::Max(1, [math]::Ceiling($warmupPhaseRps * 3100 / 1000))
     if ($UserCount -lt $warmupPopulation) { throw "UserCount must be at least $warmupPopulation for the warm-up phase's 3100ms per-user pace." }
+    $measurementPopulation = [int][math]::Max(1, [math]::Ceiling($TargetRps * 3100 / 1000))
+    if ($AuthPrepSeconds -gt 0) {
+        if ($AuthPrepSeconds -ne $RampSeconds) {
+            throw "-AuthPrepSeconds ($AuthPrepSeconds) must equal -RampSeconds ($RampSeconds): the sessions are prepared over the ramp and the submissions are released at its end, so the two names are one window."
+        }
+        if ($AuthPrepSeconds -lt 10) {
+            throw "-AuthPrepSeconds must be at least 10 so a population of thousands is spread over it rather than arriving together."
+        }
+        # The login feeder is a non-circular list of one account per session by design - a recycled
+        # account would be a second live session sharing that account's rate-limit and dedup state,
+        # so the load would not be the load it claims to be - which means every session replacement
+        # the closed model makes costs another record. The 2026-09-20 burst runs died exactly there:
+        # refusals replaced sessions, the replacements consumed the pool sized for the peak alone,
+        # and the feeder emptied before a single submission was persisted. Requiring room for one
+        # full replacement of the population is what keeps that a margin rather than a cliff.
+        if ($UserCount -lt 2 * $measurementPopulation) {
+            throw "UserCount must be at least $(2 * $measurementPopulation) when -AuthPrepSeconds separates login from submission: the peak population is $measurementPopulation, and a non-circular feeder sized for the peak alone is emptied by the session replacements a refusal causes."
+        }
+    }
+    if ($IngressPreflight) {
+        if ($AuthPrepSeconds -le 0) { throw "-IngressPreflight exists to rule out a login storm at the measurement start, so it requires -AuthPrepSeconds." }
+        if ($PreflightHoldSeconds -lt 1) { throw "-PreflightHoldSeconds must be at least 1." }
+        if ($PreflightProbeUserIndex -lt 1 -or $PreflightProbeUserIndex -gt $UserCount) { throw "-PreflightProbeUserIndex must name a seeded user (1..$UserCount)." }
+    }
     # Each phase is its own Gatling invocation with one stage, so warmupStageCount is 0: the phase
     # boundary is the harness draining the pipeline between the two runs, not a warm-up stage inside
     # one schedule. The hold carries the steady guard on top of the measured window, so the window
@@ -226,9 +277,11 @@ if ($phasedLoad) {
     if ($FaultRecovery) {
         $warmupPrefix = "fault_warm_$LatencySeed"
         $measurementPrefix = "fault_meas_$LatencySeed"
+        $preflightPrefix = "fault_pre_$LatencySeed"
     } else {
         $warmupPrefix = "norm_warm_$LatencySeed"
         $measurementPrefix = "norm_meas_$LatencySeed"
+        $preflightPrefix = "norm_pre_$LatencySeed"
     }
 }
 if ($FaultRecovery) {
@@ -302,13 +355,24 @@ if ($Staircase) {
         population = $population
         warmupPhase = [ordered]@{
             contestPrefix = $warmupPrefix; rampSeconds = $RampSeconds
+            authPrepSeconds = $AuthPrepSeconds
             targetRps = $warmupPhaseRps; population = $warmupPopulation
             holdSeconds = $WarmupSeconds; seconds = $RampSeconds + $WarmupSeconds
         }
         measurementPhase = [ordered]@{
             contestPrefix = $measurementPrefix; rampSeconds = $RampSeconds
+            authPrepSeconds = $AuthPrepSeconds
             holdSeconds = $measurementHoldSeconds; steadyGuardSeconds = $SteadyGuardSeconds
             measuredWindowSeconds = $MeasurementSeconds; seconds = $RampSeconds + $measurementHoldSeconds
+        }
+        # With the separation off this is the older reading of the same numbers and nothing moved:
+        # the ramp both starts the users and carries their first submissions. With it on, the ramp
+        # is the preparation window and the offered load starts at its end, so the window the
+        # harness reads (hold start + guard) opens after the burst has already begun.
+        submissionOnset = if ($AuthPrepSeconds -gt 0) {
+            "released at anchor + rampSeconds, the traced ramp/hold boundary: the ramp is the session-preparation window and carries logins only"
+        } else {
+            "each user begins submitting as it logs in, one full submitIntervalMillis of initial jitter from the ramp"
         }
         totalSeconds = 2 * $RampSeconds + $WarmupSeconds + $measurementHoldSeconds
     }
@@ -404,6 +468,15 @@ if ($NormalTimeout) {
         # timeseries.csv and stages.json rather than "measurement".
         measuredStageLabel = "stage-0"
         measurementWindowBasis = "the hold minus steadyGuardSeconds; the preceding ramp is part of the schedule but outside every measured window"
+        authPrepSeconds = $AuthPrepSeconds
+        sessionPreparation = if ($AuthPrepSeconds -gt 0) {
+            "login is separated from submission: the ramp is the preparation window over which the population's sessions are established, and no submission is sent until it closes"
+        } else {
+            "not separated: every user logs in and begins submitting as it starts, so the logins are spread only as widely as the ramp is long"
+        }
+        ingressPreflight = [bool]$IngressPreflight
+        preflightPrefix = if ($IngressPreflight) { $preflightPrefix } else { $null }
+        preflightHoldSeconds = if ($IngressPreflight) { $PreflightHoldSeconds } else { $null }
         expectedPlan = $expectedPlan
     }
 }
@@ -789,6 +862,358 @@ function Copy-GatlingArtifacts {
     return $log.Directory.FullName
 }
 
+# Every request in a Gatling simulation.log, not just the submits. The submit-only reader in the
+# analyzer answers "was the offered submission rate refused"; the preflight has to answer a different
+# question that the same log holds - were the *logins* refused, and did any request of any name land
+# inside the measured window. The status classification is deliberately the analyzer's, character for
+# character, so both readers call the same connection refusal by the same name.
+function Get-GatlingRequestRows {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $rows = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-Path $Path)) { return $rows }
+    foreach ($line in [System.IO.File]::ReadLines($Path)) {
+        if (-not $line.StartsWith("REQUEST`t")) { continue }
+        $p = $line.Split([char]9)
+        if ($p.Count -lt 6) { continue }
+        $started = 0L
+        if (-not [long]::TryParse($p[3], [ref]$started)) { continue }
+        $message = if ($p.Count -ge 7) { $p[6] } else { "" }
+        $status = "ok"
+        if ($p[5] -ne "OK") {
+            $code = ""
+            if ($message -match "actually found (\d{3})") { $code = $Matches[1] }
+            if ($code) { $status = "ko$code" }
+            elseif ($message -match "ConnectException|Connection refused|connect timed out|UnknownHost|No route to host") { $status = "ko-connect" }
+            else { $status = "ko-other" }
+        }
+        $rows.Add([pscustomobject]@{
+            name = $p[2]; startMillis = $started; status = $status; message = $message
+        })
+    }
+    return $rows
+}
+
+function Get-StatusCount {
+    param($Counts, [string]$Key)
+    if ($Counts.ContainsKey($Key)) { return [int]$Counts[$Key] }
+    return 0
+}
+
+# Per second *and per request name*. A per-second total cannot answer whether logins were mixed into
+# the measured window - that is a question about a name - and it cannot answer whether the offered
+# submission rate was actually supplied - that is a question about the other name. The rows are
+# bucketed by the instant the client sent the request, so `offered` is what the client offered rather
+# than what came back; offered is the sum of the outcome columns, and no request is counted twice.
+function Export-GatlingPerSecond {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Rows,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $bySecond = @{}
+    foreach ($row in $Rows) {
+        $second = [long][math]::Floor($row.startMillis / 1000)
+        if (-not $bySecond.ContainsKey($second)) { $bySecond[$second] = @{} }
+        $names = $bySecond[$second]
+        if (-not $names.ContainsKey($row.name)) { $names[$row.name] = @{} }
+        $counts = $names[$row.name]
+        $counts[$row.status] = 1 + (Get-StatusCount $counts $row.status)
+    }
+    $secondRows = foreach ($second in @($bySecond.Keys | Sort-Object)) {
+        foreach ($name in @($bySecond[$second].Keys | Sort-Object)) {
+            $counts = $bySecond[$second][$name]
+            $otherKo = 0
+            foreach ($key in @($counts.Keys)) {
+                if ($key -like "ko*" -and @("ko429", "ko500", "ko503", "ko-connect") -notcontains $key) {
+                    $otherKo += (Get-StatusCount $counts $key)
+                }
+            }
+            $ok = Get-StatusCount $counts "ok"
+            $ko429 = Get-StatusCount $counts "ko429"
+            $ko500 = Get-StatusCount $counts "ko500"
+            $ko503 = Get-StatusCount $counts "ko503"
+            $koConnect = Get-StatusCount $counts "ko-connect"
+            [pscustomobject]@{
+                epochSecond = $second
+                timestampUtc = [datetimeoffset]::FromUnixTimeSeconds($second).ToString("o")
+                request = $name
+                offered = $ok + $ko429 + $ko500 + $ko503 + $koConnect + $otherKo
+                ok = $ok; ko429 = $ko429; ko500 = $ko500; ko503 = $ko503
+                koConnect = $koConnect; koOther = $otherKo
+            }
+        }
+    }
+    $ordered = @($secondRows)
+    @($ordered) | Export-Csv $Path -NoTypeInformation -Encoding utf8
+    return $ordered
+}
+
+# The session lines. A session START after the gate is the signature of a replaced session, which is
+# what consumed the non-circular login feeder in the 2026-09-20 runs: the request counts alone would
+# show the logins that were refused, not the replacements that followed them.
+function Get-GatlingSessionRows {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $starts = New-Object System.Collections.Generic.List[long]
+    $ends = New-Object System.Collections.Generic.List[long]
+    if (-not (Test-Path $Path)) { return [pscustomobject]@{ starts = @(); ends = @() } }
+    foreach ($line in [System.IO.File]::ReadLines($Path)) {
+        if (-not $line.StartsWith("USER`t")) { continue }
+        $p = $line.Split([char]9)
+        if ($p.Count -lt 4) { continue }
+        $at = 0L
+        if (-not [long]::TryParse($p[3], [ref]$at)) { continue }
+        if ($p[2] -eq "START") { $starts.Add($at) } elseif ($p[2] -eq "END") { $ends.Add($at) }
+    }
+    return [pscustomobject]@{ starts = $starts; ends = $ends }
+}
+
+# Captured with the preference guard docker needs: a native command's stderr becomes an ErrorRecord
+# under this script's $ErrorActionPreference = "Stop", and a log read that has nothing to say would
+# otherwise terminate the run it was meant to explain.
+function Save-ContainerLog {
+    param([Parameter(Mandatory = $true)][string]$Service, [Parameter(Mandatory = $true)][string]$Path, [string]$Since = "")
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $id = @(Invoke-Compose -Arguments @("ps", "-q", $Service) | Where-Object { $_ })
+        if ($id.Count -eq 0) { "no container for $Service" | Set-Content $Path -Encoding utf8; return }
+        $arguments = @("logs", "--no-color")
+        if ($Since) { $arguments += @("--since", $Since) }
+        $arguments += $id[0]
+        & docker @arguments 2>&1 | ForEach-Object { [string]$_ } | Set-Content $Path -Encoding utf8
+    } finally { $ErrorActionPreference = $previousPreference }
+}
+
+# The one-shot container reading. `docker compose ps -q` names the nine containers and one inspect
+# answers the three questions section 3 asks of them - running, OOM-killed, restarted - in the form
+# the failure note for the 2026-09-20 runs already recorded them in.
+function Get-ContainerStates {
+    $ids = @(Invoke-Compose -Arguments @("ps", "-q") | Where-Object { $_ })
+    if ($ids.Count -eq 0) { return @() }
+    return @(& docker inspect --format '{{.Name}}|{{.State.Status}}|exit={{.State.ExitCode}}|oom={{.State.OOMKilled}}|restarts={{.RestartCount}}|started={{.State.StartedAt}}' $ids)
+}
+
+function Invoke-IngressPreflight {
+    param(
+        [Parameter(Mandatory = $true)]$Seed,
+        [Parameter(Mandatory = $true)][string]$TraceFile
+    )
+    # Section 3 of this experiment, as code. The ingress is the component that failed the 2026-09-20
+    # burst runs, and it failed before the application saw anything: 2,289 of 3,100 simultaneous
+    # connections were refused at the published port while nginx logged nothing and every container
+    # stayed running. A comparison run cannot distinguish that from a capacity result, so it is not
+    # started until the published port has been observed carrying this experiment's own arrival
+    # pattern - the whole measurement population logging in across the same preparation window - with
+    # no refusal of any kind, no login inside the hold, and a login-plus-submit round trip answering
+    # through nginx. Anything else stops the run here, where both conditions are still unspent.
+    $report = [ordered]@{
+        startedAt = [datetimeoffset]::UtcNow.ToString("o")
+        prefix = $preflightPrefix
+        contestId = [long]$Seed.contestId
+        population = $measurementPopulation
+        preparationSeconds = $AuthPrepSeconds
+        holdSeconds = $PreflightHoldSeconds
+        targetRps = $TargetRps
+        publishedPort = $null
+        containers = @()
+        readiness = @()
+        gatlingStartedAt = $null
+        gatlingExitedAt = $null
+        gatlingExitCode = $null
+        gatlingAssertionFailed = $false
+        gateUtc = $null
+        measurementStartUtc = $null
+        measurementEndUtc = $null
+        http = $null
+        sessions = $null
+        probe = $null
+        quiescence = $null
+        refusalTotal = $null
+        refusedBeforeTheApplicationSawAnything = $null
+        problems = @()
+        verdict = "not-run"
+        finishedAt = $null
+    }
+
+    $portMapping = (@(Invoke-Compose -Arguments @("port", "nginx", "80")) -join " ").Trim()
+    $report.publishedPort = if ($portMapping) { $portMapping } else { "unavailable" }
+
+    $report.containers = @(Get-ContainerStates)
+
+    # Through the published port, which is the only ingress the load may use, and repeated because a
+    # single UP is a moment rather than a state.
+    $readiness = foreach ($attempt in 1..3) {
+        $state = Test-NodeReadiness -Port 18080
+        $observation = [pscustomobject]@{
+            attempt = $attempt; at = [datetimeoffset]::UtcNow.ToString("o")
+            up = $state.up; httpStatus = $state.httpStatus; status = $state.status
+        }
+        Start-Sleep -Milliseconds 400
+        $observation
+    }
+    $report.readiness = @($readiness)
+
+    $report.gatlingStartedAt = [datetimeoffset]::UtcNow.ToString("o")
+    $phase = Start-GatlingLoadPhase -PhaseName "preflight" -Seed $Seed -UserPrefix $preflightPrefix `
+        -Rps $TargetRps -HoldSeconds $PreflightHoldSeconds -TracePath ($TraceFile -replace '\\', '/')
+    $script:preflightPhaseStartedAt = $phase.startedAt
+    $phase.process.WaitForExit()
+    $report.gatlingExitedAt = [datetimeoffset]::UtcNow.ToString("o")
+    $report.gatlingExitCode = $phase.process.ExitCode
+
+    $trace = Get-StaircaseTrace -Path $TraceFile
+    $stages = if ($null -ne $trace) { @(Get-StaircaseStages -Trace $trace) } else { @() }
+    if ($stages.Count -gt 0) {
+        # The gate is the traced ramp/hold boundary: the instant the simulation released the first
+        # submission, which is also the start of the hold segment.
+        $report.gateUtc = [datetimeoffset]::FromUnixTimeMilliseconds($stages[0].startMillis).ToString("o")
+        $report.measurementStartUtc = [datetimeoffset]::FromUnixTimeMilliseconds($stages[0].measurementStartMillis).ToString("o")
+        $report.measurementEndUtc = [datetimeoffset]::FromUnixTimeMilliseconds($stages[0].measurementEndMillis).ToString("o")
+    }
+
+    Copy-GatlingArtifacts -StartedAt $phase.startedAt -NamePrefix "preflight-" | Out-Null
+    $logPath = Join-Path $runDirectory "preflight-gatling-simulation.log"
+    $requestRows = Get-GatlingRequestRows -Path $logPath
+    Export-GatlingPerSecond -Rows $requestRows -Path (Join-Path $runDirectory "preflight-requests-1s.csv") | Out-Null
+    $loginRows = @($requestRows | Where-Object { $_.name -eq "api-login-once" })
+    $submitRows = @($requestRows | Where-Object { $_.name -eq "api-contest-submit" })
+    $refusals = @($requestRows | Where-Object { $_.status -eq "ko-connect" })
+    $refusedLogins = @($loginRows | Where-Object { $_.status -eq "ko-connect" })
+    $refusedSubmits = @($submitRows | Where-Object { $_.status -eq "ko-connect" })
+
+    $report.refusalTotal = $refusals.Count
+    # The distinction the 2026-09-20 evidence turns on: a refusal before the application saw anything
+    # is not the same failure as a refusal of a request the application answered. A refused login is
+    # the first kind - it never reached a web node - and it is the one that triggered session
+    # replacement and feeder exhaustion.
+    $report.refusedBeforeTheApplicationSawAnything = $refusedLogins.Count
+
+    $loginOk = @($loginRows | Where-Object { $_.status -eq "ok" }).Count
+    $submitOk = @($submitRows | Where-Object { $_.status -eq "ok" }).Count
+    $submitKo429 = @($submitRows | Where-Object { $_.status -eq "ko429" }).Count
+    $submitKo500 = @($submitRows | Where-Object { $_.status -eq "ko500" }).Count
+    $submitKo503 = @($submitRows | Where-Object { $_.status -eq "ko503" }).Count
+    $submitKoOther = @($submitRows | Where-Object { $_.status -eq "ko-other" }).Count
+    $report.http = [ordered]@{
+        loginOffered = $loginRows.Count
+        loginOk = $loginOk
+        loginKoConnect = $refusedLogins.Count
+        # A login answered with something other than 200 - a 401 from a rejected session, a 503 from
+        # the admission limiter - is neither OK nor a refusal, and it is what remains.
+        loginKoOther = $loginRows.Count - $loginOk - $refusedLogins.Count
+        submitOffered = $submitRows.Count
+        submitOk = $submitOk
+        submitKoConnect = $refusedSubmits.Count
+        submitKo429 = $submitKo429
+        submitKo500 = $submitKo500
+        submitKo503 = $submitKo503
+        submitKoOther = $submitKoOther
+    }
+
+    $sessionRows = Get-GatlingSessionRows -Path $logPath
+    $gateMillis = if ($stages.Count -gt 0) { [long]$stages[0].startMillis } else { $null }
+    $sessionsStartedAfterGate = if ($null -eq $gateMillis) { $null } else {
+        @($sessionRows.starts | Where-Object { $_ -ge $gateMillis }).Count
+    }
+    $loginsInHold = if ($null -eq $gateMillis -or $stages.Count -eq 0) { $null } else {
+        @($loginRows | Where-Object { $_.startMillis -ge $gateMillis -and $_.startMillis -lt [long]$stages[0].endMillis }).Count
+    }
+    $loginsInMeasurementWindow = if ($stages.Count -eq 0) { $null } else {
+        @($loginRows | Where-Object {
+            $_.startMillis -ge [long]$stages[0].measurementStartMillis -and $_.startMillis -lt [long]$stages[0].measurementEndMillis
+        }).Count
+    }
+    $report.sessions = [ordered]@{
+        started = $sessionRows.starts.Count
+        ended = $sessionRows.ends.Count
+        startedAfterGate = $sessionsStartedAfterGate
+        loginsInHold = $loginsInHold
+        loginsInMeasurementWindow = $loginsInMeasurementWindow
+        firstLoginUtc = if ($loginRows.Count -gt 0) { [datetimeoffset]::FromUnixTimeMilliseconds(($loginRows | Measure-Object -Property startMillis -Minimum).Minimum).ToString("o") } else { $null }
+        lastLoginUtc = if ($loginRows.Count -gt 0) { [datetimeoffset]::FromUnixTimeMilliseconds(($loginRows | Measure-Object -Property startMillis -Maximum).Maximum).ToString("o") } else { $null }
+    }
+
+    # One login and one submission through the published port, on a seeded account, immediately
+    # before the comparison: the readiness group says the web node is up, and this says a session
+    # established through nginx is accepted by the submission endpoint.
+    $probe = [ordered]@{
+        at = [datetimeoffset]::UtcNow.ToString("o")
+        userName = "${preflightPrefix}_user_$PreflightProbeUserIndex"
+        loginStatus = $null; sessionCookieNames = $null; submissionStatus = $null
+        submissionBody = $null; error = $null
+    }
+    try {
+        $webSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+        $login = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$baseUrl/api/login" -ContentType "application/json" `
+            -Body (ConvertTo-Json @{ userName = $probe.userName; pass = "pass" } -Compress) -WebSession $webSession -TimeoutSec 15
+        $probe.loginStatus = [int]$login.StatusCode
+        $probe.sessionCookieNames = (@($webSession.Cookies.GetCookies($baseUrl) | ForEach-Object { $_.Name }) -join ",")
+        $probeBody = "// preflight-probe-$(Get-Date -Format 'yyyyMMddHHmmss')%0Aint main(){return 0;}"
+        $submit = Invoke-WebRequest -UseBasicParsing -Method Post `
+            -Uri "$baseUrl/api/problems/$($Seed.firstProblemId)/submissions" -ContentType "application/json" `
+            -Body (ConvertTo-Json @{ code = $probeBody } -Compress) -WebSession $webSession -TimeoutSec 15
+        $probe.submissionStatus = [int]$submit.StatusCode
+        $probe.submissionBody = (Get-ResponseText -Response $submit)
+    } catch {
+        $probe.error = $_.Exception.Message
+    }
+    $report.probe = $probe
+
+    # Nothing the preflight wrote may still be running when the warm-up's baseline is taken, so the
+    # preflight's contest is drained exactly as the warm-up's is before it.
+    $report.quiescence = Wait-PipelineQuiescent -ContestId ([long]$Seed.contestId) -TimeoutSeconds 300 `
+        -Purpose "the preflight contest" -AllowMissingExecutorGauges:($DispatchMode -eq "rabbit")
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    if ($portMapping -notmatch "18080") {
+        $problems.Add("the published port for nginx:80 is '$portMapping' rather than a mapping onto 18080, so the load would not reach the ingress this experiment measures")
+    }
+    $down = @($report.readiness | Where-Object { -not $_.up })
+    if ($down.Count -gt 0) {
+        $problems.Add("$($down.Count) of 3 readiness probes through the published port did not report UP (last: $($down[-1].status))")
+    }
+    $badContainers = @($report.containers | Where-Object { $_ -notmatch '\|running\|exit=0\|oom=false\|restarts=0\|' })
+    if ($badContainers.Count -gt 0) {
+        $problems.Add("$($badContainers.Count) containers are not in the state a comparison can start from (not running, non-zero exit, OOM-killed, or restarted): $($badContainers -join '; ')")
+    }
+    if ($refusals.Count -gt 0) {
+        $problems.Add("$($refusals.Count) requests were refused at the published port during the preflight ($($refusedLogins.Count) logins, $($refusedSubmits.Count) submissions); section 3 stops the comparison here rather than measuring an ingress that cannot carry it")
+    }
+    if ($stages.Count -eq 0) {
+        $problems.Add("the preflight trace file is missing or incomplete, so the instant the submissions were released at cannot be placed")
+    }
+    if ($null -ne $loginsInHold -and $loginsInHold -gt 0) {
+        $problems.Add("$loginsInHold logins were sent after the gate: the submission load was released before every session was established")
+    }
+    if ($null -ne $sessionsStartedAfterGate -and $sessionsStartedAfterGate -gt 0) {
+        $problems.Add("$sessionsStartedAfterGate sessions started after the gate, which is a replaced session rather than a prepared one")
+    }
+    if ($probe.loginStatus -ne 200 -or $probe.submissionStatus -ne 202) {
+        $problems.Add("the login-plus-submit probe did not answer 200 then 202 (login $($probe.loginStatus), submission $($probe.submissionStatus), error $($probe.error))")
+    }
+    if (-not $report.quiescence.quiescent) {
+        $problems.Add("the preflight contest never reached quiescence ($($report.quiescence.reason))")
+    }
+    if ($null -ne $phase.process.ExitCode -and $phase.process.ExitCode -eq 2) {
+        # Recorded rather than fatal: the preflight runs at the measured rate, and Gatling's own
+        # latency assertion firing there is a finding about the stack, not an ingress failure.
+        $report.gatlingAssertionFailed = $true
+    }
+
+    # Kept whether or not the preflight passed: the nginx log beside a refusal count is the evidence
+    # that the refusal happened below the application, and on this stack that is the whole question.
+    Save-ContainerLog -Service "nginx" -Path (Join-Path $runDirectory "preflight-nginx.log")
+    $report.containers = @(Get-ContainerStates)
+    $report.problems = @($problems)
+    $report.verdict = if ($problems.Count -eq 0) { "pass" } else { "failed" }
+    $report.finishedAt = [datetimeoffset]::UtcNow.ToString("o")
+    $report | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $runDirectory "preflight.json") -Encoding utf8
+
+    if ($problems.Count -gt 0) {
+        throw "Ingress preflight failed at $($report.finishedAt): $(@($problems) -join ' | ')"
+    }
+    return $report
+}
+
 function Start-GatlingProcess {
     param([Parameter(Mandatory = $true)][string[]]$JavaArgs)
     # Start-Process -PassThru -NoNewWindow hands back a Process whose ExitCode stays empty on this
@@ -833,7 +1258,13 @@ function Start-GatlingLoadPhase {
         "-Dperf.userIndex.start=1", "-Dperf.userIndex.end=$UserCount",
         "-Dperf.contestId=$($Seed.contestId)", "-Dperf.problemId.start=$($Seed.firstProblemId)", "-Dperf.problemId.end=$($Seed.lastProblemId)",
         "-Dperf.rampSeconds=$RampSeconds", "-Dperf.stepHoldSeconds=$HoldSeconds",
-        "-Dperf.stageRps=$Rps", "-Dperf.warmupStageCount=0"
+        "-Dperf.stageRps=$Rps", "-Dperf.warmupStageCount=0",
+        # Passed on both phases rather than on the measured one alone, so the two contests are run by
+        # the same model: the ramp prepares the population's sessions in each and the first submission
+        # is released at its end. Absent this the warm-up would be the older model while the
+        # measurement was the new one, and the stack the measurement starts against would not be the
+        # stack this phase built.
+        "-Dperf.authPrepSeconds=$AuthPrepSeconds"
     )
     if ($TracePath) { $phaseProperties += "-Dperf.stageTraceFile=$TracePath" }
     $phaseArgs = $phaseProperties + @(
@@ -2109,6 +2540,12 @@ if ($DryRun) {
         $expectedPlan | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDirectory "expected-plan.json") -Encoding utf8
         if ($NormalTimeout) {
             Write-Host "Normal timeout: warm-up at $warmupPhaseRps RPS for ${WarmupSeconds}s in '$warmupPrefix' (population $warmupPopulation), full drain, then measurement at $TargetRps RPS for ${MeasurementSeconds}s in '$measurementPrefix' (hold ${effectiveHoldSeconds}s = measurement + ${SteadyGuardSeconds}s guard), claim timeout $MySqlClaimTimeout, total $($expectedPlan.totalSeconds)s, population $($expectedPlan.population)."
+            if ($AuthPrepSeconds -gt 0) {
+                Write-Host "Session preparation: each phase's population logs in across its ${AuthPrepSeconds}s ramp (~$([math]::Round($measurementPopulation / $AuthPrepSeconds, 1)) logins/s) and no submission is sent until the gate at the ramp's end; the measured window of $($MeasurementSeconds)s opens $($SteadyGuardSeconds)s after that."
+            }
+            if ($IngressPreflight) {
+                Write-Host "Ingress preflight: before the warm-up, $measurementPopulation sessions established over ${AuthPrepSeconds}s in '$preflightPrefix' (its own seeded contest), held $($PreflightHoldSeconds)s, drained to quiescence; a single refusal at the published port stops the run."
+            }
         } elseif ($FaultRecovery) {
             # One contiguous string rather than a `+` join: the earlier split landed the operator inside
             # the first fragment's quotes, so the message printed the window as "from 30 + s" instead of
@@ -2138,6 +2575,21 @@ $events.traceAnchorUtc = $null; $events.tracePlanEndUtc = $null; $events.stageWi
 $events.stageWindowAlignmentErrorSeconds = $null; $events.gatlingExitCode = $null; $events.gatlingAssertionFailed = $false
 $events.warmupContestId = $null; $events.warmupPhaseStartedAt = $null; $events.warmupPhaseEndedAt = $null
 $events.warmupQuiescedAt = $null; $events.warmupQuiescenceSeconds = $null; $events.warmupGatlingExitCode = $null
+# Ingress preflight anchors. They stay null on a run that did not ask for the preflight, which is what
+# distinguishes "the ingress was checked and carried this arrival pattern" from "it was not checked".
+$events.preflightContestId = $null; $events.preflightStartedAt = $null; $events.preflightFinishedAt = $null
+$events.preflightVerdict = $null; $events.preflightRefusals = $null; $events.preflightLoginsInHold = $null
+$events.preflightSessionsStartedAfterGate = $null; $events.preflightProbeStatus = $null
+# Login/submission separation, read off the measured phase's own request log. A null here on a run
+# that had no separation says "not asked", and a zero says "asked and none were found"; the two are
+# different findings and the run records which one it is.
+$events.measurementLoginRequests = $null; $events.measurementLoginKoConnect = $null
+$events.measurementSessionsStarted = $null; $events.measurementSubmitOffered = $null
+$events.measurementSubmitKoConnect = $null; $events.measurementGateUtc = $null
+$events.measurementSubmitOfferedInWindow = $null; $events.measurementWindowSeconds = $null
+$events.measurementLoginRequestsInWindow = $null; $events.measurementLoginRequestsInHold = $null
+$events.measurementSessionsStartedAfterGate = $null
+$events.measurementFirstLoginUtc = $null; $events.measurementLastLoginUtc = $null
 # Fault-recovery anchors. faultScheduledAt above is reused for the instant the trigger window opened,
 # which is not a kill deadline; the kill happens when the target node is observed to hold work. These
 # stay null in every other mode, where recoveryTimeout and the recovery block are not applicable.
@@ -2155,6 +2607,10 @@ $events.postRecoveryWindow = $null
 # was written on the tick, and the count is the only way to tell them apart afterwards.
 $events.sampleWriteRetries = 0
 $script:sampleWriteRetries = 0
+# Script scope rather than a local: the preflight starts its Gatling process inside its own function,
+# and a failure raised from there must still leave the failure path the instant the log it read can be
+# found by. This is what the phase's artifacts are located by after the fact.
+$script:preflightPhaseStartedAt = $null
 $staircaseTrace = $null; $staircaseStages = @(); $capturedBoundaries = @{}
 $warmupSeed = $null; $warmupTrace = $null; $warmupStages = @(); $warmupQuiescence = $null
 $warmupAcceptedAtBaseline = $null
@@ -2191,6 +2647,18 @@ try {
             throw "The warm-up and measurement contests resolved to the same contest id, so the phases would not be isolated."
         }
         $events.warmupContestId = [long]$warmupSeed.contestId
+        if ($IngressPreflight) {
+            # Its own contest and its own user pool, so the sessions it establishes and the single
+            # submission its login-plus-submit probe makes can be counted by nothing the measured
+            # window reads. Seeded here with the other two because seeding later would put database
+            # work inside the run it is meant to precede.
+            $preflightSeed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" `
+                -Body (@{ prefix=$preflightPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec 60
+            if ([long]$preflightSeed.contestId -eq [long]$seed.contestId -or [long]$preflightSeed.contestId -eq [long]$warmupSeed.contestId) {
+                throw "The preflight contest resolved to the same contest id as a phase contest, so its work would not be isolated from the measurement."
+            }
+            $events.preflightContestId = [long]$preflightSeed.contestId
+        }
     } else {
         $workloadPrefix = "tradeoff_seed_$LatencySeed"
         $seedRequest = @{ prefix=$workloadPrefix; userCount=$UserCount; problemCount=5; durationMinutes=60; reset=$true } | ConvertTo-Json -Compress
@@ -2216,6 +2684,23 @@ try {
     $classpath = (Get-Content (Join-Path $repoRoot "gatling\build\standalone-gatling\classpath.txt") -Raw).Trim()
     $resultsFolder = Join-Path $repoRoot "gatling\build\reports\gatling"
     $tracePath = (Join-Path $runDirectory "stage-trace.csv") -replace '\\', '/'
+
+    if ($stagedLoad -and $IngressPreflight) {
+        # Before the warm-up rather than between the phases: the question is whether the fresh stack
+        # can carry this experiment's arrival pattern at all, and asking it after the warm-up would
+        # have spent the warm-up on an ingress that was already known to refuse connections. The
+        # preflight's contest is drained to quiescence before this block returns, so the warm-up
+        # starts against a stack with no work of the preflight's left in it.
+        $events.preflightStartedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $preflight = Invoke-IngressPreflight -Seed $preflightSeed -TraceFile (Join-Path $runDirectory "preflight-stage-trace.csv")
+        $events.preflightFinishedAt = [datetimeoffset]::UtcNow.ToString("o")
+        $events.preflightVerdict = $preflight.verdict
+        $events.preflightRefusals = $preflight.refusalTotal
+        $events.preflightLoginsInHold = $preflight.sessions.loginsInHold
+        $events.preflightSessionsStartedAfterGate = $preflight.sessions.startedAfterGate
+        $events.preflightProbeStatus = "$($preflight.probe.loginStatus)/$($preflight.probe.submissionStatus)"
+        Write-Host "Ingress preflight passed: $($preflight.population) sessions prepared over $($preflight.preparationSeconds)s, $($preflight.http.loginOffered) logins and $($preflight.http.submitOffered) submissions offered with $($preflight.refusalTotal) refusals."
+    }
 
     if ($stagedLoad) {
         # Warm-up phase. It is offered the same rate and the same workload as the measurement and
@@ -2245,6 +2730,8 @@ try {
             throw "The warm-up phase produced no Gatling report, so its log cannot be inspected."
         }
         Copy-GatlingArtifacts -StartedAt $warmupStarted -NamePrefix "warmup-" | Out-Null
+        Export-GatlingPerSecond -Rows (Get-GatlingRequestRows -Path (Join-Path $runDirectory "warmup-gatling-simulation.log")) `
+            -Path (Join-Path $runDirectory "warmup-requests-1s.csv") | Out-Null
         # The measured window's counters are taken as a delta from the scrape below, so the warm-up
         # must be fully finished - judged, applied and no worker still inside a judge call - before
         # it is taken. Otherwise warm-up work is charged to the measured phase.
@@ -2270,6 +2757,7 @@ try {
         $javaArgs += @(
             "-Dperf.rampSeconds=$RampSeconds", "-Dperf.stepHoldSeconds=$effectiveHoldSeconds",
             "-Dperf.stageRps=$($stageRpsList -join ',')", "-Dperf.warmupStageCount=$WarmupStageCount",
+            "-Dperf.authPrepSeconds=$AuthPrepSeconds",
             "-Dperf.stageTraceFile=$tracePath",
             "-cp", $classpath, "io.gatling.app.Gatling", "-s", "my.oj.perf.ContestSubmissionStepLoadSimulation"
         )
@@ -2481,6 +2969,54 @@ try {
     }
     if ($stagedLoad) {
         Copy-GatlingArtifacts -StartedAt $gatlingStarted | Out-Null
+        # The measured phase's own request stream, per second and per name. The analyzer's http-1s.csv
+        # is the submit-only view its stage windows are read from; this is the raw one, and it is what
+        # shows where the logins landed relative to the measured window - the separation this run
+        # exists to demonstrate is a claim about two request names and cannot be read from a total.
+        $measurementLogPath = Join-Path $runDirectory "gatling-simulation.log"
+        $measurementRequests = Get-GatlingRequestRows -Path $measurementLogPath
+        Export-GatlingPerSecond -Rows $measurementRequests -Path (Join-Path $runDirectory "requests-1s.csv") | Out-Null
+        $measurementLogins = @($measurementRequests | Where-Object { $_.name -eq "api-login-once" })
+        $measurementSubmits = @($measurementRequests | Where-Object { $_.name -eq "api-contest-submit" })
+        $measurementSessions = Get-GatlingSessionRows -Path $measurementLogPath
+        $measured = @($staircaseStages | Where-Object { -not $_.isWarmup })
+        $events.measurementLoginRequests = $measurementLogins.Count
+        $events.measurementLoginKoConnect = @($measurementLogins | Where-Object { $_.status -eq "ko-connect" }).Count
+        $events.measurementSessionsStarted = $measurementSessions.starts.Count
+        $events.measurementSubmitOffered = $measurementSubmits.Count
+        $events.measurementSubmitKoConnect = @($measurementSubmits | Where-Object { $_.status -eq "ko-connect" }).Count
+        $events.measurementGateUtc = $null
+        $events.measurementLoginRequestsInWindow = $null
+        $events.measurementLoginRequestsInHold = $null
+        $events.measurementSessionsStartedAfterGate = $null
+        $events.measurementFirstLoginUtc = $null; $events.measurementLastLoginUtc = $null
+        # The count section 7's success criterion is judged on, taken directly from the request rows
+        # rather than summed out of the one-second buckets: the window is ten seconds of client
+        # request starts and it does not begin on a second boundary, so a bucket view would either
+        # drop or double the ~1000 requests in the second it straddles.
+        $events.measurementSubmitOfferedInWindow = $null
+        $events.measurementWindowSeconds = $null
+        if ($measured.Count -gt 0) {
+            $measuredStage = $measured[0]
+            $events.measurementGateUtc = [datetimeoffset]::FromUnixTimeMilliseconds($measuredStage.startMillis).ToString("o")
+            $events.measurementWindowSeconds = [math]::Round(([long]$measuredStage.measurementEndMillis - [long]$measuredStage.measurementStartMillis) / 1000.0, 3)
+            $events.measurementSubmitOfferedInWindow = @($measurementSubmits | Where-Object {
+                $_.startMillis -ge [long]$measuredStage.measurementStartMillis -and $_.startMillis -lt [long]$measuredStage.measurementEndMillis
+            }).Count
+            $events.measurementLoginRequestsInWindow = @($measurementLogins | Where-Object {
+                $_.startMillis -ge [long]$measuredStage.measurementStartMillis -and $_.startMillis -lt [long]$measuredStage.measurementEndMillis
+            }).Count
+            $events.measurementLoginRequestsInHold = @($measurementLogins | Where-Object {
+                $_.startMillis -ge [long]$measuredStage.startMillis -and $_.startMillis -lt [long]$measuredStage.endMillis
+            }).Count
+            $events.measurementSessionsStartedAfterGate = @($measurementSessions.starts | Where-Object { $_ -ge [long]$measuredStage.startMillis }).Count
+        }
+        if ($measurementLogins.Count -gt 0) {
+            $events.measurementFirstLoginUtc = [datetimeoffset]::FromUnixTimeMilliseconds(
+                ($measurementLogins | Measure-Object -Property startMillis -Minimum).Minimum).ToString("o")
+            $events.measurementLastLoginUtc = [datetimeoffset]::FromUnixTimeMilliseconds(
+                ($measurementLogins | Measure-Object -Property startMillis -Maximum).Maximum).ToString("o")
+        }
         # The predicted plan is only useful if it lands where the traffic actually ran. Gatling
         # stops the injector at maxDuration, so the last completed request is the observable end of
         # the schedule; anything larger than the tolerance means the windows are not trustworthy.
@@ -2806,10 +3342,18 @@ try {
     $events | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDirectory "events.json") -Encoding utf8
     $_ | Out-String | Set-Content (Join-Path $runDirectory "failure.txt") -Encoding utf8
     # A failed run keeps what it already collected so the reason can be read against the numbers,
-    # and stays out of the capacity comparison either way.
-    foreach ($artifact in @("timeseries.csv", "stage-trace.csv", "warmup-stage-trace.csv", "capacity.csv", "backlog.csv", "kill-snapshot.json", "recovery-samples.csv", "latency.csv", "stale-reclaims.csv")) {
+    # and stays out of the capacity comparison either way. The preflight's own artifacts are in the
+    # list because a preflight refusal is the one failure whose evidence is the ingress rather than
+    # the database: preflight.json, its per-second request rows and the nginx log beside them are
+    # what say whether the connection was refused below the application.
+    foreach ($artifact in @("timeseries.csv", "stage-trace.csv", "warmup-stage-trace.csv", "preflight-stage-trace.csv", "preflight.json", "preflight-requests-1s.csv", "preflight-nginx.log", "requests-1s.csv", "warmup-requests-1s.csv", "capacity.csv", "backlog.csv", "kill-snapshot.json", "recovery-samples.csv", "latency.csv", "stale-reclaims.csv")) {
         $candidate = Join-Path $runDirectory $artifact
         if (Test-Path $candidate) { Write-Host "Preserved for diagnosis: $candidate" }
+    }
+    # The preflight's request log is copied by name prefix, not by the measured phase's, so a failure
+    # thrown from inside the preflight still leaves the log its counts were read from.
+    if ($null -ne $script:preflightPhaseStartedAt -and -not (Test-Path (Join-Path $runDirectory "preflight-gatling-simulation.log"))) {
+        try { Copy-GatlingArtifacts -StartedAt $script:preflightPhaseStartedAt -NamePrefix "preflight-" | Out-Null } catch { Write-Warning $_ }
     }
     # A fault run dies after the kill often enough that latency.csv is still missing when the failure
     # path runs. The raw rows are in the database and the export is read-only, so reconstruct the file
