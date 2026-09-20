@@ -33,7 +33,8 @@ public final class ContestScoreboardRecoverySummary {
             case FULL_REPLAY -> {
                 ContestScoreboardRecoveryProperties.FullReplay fullReplay = properties.fullReplay();
                 summary.append(" db-batch-size=").append(fullReplay.dbBatchSize())
-                        .append(" replay-batch-size=").append(fullReplay.replayBatchSize());
+                        .append(" replay-batch-size=").append(fullReplay.replayBatchSize())
+                        .append(" startup-replay-enabled=").append(fullReplay.startupReplayEnabled());
             }
             case REDIS_SEQ -> {
                 ContestScoreboardRecoveryProperties.RedisSequence redisSeq = properties.redisSeq();

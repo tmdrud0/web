@@ -21,7 +21,6 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
 
 import java.time.LocalDateTime;
-import java.util.Comparator;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -86,10 +85,7 @@ class ContestScoreboardLiveVersusRebuildRedisIntegrationTests {
     }
 
     private void applyLiveStream() {
-        List<Attempt> judgingOrder = attempts.stream()
-                .sorted(Comparator.comparingInt(Attempt::judgedMinute)
-                        .thenComparingLong(Attempt::submissionId))
-                .toList();
+        List<Attempt> judgingOrder = ContestScoreboardTestData.inJudgingOrder(attempts);
         for (int index = 0; index < judgingOrder.size(); index++) {
             Attempt attempt = judgingOrder.get(index);
             scoreboardApplier.apply(ContestScoreboardApplier.ApplyRequest.stream(
@@ -115,21 +111,7 @@ class ContestScoreboardLiveVersusRebuildRedisIntegrationTests {
     private void seedContest() {
         contest = ContestScoreboardTestData.seedContest(
                 jdbcTemplate, "live-vs-rebuild", CONTEST_START, 2, 2);
-        long problemA = contest.problemIds().get(0);
-        long problemB = contest.problemIds().get(1);
-        long userA = contest.userIds().get(0);
-        long userB = contest.userIds().get(1);
-
-        attempts = List.of(
-                new Attempt(920_000_000_000_000_001L, problemA, userA, 10, 14, SubmissionResult.WRONG_ANSWER),
-                new Attempt(920_000_000_000_000_002L, problemA, userA, 12, 12, SubmissionResult.ACCEPTED),
-                new Attempt(920_000_000_000_000_003L, problemB, userA, 20, 21, SubmissionResult.WRONG_ANSWER),
-                new Attempt(920_000_000_000_000_004L, problemB, userA, 22, 30, SubmissionResult.ACCEPTED),
-                new Attempt(920_000_000_000_000_005L, problemB, userA, 25, 26, SubmissionResult.ACCEPTED),
-                new Attempt(920_000_000_000_000_006L, problemA, userB, 5, 40, SubmissionResult.ACCEPTED),
-                new Attempt(920_000_000_000_000_007L, problemA, userB, 7, 8, SubmissionResult.WRONG_ANSWER),
-                new Attempt(920_000_000_000_000_008L, problemB, userB, 9, 10, SubmissionResult.RUNTIME_ERROR)
-        );
+        attempts = ContestScoreboardTestData.standardAttempts(contest, CONTEST_START);
         ContestScoreboardTestData.insertAttempts(
                 jdbcTemplate, contest.contestId(), CONTEST_START, attempts, true);
     }

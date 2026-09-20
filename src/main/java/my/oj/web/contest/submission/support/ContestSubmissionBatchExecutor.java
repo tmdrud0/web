@@ -11,6 +11,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 @Component
 public class ContestSubmissionBatchExecutor {
@@ -38,6 +39,33 @@ public class ContestSubmissionBatchExecutor {
                                                BatchLoader loader,
                                                Consumer<List<Long>> batchConsumer) {
         process(contestId, batchSize, loader, batchConsumer, BatchTransactionMode.NON_TRANSACTIONAL);
+    }
+
+    /**
+     * The same keyset loop, for a loader that returns whole rows rather than ids.
+     *
+     * <p>Paging stays bounded by {@code batchSize} no matter how many rows the scope holds, which is
+     * the point: a replay must not load a contest's results into memory in one go.</p>
+     *
+     * @param idOf reads the keyset column out of a row, so the next page can start after the last
+     *             row of this one
+     */
+    public <T> void processBatchesOf(Long scopeId,
+                                     int batchSize,
+                                     RowLoader<T> loader,
+                                     Function<T, Long> idOf,
+                                     Consumer<List<T>> batchConsumer) {
+        Long lastProcessedId = null;
+        Pageable pageable = PageRequest.of(0, batchSize);
+        while (true) {
+            List<T> rows = loader.load(scopeId, lastProcessedId, pageable);
+            if (rows == null || rows.isEmpty()) {
+                break;
+            }
+            List<T> batch = List.copyOf(rows);
+            executeWithRetry(() -> transactionTemplate.executeWithoutResult(status -> batchConsumer.accept(batch)));
+            lastProcessedId = idOf.apply(batch.get(batch.size() - 1));
+        }
     }
 
     private void process(Long contestId,
@@ -87,6 +115,11 @@ public class ContestSubmissionBatchExecutor {
     @FunctionalInterface
     public interface BatchLoader {
         List<Long> load(Long contestId, Long afterSubmissionId, Pageable pageable);
+    }
+
+    @FunctionalInterface
+    public interface RowLoader<T> {
+        List<T> load(Long scopeId, Long afterId, Pageable pageable);
     }
 
     private enum BatchTransactionMode {

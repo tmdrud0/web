@@ -30,7 +30,8 @@ public record ContestScoreboardRecoveryProperties(
     /** Replaying the whole contest from MySQL. */
     public record FullReplay(
             @DefaultValue("1000") @Min(1) int dbBatchSize,
-            @DefaultValue("500") @Min(1) int replayBatchSize
+            @DefaultValue("500") @Min(1) int replayBatchSize,
+            @DefaultValue("true") boolean startupReplayEnabled
     ) {
     }
 
