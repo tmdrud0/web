@@ -2,8 +2,6 @@ package my.oj.web.contest.scoreboard.recovery;
 
 import lombok.RequiredArgsConstructor;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
-import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
-import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.contest.submission.core.ContestScoreboardReplayRow;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
@@ -23,16 +21,19 @@ import java.util.List;
  *
  * <p>The mode deliberately leaves the stream checkpoint alone: a rebuild request carries no offset,
  * so the script writes neither the offset nor its dependent state.</p>
+ *
+ * <p>What this class decides is which rows to offer and in what sized chunks. Applying them, and
+ * recording that they were applied, is {@link ContestScoreboardReplayApplication} - shared with
+ * {@code redis-seq} so that neither mode can drift on the transaction boundary, which is the part
+ * both of them are easy to get wrong about and neither of them is about.</p>
  */
 @Service
 @RequiredArgsConstructor
 public class ContestScoreboardFullReplayService {
 
-    private final ContestScoreboardApplier scoreboardApplier;
     private final ContestSubmissionResultRepository resultRepository;
     private final ContestSubmissionBatchExecutor batchExecutor;
-    private final ContestScoreboardAppliedMarker appliedMarker;
-    private final ContestScoreboardApplyLock applyLock;
+    private final ContestScoreboardReplayApplication replayApplication;
     private final ContestScoreboardRecoveryProperties properties;
 
     /**
@@ -67,40 +68,15 @@ public class ContestScoreboardFullReplayService {
         int replayBatchSize = properties.fullReplay().replayBatchSize();
         int applied = 0;
         for (int start = 0; start < rows.size(); start += replayBatchSize) {
-            applied += applyChunk(
-                    contestId,
-                    rows.subList(start, Math.min(start + replayBatchSize, rows.size()))
+            List<ContestScoreboardReplayRow> chunk =
+                    rows.subList(start, Math.min(start + replayBatchSize, rows.size()));
+            replayApplication.apply(
+                    chunk.stream().map(ContestScoreboardFullReplayService::request).toList(),
+                    "contest " + contestId
             );
+            applied += chunk.size();
         }
         return applied;
-    }
-
-    /**
-     * The lock is taken per chunk and released between them rather than held for the whole replay,
-     * so a long replay delays the live stream path by at most one chunk and never blocks it while
-     * this service is reading MySQL.
-     */
-    private int applyChunk(Long contestId, List<ContestScoreboardReplayRow> rows) {
-        List<ContestScoreboardApplier.ApplyRequest> requests = rows.stream()
-                .map(ContestScoreboardFullReplayService::request)
-                .toList();
-        applyLock.withLock(() -> {
-            List<ContestScoreboardApplier.ApplyResult> results = scoreboardApplier.applyAll(requests);
-            String failure = results.stream()
-                    .filter(result -> !result.succeeded())
-                    .map(ContestScoreboardApplier.ApplyResult::errorMessage)
-                    .findFirst()
-                    .orElse(null);
-            if (failure != null || results.size() != requests.size()) {
-                throw new IllegalStateException("Failed to replay contest " + contestId
-                        + " onto the scoreboard: "
-                        + (failure == null ? "batch stopped before every result was applied" : failure));
-            }
-            appliedMarker.markApplied(requests.stream()
-                    .map(request -> request.update().contestSubmissionId())
-                    .toList());
-        });
-        return requests.size();
     }
 
     /**

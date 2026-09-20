@@ -92,6 +92,10 @@ class ContestScoreboardRedisSequenceRecoveryServiceTests {
             invocation.getArgument(0, Runnable.class).run();
             return null;
         }).when(applyLock).withLock(any(Runnable.class));
+        doAnswer(invocation -> {
+            invocation.getArgument(0, Runnable.class).run();
+            return null;
+        }).when(batchExecutor).inNewTransaction(any(Runnable.class));
     }
 
     @Test
@@ -282,9 +286,8 @@ class ContestScoreboardRedisSequenceRecoveryServiceTests {
     void aReplayFailurePropagatesToTheCaller() {
         givenTailFirstRoundOnly(row(SUBMISSION_101, 5L));
         when(sequenceSource.allocatorSequence()).thenReturn(1L);
-        doAnswer(invocation -> {
-            throw new IllegalStateException("scoreboard unavailable");
-        }).when(batchExecutor).executeWithRetry(any(), anyInt(), any());
+        when(scoreboardApplier.applyAll(anyList()))
+                .thenThrow(new IllegalStateException("scoreboard unavailable"));
 
         assertThatThrownBy(() -> service(config()).check())
                 .isInstanceOf(IllegalStateException.class)
@@ -330,10 +333,9 @@ class ContestScoreboardRedisSequenceRecoveryServiceTests {
             ContestScoreboardRecoveryProperties.RedisSequence redisSeq) {
         return new ContestScoreboardRedisSequenceRecoveryService(
                 resultRepository,
-                scoreboardApplier,
                 sequenceSource,
-                applyLock,
-                appliedMarker,
+                new ContestScoreboardReplayApplication(
+                        scoreboardApplier, appliedMarker, applyLock, batchExecutor, registry),
                 batchExecutor,
                 properties(redisSeq),
                 new ContestScoreboardRedisSequenceMetrics(registry)

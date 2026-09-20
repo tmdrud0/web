@@ -2,9 +2,7 @@ package my.oj.web.contest.scoreboard.recovery;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
-import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.ContestScoreboardSequenceSource;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.contest.submission.core.ContestScoreboardDuplicateSequence;
@@ -88,10 +86,8 @@ import java.util.Map;
 public class ContestScoreboardRedisSequenceRecoveryService {
 
     private final ContestSubmissionResultRepository resultRepository;
-    private final ContestScoreboardApplier scoreboardApplier;
     private final ContestScoreboardSequenceSource sequenceSource;
-    private final ContestScoreboardApplyLock applyLock;
-    private final ContestScoreboardAppliedMarker appliedMarker;
+    private final ContestScoreboardReplayApplication replayApplication;
     private final ContestSubmissionBatchExecutor batchExecutor;
     private final ContestScoreboardRecoveryProperties properties;
     private final ContestScoreboardRedisSequenceMetrics metrics;
@@ -284,32 +280,18 @@ public class ContestScoreboardRedisSequenceRecoveryService {
     }
 
     /**
-     * The lock is taken per chunk rather than for the whole replay, so a long recovery delays the
-     * live stream path by at most one chunk and never while this service is reading MySQL.
+     * One chunk, through the shared replay application.
      *
-     * <p>The marker is what persists the sequence the scoreboard just issued: it reads the mapping
-     * back after the apply and writes it beside the timestamp, so a replayed result stops being a
-     * candidate because the database now agrees with the scoreboard about its sequence.</p>
+     * <p>The retry bounds around it are this mode's, and they bound <em>re-offering the chunk</em>:
+     * the apply path is idempotent, so a transient failure of the scoreboard is repaired by asking it
+     * again. The applied marker's own retry lives inside the application, because a marker that
+     * failed needs the database rather than another {@code EVAL}.</p>
      */
     private void applyChunk(List<ContestScoreboardSequencedRow> chunk) {
-        List<ContestScoreboardApplier.ApplyRequest> requests = chunk.stream()
-                .map(ContestScoreboardRedisSequenceRecoveryService::request)
-                .toList();
-        applyLock.withLock(() -> {
-            List<ContestScoreboardApplier.ApplyResult> results = scoreboardApplier.applyAll(requests);
-            String failure = results.stream()
-                    .filter(result -> !result.succeeded())
-                    .map(ContestScoreboardApplier.ApplyResult::errorMessage)
-                    .findFirst()
-                    .orElse(null);
-            if (failure != null || results.size() != requests.size()) {
-                throw new IllegalStateException("Failed to replay sequenced results onto the scoreboard: "
-                        + (failure == null ? "batch stopped before every result was applied" : failure));
-            }
-            appliedMarker.markApplied(requests.stream()
-                    .map(request -> request.update().contestSubmissionId())
-                    .toList());
-        });
+        replayApplication.apply(
+                chunk.stream().map(ContestScoreboardRedisSequenceRecoveryService::request).toList(),
+                "sequenced results"
+        );
     }
 
     /**

@@ -50,6 +50,7 @@ class ContestScoreboardRecoveryModeWiringTests {
                     // comes up in every mode, and a bean the test itself registers would answer that
                     // whichever way the service were annotated.
                     ContestScoreboardFullReplayService.class,
+                    ContestScoreboardReplayApplication.class,
                     ContestScoreboardStreamRecoveryService.class,
                     ContestScoreboardRecoveryStrategyConfig.class,
                     ContestScoreboardFullReplayStartupRunner.class,
@@ -84,6 +85,7 @@ class ContestScoreboardRecoveryModeWiringTests {
                 .withUserConfiguration(
                         Dependencies.class,
                         ContestScoreboardFullReplayService.class,
+                        ContestScoreboardReplayApplication.class,
                         ContestScoreboardRecoveryStrategyConfig.class
                 )
                 .run(context -> assertThat(context).doesNotHaveBean(ContestScoreboardRecoveryStrategy.class));

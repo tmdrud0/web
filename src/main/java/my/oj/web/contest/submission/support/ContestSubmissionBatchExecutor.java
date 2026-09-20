@@ -48,6 +48,15 @@ public class ContestSubmissionBatchExecutor {
      * <p>Paging stays bounded by {@code batchSize} no matter how many rows the scope holds, which is
      * the point: a replay must not load a contest's results into memory in one go.</p>
      *
+     * <p><strong>No transaction is opened around the batch consumer</strong>, unlike
+     * {@link #processBatches}. The one caller replays stored judgements onto a Redis scoreboard, so a
+     * transaction here would run the script's {@code EVAL} - and the read-back of the sequence it
+     * issued - inside a database transaction holding a connection. That is a boundary with nothing
+     * on the other side of it: the database transaction can be rolled back and the Redis writes
+     * cannot, so the two halves of a replay would be able to disagree while the loop's own retry
+     * re-ran them together. Each half takes the transaction it actually needs instead, and the
+     * consumer's is {@link #inNewTransaction}.</p>
+     *
      * @param idOf reads the keyset column out of a row, so the next page can start after the last
      *             row of this one
      */
@@ -64,9 +73,20 @@ public class ContestSubmissionBatchExecutor {
                 break;
             }
             List<T> batch = List.copyOf(rows);
-            executeWithRetry(() -> transactionTemplate.executeWithoutResult(status -> batchConsumer.accept(batch)));
+            executeWithRetry(() -> batchConsumer.accept(batch));
             lastProcessedId = idOf.apply(batch.get(batch.size() - 1));
         }
+    }
+
+    /**
+     * One short transaction, for the database half of a step whose Redis half has already happened.
+     *
+     * <p>Always a new one, and never spanning the call that did the Redis work: the caller writes the
+     * scoreboard first and records that it did so afterwards, so what this transaction commits is
+     * evidence about a write that is already durable and cannot be taken back.</p>
+     */
+    public void inNewTransaction(Runnable work) {
+        transactionTemplate.executeWithoutResult(status -> work.run());
     }
 
     private void process(Long contestId,

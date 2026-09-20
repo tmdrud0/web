@@ -1,13 +1,14 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
-import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
-import my.oj.web.contest.submission.core.ContestScoreboardReplayRow;
+import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;import my.oj.web.contest.submission.core.ContestScoreboardReplayRow;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
 import my.oj.web.submission.SubmissionResult;
+import my.oj.web.testsupport.NoOpTransactionManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -16,11 +17,6 @@ import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.domain.Pageable;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.TransactionDefinition;
-import org.springframework.transaction.TransactionException;
-import org.springframework.transaction.TransactionStatus;
-import org.springframework.transaction.support.SimpleTransactionStatus;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -56,13 +52,27 @@ class ContestScoreboardFullReplayServiceTests {
 
     @BeforeEach
     void setUp() {
-        replayService = new ContestScoreboardFullReplayService(
-                scoreboardApplier,
+        replayService = service(properties(2, 2));
+    }
+
+    /**
+     * The real application, not a mock of it: the requests it builds, the order it writes in and the
+     * marker it records are what these tests are about, so a stub would assert nothing.
+     */
+    private ContestScoreboardFullReplayService service(ContestScoreboardRecoveryProperties properties) {
+        ContestSubmissionBatchExecutor batchExecutor =
+                new ContestSubmissionBatchExecutor(new NoOpTransactionManager());
+        return new ContestScoreboardFullReplayService(
                 resultRepository,
-                new ContestSubmissionBatchExecutor(new NoOpTransactionManager()),
-                appliedMarker,
-                new ContestScoreboardApplyLock(),
-                properties(2, 2)
+                batchExecutor,
+                new ContestScoreboardReplayApplication(
+                        scoreboardApplier,
+                        appliedMarker,
+                        new ContestScoreboardApplyLock(),
+                        batchExecutor,
+                        new SimpleMeterRegistry()
+                ),
+                properties
         );
     }
 
@@ -130,14 +140,7 @@ class ContestScoreboardFullReplayServiceTests {
     /** The database batch bounds the read; the replay batch bounds how much one EVAL carries. */
     @Test
     void replayContest_sendsOneReplayBatchPerChunkOfTheDatabaseBatch() {
-        replayService = new ContestScoreboardFullReplayService(
-                scoreboardApplier,
-                resultRepository,
-                new ContestSubmissionBatchExecutor(new NoOpTransactionManager()),
-                appliedMarker,
-                new ContestScoreboardApplyLock(),
-                properties(4, 2)
-        );
+        replayService = service(properties(4, 2));
         stubPage(null, List.of(
                 row(1L, SubmissionResult.ACCEPTED),
                 row(2L, SubmissionResult.ACCEPTED),
@@ -288,23 +291,6 @@ class ContestScoreboardFullReplayServiceTests {
         @Override
         public SubmissionResult getResult() {
             return result;
-        }
-    }
-
-    private static class NoOpTransactionManager implements PlatformTransactionManager {
-        @Override
-        public TransactionStatus getTransaction(TransactionDefinition definition) throws TransactionException {
-            return new SimpleTransactionStatus();
-        }
-
-        @Override
-        public void commit(TransactionStatus status) throws TransactionException {
-            // no-op
-        }
-
-        @Override
-        public void rollback(TransactionStatus status) throws TransactionException {
-            // no-op
         }
     }
 }

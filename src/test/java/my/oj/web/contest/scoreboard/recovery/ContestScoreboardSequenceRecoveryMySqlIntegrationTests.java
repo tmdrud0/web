@@ -15,6 +15,7 @@ import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
 import my.oj.web.submission.SubmissionResult;
 import my.oj.web.testsupport.ContestScoreboardTestData;
+import my.oj.web.testsupport.NoOpTransactionManager;
 import my.oj.web.testsupport.ContestScoreboardTestData.Attempt;
 import my.oj.web.testsupport.ContestScoreboardTestData.SeededContest;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -27,7 +28,6 @@ import org.springframework.context.annotation.Import;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
-import org.springframework.transaction.PlatformTransactionManager;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -60,8 +60,6 @@ class ContestScoreboardSequenceRecoveryMySqlIntegrationTests {
     private JdbcTemplate jdbcTemplate;
     @Autowired
     private ContestSubmissionResultRepository resultRepository;
-    @Autowired
-    private PlatformTransactionManager transactionManager;
 
     private InMemoryContestScoreboard scoreboard;
     private InMemoryContestScoreboardApplier applier;
@@ -74,13 +72,20 @@ class ContestScoreboardSequenceRecoveryMySqlIntegrationTests {
         JdbcContestScoreboardAppliedAtWriter writer = new JdbcContestScoreboardAppliedAtWriter(jdbcTemplate);
         ContestScoreboardAppliedMarker marker =
                 new ContestScoreboardAppliedMarker(writer, applier, () -> true);
+        // The transaction manager is the no-op one, and deliberately not the real one this slice
+        // autowires: the marker's own transaction would be started on a connection that cannot see
+        // the rows this test has seeded inside its own, uncommitted transaction. What the slice is
+        // about - the detection queries, the walk and the convergence - is unaffected by that, and
+        // the marker's transaction boundary is pinned by ContestScoreboardReplayTransactionBoundaryTests.
+        ContestSubmissionBatchExecutor batchExecutor =
+                new ContestSubmissionBatchExecutor(new NoOpTransactionManager());
         recoveryService = new ContestScoreboardRedisSequenceRecoveryService(
                 resultRepository,
                 applier,
-                applier,
-                new ContestScoreboardApplyLock(),
-                marker,
-                new ContestSubmissionBatchExecutor(transactionManager),
+                new ContestScoreboardReplayApplication(
+                        applier, marker, new ContestScoreboardApplyLock(), batchExecutor,
+                        new SimpleMeterRegistry()),
+                batchExecutor,
                 properties(1000, 4),
                 new ContestScoreboardRedisSequenceMetrics(new SimpleMeterRegistry())
         );
