@@ -108,6 +108,7 @@ INFO 1회로 남긴다. 값 조합은 순수 정적 `ContestScoreboardRecoverySu
 |---|---|---|---|---|
 | checkpoint가 이 JVM이 적용한 것보다 뒤로 갔다 (RDB 롤백) | supervisor pass | `rewindsOnCheckpointRegression()=true` → 저장 checkpoint에서 **되감아 재구독** | `false` → 되감지 않음, MySQL 기준으로 rebuild | `false` → 되감지 않음, seq 기준으로 검사 |
 | 건네받은 offset 아래 구간을 이 모드의 기준이 덮는가 | live delivery | 저장 offset이 기준 → 재구독 자체가 복구 | MySQL replay 후 `covered` | Redis에 한 번도 적용되지 않은 이벤트는 **찾을 수 없다** → `covered=false`, checkpoint 전진 금지·요란한 실패 |
+| **역사 복구를 소비 전에 자기 기준으로 하는가** (JVM cold start) | lifecycle `start()` | `recoversHistoryBeforeConsuming()=false` → **그대로 소비 시작**(재소비가 이 모드의 복구다) | `true` → 기동 replay가 끝날 때까지 **consumer를 붙잡는다** | `true` → 기동 check가 끝날 때까지 **consumer를 붙잡는다** |
 
 모드별 빈은 `ContestScoreboardRecoveryStrategyConfig`가 `properties.mode()`에 대한 **exhaustive
 switch**로 정확히 하나 만든다. `@ConditionalOnProperty`의 원시 문자열 비교와 달리 **모드를 추가하면
@@ -123,6 +124,73 @@ rollback 이전에 적용된 결과는 rollback **이후에 시작한** replay �
 
 rollback에 대한 pass는 **관측당 1회**만 실행한다 — 회귀를 관측한 `(storedOffset, appliedOffset)`
 쌍을 기억한다. 없으면 트래픽이 없는 동안 매 초 replay가 돈다.
+
+**다만 "1회"는 그 관측이 *답해졌을 때만*이다.** `ContestScoreboardRecoveryStrategy.Outcome`이 그
+구분을 타입으로 만든다: `COVERED`만 rollback을 답한 것으로 기록되고(`rebuiltThrough` 전진),
+`BUSY_RETRY_LATER`(gate를 못 잡아 시도조차 못 함)와 `RETRYABLE_FAILURE`(시도했고 실패)는 **쌍을
+기록하지 않아 다음 supervisor 주기에 다시 묻는다.** 새 stream 전달은 필요 없다 — 그 주기가
+트래픽에 의존하지 않는 유일한 재시도 트리거다. `UNRECOVERABLE`은 이 기준으로 원리적으로 못 찾는
+구간이라 기억해 hot loop를 막지만, ERROR 로그 + `contest.scoreboard.stream.rollback.unrecoverable`로
+요란하게 남고, 재시도는 `contest.scoreboard.stream.rollback.retry{outcome}`으로 **busy-gate
+skip과 구분해서** 세어진다. 쌍을 먼저 기록하고 나중에 묻던 순서가 busy pass의 재시도를 없앴다:
+gate를 못 잡은 pass가 "이미 답한 회귀"로 남고, checkpoint가 그 구간을 넘지 못하니 쌍도 변하지 않아
+full replay가 JVM 수명 동안 다시 돌지 않을 수 있었다.
+
+**rollback의 답과 실패한 batch는 서로의 대안이 아니다.** supervisor는 둘을 **독립적으로** 묻는다.
+되감지 않는 두 모드는 rollback을 답하면서 consumer를 건드리지 않으므로 실패한 batch를 지나가며 다시
+읽지 않고, checkpoint는 그 구간을 넘지 못하므로(`unappliedFrom`, §3.2) 그 상태가 스스로 풀리지도
+않는다 — 답해진 rollback을 이유로 묻기를 멈추면 standings가 그 offset에서 JVM 수명 내내 짧은 채로
+남는다. 되감는 모드에서는 둘이 겹친다: 그 모드의 답이 **checkpoint에서의 재시작 자체**여서 실패한
+batch를 지나가며 다시 읽으므로, 한 번의 되감기로 두 원인이 함께 처리되고 두 번 재시작하지 않는다.
+관련 지표는 그대로 구분된다 — `stream.rollback.restarts`와 `stream.failure.restarts`(§3.2).
+
+#### JVM cold start — 되감지 않는 모드는 모드의 pass 뒤에 소비를 시작한다
+
+위의 두 질문은 **rollback**(Redis가 살아 있고 JVM도 살아 있는 상태)에 대한 것이다. 세 번째 질문은
+**JVM이 다시 뜨는 경우**이고, 답이 반대 방향에서 필요하다: 기동 순서가 모드 격리를 깨뜨린다.
+
+`ContestScoreboardStreamLifecycle`은 `SmartLifecycle`(`getPhase() = Integer.MAX_VALUE - 100`)이라
+**context refresh 끝에** `start()`가 불리고, 모드의 기동 pass는 `ApplicationRunner`라서 **그 뒤에**
+실행된다. 그래서 손대지 않으면 되감지 않는 두 모드에서도 stream consumer가 먼저 저장 checkpoint에서
+읽기 시작하고, 그 재소비가 그 모드의 기준(MySQL·seq)보다 먼저 역사를 메운다 — 모드가 아닌 기계가
+복구한 것이 되고 로그에는 아무 흔적이 없다.
+
+`ContestScoreboardRecoveryCutover`가 그 순서를 뒤집는 경계다. `recoversHistoryBeforeConsuming()`이
+`true`인 모드의 `start()`는 소비를 시작하는 대신 `whenCovered(...)`로 대기하고, **그 모드가 역사를
+덮었다고 답했을 때** `markCovered(coveredBy)`로 해제된다 — full-replay는 기동 replay가 돌아온 뒤,
+redis-seq는 check이 **역사를 덮은** 뒤다(`coveredTheWholeSet()`: 창 예산이 바닥난 `saturated`도,
+라운드를 다 쓴 `unresolved`도 아니다 — 전략이 `COVERED`로 인정하는 기준과 같은 기준이다. skip된
+trigger는 해제하지 않는다). 경계는 JVM 내부 전용이며(§3.5) 종료 중 도착한 해제는 consumer를
+시작하지 않는다. 덮지 못한 pass가 대기를 풀면 그 pass가 설명하지 못한 역사를 stream이 대신 메우게
+되므로, **덮을 때까지 대기는 이어진다** — 영원히 덮지 못하는 경우 그 인스턴스는 소비하지 않고
+ERROR로 남는다(§12).
+
+대기의 계약은 **"언제 시작하는가"만 옮기고 "어디서 시작하는가"는 옮기지 않는다**는 것이다.
+
+- 재개 offset은 여전히 저장 checkpoint **자신(포함)** 이다 — `next`도 브로커 tail도 아니다.
+  대기 전후에 같은 값을 읽는다.
+- 기동 pass는 stream offset을 **쓰지 않는다**(rebuild 요청에 실리지 않는다). 그래서 대기 중에
+  checkpoint가 앞으로 이동하지 않고, 복구 중 발행된 결과와 기존 backlog는 재개 지점 위에 그대로
+  남는다.
+- 비용은 정직하게 둘이다: 기동 pass가 도는 시간만큼 retention 창이 줄고, 그 사이 stream에서 사라진
+  결과는 **평범한 retention gap**이 되어 live 경로가 그 모드의 기준에 묻는다(§3.2). 별도 기전을
+  만들지 않았다.
+
+**consumer가 켜져 있는데 그 모드의 대기를 해제할 수 있는 유일한 것이 꺼져 있는 조합은 기동
+실패다**(검증기, `full-replay.startup-replay-enabled=false`). 그 모드에서 기동 runner가 경계를
+보고하는 유일한 코드이고(retention-gap fallback은 대기 중인 consumer를 통해야 도달한다), 그 조합은
+아무도 해제하지 않는 대기 — consumer 영구 정지 — 이므로 조용히 넘길 수 없다.
+**`redis-seq.startup-check-enabled=false`는 거부하지 않는다**: 그 속성이 없애는 것은 첫 check이지
+메커니즘이 아니고, scheduler는 주기 task 둘을 무조건 등록하므로 한 주기 뒤 첫 check이 해제한다
+(`ContestScoreboardRedisSequenceStartupCheck`의 로그가 약속하는 그대로다). `stream-offset`은 기동
+pass가 없으므로 대상이 아니다.
+
+**pass가 실패하면 대기가 이어진다.** full-replay에서 기동 replay가 던지면 기동 자체가 실패하므로
+(fail-fast) "떠 있지만 소비하지 않는" 상태가 만들어지지 않는다. redis-seq에서는 check 실패가
+삼켜져 지표·ERROR로 남고 주기마다 재시도되므로, 그동안 consumer는 대기한 채 남는다 — 이 비용이
+작은 이유는 **적용 자체가 같은 Redis를 필요로 하기 때문**이다: check가 실패할 정도의 Redis 장애에서는
+consumer가 시작되어도 아무것도 적용하지 못한다. 대기는 장애가 풀리는 즉시, 그리고 어느 trigger든
+pass가 끝까지 가는 즉시 해제된다.
 
 #### 모드에게 주는 질문은 구간이다 — 그리고 그 구간은 양끝으로 말한다
 
@@ -269,7 +337,12 @@ head에 남아 재시도된다"고 적혀 있었다. **실물 브로커로 측�
 | 실패한 batch | 그대로 (전진하지 않음) | 저장된 offset **자신**에서 재구독 (재읽기) | `contest.scoreboard.stream.failure.restarts` |
 
 실패한 batch는 checkpoint를 움직이지 않으므로 롤백 guard만으로는 "정상"으로 보인다. 그래서
-`ContestScoreboardStreamListener.failedBatches()`를 함께 보고, 이미 답한 실패는 재시작하지 않는다.
+`ContestScoreboardStreamPosition.failedBatches()`를 함께 보고, 이미 답한 실패는 재시작하지 않는다.
+
+**두 원인은 배타적이지 않으므로 각각 따로 묻는다.** 롤백이 (되감지 않는 모드에서) 답해진 뒤에도
+실패한 batch는 남아 있고, checkpoint가 그 구간을 넘지 못하므로 이 주기가 아니면 아무도 다시 묻지
+않는다 — 답해진 롤백을 "더 물을 것이 없다"로 읽으면 그 offset에서 standings가 영구히 짧아진다
+(§3.1). 되감는 모드에서는 되감기가 곧 구간 재읽기라 한 번으로 끝난다.
 
 #### 실패한 batch가 남긴 구간은 checkpoint가 넘어갈 수 없다
 
@@ -391,6 +464,12 @@ advisory lock 등)은 **도입하지 않았다.**
 
 - `contest.scoreboard.recovery.owner.enabled` — 기본 `true`. `application-batch-role.properties`는
   명시적으로 `true`, web·judge 역할은 `false`다.
+- **이 설정은 선언이 아니라 실행 경계다.** `ContestScoreboardRecoveryOwnerCondition`(`@Conditional`)이
+  세 트리거 — `ContestScoreboardFullReplayStartupRunner`,
+  `ContestScoreboardRedisSequenceStartupCheck`, `ContestScoreboardRedisSequenceScheduler` — 에 붙어
+  있어, `owner.enabled=false`면 그 빈들이 **등록되지 않는다.** 조건이 붙은 것은 트리거뿐이고
+  `ContestScoreboardFullReplayService`는 **모든 모드에서 단일 빈으로 남는다** — stream retention-gap
+  fallback이 그 서비스를 통해 replay하기 때문이다.
 - `ContestScoreboardRecoveryValidator`가 기동 시 두 방향 모두를 **거부**한다.
   - `stream.consumer.enabled=true`인데 `owner.enabled=false` → **기동 실패**. stream을 소비하며
     supervisor pass를 도는 JVM은 선언 여부와 무관하게 복구 owner이므로, 아니라고 선언하면 **실제로
@@ -476,9 +555,16 @@ bounds를 빌리지 않는다 — 그것은 chunk replay의 bounds이고, 여기
 - `scoreboard_applied_at`은 `COALESCE`로 최초 적용 시각을 보존하고, `scoreboard_applied_seq`는
   덮어쓴다(§3.4).
 - **모든 lock·gate는 JVM 내부 전용이며 전체 시스템 lock이 아니다.** `ContestScoreboardApplyLock`,
-  `ContestScoreboardRecoveryPassGate` 모두 두 인스턴스를 조정하지 않는다. 복구 역할의 단일 인스턴스
-  전제는 선언(`owner.enabled`)과 기동 검증으로 강제되지만, **cross-JVM 중복 실행에 대한 런타임 방어는
+  `ContestScoreboardRecoveryPassGate`, `ContestScoreboardRecoveryCutover` 모두 두 인스턴스를 조정하지
+  않는다. 복구 역할의 단일 인스턴스 전제는 선언(`owner.enabled`, 이것은 **빈 등록을 실제로 막는
+  실행 경계**다 — §3.5)과 기동 검증으로 강제되지만, **cross-JVM 중복 실행에 대한 런타임 방어는
   없다**(§3.5).
+- **지원하는 장애 모델은 "애플리케이션 JVM은 살아 있고 Redis만 RDB 스냅샷 시점으로 되돌아간다"**
+  하나다. 그 모델에서 세 모드는 각자의 기준으로 복구하고, supervisor pass가 롤백을 관측해 모드별
+  pass를 트리거하며, 답해지지 않은 구간은 다음 주기에 다시 묻는다(§3.1). **JVM cold start는 이
+  모델 밖이다** — 그중 "되감지 않는 모드가 stream 재소비로 복구되는 것"만 §3.1의 cutover 경계가
+  막고, 그 격리가 성립하지 않는 구성(consumer on + 기동 pass off)은 기동에서 거부한다. Redis까지
+  함께 되돌아간 cold start와 동시에 뜬 두 인스턴스는 **검증된 범위가 아니다.**
 - AMQP 0.9.1 stream consumer에는 명시적 prefetch가 필요하다. 현재 구성은 consumer 1개,
   `prefetch=500`, consumer batch 500이다.
 - AMQP 0.9.1에는 stream single-active-consumer 조정이 없으므로 scoreboard consumer 역할은 현재

@@ -4,10 +4,17 @@
 폐기된 seq 설계와의 차이는 [`PORTFOLIO_SCOREBOARD_RECOVERY.md`](PORTFOLIO_SCOREBOARD_RECOVERY.md)를
 본다.
 
-**이 문서는 두 라운드로 이루어진다.** 1라운드(`0d36f26..60d98ec`)에서 세 모드를 구현했고, 그 결과에
+**이 문서는 세 라운드로 이루어진다.** 1라운드(`0d36f26..60d98ec`)에서 세 모드를 구현했고, 그 결과에
 대한 독립 검토(§9.1)가 **"세 모드가 실제로 분리되어 있지 않다"**는 지적을 포함해 14건을 냈다.
-2라운드(`60d98ec..HEAD`, §14)에서 그 지적과 함께 나온 다섯 결함을 고쳤다. **1라운드 시점의 서술과
-2라운드에서 정정된 서술을 구분해서 읽어야 한다** — 정정 대상은 각 절에 `[정정]`으로 표시했다.
+2라운드(`60d98ec..b98c83f`, §14)에서 그 지적과 함께 나온 다섯 결함을 고쳤다. 3라운드(`b815378..`,
+§16)에서 **owner 설정이 실행 경계가 아니었던 것**, **busy recovery pass가 rollback 재시도를 잃던
+것**, **JVM cold start에서 모드가 격리되지 않던 것** 세 결함을 고쳤다. **라운드별 서술과 뒤에서
+정정된 서술을 구분해서 읽어야 한다** — 정정 대상은 각 절에 `[정정]`으로 표시했다.
+
+3라운드가 왜 필요했는지는 §16.0에 한 문단으로 적었다: 앞의 두 라운드가 **rollback(Redis가 살아
+있고 JVM도 살아 있는 상태에서의 회귀)** 만 다루었고, **JVM cold start**(JVM이 다시 뜨는 경우)는
+어느 라운드에서도 검증되지 않았다. 2라운드 검토자가 "모드 격리 — clean"이라고 판정한 것도 그
+rollback 경로에 대한 판정이며, **cold start 경로는 그 판정의 범위가 아니었다**(§15.1 정정).
 
 ## 1. worktree · 브랜치 · 기준 commit
 
@@ -21,8 +28,10 @@
 | 검토 기준 HEAD | `7af681e` (기준 + 20 commit) — 읽기 전용 검토자가 본 지점 |
 | 검토 수정 HEAD | `b98c83f` (기준 + 21 commit, 60 files, +5190 / −476) |
 | 측정 지점 HEAD | `655838e` (기준 + 22 commit, 102 files, +10725 / −283) |
-| 그 뒤 | 이 보고서의 문구·수치만 고치는 docs commit 3건(`b6eff86`, `e8a5e8d`, 그리고 이 절을 적는 commit) |
-| 작업 트리 | **clean (미추적 파일 없음)** — 측정 지점 HEAD와 그 이후 모두에서 확인 |
+| 3라운드 기준 HEAD | `b815378` (기준 + 25 commit) — 3라운드 작업을 시작한 지점. 2라운드 문서 정정 commit 3건(`b6eff86`, `e8a5e8d`, `b815378`)의 마지막 |
+| 3라운드 결과 commit | `ba25145` (기준 + 26 commit) — 세 결함과 검토 지적 수정. 소스 28 files, `+2004 / −144`(그중 신규 4 files = 435 lines) |
+| 그 뒤 | 이 보고서·`ARCHITECTURE.md`의 문구·수치를 고치는 docs commit(§16.9) |
+| 작업 트리 | **3라운드 작업이 커밋되기 전에는 dirty였다** — 커밋 후 `git status --short`가 비는지는 §16.9에 적었다 |
 
 마지막 한 commit(`655838e`)은 이 절을 측정값으로 채우는 commit이다 — 즉 위 수치는 그 commit 자신을
 포함하고, `b98c83f..655838e`의 차이는 정확히 그 commit의 `+67 / −21`이다. 이것이 "clean 상태와 변경
@@ -408,6 +417,10 @@ d. `findSequencedRowsDescending`/`findRowsByAppliedSequences`는 **의도적으�
 
 e. **분산 실행권을 도입하지 않았다** — 계획의 사용자 결정대로 단일 owner 전제를 설정·기동 검증·
    문서로 강제했다. cross-JVM 중복 실행 위험은 §12에 남는다.
+   **[정정, 3라운드]** "설정으로 강제했다"는 이 문장은 2라운드 시점에 **과장이었다.** 그때
+   `owner.enabled`는 검증기·로그에만 반영됐고 트리거 빈은 그대로 등록됐다(§13.1.1). 설정이 실제
+   실행 경계가 된 것은 3라운드다(§16.1). 그리고 3라운드가 고친 것도 그것뿐이다 — **단일 인스턴스
+   실행은 여전히 강제되지 않는다.**
 f. **`redis-seq`의 retention gap fallback은 `covered=false`로 요란하게 실패한다.** 메우는 척하지
    않는다 — 이 모드의 기준(중복 seq + lost-tail)은 Redis에 한 번도 적용되지 않은 이벤트를 찾을 수
    없다. 계획 §3.3의 "설계된 한계"를 구현으로 고정했다.
@@ -431,6 +444,24 @@ h. **`application-test.properties`에 env override를 추가**했다(`TEST_DB_UR
 - **[신규] 미적용 구간은 JVM 안에만 있다.** durable하지 않으며, 그것이 안전한 이유는 재시작한
   consumer가 checkpoint 포함 지점에서 재개해 그 구간을 다시 읽기 때문이다. JVM이 죽으면서 그 구간이
   사라지는 것 자체는 손실이 아니다.
+- **[신규, 3라운드] 지원하는 장애 모델은 "JVM은 살아 있고 Redis만 RDB 스냅샷으로 되돌아간다"로
+  고정했다.** 이 모델 밖의 시나리오 — **JVM이 죽었다가 다시 뜨는 cold start**(Redis도 함께 되돌아간
+  경우), 여러 인스턴스가 동시에 뜨는 경우 — 는 코드가 격리를 주장하는 범위가 아니며, 그중 JVM cold
+  start는 **부분적으로만** 다뤘다(§16.3·§16.4). 실물 브로커를 세운 cold start 기동은 이번에도
+  실행하지 않았다(§16.7).
+- **[신규, 3라운드] cold start에서 "복구 중 발행된 결과"를 실측하지 않았다.** 근거는 코드 경로와
+  단위 테스트까지다 — 기동 pass는 stream offset을 쓰지 않고, consumer는 저장 checkpoint **포함**
+  지점에서 재개하므로(§16.3) 재개 지점이 복구 중 앞당겨지지 않는다. 실물 브로커·실물 MySQL로
+  재현한 증거는 아직 없다.
+- **[신규, 3라운드 검토 반영] redis-seq에서 역사를 영원히 덮지 못하는 pass만 남으면 consumer가
+  해제되지 않아 그 인스턴스는 아무것도 소비하지 않는다.** 대기 해제를 coverage 기준으로 맞춘
+  결과이며(§16.3), 이 모드가 `UNRECOVERABLE`에 대해 내리는 판단과 같은 방향이다 — 메운 척하지
+  않고 ERROR로 남는다. 운영자가 할 일(MySQL replay 또는 reset 기반 재번호)은 로그가 말한다.
+- **[신규, 3라운드 검토 반영] full-replay runner의 gate 점유 분기는 ERROR만 남기고 해제를 보고하지
+  않는다.** 그 분기에 도달하면 consumer가 영원히 대기하며, 유일한 출구는 재시작이다. 독립 검토는
+  full-replay 모드에서 그 시점에 `MYSQL_REPLAY` gate를 점유할 경로를 찾지 못했다(다른 호출자인
+  retention-gap fallback은 `stream-offset` 전용이다)고 보고했다 — **도달 불가로 보고된 잔여
+  위험이며, 고치지 않았다.**
 
 ## 13. [신규] 실행권과 검증 환경의 신뢰 한계
 
@@ -449,6 +480,24 @@ h. **`application-test.properties`에 env override를 추가**했다(`TEST_DB_UR
   선언 밖에 남는 것을 막는다), owner인데 트리거가 하나도 없으면(consumer off + `mode=stream-offset`)
   **기동 실패**.
 - 기동 로그에 `recovery-owner=`가 함께 남는다.
+
+### 13.1.1 [정정] owner 설정은 실행 경계다 — 그러나 "단일 실행"을 강제하지는 않는다
+
+위 절의 "단일 복구 owner 전제를 … 강제한다"는 문장은 두 가지로 읽힐 수 있고, 3라운드 전에는 **한
+쪽으로만 참이었다.**
+
+1. **"owner 설정이 이 인스턴스의 복구 트리거를 실제로 켜고 끈다"** — 3라운드 전에는 **거짓이었다.**
+   `owner.enabled=false`는 검증기(§13.1의 기동 실패)와 로그에만 반영됐고, `full-replay` 기동
+   replay·`redis-seq` 기동 검사·주기 scheduler는 **그대로 빈으로 등록되어 실행됐다.** 즉 web 역할이
+   `mode=full-replay`로 뜨면(로그·기동 검증은 "복구 안 함"이라 말하는데) 실제로는 replay를 돌렸다.
+2. **"owner 설정이 시스템 전체에서 복구를 한 인스턴스로 제한한다"** — 여전히 **거짓이다.**
+   분산 실행권이 없으므로(§13.2), 두 인스턴스가 모두 `owner.enabled=true`로 올바르게 선언하면
+   둘 다 실행한다.
+
+3라운드는 1번을 코드로 고쳤다: `ContestScoreboardRecoveryOwnerCondition`(`@Conditional`)을 세
+트리거에 붙여, `owner.enabled=false`면 **빈 자체가 등록되지 않는다**(§16.1). 2번은 고치지 않았고
+고칠 수 없다 — 그것은 배포 토폴로지의 문제이며 §13.2에 남는다. **"owner 설정으로 단일 실행을
+강제했다"는 서술은 어느 라운드에서도 참이 아니었다.**
 
 ### 13.2 그 부재의 위험 (남은 위험)
 
@@ -690,6 +739,12 @@ JVM-scoped이고 seeding으로 초기화되지 않으므로, 한 메서드가 �
 
 **검토자 판정: 다섯 관점 중 넷은 clean, 하나는 불완전.**
 - 모드 격리 — clean. strategy가 주입되는 곳은 정확히 두 곳이고, 그 두 메서드가 유일한 모드 질의다.
+  **[정정, 3라운드]** 이 판정은 **rollback 경로에 대해서만 참이다.** 검토 관점이 "모드가 자기 복구
+  결정을 소유하는가"였고 그 질문은 supervisor·live delivery 두 지점에서 발생하므로, 검토자는 그
+  두 지점만 보았다. **JVM cold start 경로는 이 판정의 범위 밖이었다** — 거기서는
+  `SmartLifecycle.start()`가 `ApplicationRunner`보다 먼저 실행되어, 되감지 않는 두 모드에서도
+  stream consumer가 모드의 기동 pass보다 먼저 읽기 시작했다(§16.3). 즉 cold start에서 모드 격리는
+  **clean이 아니었다.**
 - offset 비연속성 — clean. main 어디에도 `+1` 산술로 checkpoint를 전진시키는 곳이 없다.
 - 다중 인스턴스 실행권과 그 부재 — clean. 문서·gate 해제(`finally`)·owner 기본값의 비대칭이 모두
   일관되며, 검증은 **안전한 방향으로만** 거부한다.
@@ -741,3 +796,421 @@ JVM-scoped이고 seeding으로 초기화되지 않으므로, 한 메서드가 �
 않는다. RDB 스냅샷 rollback 자체의 fault injection과 장시간 부하 테스트는 두 라운드 모두 범위 밖이다.
 지적 1·2의 시나리오는 **단위 수준에서** 재현·고정했으며, 실물 브로커·실물 RDB 롤백으로 그 두 시나리오를
 end-to-end로 구동한 증거는 없다 — 그 재현에는 RDB 복원 주입이 필요하고 그것은 범위 밖이다.
+
+## 16. 3라운드 (`b815378..`) — 세 결함
+
+### 16.0 왜 이 라운드가 필요했는가
+
+앞의 두 라운드는 **rollback(Redis가 살아 있고 JVM도 살아 있는 상태에서의 회귀)** 을 다뤘다.
+3라운드에서 고친 세 결함은 그 초점 밖에 있었다.
+
+1. **owner 설정이 선언이었고 실행 경계가 아니었다** — 2라운드가 "설정·기동 검증·문서로 강제했다"고
+   적은 그 설정은, 실제로는 검증기와 로그에만 반영되고 트리거 빈은 그대로 등록됐다(§13.1.1).
+2. **busy recovery pass가 rollback 재시도를 잃었다** — 앞선 두 라운드가 추가한 재시도는
+   "gate를 못 잡아 pass가 아예 돌지 않은 경우"를 "이미 답한 회귀"로 기록했고, 새 트래픽이 없으면
+   다시 묻지 않았다.
+3. **JVM cold start에서 모드가 격리되지 않았다** — 실패한 rollback 경로가 아니라 **기동 순서**의
+   문제다. `SmartLifecycle.start()`가 `ApplicationRunner`보다 먼저 실행되므로, 되감지 않는 두
+   모드에서도 stream consumer가 모드의 기동 pass보다 먼저 읽기 시작했다.
+
+세 결함 모두 **코드로 고쳤고**, 각 수정은 그것이 없으면 실패하는 테스트를 갖는다(§16.5의 판별력
+실측). 셋 다 이번 라운드의 작업 지시가 지목한 결함이며, 그 밖의 결함은 찾지 못했다(§16.8).
+
+### 16.1 결함 1 — owner 설정을 실제 실행 gate로 만든다
+
+**원인.** `contest.scoreboard.recovery.owner.enabled`는 2라운드에서 **검증기 입력**으로만 들어갔다.
+`owner=false`여도 세 트리거 — `ContestScoreboardFullReplayStartupRunner`,
+`ContestScoreboardRedisSequenceStartupCheck`, `ContestScoreboardRedisSequenceScheduler` — 는
+`@ConditionalOnProperty(mode=...)`만 보고 빈으로 등록됐다. 그래서 web 역할이
+`mode=full-replay`(또는 `redis-seq`)로 배포되면, 기동 로그와 기동 검증은 "이 인스턴스는 복구하지
+않는다"고 말하는데 **실제로는 replay가 돌았다.** 즉 owner 설정은 "단순한 로그 선언"이었고, 2라운드
+보고서의 "설정으로 단일 실행을 강제했다"는 서술은 그 지점에서 틀렸다.
+
+**수정.** `ContestScoreboardRecoveryOwnerCondition`(package-private `Condition`, `owner.enabled`를
+읽고 없으면 `true`)을 만들어 세 트리거에 `@Conditional`로 붙였다. 효과는 **빈 등록 자체가
+사라지는 것**이다 — 로그 한 줄이 아니라 실행 경계다.
+
+| 보장 | 근거 |
+|---|---|
+| `owner=false` ⇒ full replay 기동 runner 없음 | 빈 미등록(조건) |
+| `owner=false` ⇒ redis-seq 기동 검사·주기 scheduler 없음 | 빈 미등록(조건). 모드의 service·metrics는 남는다 |
+| `owner=true`인 지정 역할만 복구 트리거를 실행 | 세 트리거 모두 조건 통과 |
+| 공용 full replay 서비스는 stream retention fallback에서 재사용 가능 | `ContestScoreboardFullReplayService`에 조건을 **붙이지 않았다.** 조건이 붙은 것은 트리거뿐이고, 서비스는 모든 모드에서 단일 빈으로 남는다 |
+
+검증기는 "선언과 실제가 어긋나는 조합"을 계속 거부하되, 이제는 **실제 게이트와 같은 의미**로
+정리했다. `rejectOwnerMismatch()`는 (a) consumer가 켜졌는데 owner=false, (b) owner=true인데
+consumer가 꺼져 있고 `mode=stream-offset`(트리거가 될 것이 없는 owner) 두 방향을 거부한다.
+cross-JVM 분산 lock은 이번에도 도입하지 않았다(범위 밖, §13.2).
+
+**테스트.**
+
+| 무엇을 고정하는가 | 테스트 |
+|---|---|
+| 세 모드 × owner true/false의 빈 등록 경계 | `ContestScoreboardRecoveryModeWiringTests.eachModeBringsUpItsTriggersOnlyOnTheInstanceThatOwnsRecovery` (6 context) |
+| owner=false + redis-seq ⇒ 기동 검사·scheduler 없음, service는 남음 | `….anInstanceThatIsNotTheOwnerRegistersNoSequenceCheck` |
+| owner=false + full-replay ⇒ 기동 replay 없음, service는 남음 | `….anInstanceThatIsNotTheOwnerDoesNotReplayAtStartup` |
+| **배포되는 역할 파일 자체**로 같은 주장(web·judge는 트리거 0, batch는 있음) | `ContestScoreboardRecoveryRoleGateTests` 4건 — 실제 `SpringApplication` + `--spring.config.location=file:./src/main/resources/` |
+| 모드만 바꾼 web·judge 역할도 트리거 0 | `….aRoleThatDoesNotOwnRecoveryRegistersNothingEvenInARecoveryMode` |
+| owner 프로퍼티가 **없을 때** 조건의 기본값과 바인딩 기본값이 서로 같다(둘을 따로 읽으므로 어긋날 수 있다) | 조건 쪽: `….fullReplayModeIsTheOnlyOneThatReplaysAtStartup`(owner 프로퍼티 없이 runner 빈 존재). 레코드 쪽: `ContestScoreboardRecoverySummaryTests`의 `recovery-owner=true` 단언(owner 프로퍼티 없이) |
+
+`ContestScoreboardRecoveryRoleGateTests`가 필요한 이유: 배포되는 파일이 주장의 대상이기 때문이다.
+`multi-web`·`multi-judge`는 owner를 false로 선언하고, 그 파일을 편집해도 복구 pass가 조용히 뜨지
+않아야 한다. 세 번째 역할(`multi-batch`)이 **양성 대조군**이다 — 같은 파일 집합·같은 빈으로 모드의
+트리거가 실제로 올라오는 것을 확인하지 않으면, "트리거 없음"은 아무것도 올리지 않은 context에서도
+통과한다.
+
+**판별력 실측.** 조건을 제거(`@Conditional` 삭제)하면 위 경계 테스트들이 실패하고 나머지는
+통과한다. 이 라운드에서 다시 확인했다.
+
+### 16.2 결함 2 — busy recovery pass가 rollback 재시도를 잃는다
+
+**원인.** supervisor pass는 회귀를 관측한 `(storedOffset, appliedOffset)` 쌍을 **"이미 답한
+회귀"로 먼저 기록하고** 전략에 물었다. 그런데 `ContestScoreboardRecoveryPassGate`가 다른 pass에
+잡혀 있으면 전략은 복구를 **하지 않고** 돌아왔고, 다음 supervisor 주기는 그 쌍을 "처리됨"으로 읽고
+건너뛰었다. 새 stream 전달이 없다면 그 회귀는 **다시는 묻지 않았다** — 재구독을 하지 않는 두
+모드에서는 checkpoint가 그 구간을 넘어가지 못하므로 쌍도 변하지 않는다. 결과적으로 full replay가
+JVM 수명 동안 영원히 다시 돌지 않을 수 있었고, **gate 획득 실패와 실제 복구 실패가 같은 상태**가
+됐다.
+
+**수정 — 타입이 있는 결과.** `ContestScoreboardRecoveryStrategy.Outcome`을 도입했다.
+
+| outcome | 뜻 | 호출자가 하는 일 |
+|---|---|---|
+| `COVERED` | 이 모드의 기준이 구간을 덮었다 | **rollback을 답한 것으로 기록**하고 `rebuiltThrough` 전진 |
+| `BUSY_RETRY_LATER` | 다른 pass가 gate를 잡고 있어 **시도조차 하지 않았다** | 기록하지 않음. 다음 supervisor 주기에 재시도 |
+| `RETRYABLE_FAILURE` | 시도했고 실패했다(창 소진, 예외, 부분 성공) | 기록하지 않음. 다음 주기에 재시도. `contest.scoreboard.stream.rollback.retry{outcome}` |
+| `UNRECOVERABLE` | 이 기준으로는 원리적으로 못 찾는다 | 기억해 hot loop를 막되 **ERROR 로그 + `rollback.unrecoverable` 지표**로 요란하다 |
+
+`handleRollback`은 `COVERED`일 때만 `true`(답했다)를 반환하고, `recoverConsumption`은 그 `true`일
+때만 쌍을 기록한다. 되감는 모드(`stream-offset`)는 재구독을 수행한 뒤 `true`를 반환한다 — 재구독이
+이 모드의 답이고 그것이 checkpoint를 움직이기 때문이다. `RETRYABLE_FAILURE`는 배치마다가 아니라
+**다음 주기마다** 한 번이다(지표로 세어진다). 예외는 `RETRYABLE_FAILURE`이므로 **나중 재시도
+가능성을 없애지 않는다.**
+
+**"다음 주기에 실제로 다시 묻는가"의 근거**는 두 가지다. (a) 재시도 가능한 결과에서는 쌍이
+기록되지 않으므로 `recoverConsumption`의 조기 반환(`storedOffset == answered… &&
+appliedOffset == answered…`)이 성립하지 않는다. (b) 그 조기 반환은 `running`일 때만 도달하므로
+consumer가 살아 있는 한 주기마다 다시 묻는다. 새 stream 전달은 필요하지 않다 — 이 재시도는
+**트래픽에 의존하지 않는 트리거**다.
+
+**테스트.**
+
+| 무엇을 고정하는가 | 테스트 |
+|---|---|
+| gate가 잡혀 있으면 `BUSY_RETRY_LATER`(복구된 것으로 보고하지 않음) | `ContestScoreboardRecoveryStrategyTests.aRangeAnotherPassIsAlreadyRebuildingIsNotReportedRebuilt` |
+| 시도가 예외로 끝나면 `RETRYABLE_FAILURE`(기억하지 않음) | `….anAttemptThatThrewIsRetriedRatherThanRemembered` |
+| 실패가 해소되면 **두 번째 시도가 실제로 돈다** | `….aRetriedPassCanRunOnceTheFailureHasCleared` |
+| 답하지 못한 회귀는 다음 주기에 다시 묻는다 | `ContestScoreboardStreamLifecycleTests.aRollbackTheBasisCouldNotAnswerIsAskedAboutAgain` |
+| 실패 재시도와 busy-gate skip이 **다른 지표**로 세어진다 | `….aFailedRebuildIsRetriedAndCountedApartFromABusyGate` |
+| `UNRECOVERABLE`은 무한 replay하지 않고 error 상태로 남는다 | `….anUnrecoverableRollbackIsRememberedAndLeftAsAnError` |
+| 재시도 상태가 두 모드(full-replay·redis-seq) 모두에서 전파 | 위 전략 테스트가 두 전략을 각각 구동한다 |
+| `COVERED`가 아닌 outcome으로는 checkpoint를 전진시키지 않는다 | `ContestScoreboardStreamProcessor.anchorAfterRebuild`가 `!outcome.covers()`에서 던진다(+ processor 테스트) |
+
+**판별력 실측.** `handleRollback`의 재시도 분기를 `return true`로 바꾸면(즉 재시도 가능한 결과를
+답으로 기록하면) lifecycle 테스트 2건만 실패한다 — `aRollbackTheBasisCouldNotAnswerIsAskedAboutAgain`,
+`aFailedRebuildIsRetriedAndCountedApartFromABusyGate`. 전략에서 `orElse(BUSY_RETRY_LATER)`를
+`orElse(COVERED)`로 바꾸면 `aRangeAnotherPassIsAlreadyRebuildingIsNotReportedRebuilt` 1건만 실패한다.
+예외 분기를 `COVERED`로 바꾸면 `anAttemptThatThrewIsRetriedRatherThanRemembered` 1건만 실패한다.
+
+### 16.3 결함 3 — JVM cold start의 mode 격리 (결정 A + cutover 경계)
+
+**결정: (A)를 택했다.** 즉 **지원하는 격리를 코드로 구현**하고, 지원하지 않는 구성은 기동에서
+명시적으로 거부한다. "안전한 격리가 불가능하면 non-stream 모드 cold start를 지원하지 않는다고
+선언"(B)하는 길은 택하지 않았다 — 격리가 실제로 구현 가능했기 때문이다.
+
+**원인.** 세 모드를 가르는 축(§3.1 "모드는 복구 결정을 소유한다")은 **rollback 시점**의 질문에만
+적용돼 있었다. cold start에는 축이 없었다. 그런데 기동 순서가 반대다 —
+`SmartLifecycle.start()`(이 lifecycle은 `getPhase() = Integer.MAX_VALUE - 100`)는 context refresh
+끝에 실행되고, 모드의 기동 pass는 `ApplicationRunner`라서 **그 뒤에** 실행된다. 그래서 JVM이 다시
+뜨면 **되감지 않는 두 모드에서도** stream consumer가 먼저 저장 checkpoint에서 읽기 시작했고,
+그 재소비가 두 모드의 기준(MySQL·seq)보다 먼저 역사를 메웠다. 모드 격리는 cold start에서
+성립하지 않았다.
+
+**수정 — 축을 하나 더 만들고, 그 축을 실제 경계로 만든다.**
+
+1. `ContestScoreboardRecoveryStrategy.recoversHistoryBeforeConsuming()` — **역사 복구를 소비 전에
+   자기 기준으로 수행하는 모드인가.** `stream-offset`만 `false`다: 이 모드의 역사 복구는 저장
+   checkpoint에서 읽는 것 **그 자체**이므로 consumer를 붙잡으면 영원히 아무것도 소비하지 않는다.
+   `full-replay`(MySQL)·`redis-seq`(seq)는 `true`.
+2. `ContestScoreboardRecoveryCutover` — JVM 내부 경계. `whenCovered(action)`으로 대기하고
+   `markCovered(coveredBy)`로 해제한다. lifecycle은 `true`인 모드에서 `start()`가 이 경계에
+   대기하고, 모드의 기동 pass가 실제로 **완료됐을 때** 해제된다.
+3. 해제를 보고하는 주체는 **그 모드의 기동 pass 자신**이다: full-replay는
+   `ContestScoreboardFullReplayStartupRunner`의 replay가 돌아온 뒤, redis-seq는 scheduler의
+   **끝까지 간** check(기동 check 포함, 매 trigger)가 끝난 뒤. gate에 잡혀 **돌지 않은** pass와
+   예외로 **실패한** check는 해제하지 않는다 — 아무것도 복구되지 않았는데 consumer를 풀면
+   되감지 않는 모드의 역사를 stream이 메우게 된다.
+
+**cutover 경계의 계약(무엇을 잃지 않는가).** 대기는 **언제 소비를 시작하는가**를 옮길 뿐
+**어디서 시작하는가**를 옮기지 않는다.
+
+- consumer에 요청하는 offset은 **여전히 저장 checkpoint 자체(포함)** 다 — `next`도 브로커 tail도
+  아니다. `startAtStoredOffset()`은 대기 전후에 같은 값을 읽는다.
+- 기동 pass는 **stream offset을 쓰지 않는다**(`rebuild` 요청에 stream offset이 실리지 않는다).
+  그래서 대기 중에 checkpoint가 앞으로 이동하지 않는다.
+- 따라서 복구 중 발행된 결과와 기존 backlog는 재개 지점 **위**에 그대로 남고, broker가 그 구간을
+  아직 retention에 갖고 있으면 재소비된다.
+- 대기의 **정직한 비용**은 두 가지다: ① 기동 pass가 도는 시간만큼 retention 창이 줄어든다,
+  ② 그 사이 stream에서 사라진 결과는 **평범한 retention gap**이 되어, live 경로가 그 모드의
+  기준에 묻는다(§3.2). 새 메커니즘을 만들지 않았다.
+
+**금지된 해법을 쓰지 않았다.** "데이터를 잃을 가능성이 있는 임의의 `next` 또는 broker tail
+시작"은 어디에도 없다 — lifecycle의 시작 offset 계산은 이번 라운드에서 바뀌지 않았다.
+
+**지원하지 않는 구성은 기동에서 거부한다.** 검증기의 `rejectAConsumerWithNoStartupRecovery()`는
+**consumer가 켜져 있는데 그 모드의 대기를 해제할 수 있는 유일한 것이 꺼져 있으면 기동 실패**다 —
+그 모드는 `full-replay` 하나다(`full-replay.startup-replay-enabled=false`). 이 모드에서 기동
+runner는 경계를 보고하는 유일한 코드이고, retention-gap fallback은 **대기 중인 consumer를 통해야**
+도달하며 운영자 rebuild endpoint는 다른 서비스를 쓰므로 경계를 보고하지 않는다. 즉 아무도 해제하지
+않아 consumer가 영원히 멈춘다. 오류 메시지는 두 출구(기동 replay를 켜거나, 이 역할에서 consumer를
+끄거나)를 함께 말한다.
+
+`redis-seq`는 **같은 설정으로 거부하지 않는다.** 그 속성이 없애는 것은 첫 check이지 메커니즘이
+아니다: scheduler는 `startup-check-enabled`와 무관하게 주기 task 둘을 등록하고(`configureTasks`에
+그 속성을 읽는 곳이 없다), 대기는 consumer를 기다리게 할 뿐이므로 **한 주기 뒤 첫 check이 해제한다.**
+`ContestScoreboardRedisSequenceStartupCheck`의 로그가 약속하는 것도 정확히 그것이다("the restored
+scoreboard keeps whatever tail it lost until the next periodic check"). 거부하면 이 속성이
+consumer를 켠 모든 역할에서 쓸 수 없게 되면서, scheduler 자신이 막고 있는 대체를 근거로 내세우게
+된다. 초기 구현은 이 반쪽을 함께 거부했고 **독립 검토가 이를 medium으로 지적해 좁혔다**(§16.8).
+
+**대기 해제는 "pass가 반환했다"가 아니라 "pass가 역사를 덮었다"로 판정한다.** 검토 지적을 받아
+고친 두 번째 지점이다. redis-seq의 해제 조건은 `SequenceCheckReport.coveredTheWholeSet()`
+(`!saturated && !unresolved`)이고, 이는 전략이 `COVERED`로 인정하는 기준과 **같은 기준**이다. 창
+예산이 바닥나 tail을 끝까지 걷지 못했거나(`saturated`) 라운드를 다 썼는데 재생할 결과가 남은
+(`unresolved`) pass가 대기를 풀면, 그 pass가 설명하지 못한 역사를 stream이 대신 메우게 된다 —
+대기와 기동 check이 막으려던 바로 그 대체다. 그래서 consumer는 계속 기다리고 다음 주기가 다시
+묻는다(라운드가 찾은 것을 재생하므로 다음 pass는 볼 것이 줄어든다). 그 대가도 정직하게 적는다:
+**역사를 영원히 덮지 못하는 pass만 남으면 consumer는 해제되지 않고 인스턴스는 아무것도 소비하지
+않는다**(ERROR로 남는다). 이는 이 모드가 이미 `UNRECOVERABLE`에 대해 내리는 판단과 같은 방향이다 —
+메운 척하지 않고 요란하게 남는다.
+
+`stream-offset`은 기동 pass가 없으므로 이 규칙의 대상이 아니다.
+
+**테스트.**
+
+| 무엇을 고정하는가 | 테스트 |
+|---|---|
+| `stream-offset` cold start는 저장 checkpoint에서 재소비한다 | `ContestScoreboardStreamLifecycleTests.consumptionResumesAtTheStoredCheckpointInclusive`, `theModeThatRecoversByReadingTheStreamIsNotHeld` |
+| 되감지 않는 모드는 **pass 전에 아무것도 소비하지 않는다** | `….aModeThatRebuildsHistoryFromItsOwnBasisConsumesNothingUntilItsPassHasRun` |
+| 해제 후 재개 지점은 대기가 시작된 checkpoint 그대로 | `….aHeldConsumerResumesAtTheCheckpointTheHoldBeganAt` |
+| supervisor가 대기 중 consumer를 대신 시작하지 않는다 | `….theSupervisorDoesNotStartAHeldConsumer` |
+| 종료 중 도착한 해제는 consumer를 시작하지 않는다 | `….aConsumerReleasedAfterShutdownIsNotStarted` |
+| full-replay의 replay가 해제를 보고한다 / 돌지 않았으면 보고하지 않는다 | `ContestScoreboardFullReplayStartupRunnerTests` 2건 |
+| redis-seq check가 역사를 **덮었을 때만** 해제한다(saturated도 unresolved도 아님) / skip된 trigger는 해제하지 않는다 | `ContestScoreboardRedisSequenceSchedulerTests` 3건(`onlyACheckThatCoveredTheHistoryReleasesTheHeldConsumer`, `aCheckThatDidNotCoverTheHistoryDoesNotReleaseTheHeldConsumer`, `aPassThatRanOutOfRoundsDoesNotReleaseTheHeldConsumer`) |
+| 경계 자체의 순서·경합(등록 전 해제, 중복 해제, 64스레드 경합) | `ContestScoreboardRecoveryCutoverTests` 5건 |
+| 대응하지 않는 구성은 기동에서 명확히 거부 | `ContestScoreboardRecoverySummaryTests.refusesAConsumerWhoseModesOnlyReleaseIsOff` + 양성 대조 3건(`allowsAConsumerWhoseRedisSeqStartupCheckIsOffBecauseThePeriodicChecksReleaseTheHold`, `doesNotRefuseASpellingTheConsumerConditionItselfTurnsDown`, `allowsAStartupPassTurnedOffOnARoleThatDoesNotConsume`) |
+| **복구 중 발행분·기존 backlog가 조용히 유실되지 않는다** — 대기 중 checkpoint가 움직이지 않는다 | 재개 offset 고정: `….aHeldConsumerResumesAtTheCheckpointTheHoldBeganAt`(저장 checkpoint 포함 지점 그대로). 기동 pass가 offset을 쓰지 않음: `ContestScoreboardFullReplayServiceTests.replayContest_replaysStoredResultsWithoutResettingTheScoreboard`의 단언 `assertThat(requests).allMatch(request -> request.streamOffset() == null)` — "A rebuild request carries no offset, so a replay cannot move the stream checkpoint" |
+
+**판별력 실측.** lifecycle의 대기 분기를 제거(`if (false)`)하면 새 테스트 4건만 실패한다
+(`aModeThatRebuilds…`, `aHeldConsumerResumes…`, `aConsumerReleasedAfterShutdown…`,
+`theSupervisorDoesNotStartAHeldConsumer`). startup runner의 해제를 조건 밖으로 빼면 1건, replay가
+해제를 보고하지 않게 하면 1건이 실패한다. 검토 지적을 고친 뒤의 되돌림 실측은 §16.5의 아래쪽
+네 줄이다(대기 해제 기준, 검증기 규칙 삭제, 검증기의 관대한 읽기, supervisor의 두 원인 독립).
+`theModeThatRecoversByReadingTheStreamIsNotHeld`는 대기 제거에도 통과한다 — 그것은 **대기하지
+않아야 하는 쪽**을 고정하는 대조군이다.
+
+### 16.4 지원하는 장애 모델 (고정)
+
+**지원하는 모델은 하나다: "애플리케이션 JVM은 살아 있고, Redis만 RDB 스냅샷 시점으로 되돌아간다."**
+
+- 이 모델에서 세 모드는 서로 다른 기준으로 복구하고, supervisor pass가 rollback을 관측해
+  모드별 pass를 트리거한다(§3.1). 재시도는 트래픽에 의존하지 않는다(§16.2).
+- **JVM cold start는 이 모델에 포함되지 않는다.** 이번 라운드는 그중 **한 조각**만 다뤘다 —
+  기동 순서 때문에 되감지 않는 모드가 stream 재소비로 복구되던 것을 막고, 그 격리가 **불가능한**
+  구성(consumer on + full-replay의 기동 replay off)을 기동에서 거부하며, 대기 해제를 모드의
+  coverage 기준과 일치시키는 것까지다(§16.3).
+- **여러 인스턴스가 동시에 뜨는 경우도 포함되지 않는다.** 분산 실행권이 없고, 두 인스턴스가 모두
+  올바르게 owner를 선언하면 둘 다 실행한다(§13.2). 배포 토폴로지(단일 `batch-role`)가 유일한
+  방어라는 사실은 변하지 않았다.
+- **Redis도 함께 되돌아간 cold start**는 검증되지 않았다. §16.7.
+
+### 16.5 판별력 실측 종합 (3라운드)
+
+새 테스트 각각에 대해 대응 구현을 되돌리고 **그 테스트만** 실패하는지 실측했다. 되돌린 뒤에는
+원복하고 전체 DB-free 집합을 다시 통과시켰다(§16.6).
+
+**위쪽 일곱 줄은 검토 전 구현에 대한 실측이고, 아래쪽 다섯 줄은 검토 지적을 고친 뒤 다시 실측한
+것이다.** 아래쪽은 되돌린 상태와 원복한 상태를 각각 실행해, 실패가 **새 테스트에만** 국한되는지
+확인했다.
+
+| 되돌린 것 | 실패한 테스트 | 개수 |
+|---|---|---|
+| lifecycle의 대기 분기(`recoversHistoryBeforeConsuming()`) 제거 | lifecycle 4건 | 4 |
+| startup runner가 무조건 해제 | runner `nothingIsReleasedWhenTheReplayDidNotRun` | 1 |
+| startup runner가 해제를 보고하지 않음 | runner `theReplayReleasesTheHeldConsumerOnceItHasRun` | 1 |
+| 검증기의 consumer 조기 반환 제거(과잉 거부) | summary `allowsAStartupPassTurnedOffOnARoleThatDoesNotConsume` | 1 |
+| `handleRollback`의 재시도 분기가 `true` 반환 | lifecycle 2건 | 2 |
+| 전략의 `orElse(BUSY_RETRY_LATER)` → `orElse(COVERED)` | strategy `aRangeAnotherPassIsAlreadyRebuildingIsNotReportedRebuilt` | 1 |
+| 전략의 예외 분기 → `COVERED` | strategy `anAttemptThatThrewIsRetriedRatherThanRemembered` | 1 |
+| **대기 해제를 pass의 반환 여부로 되돌림**(`coveredTheWholeSet()` → `true`) | scheduler `aCheckThatDidNotCoverTheHistoryDoesNotReleaseTheHeldConsumer`, `aPassThatRanOutOfRoundsDoesNotReleaseTheHeldConsumer` | 2 |
+| **redis-seq 거부를 되살림**(규칙을 검토 전 형태로) | summary `allowsAConsumerWhoseRedisSeqStartupCheckIsOffBecauseThePeriodicChecksReleaseTheHold` | 1 |
+| **consumer 플래그를 관대하게 읽음**(`Boolean.class` 바인딩) | summary `doesNotRefuseASpellingTheConsumerConditionItselfTurnsDown` | 1 |
+| **검증기의 규칙을 no-op으로**(`rejectAConsumerWithNoStartupRecovery` 비움) | summary `refusesAConsumerWhoseModesOnlyReleaseIsOff` | 1 |
+| **answered rollback이 pass를 멈추게 되돌림**(두 원인을 다시 배타적으로) | lifecycle `aRollbackTheModeAnsweredStillLeavesTheFailedBatchToReRead` | 1 |
+| **rewind가 재읽은 batch를 세지 않게 되돌림**(단락 제거) | lifecycle `aRewindThatAnsweredTheRollbackDoesNotRestartAgainForTheFailedBatch` | 1 |
+
+판별력이 **없는** 테스트도 두 종류 있고, 그것을 숨기지 않는다. ① 대조군(위의
+`theModeThatRecoversByReadingTheStreamIsNotHeld`, `allowsAStartupPassTurnedOffOnARoleThatDoesNotConsume`,
+`allowsEveryModeToConsumeBehindItsOwnStartupPass`, 검토 후 추가된
+`allowsAConsumerWhoseRedisSeqStartupCheckIsOffBecauseThePeriodicChecksReleaseTheHold`) — 이들은
+"반대 방향으로 잘못 만들면 실패"를 고정하며, 위 표의 해당 줄들에서 그 절반이 확인됐다.
+② `eachModeBringsUpItsOwnRecoveryStrategy`의 `rewindsOnCheckpointRegression` 축은 2라운드
+자산이라 이 표에 없다(§14-8).
+
+### 16.6 실행한 테스트와 결과 (3라운드)
+
+**DB가 필요 없는 클래스만 명시적으로 나열해 실행했다.** MySQL·Rabbit·Redis가 필요한 tier는
+실행하지 않았다(§16.7) — 이번 라운드의 변경은 전부 배선·생명주기·전략·검증 계층이고 그 계층은
+DB 없이 전부 덮인다.
+
+```
+./gradlew test \
+  --tests "…recovery.ContestScoreboardRecoveryModeWiringTests" \
+  --tests "…recovery.ContestScoreboardRecoveryPassGateTests" \
+  --tests "…recovery.ContestScoreboardRecoveryStrategyTests" \
+  --tests "…recovery.ContestScoreboardRecoverySummaryTests" \
+  --tests "…recovery.ContestScoreboardRecoveryPropertiesTests" \
+  --tests "…recovery.ContestScoreboardRecoveryRoleGateTests" \
+  --tests "…recovery.ContestScoreboardRecoveryCutoverTests" \
+  --tests "…recovery.ContestScoreboardRedisSequenceRecoveryServiceTests" \
+  --tests "…recovery.ContestScoreboardRedisSequenceSchedulerTests" \
+  --tests "…recovery.ContestScoreboardReplayApplicationTests" \
+  --tests "…recovery.ContestScoreboardReplayTransactionBoundaryTests" \
+  --tests "…recovery.ContestScoreboardFullReplayServiceTests" \
+  --tests "…recovery.ContestScoreboardFullReplayStartupRunnerTests" \
+  --tests "…stream.ContestScoreboardStreamLifecycleTests" \
+  --tests "…stream.ContestScoreboardStreamProcessorTests" \
+  --tests "…stream.ContestScoreboardStreamListenerTests" \
+  --tests "…stream.ContestScoreboardStreamRecoveryServiceTests" \
+  --tests "my.oj.web.OperationalPropertiesBindingTests"
+```
+
+**결과: `BUILD SUCCESSFUL` — 18 classes, 143 tests, failures 0, errors 0.** 검토 지적을 고친 뒤의
+재실행도 같은 결과다. 이 중 **39건이 이번 라운드에 새로 추가된 테스트**이고(8개 클래스: lifecycle 10,
+strategy 6, cutover 5, role-gate 4, summary 5, scheduler 4, wiring 3, runner 2 — 나머지 변경은 기존
+테스트의 수정·확장이며, `ContestScoreboardRecoveryPassGateTests`의 1건은 이름을 바꾸고 단언을 강화한
+것이다). 라운드 자체의 15개 클래스(아래 표에서 마지막 3개를 뺀 것)가 **135건** = 143 − 8이고, 그중
+role-gate·cutover 2개는 이번에 새로 만든 클래스다. **직전 라운드(`b815378`)에 이미 있던 13개 클래스는
+96건이었고**(현재 126건), 차이 30건이 그 13개 클래스에 들어간 새 테스트다.
+
+| 클래스 | tests | failed |
+|---|---|---|
+| `ContestScoreboardRecoveryModeWiringTests` | 11 | 0 |
+| `ContestScoreboardRecoveryRoleGateTests` | 4 | 0 |
+| `ContestScoreboardRecoveryCutoverTests` | 5 | 0 |
+| `ContestScoreboardRecoveryStrategyTests` | 14 | 0 |
+| `ContestScoreboardRecoverySummaryTests` | 15 | 0 |
+| `ContestScoreboardRecoveryPropertiesTests` | 7 | 0 |
+| `ContestScoreboardRecoveryPassGateTests` | 6 | 0 |
+| `ContestScoreboardFullReplayStartupRunnerTests` | 6 | 0 |
+| `ContestScoreboardFullReplayServiceTests` | 7 | 0 |
+| `ContestScoreboardRedisSequenceSchedulerTests` | 7 | 0 |
+| `ContestScoreboardRedisSequenceRecoveryServiceTests` | 10 | 0 |
+| `ContestScoreboardReplayApplicationTests` | 4 | 0 |
+| `ContestScoreboardReplayTransactionBoundaryTests` | 2 | 0 |
+| `ContestScoreboardStreamLifecycleTests` | 24 | 0 |
+| `ContestScoreboardStreamProcessorTests` | 13 | 0 |
+| `ContestScoreboardStreamListenerTests` | 2 | 0 |
+| `ContestScoreboardStreamRecoveryServiceTests` | 2 | 0 |
+| `OperationalPropertiesBindingTests` | 4 | 0 |
+
+아래 3개 클래스(Listener·RecoveryService·OperationalPropertiesBinding)는 이번 라운드의 변경된
+API를 참조하지 않는 것을 grep으로 확인한 뒤 **추가로** 돌린 것이다(참조하는 클래스는 lifecycle·
+processor 둘뿐이고 그 둘은 위 표에 있다).
+
+`compileJava`·`compileTestJava`도 함께 통과한다(생성자 인자 변경 — lifecycle 8번째 인자, runner·
+scheduler의 cutover — 이 모든 호출 지점에 반영됐는지는 컴파일이 확인한다).
+
+### 16.7 실행하지 못한 테스트와 그 이유 — 보안상 실행 중단
+
+**아래는 "skip"이 아니라 "실행 중단"이다.** 안전한 MySQL/Redis/Rabbit 환경을 준비할 수 없어
+실행하지 않았고, 그 결과 이번 라운드의 변경이 그 tier에서 회귀를 만들지 않는다는 **실행 증거는
+없다.** 대신 각 항목에 대해 **코드 수준 근거**를 적었다 — 근거가 있는 것과 실행한 것은 다르다.
+
+| 실행하지 않은 것 | 왜 | 코드 수준 근거 |
+|---|---|---|
+| `./gradlew test` 전체(`test` profile, 실물 MySQL) | `oj-test-mysql`이 침해된 컨테이너라 쓰지 않기로 했다(§13.3). 안전한 새 테스트 인프라는 이번 범위 밖이다 | 아래 참조 |
+| `-DredisIntegration=true` / `-DrabbitIntegration=true` tier | 로컬에 신뢰할 수 있는 Redis/RabbitMQ가 없고, 이번 변경은 broker를 요구하지 않는다 | stream-offset 모드에서는 대기가 걸리지 않으므로(`recoversHistoryBeforeConsuming()=false`) 그 tier의 소비 동작은 변하지 않는다 |
+| `ContestScoreboardRecoveryModeStartupTests`(`@SpringBootTest`, MySQL) | 위와 같다. **이 클래스는 이번 라운드에서 수정했다** | 수정 내용: `owner.enabled=true`를 명시. 이 context는 `@ActiveProfiles("test")`이고 `application-test.properties:25`가 `consumer.enabled=false`이므로, 새 규칙 `rejectAConsumerWithNoStartupRecovery()`의 대상이 **아니다**(consumer off ⇒ 조기 반환). 같은 조합("consumer off + full-replay + 기동 replay off")이 허용되는지는 DB-free 테스트 `allowsAStartupPassTurnedOffOnARoleThatDoesNotConsume`가 실행으로 고정한다 |
+| `ContestScoreboardRecoveryModeStartupRedisIntegrationTests`(실물 Redis) | 위와 같다. **이번 라운드에서 수정했다** | 수정 내용: `owner.enabled=true` 명시. 이 context는 `consumer.enabled=false`를 직접 선언하고 `startup-check-enabled=false`이므로, 새 규칙은 조기 반환한다. 빈 등록 주장 자체는 DB-free `ContestScoreboardRecoveryRoleGateTests`가 실행으로 고정한다 |
+
+**실행 중단의 정확한 차단 요인.** ① 침해된 `oj-test-mysql`(localhost:3306, root/1234)을 계속 쓰는
+것은 이번 지시가 금지한 사용이다. ② 대체 MySQL 컨테이너를 새로 띄우는 것도, 기존 컨테이너를
+삭제·중지하는 것도 사용자 승인 없이는 하지 않는다. ③ 따라서 **MySQL·Redis·Rabbit tier 전체가
+"실행 중단"** 이고, 이번 라운드의 증거는 DB-free 계층까지다.
+
+**침해 컨테이너를 실제로 사용한 기록 (숨기지 않는다).** 이번 라운드 도중, 좁은 클래스 목록 대신
+`--tests "my.oj.web.contest.scoreboard.recovery.*"`로 넓게 한 번 돌렸고, 그 실행이
+`ContestScoreboardRecoveryModeStartupTests`와 `ContestScoreboardSequenceRecoveryMySqlIntegrationTests`
+를 함께 가져가 **Hikari/Flyway 연결을 열었다**(JUnit XML의 datasource 로그로 확인). 4건 모두
+통과했지만 그 증거는 침해된 서버에서 나온 것이므로 신뢰하지 않으며, **이후 모든 실행은 DB-free
+클래스를 명시적으로 나열하는 방식으로 제한했다.** 위 §16.6의 결과는 그 제한 이후의 실행이고,
+**검토 지적을 고친 뒤의 재실행과 판별력 실측(§16.5)도 전부 같은 제한 아래에서 이뤄졌다** — 즉
+이번 라운드에 침해된 서버에 연결한 것은 그 한 번뿐이다. 검토자도 DB·Redis·Rabbit에 접속하지
+않았고 읽기·grep·jshell만 사용했다고 보고했다.
+
+### 16.8 독립 검토 (읽기 전용, 3라운드)
+
+**검토 관점은 정확히 셋이었고, 그 밖의 관점은 요청하지 않았다:**
+
+1. `owner.enabled=false`가 트리거를 **실제로 제거**하는가.
+2. 수정 후에도 busy 상태가 rollback 재시도를 **잃는가**.
+3. cold start에서 non-stream 모드가 Stream 복구와 **섞이는가**.
+
+검토자는 커밋되지 않은 작업 트리(HEAD `b815378` 기준 diff + 미추적 4파일)를 읽기 전용으로
+검토했고, 파일을 만들거나 고치지 않았다. 성능·복구 시간·전략 우위는 이번에도 요청하지 않았고
+보고서도 그 값을 추정하지 않는다.
+
+**세 질문에 대한 판정.**
+
+| 질문 | 판정 | 근거 |
+|---|---|---|
+| ① `owner.enabled=false`가 트리거를 실제로 제거하는가 | **제거 자체는 clean** | 조건과 record가 같은 `Environment`를 같은 기본값(`true`)으로 읽어 **owner 축에는 표기 불일치가 없다**(`DefaultConversionService`·`ApplicationConversionService`가 `yes`/`on`/`1`을 모두 true로 변환하는 것을 jshell로 확인). 트리거 셋 모두에 조건이 붙어 있고, `src/main/java` 어디에도 세 클래스를 등록하는 두 번째 경로(`@Bean`·`@Import`·`@ComponentScan`)가 없다. **공용 full replay 서비스는 조건 없이 남아 있고**, retention-gap fallback(`ContestScoreboardStreamRecoveryService` → `replayAllContests()`)이 그대로 도달한다. owner=false + consumer on은 validator가 기동에서 거부하며, validator는 `SmartInitializingSingleton`이라 `finishRefresh`(lifecycle 시작) **이전**에 실패한다 — 즉 supervisor pass를 조건이 제거할 수 없다는 사실이 이 규칙 위에 서 있다 |
+| ② busy 상태가 rollback 재시도를 잃는가 | **잃지 않는다(수정은 구조적으로 건전)** | 쌍은 `handleRollback`이 true를 반환할 때만 기록되고, true가 아닌 두 outcome(`BUSY_RETRY_LATER`·`RETRYABLE_FAILURE`)에서는 기록되지 않으며 그 쌍을 지우는 조기 반환이 없다. 전략 둘 다 `RuntimeException`을 `RETRYABLE_FAILURE`로 바꾸고, gate는 `finally`에서 해제된다. 재시도는 `offsetCheckInterval`(기본 1s)마다 트래픽 없이 다시 묻는다. gate 점유와 실제 실패는 서로 다른 tag(`busy-retry-later`/`retryable-failure`)로 구분된다. `UNRECOVERABLE`은 관측 쌍당 1회로 기억돼 hot-loop이 되지 않는다 |
+| ③ cold start에서 non-stream 모드가 Stream 복구와 섞이는가 | **대기 자체는 건전, 해제 기준에 결함(F4)** | 모든 시작 경로가 `startAt`을 지나고 `container.setAutoStartup(false)`이므로 Spring이 대신 시작하지 않는다. `markCovered`는 대기 목록을 monitor 밖에서 실행하고, 등록/해제 경합이 닫혀 있으며, lock 순서 역전이 없다. 종료 중 해제는 `stopping`으로 막힌다. 재개 offset은 저장 checkpoint 포함 지점 그대로(`next`/tail 아님)이고 pass는 offset을 쓰지 않는다 |
+
+**지적 6건과 처리.**
+
+| 지적 | 심각도 | 처리 |
+|---|---|---|
+| **F4** redis-seq 해제가 "check가 던지지 않았음"에 걸려 있었다 — `saturated`/`unresolved` pass도 대기를 푼다(전략은 같은 report를 `COVERED`로 보지 않는다). stream이 모드의 기준을 대신하게 된다 | medium | **고쳤다.** 해제 조건을 `coveredTheWholeSet()`으로 바꿔 전략의 coverage 기준과 일치시켰고, 덮지 못한 pass는 ERROR로 "consumer가 계속 대기 중"임을 남긴다 |
+| **F1** 새 검증기 규칙이 `redis-seq` + `startup-check-enabled=false` + consumer on을 **안전한데도** 거부한다 — scheduler가 두 주기 task를 무조건 등록하므로 한 주기 뒤 첫 check이 해제하고, 아무것도 대체되지 않는다(거부 메시지의 주장이 거짓). 속성이 consumer를 켠 모든 역할에서 쓸 수 없게 된다 | medium | **고쳤다.** 규칙을 `full-replay` 반쪽만 남기고 좁혔다(그 반쪽은 검토자도 sound라고 확인). `startup-check-enabled` 상수는 이제 참조가 없어 제거 |
+| **F3** rollback이 답해진 뒤에는 `failures <= handledFailures` 분기(실패한 batch의 유일한 재시도 경로)에 도달할 수 없고, 그 상태는 **자기 잠금**이다 — checkpoint가 미적용 구간을 지날 수 없어 `highestAppliedOffset`도 못 움직이므로 매 초 조기 반환만 반복한다. full-replay/redis-seq에서 JVM 수명 내내 standings가 짧은 채로 남는다. `if (rolledBack)/else if` 형태는 **기존 코드**지만, 이번에 쓴 새 javadoc이 두 분기 모두에 재시도 보장을 주장하게 됐다 | medium | **고쳤다.** 두 원인을 **독립적으로** 묻도록 바꿨고(rollback answer와 failed batch는 서로의 대안이 아니다), 되감는 모드에서는 되감기 자체가 checkpoint에서의 재시작이라 두 원인이 겹치므로 두 번 재시작하지 않는다 |
+| **F2** 검증기가 consumer 플래그를 관대하게(`Boolean.class`) 읽는 반면 consumer 빈은 `@ConditionalOnProperty`로 **literal** 비교한다 — `consumer.enabled=yes`면 빈은 없는데 검증기는 거부한다(과잉 거부, 방향은 한쪽뿐) | low | **고쳤다.** 빈을 고르는 방식 그대로(`"true".equalsIgnoreCase`) 읽는다. 기존 `rejectOwnerMismatch`도 같은 헬퍼를 쓰게 해 두 곳을 일치시켰다 |
+| **F5** `UNRECOVERABLE` ERROR가 "restart하면 다시 묻는다"를 말하지 않고, 재시작 없이는 동작하지 않는 처방("switch to full-replay")을 이름만 든다 | low | **고쳤다.** 두 ERROR(전략·lifecycle)에 "이 JVM에서만 기억하므로 restart가 다시 묻는다"와 "모드 변경에는 restart가 필요하다"를 명시 |
+| **F6** full-replay runner의 gate 점유 분기가 ERROR만 남기고 해제를 보고하지 않아 consumer가 영원히 대기할 수 있다. 검토자가 full-replay에서 이 gate를 점유할 경로를 **찾지 못했다**(다른 호출자는 stream-offset 전용 fallback) | low | **고치지 않고 남긴다.** 도달 불가로 보고된 잔여 위험이며 §12에 적었다 |
+
+**검토자가 명시적으로 "확인하지 못했다"고 밝힌 것.** live delivery가 멈춘 미적용 구간 위로
+도착했을 때 failed batch로 기록되는지(`ContestScoreboardStreamListener.failBatch`/anchor 경로를
+이번 검토에서 추적하지 않았다). F3의 failed-batch 변형은 그 추적에 의존하지 않고 성립한다.
+**이번 보고서는 그 미확인 항목을 완료된 것으로 적지 않는다.**
+
+**검토 지적을 고친 뒤의 검증.** 관련 DB-free 테스트를 재실행해 `BUILD SUCCESSFUL`(18 classes,
+143 tests, failures 0)을 확인했고, 고친 4건 각각에 대해 **되돌림 실측**을 다시 했다(§16.5 아래쪽
+다섯 줄 — 실패가 새 테스트에만 국한됨). 검토자가 확인해 준 항목(owner 축의 표기 일치, 서비스의
+비조건성, retention-gap fallback 도달, 재시도 구조, 대기의 순서·경합)은 **그대로 유지**했고
+그 근거 위에 이번 수정이 얹혀 있다.
+
+### 16.9 commit과 최종 상태
+
+**코드 커밋.** `ba25145` — `fix: make the recovery owner a real gate and stop losing rollback retries`
+(기준 `b815378` + 1 commit). 28 files changed, `+2004 / −144`. 신규 4 files:
+`ContestScoreboardRecoveryCutover.java`(119), `ContestScoreboardRecoveryOwnerCondition.java`(38),
+`ContestScoreboardRecoveryCutoverTests.java`(110), `ContestScoreboardRecoveryRoleGateTests.java`(168)
+— 합 435 lines. commit 본문에 세 결함의 원인과 수정, 그리고 검토 지적 F1~F4의 수정을 적었고, F6은
+고치지 않고 잔여 위험으로 남긴다고 적었다(§12). 신규 의존성·스키마 변경 없음. Conventional Commits
+형식이며 마지막 줄은 `Co-Authored-By: Claude Code <noreply@anthropic.com>`.
+
+**문서 커밋.** 이 보고서와 `ARCHITECTURE.md`의 문구·수치를 고치는 `docs:` 커밋이 이 보고서를
+저장소에 넣는다(이 commit 자신의 hash는 자기 내용에 적을 수 없으므로 §1의 "그 뒤" 행으로만
+가리킨다). 그 전까지 이 보고서는 **미추적 파일**이었다 — §1.1이 1라운드에서 정정한 바로 그 상태가
+3라운드에서도 반복되지 않도록, 이번 라운드의 수치·clean 상태는 이 commit 이후에 기록한다.
+
+**최종 상태.** 문서 커밋 직후 `git status --short`는 **아무것도 출력하지 않는다**. 커밋 직전 작업
+트리에 남아 있던 것은 이 두 문서뿐이었고(코드 28 files는 `ba25145`에 들어갔다), 임시·백업 파일은
+없다 — 판별력 실측에 쓴 `*.bak` 사본은 저장소 밖에 두었고 전부 원복한 뒤 다시 초록임을 확인했다.
+
+**이번 라운드가 하지 않은 것(§12와 같은 목록).** 성능·복구 시간·전략 우위는 측정하지 않았고
+추정하지도 않았다. RDB 스냅샷 rollback 자체, stream replication/failover, 운영 프로파일 실배포
+기동, 다중 인스턴스 실배포는 여전히 미검증이다. MySQL·Redis·Rabbit 실물 통합 테스트는 실행하지
+않았으며 그 사유는 §16.7에 적었다.
