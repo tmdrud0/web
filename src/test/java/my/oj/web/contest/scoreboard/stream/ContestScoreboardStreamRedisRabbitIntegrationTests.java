@@ -40,6 +40,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 @TestPropertySource(properties = {
         "contest.scoreboard.store=redis",
         "contest.scoreboard.stream.consumer.enabled=true",
+        // This context consumes the stream, so it runs the supervisor pass and is the
+        // recovery owner by definition. application-test.properties declares no owner, so
+        // the declaration has to be made here rather than inherited.
+        "contest.scoreboard.recovery.owner.enabled=true",
         "contest.scoreboard.stream.consumer.batch-size=20",
         "contest.scoreboard.stream.consumer.prefetch=20",
         "contest.scoreboard.stream.consumer.receive-timeout=20ms",
