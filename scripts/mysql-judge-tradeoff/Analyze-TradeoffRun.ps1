@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$RunDirectory,
     # A stage where the API refused a share of submissions is measuring the rate limiter, not judge
@@ -22,6 +22,11 @@ $latencyPath = Join-Path $runPath "latency.csv"
 $eventsPath = Join-Path $runPath "events.json"
 $verificationPath = Join-Path $runPath "db-verification.json"
 $parametersPath = Join-Path $runPath "parameters.json"
+
+# The rabbit verdicts live in their own file because the runner reads them too, and a rule copied into
+# two scripts is a rule that drifts. It is dot-sourced here for the rabbit fault export below; every
+# other reader in this file is unaffected by it, because nothing else calls into it.
+. (Join-Path $PSScriptRoot "RabbitFaultRecoveryVerdict.ps1")
 
 function Get-Percentile {
     param([double[]]$Values, [double]$Percentile)
@@ -121,6 +126,17 @@ function ConvertTo-UtcNaiveOrNull {
 # consequence of reading a normalisation there is carried by cohort E, which reports itself unavailable
 # when too little measured load remained, so the late instant cannot pass as recovered steady state.
 function Get-RecoverySamples {
+    # The backlog column's definition is dispatch-specific, and the two definitions are not
+    # interchangeable: reading one as the other is a wrong number rather than a missing one.
+    #
+    # Under mysql dispatch the outbox relay's unfinished rows ARE the stranded work, so that is what
+    # the harness wrote and what is read here. Under rabbit dispatch the outbox row is PUBLISHED as
+    # soon as the broker confirms it, so its unfinished count sits near zero while the judges are
+    # still behind, and the experiment's own definition is accepted submissions minus persisted
+    # results. recovery-samples.csv carries the right column either way - the harness wrote it - but
+    # the drain rows appended from timeseries.csv below carry the mysql column, and the series the
+    # two are pooled into has to mean one thing.
+    $rabbitDispatch = ([string]$parameters.dispatchMode -eq "rabbit")
     $samples = New-Object System.Collections.Generic.List[object]
     $samplesPath = Join-Path $runPath "recovery-samples.csv"
     if (Test-Path $samplesPath) {
@@ -143,12 +159,22 @@ function Get-RecoverySamples {
                 if ($row.phase -eq "warmup") { continue }
                 $at = ConvertTo-DateTimeOrNull $row.timestamp
                 if ($null -eq $at -or $at -le $lastAt) { continue }
+                $accepted = ConvertTo-LongOrNull $row.acceptedTotal
+                $results = ConvertTo-LongOrNull $row.resultsTotal
+                $unfinished = ConvertTo-LongOrNull $row.unfinishedOutbox
+                if ($rabbitDispatch) {
+                    # A drain row whose two counts were not both read leaves this null rather than
+                    # falling back to the relay column: a zero here would be read as a normalised
+                    # backlog, which is the one conclusion this series is used to draw.
+                    $unfinished = $null
+                    if ($null -ne $accepted -and $null -ne $results) { $unfinished = [math]::Max(0, $accepted - $results) }
+                }
                 $samples.Add([pscustomobject]@{
                     at = $at
-                    unfinished = ConvertTo-LongOrNull $row.unfinishedOutbox
+                    unfinished = $unfinished
                     unapplied = ConvertTo-LongOrNull $row.unappliedScoreboard
-                    accepted = ConvertTo-LongOrNull $row.acceptedTotal
-                    results = ConvertTo-LongOrNull $row.resultsTotal
+                    accepted = $accepted
+                    results = $results
                 })
                 $appended++
             }
@@ -165,12 +191,19 @@ function Get-RecoverySamples {
         if ($row.phase -eq "warmup") { continue }
         $at = ConvertTo-DateTimeOrNull $row.timestamp
         if ($null -eq $at) { continue }
+        $accepted = ConvertTo-LongOrNull $row.acceptedTotal
+        $results = ConvertTo-LongOrNull $row.resultsTotal
+        $unfinished = ConvertTo-LongOrNull $row.unfinishedOutbox
+        if ($rabbitDispatch) {
+            $unfinished = $null
+            if ($null -ne $accepted -and $null -ne $results) { $unfinished = [math]::Max(0, $accepted - $results) }
+        }
         $samples.Add([pscustomobject]@{
             at = $at
-            unfinished = ConvertTo-LongOrNull $row.unfinishedOutbox
+            unfinished = $unfinished
             unapplied = ConvertTo-LongOrNull $row.unappliedScoreboard
-            accepted = ConvertTo-LongOrNull $row.acceptedTotal
-            results = ConvertTo-LongOrNull $row.resultsTotal
+            accepted = $accepted
+            results = $results
         })
     }
     return $samples.ToArray()
@@ -308,8 +341,19 @@ function Get-FaultRecoveryAnalysis {
     param([object[]]$LatencyIndexed)
 
     $unavailableFault = New-Object System.Collections.Generic.List[string]
-    $unavailableFault.Add("the killed node's in-process Prometheus counters are lower bounds: SIGKILL took the JVM, so every invocation, duration and claim increment between the pre-fault scrape and the kill died with the process, and a lost counter is not a zero. The durable evidence is the outbox attempts column and the final row state.")
-    $unavailableFault.Add("attempts > 1 counts recovery re-claims after the static lease expired, not concurrent duplicate CPU execution: the process holding the claim was SIGKILLed, so it did not keep judging. Testing true concurrent duplicate execution and fencing needs a separate docker pause -> wait past the claim timeout -> unpause experiment, which this round does not run.")
+    # Two dispatch paths, and the limits are not the same limits. Under mysql dispatch the recovery
+    # signal is a claim lease expiring, so the durable attempts column is the evidence and its
+    # re-claim count is what can be read back. Under rabbit dispatch no row ever records a claim: the
+    # broker returns what the dead node held unacknowledged when its connection drops, and the
+    # evidence is the broker's own counters. Reporting one path's limits on the other would name a
+    # mechanism that run did not use.
+    if ([string]$parameters.dispatchMode -eq "rabbit") {
+        $unavailableFault.Add("the killed node's in-process Prometheus counters are lower bounds: SIGKILL took the JVM, so every invocation, duration and republish increment between the pre-fault scrape and the kill died with the process, and a lost counter is not a zero. The broker's own publish/deliver/ack/redeliver counters are not lost this way: they live in the broker, which was not killed, so their deltas across the run are complete.")
+        $unavailableFault.Add("the redelivered submissions cannot be attributed individually: RabbitMQ keeps no durable per-delivery record, so a redelivery cannot be linked to a submission id. What is reported instead is the aggregate decomposition of the broker's redeliver count against the durable stored_result.republish delta, and the redelivered-submissions latency cohort is unavailable rather than estimated.")
+    } else {
+        $unavailableFault.Add("the killed node's in-process Prometheus counters are lower bounds: SIGKILL took the JVM, so every invocation, duration and claim increment between the pre-fault scrape and the kill died with the process, and a lost counter is not a zero. The durable evidence is the outbox attempts column and the final row state.")
+        $unavailableFault.Add("attempts > 1 counts recovery re-claims after the static lease expired, not concurrent duplicate CPU execution: the process holding the claim was SIGKILLed, so it did not keep judging. Testing true concurrent duplicate execution and fencing needs a separate docker pause -> wait past the claim timeout -> unpause experiment, which this round does not run.")
+    }
 
     $faultAt = ConvertTo-DateTimeOrNull $events.faultInjectedAt
     $restartRequestedAt = ConvertTo-DateTimeOrNull $events.restartRequestedAt
@@ -375,6 +419,7 @@ function Get-FaultRecoveryAnalysis {
 
     $rolling = New-Object System.Collections.Generic.List[object]
     $recomputedRecoveredAt = $null
+    $ungatedRecoveredAt = $null
     $rollingSpanMaxSeconds = $null
     if ($null -ne $preFaultResultRps -and $preFaultResultRps -gt 0) {
         $thresholdRps = 0.90 * $preFaultResultRps
@@ -403,6 +448,18 @@ function Get-FaultRecoveryAnalysis {
             $held = $true
             for ($j = $i; $j -lt ($i + 3); $j++) { if ($rolling[$j].rps -lt $thresholdRps) { $held = $false } }
             if ($held) { $recomputedRecoveredAt = $rolling[$i].at; break }
+        }
+        # The same search from the fault instead of from readiness. It exists for the same reason the
+        # ungated backlog search does: the question "did the surviving node carry the load alone" is
+        # only answerable from an instant that is allowed to precede the replacement node, and the
+        # gated search cannot produce one by construction. It is reported beside the gated instant
+        # rather than replacing it - the gated reading is what cohort D is bounded by - and a reader
+        # comparing the two can see whether the recovery waited for the restart.
+        for ($i = 0; $i -le ($rolling.Count - 3); $i++) {
+            if ($null -ne $faultAt -and $rolling[$i].at -lt $faultAt) { continue }
+            $held = $true
+            for ($j = $i; $j -lt ($i + 3); $j++) { if ($rolling[$j].rps -lt $thresholdRps) { $held = $false } }
+            if ($held) { $ungatedRecoveredAt = $rolling[$i].at; break }
         }
     }
 
@@ -698,6 +755,15 @@ function Get-FaultRecoveryAnalysis {
             recoveredAt = if ($null -eq $recomputedRecoveredAt) { $null } else { $recomputedRecoveredAt.ToString("o") }
             secondsAfterFault = if ($null -eq $recomputedRecoveredAt -or $null -eq $faultAt) { $null } else { [math]::Round(($recomputedRecoveredAt - $faultAt).TotalSeconds, 3) }
             secondsAfterNodeReady = if ($null -eq $recomputedRecoveredAt -or $null -eq $nodeReadyAt) { $null } else { [math]::Round(($recomputedRecoveredAt - $nodeReadyAt).TotalSeconds, 3) }
+            # The same search from the fault rather than from readiness. The gated instant cannot
+            # precede nodeReadyAt by construction, so this is the only reading that can answer whether
+            # the surviving node recovered the throughput alone - and it is reported beside the gated
+            # one rather than instead of it, because the gated search is what the cohorts are cut on.
+            ungatedRecoveredAt = if ($null -eq $ungatedRecoveredAt) { $null } else { $ungatedRecoveredAt.ToString("o") }
+            ungatedSecondsAfterFault = if ($null -eq $ungatedRecoveredAt -or $null -eq $faultAt) { $null } else { [math]::Round(($ungatedRecoveredAt - $faultAt).TotalSeconds, 3) }
+            ungatedSecondsAfterRestartRequested = if ($null -eq $ungatedRecoveredAt -or $null -eq $restartRequestedAt) { $null } else { [math]::Round(($ungatedRecoveredAt - $restartRequestedAt).TotalSeconds, 3) }
+            ungatedPrecedesRestartRequested = ($null -ne $ungatedRecoveredAt -and $null -ne $restartRequestedAt -and $ungatedRecoveredAt -lt $restartRequestedAt)
+            ungatedBasis = "the identical rolling-window rule searched from faultInjectedAt instead of from max(faultInjectedAt, nodeReadyAt): an instant before the restart request is throughput the surviving node carried alone, which the gated search can never report. Read it beside the gated instant rather than as a replacement, and beside the load's own arrivals, because a backlog that is below its baseline for lack of arrivals is not a recovered pipeline"
             harnessReportedAt = $events.throughputRecoveredAt
             harnessAndAnalyzerAgree = ($events.throughputRecoveredAt -eq $(if ($null -eq $recomputedRecoveredAt) { $null } else { $recomputedRecoveredAt.ToString("o") }))
             basis = "5s rolling result RPS from the cumulative results column, each window spanning between 5s and ${maxWindowSpanSeconds}s so a sampling hole cannot pass as a rate, at or above 90% of the pre-fault result RPS for 3 consecutive windows, at or after max(faultInjectedAt, nodeReadyAt)"
@@ -724,6 +790,686 @@ function Get-FaultRecoveryAnalysis {
         cohorts = $cohortsFault
         unavailable = [object[]]$unavailableFault
     }
+}
+
+# --- rabbit fault result summary -------------------------------------------------------------------
+# The two artifacts a rabbit fault run is read from, built here rather than in the runner because this
+# file already holds the recomputed recovery and normalisation instants and every latency cohort. A
+# second derivation in the runner would be a second answer to the same question.
+#
+# Everything the request asks to be left unavailable when it cannot be attributed stays unavailable.
+# Nothing is estimated from a neighbouring number, and every criterion that decided a verdict travels
+# with the value it was decided from.
+
+function Format-RabbitSummaryCell {
+    param($Value)
+    if ($null -eq $Value) { return "unavailable" }
+    if ($Value -is [bool]) { if ($Value) { return "true" } else { return "false" } }
+    if ($Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) { return [string]([math]::Round([double]$Value, 3)) }
+    return [string]$Value
+}
+
+function New-RabbitSummaryMetric {
+    param([string]$Metric, $Value, [string]$Unit, [string]$Basis)
+    return [pscustomobject]@{
+        metric = $Metric
+        value = Format-RabbitSummaryCell $Value
+        unit = $Unit
+        basis = $Basis
+    }
+}
+
+function Get-RabbitContainerWatchSummary {
+    param(
+        [object[]]$Rows,
+        [string]$KilledNodeContainer = ""
+    )
+    <#
+    What docker reported about each container, per container rather than per tick.
+
+    The sampler records raw state and decides nothing, so the question "was this restart the one we
+    caused" is answered here, against the run's timeline: the killed node's single restart at
+    restartRequestedAt is the intentional one, and any restart of anything else is abnormal by
+    definition.
+    #>
+    $document = [ordered]@{
+        available = $false
+        rowCount = 0
+        containers = @()
+        abnormalRestarts = @()
+        oomKilledContainers = @()
+        killedNodeContainer = $KilledNodeContainer
+        killedNodeRestartCount = $null
+        basis = "container-watch.csv, one row per container per slow tick: state, restart count, OOM flag, exit code and start instant exactly as docker reported them. Which restart was intentional is decided against events.json here, because the observation itself cannot know it"
+    }
+    if ($null -eq $Rows -or $Rows.Count -eq 0) { return $document }
+    $document.rowCount = $Rows.Count
+    $document.available = $true
+    $byContainer = [ordered]@{}
+    foreach ($row in $Rows) {
+        $name = [string](Get-RabbitMemberValue -Object $row -Name "container")
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        if (-not $byContainer.Contains($name)) {
+            $byContainer[$name] = [ordered]@{
+                container = $name
+                sampleCount = 0
+                statesSeen = @()
+                exitCodesSeen = @()
+                startInstantsSeen = @()
+                restartCountMax = $null
+                lastState = $null
+                lastRestartCount = $null
+                lastStartedAt = $null
+                oomKilledEver = $false
+            }
+        }
+        $entry = $byContainer[$name]
+        $entry.sampleCount++
+        $state = [string](Get-RabbitMemberValue -Object $row -Name "state")
+        $entry.lastState = $state
+        if (-not [string]::IsNullOrWhiteSpace($state) -and $entry.statesSeen -notcontains $state) { $entry.statesSeen += $state }
+        $restarts = Get-RabbitNumberOrNull (Get-RabbitMemberValue -Object $row -Name "restartCount")
+        if ($null -ne $restarts) {
+            $entry.lastRestartCount = $restarts
+            if ($null -eq $entry.restartCountMax -or $restarts -gt $entry.restartCountMax) { $entry.restartCountMax = $restarts }
+        }
+        if ([string](Get-RabbitMemberValue -Object $row -Name "oomKilled") -eq "true") { $entry.oomKilledEver = $true }
+        $exitCode = [string](Get-RabbitMemberValue -Object $row -Name "exitCode")
+        if (-not [string]::IsNullOrWhiteSpace($exitCode) -and $entry.exitCodesSeen -notcontains $exitCode) { $entry.exitCodesSeen += $exitCode }
+        $startedAt = [string](Get-RabbitMemberValue -Object $row -Name "startedAt")
+        if (-not [string]::IsNullOrWhiteSpace($startedAt) -and $entry.startInstantsSeen -notcontains $startedAt) {
+            $entry.startInstantsSeen += $startedAt
+            $entry.lastStartedAt = $startedAt
+        }
+    }
+    $document.containers = @($byContainer.Values)
+    $document.abnormalRestarts = @($document.containers | Where-Object {
+        $_.container -ne $KilledNodeContainer -and $null -ne $_.restartCountMax -and $_.restartCountMax -gt 0 })
+    $document.oomKilledContainers = @($document.containers | Where-Object { $_.oomKilledEver })
+    foreach ($entry in $document.containers) {
+        if ($entry.container -eq $KilledNodeContainer) { $document.killedNodeRestartCount = $entry.restartCountMax }
+    }
+    return $document
+}
+
+function Export-RabbitFaultResultSummary {
+    param(
+        [Parameter(Mandatory = $true)][string]$RunPath,
+        [Parameter(Mandatory = $true)]$Parameters,
+        [Parameter(Mandatory = $true)]$Events,
+        [Parameter(Mandatory = $true)]$Verification,
+        [Parameter(Mandatory = $true)]$FaultRecovery,
+        $Cohorts
+    )
+    $faultAt = ConvertTo-DateTimeOrNull $Events.faultInjectedAt
+    $restartRequestedAt = ConvertTo-DateTimeOrNull $Events.restartRequestedAt
+    $nodeReadyAt = ConvertTo-DateTimeOrNull $Events.nodeReadyAt
+    $containerRunningAt = ConvertTo-DateTimeOrNull $Events.containerRunningAt
+    $measurementStartedAt = ConvertTo-DateTimeOrNull $Events.measurementStartedAt
+    $ungatedRecoveredAt = ConvertTo-DateTimeOrNull $FaultRecovery.throughput.ungatedRecoveredAt
+    $gatedRecoveredAt = ConvertTo-DateTimeOrNull $FaultRecovery.throughput.recoveredAt
+    $normalizedAt = ConvertTo-DateTimeOrNull $FaultRecovery.normalization.backlogNormalizedAt
+    $workerCount = $Parameters.workerCountPerNode
+    $expectedConsumers = $workerCount * $Parameters.judgeNodeCount
+    $killedNodeContainer = "oj-loadtest-$($Parameters.killedNode)"
+    # Section 7 states this window itself: the first five seconds after a kill are partly work the dead
+    # node had already set up, so crediting them to the survivor is how a fail-stop run reports a
+    # throughput it never sustained. It is one constant here rather than a hidden default, and it is
+    # handed to the verdict library so the number that decided the criterion is the number reported.
+    $nodeDownExcludedSeconds = 5.0
+
+    # -- artifacts ----------------------------------------------------------------------------------
+    # A run missing the broker sampler or the container watcher is not a success, so presence is
+    # checked first and a missing file makes every verdict unavailable rather than merely noting the
+    # absence. An empty CSV counts as missing: the header alone is what a sampler that never took a
+    # reading leaves behind, and that is the same failure with a file in front of it.
+    $requiredArtifacts = @(
+        "parameters.json", "events.json", "db-verification.json", "latency.csv", "recovery-samples.csv",
+        "rabbit-queue-samples.csv", "rabbit-queue-raw.jsonl", "container-watch.csv", "kill-snapshot.json",
+        "requests-1s.csv", "gatling-simulation.log", "summary.json"
+    )
+    $artifactReport = New-Object System.Collections.Generic.List[object]
+    $artifactRows = @{}
+    $missing = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $requiredArtifacts) {
+        $path = Join-Path $RunPath $name
+        $present = Test-Path $path
+        $rowCount = $null
+        $rows = $null
+        if ($present -and $name -like "*.csv") {
+            $rows = @(Import-Csv $path)
+            $rowCount = $rows.Count
+            if ($rowCount -eq 0) {
+                $present = $false
+                $missing.Add("$name has a header and no data rows")
+            }
+        }
+        if (-not $present -and $null -eq $rowCount) { $missing.Add("$name is missing") }
+        $artifactRows[$name] = $rows
+        $artifactReport.Add([pscustomobject]@{ name = $name; present = $present; dataRows = $rowCount })
+    }
+
+    $queueDoc = Get-RabbitQueueSampleSeries -Rows $artifactRows["rabbit-queue-samples.csv"]
+    $resultDoc = Get-RabbitResultSampleSeries -Rows $artifactRows["recovery-samples.csv"]
+    $watchDoc = Get-RabbitContainerWatchSummary -Rows $artifactRows["container-watch.csv"] -KilledNodeContainer $killedNodeContainer
+    $killSnapshot = $null
+    $killSnapshotText = $null
+    $killSnapshotPath = Join-Path $RunPath "kill-snapshot.json"
+    if (Test-Path $killSnapshotPath) {
+        try { $killSnapshotText = Get-Content $killSnapshotPath -Raw; $killSnapshot = $killSnapshotText | ConvertFrom-Json } catch { $killSnapshot = $null }
+    }
+
+    # The sampler has to have covered the two instants the measurement is made of, not merely to have
+    # written a file: a sampler that started after the kill or stopped before the restart leaves a
+    # series that cannot place the transition it exists to place.
+    $samplerCoverage = [ordered]@{
+        firstSampleAt = if ($null -eq $queueDoc.firstAt) { $null } else { $queueDoc.firstAt.ToString("o") }
+        lastSampleAt = if ($null -eq $queueDoc.lastAt) { $null } else { $queueDoc.lastAt.ToString("o") }
+        startedBeforeFault = $null
+        ranPastRestart = $null
+        basis = "whether the broker series brackets the fault and the restart request, which is what makes its transitions observable at all"
+    }
+    if ($null -ne $queueDoc.firstAt -and $null -ne $faultAt) { $samplerCoverage.startedBeforeFault = ($queueDoc.firstAt -le $faultAt) }
+    if ($null -ne $queueDoc.lastAt -and $null -ne $restartRequestedAt) { $samplerCoverage.ranPastRestart = ($queueDoc.lastAt -ge $restartRequestedAt) }
+    $watchCoverage = [ordered]@{
+        rowCount = $watchDoc.rowCount
+        available = $watchDoc.available
+        basis = "the container watcher's own rows, which are what separate the intentional kill from an abnormal termination"
+    }
+    if (-not $samplerCoverage.startedBeforeFault -or -not $samplerCoverage.ranPastRestart) {
+        $missing.Add("the broker series does not bracket the fault and the restart request, so the consumer transition and the first redelivery cannot be placed on it")
+    }
+    if (-not $watchDoc.available) { $missing.Add("container-watch.csv carries no container state, so the intentional kill cannot be separated from an abnormal termination") }
+    $artifactsComplete = ($missing.Count -eq 0)
+
+    # -- offered rate -------------------------------------------------------------------------------
+    $offeredOutage = Get-RabbitOfferedRateFromBuckets -Rows $artifactRows["requests-1s.csv"] `
+        -RequestName "api-contest-submit" -From $faultAt -To $restartRequestedAt
+    $offeredMeasuredWindow = $null
+    if ($null -ne $Events.measurementSubmitOfferedInWindow -and $null -ne $Events.measurementWindowSeconds -and [double]$Events.measurementWindowSeconds -gt 0) {
+        $offeredMeasuredWindow = [math]::Round([double]$Events.measurementSubmitOfferedInWindow / [double]$Events.measurementWindowSeconds, 6)
+    }
+    $offeredVerdict = Get-RabbitOfferedRateVerdict -TargetRps $Parameters.targetRps -OfferedRps $offeredOutage.rps
+
+    # -- throughput ---------------------------------------------------------------------------------
+    $nodeDownRps = Get-RabbitWindowResultRps -Samples $resultDoc.samples -From $faultAt -To $restartRequestedAt `
+        -ExcludeHeadSeconds $nodeDownExcludedSeconds
+    $nodeDownRpsToReady = Get-RabbitWindowResultRps -Samples $resultDoc.samples -From $faultAt -To $nodeReadyAt `
+        -ExcludeHeadSeconds $nodeDownExcludedSeconds
+
+    # -- backlog ------------------------------------------------------------------------------------
+    $judgeP95 = $FaultRecovery.preFault.judgeBacklogP95
+    $outageFrom = if ($null -eq $faultAt) { $null } else { $faultAt.AddSeconds($nodeDownExcludedSeconds) }
+    $growth = Get-RabbitBacklogGrowthVerdict -Samples $resultDoc.samples -From $outageFrom -To $restartRequestedAt -Field "judgeBacklog"
+    $peak = Get-RabbitBacklogPeak -Samples $resultDoc.samples -From $faultAt
+    $firstAtOrBelow = $null
+    if ($null -ne $judgeP95 -and $null -ne $faultAt) {
+        foreach ($sample in $resultDoc.samples) {
+            if ($sample.at -lt $faultAt -or $null -eq $sample.judgeBacklog) { continue }
+            if ([double]$sample.judgeBacklog -le [double]$judgeP95) { $firstAtOrBelow = $sample; break }
+        }
+    }
+    $growthRatePerSecond = $null
+    $decayRatePerSecond = $null
+    if ($peak.available -and $null -ne $faultAt) {
+        $atFault = $null
+        foreach ($sample in $resultDoc.samples) {
+            if ($sample.at -le $faultAt -and $null -ne $sample.judgeBacklog) { $atFault = $sample }
+        }
+        if ($null -ne $atFault) {
+            $span = ($peak.at - $atFault.at).TotalSeconds
+            if ($span -gt 0) { $growthRatePerSecond = [math]::Round(([double]$peak.value - [double]$atFault.judgeBacklog) / $span, 6) }
+        }
+        if ($null -ne $normalizedAt -and $normalizedAt -gt $peak.at) {
+            $after = $null
+            foreach ($sample in $resultDoc.samples) {
+                if ($sample.at -le $normalizedAt -and $null -ne $sample.judgeBacklog) { $after = $sample }
+            }
+            if ($null -ne $after) {
+                $span = ($after.at - $peak.at).TotalSeconds
+                if ($span -gt 0) { $decayRatePerSecond = [math]::Round(([double]$peak.value - [double]$after.judgeBacklog) / $span, 6) }
+            }
+        }
+    }
+
+    # -- broker transitions -------------------------------------------------------------------------
+    $consumerDrop = Get-RabbitConsumerTransition -Samples $queueDoc.samples -FromConsumers $expectedConsumers -ToConsumers $workerCount
+    $consumerRestore = Get-RabbitConsumerTransition -Samples $queueDoc.samples -FromConsumers $workerCount -ToConsumers $expectedConsumers
+    $firstRedelivery = Get-RabbitFirstRedelivery -Samples $queueDoc.samples -From $faultAt
+    $recoveryTimes = Get-RabbitRecoveryTimes -FaultAt $faultAt -ConsumerDroppedAt $consumerDrop.at `
+        -FirstRedeliveryAt $firstRedelivery.at -ThroughputRecoveredAt $ungatedRecoveredAt `
+        -BacklogNormalizedAt $normalizedAt -RestartRequestedAt $restartRequestedAt -NodeReadyAt $nodeReadyAt `
+        -ConsumerRestoredAt $consumerRestore.at
+
+    # Section 7's backlog criterion reads "normalised at or below the pre-fault p95 BEFORE judge-1 was
+    # restarted", and the sustained instant above cannot satisfy that by construction: its search begins
+    # at max(faultInjectedAt, nodeReadyAt), and nodeReadyAt always follows restartRequestedAt, so feeding
+    # it to this criterion would make the criterion false whatever the run did. The criterion is decided
+    # instead on the analyzer's second, ungated search - the one allowed to begin at the fault - and that
+    # instant's own warning travels with it, because it is not free: with the killed node down the
+    # surviving node is fed less work than the cluster would have taken, so a backlog can sit below its
+    # baseline for lack of arrivals rather than because more was drained. That is exactly why the
+    # offered-rate criterion is a co-criterion of the same conjunction, and why both instants are
+    # reported rather than one replacing the other.
+    $earliestNormalizedAt = ConvertTo-DateTimeOrNull $FaultRecovery.normalization.earliestNormalizedAt
+    $earlyBacklogNormalization = [ordered]@{
+        normalizedAt = if ($null -eq $earliestNormalizedAt) { $null } else { $earliestNormalizedAt.ToString("o") }
+        precedesRestartRequest = if ($null -eq $earliestNormalizedAt -or $null -eq $restartRequestedAt) { $null } else { $earliestNormalizedAt -lt $restartRequestedAt }
+        precedesNodeReady = $FaultRecovery.normalization.earliestNormalizedPrecedesNodeReady
+        secondsAfterFault = if ($null -eq $earliestNormalizedAt -or $null -eq $faultAt) { $null } else { [math]::Round(($earliestNormalizedAt - $faultAt).TotalSeconds, 3) }
+        usedFor = "the single-node-sustainable backlog criterion, which names an instant before the restart; the gated instant reported as sustainedNormalizedAt is authoritative for the latency cohorts and for the normalisation timing"
+        basis = $FaultRecovery.normalization.earliestNormalizedBasis
+    }
+
+    # -- broker counters ----------------------------------------------------------------------------
+    # Baseline is the measured window's own start, so a delta is the run's rather than the queue's
+    # lifetime. The counters live in the broker, which was not killed, so unlike the JVM's counters
+    # these deltas are complete.
+    $brokerCounters = [ordered]@{}
+    foreach ($field in @("publish", "deliver", "ack", "redeliver")) {
+        $brokerCounters[$field] = Get-RabbitCounterDelta -Samples $queueDoc.samples -Field $field -From $measurementStartedAt
+    }
+    $redeliverFromFault = Get-RabbitCounterDelta -Samples $queueDoc.samples -Field "redeliver" -From $faultAt
+    $storedRepublishes = $Verification.workCost.storedResultRepublishes
+    $redeliveryDecomposition = Get-RabbitRedeliveryDecomposition -BrokerRedeliverCount $redeliverFromFault.delta `
+        -StoredResultRepublishes $storedRepublishes
+
+    $readyPeak = $null
+    $unackedPeak = $null
+    $readyPlusUnackedPeak = $null
+    $deadLettersPeak = $null
+    $deadLettersEnd = $null
+    $connectionsMax = $null
+    $channelsMax = $null
+    foreach ($sample in $queueDoc.samples) {
+        if ($null -ne $sample.ready -and ($null -eq $readyPeak -or $sample.ready -gt $readyPeak)) { $readyPeak = $sample.ready }
+        if ($null -ne $sample.unacked -and ($null -eq $unackedPeak -or $sample.unacked -gt $unackedPeak)) { $unackedPeak = $sample.unacked }
+        if ($null -ne $sample.readyPlusUnacked -and ($null -eq $readyPlusUnackedPeak -or $sample.readyPlusUnacked -gt $readyPlusUnackedPeak)) { $readyPlusUnackedPeak = $sample.readyPlusUnacked }
+        if ($null -ne $sample.deadLetters -and ($null -eq $deadLettersPeak -or $sample.deadLetters -gt $deadLettersPeak)) { $deadLettersPeak = $sample.deadLetters }
+        if ($null -ne $sample.deadLetters) { $deadLettersEnd = $sample.deadLetters }
+        if ($null -ne $sample.connections -and ($null -eq $connectionsMax -or $sample.connections -gt $connectionsMax)) { $connectionsMax = $sample.connections }
+        if ($null -ne $sample.channels -and ($null -eq $channelsMax -or $sample.channels -gt $channelsMax)) { $channelsMax = $sample.channels }
+    }
+
+    # -- kill-time evidence -------------------------------------------------------------------------
+    $trigger = if ($null -eq $Verification.faultRecovery) { $null } else { $Verification.faultRecovery.trigger }
+    $killedNodeUnackedAtTrigger = $null
+    if ($null -ne $trigger -and $null -ne $trigger.thresholdReadings) {
+        $killedNodeUnackedAtTrigger = Get-RabbitNumberOrNull $trigger.thresholdReadings.killedNodeUnacknowledged
+    }
+    $activeWorkAtKill = $null
+    if ($null -ne $killedNodeUnackedAtTrigger) { $activeWorkAtKill = ($killedNodeUnackedAtTrigger -ge 1) }
+    if ($Events.faultNotInjectedWithActiveWork -eq $true) { $activeWorkAtKill = $false }
+
+    # -- integrity ----------------------------------------------------------------------------------
+    $counts = $Verification.counts
+    $countsAvailable = ($null -ne $counts.accepted -and $null -ne $counts.uniqueSubmissions -and
+        $null -ne $counts.results -and $null -ne $counts.scoreboardApplied)
+    $duplicateResultRows = $null
+    $duplicateScoreboardApplications = $null
+    if ($countsAvailable) {
+        $duplicateResultRows = [long]$counts.results - [long]$counts.uniqueSubmissions
+        $duplicateScoreboardApplications = [long]$counts.scoreboardApplied - [long]$counts.uniqueSubmissions
+    }
+    $integrityPassed = $null
+    if ($null -ne $Verification.integrity.passed) {
+        $integrityPassed = [bool]$Verification.integrity.passed
+        if ($null -ne $deadLettersEnd -and $deadLettersEnd -gt 0) { $integrityPassed = $false }
+    }
+
+    # -- cohorts ------------------------------------------------------------------------------------
+    $cohortTable = [ordered]@{}
+    if ($null -ne $Cohorts) {
+        foreach ($name in @($Cohorts.Keys)) {
+            $cohort = $Cohorts[$name]
+            if ($null -eq $cohort) { continue }
+            if ($cohort.available -eq $false) {
+                # `reason` as well as `unavailableReason`: the run-level cohorts name their
+                # unavailability with the first spelling and the fault cohorts with the second, and a
+                # reader is owed whichever one the run actually wrote.
+                $note = if (-not [string]::IsNullOrWhiteSpace([string]$cohort.unavailableReason)) { [string]$cohort.unavailableReason } else { [string]$cohort.reason }
+                $cohortTable[$name] = [ordered]@{ available = $false; submissionCount = 0; unavailableReason = $note }
+                continue
+            }
+            $cohortTable[$name] = [ordered]@{
+                available = $true
+                submissionCount = $cohort.submissionCount
+                L_result_ms = $cohort.L_result_ms
+                L_scoreboard_ms = $cohort.L_scoreboard_ms
+                L_total_ms = $cohort.L_total_ms
+                byLatencyClass = $cohort.byLatencyClass
+                over5sCount = $cohort.over5sCount
+                over5sRatio = $cohort.over5sRatio
+                over10sCount = $cohort.over10sCount
+                over10sRatio = $cohort.over10sRatio
+                estimator = $cohort.estimator
+            }
+        }
+    }
+    $keyCohort = $null
+    if ($cohortTable.Contains("fault-down-arrivals")) { $keyCohort = $cohortTable["fault-down-arrivals"] }
+
+    # -- unavailable --------------------------------------------------------------------------------
+    $unavailable = New-Object System.Collections.Generic.List[string]
+    foreach ($note in @($Verification.unavailable)) { $unavailable.Add($note) }
+    foreach ($note in @($FaultRecovery.unavailable)) { $unavailable.Add($note) }
+    $unavailable.Add("the redelivered-submissions latency cohort is unavailable: RabbitMQ keeps no durable per-delivery record, so a redelivery cannot be linked to the submission id it carried. The aggregate decomposition of the broker's redeliver count is reported instead")
+    $unavailable.Add("concurrent duplicate execution by two judges is unavailable rather than zero: whether a redelivered message was re-executed while the killed node was still inside it cannot be recovered from the broker, and the identity residual that bounds it is reported as a residual, not as an answer")
+    $unavailable.Add("the killed node's in-process counters are lower bounds; the broker's publish/deliver/ack/redeliver deltas are not, because the broker was not killed")
+
+    # -- verdicts -----------------------------------------------------------------------------------
+    $backlogNotGrowing = $null
+    if ($null -ne $growth.continuouslyGrowing) { $backlogNotGrowing = (-not [bool]$growth.continuouslyGrowing) }
+    $normalizedBeforeRestart = $earlyBacklogNormalization.precedesRestartRequest
+    $singleNode = Get-RabbitSingleNodeSustainableVerdict -ActiveWorkAtKill $activeWorkAtKill `
+        -ConsumerDropObserved $consumerDrop.observed -OfferedRateHeld $offeredVerdict.held `
+        -NodeDownResultRps $nodeDownRps.resultRps -OfferedRps $offeredOutage.rps `
+        -NodeDownWindowSeconds $nodeDownRps.windowSeconds `
+        -NodeDownExcludedSeconds $nodeDownExcludedSeconds `
+        -BacklogContinuouslyGrowing $growth.continuouslyGrowing -BacklogNormalizedBeforeRestart $normalizedBeforeRestart `
+        -IntegrityPassed $integrityPassed
+    $fastFailover = Get-RabbitFastFailoverVerdict -ThroughputRecoveredAt $ungatedRecoveredAt -FaultAt $faultAt `
+        -ConsumerDroppedAt $consumerDrop.at -FirstRedeliveryAt $firstRedelivery.at -RestartRequestedAt $restartRequestedAt
+
+    $verdictGate = [ordered]@{
+        artifactsComplete = $artifactsComplete
+        missing = @($missing)
+        basis = "a run missing the broker sampler or the container watcher is not judged a success, so an incomplete artifact set makes every verdict unavailable rather than merely noted"
+    }
+    if (-not $artifactsComplete) {
+        $singleNode.verdict = "unavailable"
+        $fastFailover.verdict = "unavailable"
+        $verdictGate.effect = "both verdicts are reported as unavailable regardless of the criteria, because the observation the request makes mandatory is incomplete"
+    }
+
+    # -- document -----------------------------------------------------------------------------------
+    $document = [ordered]@{
+        runId = $Parameters.runId
+        gitCommit = $Parameters.gitCommit
+        gitTreeDirty = $Parameters.gitTreeDirty
+        dispatchMode = $Parameters.dispatchMode
+        generatedAt = [datetimeoffset]::UtcNow.ToString("o")
+        generator = "Analyze-TradeoffRun.ps1 (rabbit fault branch)"
+        configuration = [ordered]@{
+            dispatchMode = $Parameters.dispatchMode
+            judgeNodeCount = $Parameters.judgeNodeCount
+            workerCountPerNode = $workerCount
+            rabbitPrefetch = $Parameters.rabbitPrefetch
+            rabbitReservedPerNode = $Parameters.rabbitReservedPerNode
+            killedNode = $Parameters.killedNode
+            targetRps = $Parameters.targetRps
+            downDurationSeconds = $Parameters.downDurationSeconds
+            drainTimeoutSeconds = $Parameters.drainTimeoutSeconds
+            deterministicLatencySeed = $Parameters.deterministicLatencySeed
+            basis = "read from parameters.json, which is the run's own record of what it was asked to do; these are the settings the measurement was taken under and are not measurements themselves"
+        }
+        artifacts = [ordered]@{
+            required = $artifactReport.ToArray()
+            complete = $artifactsComplete
+            missing = @($missing)
+            queueSampler = $samplerCoverage
+            containerWatch = $watchCoverage
+            basis = "every file the request makes mandatory, checked for presence and for at least one data row; the broker sampler is additionally required to bracket the fault and the restart request"
+        }
+        evidence = [ordered]@{
+            trigger = $trigger
+            killSnapshot = $killSnapshot
+            activeWorkAtKillMeasured = $killedNodeUnackedAtTrigger
+            deadQueueDepthAtKill = $Events.deadQueueDepthAtKill
+            queuePurgeBeforeWarmup = $Events.rabbitQueuePurge
+            samplerStartedAt = $Events.rabbitSamplerStartedAt
+            samplerConfigSha256 = $Events.rabbitSamplerConfigJsonSha256
+            basis = "the harness's own kill-time record and the sampler's identity; the per-node unacknowledged count is the trigger's pre-kill reading of the killed node's channels, which is the only per-node reading of that node that can exist after the kill"
+        }
+        measured = [ordered]@{
+            offeredRate = [ordered]@{
+                targetRps = $Parameters.targetRps
+                outageWindow = $offeredOutage
+                measuredWindowRps = $offeredMeasuredWindow
+                measuredWindowBasis = "the generator's own count of submit requests started inside the measured window divided by that window's length, recorded by the harness during the run; the outage-window reading is the one section 7's offered-rate criterion is judged on, because that is the window the criterion names"
+                verdict = $offeredVerdict
+            }
+            resultThroughput = [ordered]@{
+                preFaultResultRps = $FaultRecovery.preFault.resultRps
+                preFaultBasis = $FaultRecovery.preFault.basis
+                nodeDownOverOutage = $nodeDownRps
+                nodeDownToNodeReady = $nodeDownRpsToReady
+                throughputRecoveryGatedAt = $FaultRecovery.throughput.recoveredAt
+                throughputRecoveryGatedSecondsAfterFault = $FaultRecovery.throughput.secondsAfterFault
+                throughputRecoveryUngatedAt = $FaultRecovery.throughput.ungatedRecoveredAt
+                throughputRecoveryUngatedSecondsAfterFault = $FaultRecovery.throughput.ungatedSecondsAfterFault
+                throughputRecoveryPrecededRestartRequest = $FaultRecovery.throughput.ungatedPrecedesRestartRequested
+                thresholdRps = $FaultRecovery.throughput.thresholdRps
+                windowSeconds = $FaultRecovery.throughput.windowSeconds
+                consecutiveWindows = $FaultRecovery.throughput.consecutiveWindows
+                gatedBasis = $FaultRecovery.throughput.basis
+                ungatedBasis = $FaultRecovery.throughput.ungatedBasis
+            }
+            backlog = [ordered]@{
+                definition = "accepted submissions minus persisted results; the broker's ready and unacknowledged depths are reported as constituents and are never added into this value"
+                preFaultP95 = $judgeP95
+                preFaultSamples = $FaultRecovery.preFault.judgeBacklogSamples
+                peak = $peak
+                growthOverOutage = $growth
+                growthRatePerSecond = $growthRatePerSecond
+                decayRatePerSecond = $decayRatePerSecond
+                firstSampleAtOrBelowPreFaultP95 = if ($null -eq $firstAtOrBelow) { $null } else { $firstAtOrBelow.at.ToString("o") }
+                firstSampleAtOrBelowValue = if ($null -eq $firstAtOrBelow) { $null } else { $firstAtOrBelow.judgeBacklog }
+                firstSampleAtOrBelowBasis = "a single sample at or below the pre-fault p95 is NOT a normalisation: the surviving node drains while the killed one is still down, so one dip proves nothing. It is reported because it is the earliest instant the series could be read that way, and the sustained instant below is the one the verdict uses"
+                sustainedNormalizedAt = $FaultRecovery.normalization.backlogNormalizedAt
+                sustainedSecondsAfterFault = $FaultRecovery.recoveryTimes.T_backlogNormalizationSeconds
+                sustainedSecondsAfterRestartRequested = $recoveryTimes.T_backlogNormalizationAfterRestartSeconds
+                sustainedSecondsAfterNodeReady = $recoveryTimes.T_backlogNormalizationAfterNodeReadySeconds
+                normalizedBeforeRestart = $normalizedBeforeRestart
+                normalizedBeforeNodeReady = $recoveryTimes.backlogNormalizedBeforeNodeReady
+                earliestSearchFromFault = $FaultRecovery.normalization.earliestNormalizedAt
+                earliestSearchPrecedesNodeReady = $FaultRecovery.normalization.earliestNormalizedPrecedesNodeReady
+                # The same instant read against the restart rather than against readiness, which is what
+                # section 7's criterion actually names. Read it with the `usedFor` and `basis` lines in
+                # earlyNormalization: the gated instant below is the authoritative normalisation timing.
+                earliestSearchPrecedesRestartRequest = $earlyBacklogNormalization.precedesRestartRequest
+                earlyNormalization = $earlyBacklogNormalization
+                sustainSeconds = $FaultRecovery.normalization.sustainSeconds
+                maxSampleGapSeconds = $FaultRecovery.normalization.maxSampleGapSeconds
+                growthRateBasis = "the peak minus the last reading at or before the fault, divided by the seconds between them; a rate over a window, not a fitted slope"
+                decayRateBasis = "the peak minus the last reading at or before the sustained normalisation, divided by the seconds between them; a rate over a window, not a fitted slope"
+                basis = $FaultRecovery.normalization.basis
+            }
+            consumers = [ordered]@{
+                expectedConsumers = $expectedConsumers
+                oneNodeConsumers = $workerCount
+                drop = $consumerDrop
+                restore = $consumerRestore
+                connectionsMax = $connectionsMax
+                channelsMax = $channelsMax
+                basis = "the live queue's own consumer count from the broker's management API, sampled at the queue interval; the transition is reported as a bracket because the change happened between two ticks"
+            }
+            redelivery = [ordered]@{
+                first = $firstRedelivery
+                decomposition = $redeliveryDecomposition
+                redeliverDeltaFromFault = $redeliverFromFault
+                basis = "the broker's cumulative redeliver counter; RabbitMQ records no per-delivery history, so this counts redeliveries and never identifies them"
+            }
+            brokerCounters = $brokerCounters
+            brokerCountersBasis = "cumulative broker counters as baseline-versus-end deltas, the baseline being the measured window's own start; these live in the broker, which was not killed, so they are complete"
+            queueDepths = [ordered]@{
+                readyPeak = $readyPeak
+                unacknowledgedPeak = $unackedPeak
+                readyPlusUnacknowledgedPeak = $readyPlusUnackedPeak
+                deadLettersPeak = $deadLettersPeak
+                deadLettersEnd = $deadLettersEnd
+                constituentNotAddend = "these are the broker's own depths. They are reported as explanatory constituents of the backlog and are never added to it: a message sitting ready has not been judged, but it is already counted once by accepted-minus-results"
+            }
+            recoveryTimes = $recoveryTimes
+            latencyCohorts = $cohortTable
+            latencyCohortBasis = "submission-level L_result, L_scoreboard and L_total in milliseconds, per cohort, split by the deterministic latency class. The fault-down-arrivals fast-class p95/p99 is the key user-impact metric: it is what a submission arriving while the node was down actually waited through"
+            integrity = [ordered]@{
+                counts = $counts
+                countsAvailable = $countsAvailable
+                lostOrIncomplete = $Verification.integrity.lostOrIncomplete
+                finalResultMismatch = $Verification.integrity.finalResultMismatch
+                duplicateResultRows = $duplicateResultRows
+                duplicateScoreboardApplications = $duplicateScoreboardApplications
+                judgeInvocations = $Verification.workCost.judgeInvocations
+                judgeInvocationsLowerBound = $Verification.workCost.judgeInvocationsLowerBound
+                storedResultRepublishes = $storedRepublishes
+                deadLetterPeak = $deadLettersPeak
+                deadLetterEnd = $deadLettersEnd
+                passed = $integrityPassed
+                reason = $Verification.integrity.reason
+                basis = "accepted = unique submissions = results = scoreboard applied, with an empty dead-letter queue and no positive duplicate residual. A duplicate count is the identity residual and is reported with that basis; it is not a claim about which rows were duplicated"
+            }
+            containers = $watchDoc
+            downDurationSeconds = $FaultRecovery.recoveryTimes.downDurationSeconds
+            downDurationConfiguredSeconds = $FaultRecovery.recoveryTimes.downDurationConfiguredSeconds
+            drainSeconds = $Events.drainSeconds
+        }
+        verdicts = [ordered]@{
+            gate = $verdictGate
+            # Which instant each criterion was decided on, spelled out, because two of these readings are
+            # search-origin readings that a reader must not mistake for the gated ones. A verdict that
+            # does not say what it was computed from is a verdict that cannot be re-checked.
+            inputs = [ordered]@{
+                singleNodeSustainable = [ordered]@{
+                    activeWorkAtKill = "the trigger's own pre-kill per-node unacknowledged count for the killed node, from db-verification.json"
+                    consumerDropObserved = "the broker series' consumer count falling from $expectedConsumers to $workerCount"
+                    offeredRateHeld = "the offered rate over faultInjectedAt to restartRequestedAt against targetRps, from requests-1s.csv"
+                    nodeDownResultRps = "persisted results per second over faultInjectedAt to restartRequestedAt with the first ${nodeDownExcludedSeconds}s removed, from recovery-samples.csv"
+                    backlogContinuouslyGrowing = "the judge backlog over the same window minus the same head"
+                    backlogNormalizedBeforeRestart = "the UNGATED normalisation search, the only one that can precede the restart; see earlyNormalization for its warning"
+                    integrityPassed = "accepted = unique = results = scoreboard applied, with an empty dead-letter queue"
+                }
+                fastFailover = [ordered]@{
+                    throughputRecoveredWithinWindow = "the UNGATED rolling-window search from faultInjectedAt, measured against the fault and against the consumer drop"
+                    firstRedeliveryRightAfterFault = "the live queue's cumulative redeliver counter rising above its pre-fault value, from rabbit-queue-samples.csv"
+                    recoveryBeganWithoutRestart = "the same ungated instant against restartRequestedAt"
+                }
+                basis = "section 7's criteria are decided on the readings that can answer them. Both clauses that name an instant before the restart are decided on the ungated searches, because the gated ones begin at nodeReadyAt and so cannot precede restartRequestedAt by construction - deciding those criteria on the gated instants would report a false for a run that recovered"
+            }
+            singleNodeSustainable = $singleNode
+            fastFailover = $fastFailover
+            backlogGrowth = $growth
+            offeredRate = $offeredVerdict
+        }
+        unavailable = @($unavailable)
+    }
+
+    # -- files --------------------------------------------------------------------------------------
+    # The instants written as text are computed here rather than inline in the argument list: an `if`
+    # statement is a valid value after `=` in a hash literal but not inside `( ... )` in an argument
+    # position, where PowerShell 5.1 reads it as a command name.
+    $consumerDropAtText = if ($null -eq $consumerDrop.at) { $null } else { $consumerDrop.at.ToString("o") }
+    $consumerRestoreAtText = if ($null -eq $consumerRestore.at) { $null } else { $consumerRestore.at.ToString("o") }
+    $firstRedeliveryAtText = if ($null -eq $firstRedelivery.at) { $null } else { $firstRedelivery.at.ToString("o") }
+    $backlogPeakAtText = if ($peak.available) { $peak.at.ToString("o") } else { $null }
+    $metrics = New-Object System.Collections.Generic.List[object]
+    $metrics.Add((New-RabbitSummaryMetric -Metric "offered_rps_outage_window" -Value $offeredOutage.rps -Unit "submissions/s" -Basis "submit requests the generator started inside faultInjectedAt to restartRequestedAt, divided by the whole seconds that window spans"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "offered_rps_measured_window" -Value $offeredMeasuredWindow -Unit "submissions/s" -Basis "the harness's own count of submit requests started inside the measured window divided by the window length"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "offered_rate_verdict" -Value $offeredVerdict.verdict -Unit "verdict" -Basis "the measured outage-window rate against targetRps within the tolerance band"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "active_work_at_kill" -Value $activeWorkAtKill -Unit "bool" -Basis "the killed node's unacknowledged deliveries on the broker at the trigger reading"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "killed_node_unacked_at_kill" -Value $killedNodeUnackedAtTrigger -Unit "messages" -Basis "the trigger's own pre-kill reading of the killed node's consumer channels"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "consumers_dropped_observed" -Value $consumerDrop.observed -Unit "bool" -Basis "a consumer transition from the configured total down to one node's share, observed on the broker's consumer count"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "consumers_dropped_at" -Value $consumerDropAtText -Unit "utc" -Basis "the first tick observed at the destination count; the true transition lies inside the bracket back to the previous tick"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "T_consumer_drop_seconds" -Value $recoveryTimes.T_consumerDropSeconds -Unit "s" -Basis "consumers_dropped_at minus faultInjectedAt"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "consumers_restored_at" -Value $consumerRestoreAtText -Unit "utc" -Basis "the first tick observed back at the configured total"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "T_consumer_restored_seconds" -Value $recoveryTimes.T_consumerRestoredAfterFaultSeconds -Unit "s" -Basis "consumers_restored_at minus faultInjectedAt"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "first_redelivery_at" -Value $firstRedeliveryAtText -Unit "utc" -Basis "the first tick at which the live queue's cumulative redeliver counter exceeded its pre-fault value"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "T_first_redelivery_seconds" -Value $recoveryTimes.T_firstRedeliverySeconds -Unit "s" -Basis "first_redelivery_at minus faultInjectedAt"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "redeliver_count_from_fault" -Value $redeliverFromFault.delta -Unit "messages" -Basis "the broker's cumulative redeliver counter at the end of the series minus its last value at or before the fault"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "pre_fault_result_rps" -Value $FaultRecovery.preFault.resultRps -Unit "results/s" -Basis $FaultRecovery.preFault.basis))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "node_down_result_rps" -Value $nodeDownRps.resultRps -Unit "results/s" -Basis "persisted results per second over faultInjectedAt to restartRequestedAt with the first $($nodeDownRps.excludeHeadSeconds)s removed"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "node_down_result_rps_window_seconds" -Value $nodeDownRps.windowSeconds -Unit "s" -Basis "the seconds between the first and last readable result readings inside that window"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "node_down_to_node_ready_result_rps" -Value $nodeDownRpsToReady.resultRps -Unit "results/s" -Basis "the same reading over faultInjectedAt to nodeReadyAt"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "T_throughput_recovery_seconds" -Value $FaultRecovery.throughput.ungatedSecondsAfterFault -Unit "s" -Basis $FaultRecovery.throughput.ungatedBasis))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "T_throughput_recovery_gated_seconds" -Value $FaultRecovery.throughput.secondsAfterFault -Unit "s" -Basis $FaultRecovery.throughput.basis))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "throughput_recovery_preceded_restart" -Value $FaultRecovery.throughput.ungatedPrecedesRestartRequested -Unit "bool" -Basis "whether the throughput recovery instant precedes restartRequestedAt"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "backlog_peak" -Value $peak.value -Unit "submissions" -Basis "the largest judge backlog observed, with its instant"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "backlog_peak_at" -Value $backlogPeakAtText -Unit "utc" -Basis "the instant the peak was observed at"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "backlog_growth_rate" -Value $growthRatePerSecond -Unit "submissions/s" -Basis "peak minus the last reading at or before the fault, over the seconds between them"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "backlog_decay_rate" -Value $decayRatePerSecond -Unit "submissions/s" -Basis "peak minus the last reading at or before the sustained normalisation, over the seconds between them"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "backlog_growth_verdict" -Value $growth.verdict -Unit "verdict" -Basis $growth.basis))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "backlog_normalized_at" -Value $FaultRecovery.normalization.backlogNormalizedAt -Unit "utc" -Basis "the 5s-sustained normalisation recomputed over the whole series, including the drain, searched from readiness; this is the authoritative normalisation timing and the instant the latency cohorts are cut on"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "T_backlog_normalization_seconds" -Value $FaultRecovery.recoveryTimes.T_backlogNormalizationSeconds -Unit "s" -Basis "backlog_normalized_at minus faultInjectedAt"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "backlog_earliest_search_normalized_at" -Value $earlyBacklogNormalization.normalizedAt -Unit "utc" -Basis "the same 5s-sustained rule searched from faultInjectedAt instead of from readiness. A search-origin reading, not an achieved recovery: with the killed node down less work arrives, so a backlog can sit below its baseline for lack of arrivals rather than because more was drained. Read it beside the offered rate, which is a co-criterion for exactly this reason"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "backlog_normalized_before_restart" -Value $normalizedBeforeRestart -Unit "bool" -Basis "whether the ungated (search-from-fault) normalisation instant precedes restartRequestedAt. The gated instant cannot precede it by construction, so this is the only reading that can answer section 7's criterion - and it is the one that criterion was decided on"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "backlog_normalized_before_node_ready" -Value $recoveryTimes.backlogNormalizedBeforeNodeReady -Unit "bool" -Basis "whether the sustained normalisation precedes nodeReadyAt"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "dead_letter_peak" -Value $deadLettersPeak -Unit "messages" -Basis "the largest dead-letter queue depth observed"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "dead_letter_end" -Value $deadLettersEnd -Unit "messages" -Basis "the dead-letter queue depth at the last sampler tick"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "accepted" -Value $counts.accepted -Unit "submissions" -Basis "contest_submission rows for the measured contest"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "unique_submissions" -Value $counts.uniqueSubmissions -Unit "submissions" -Basis "distinct submissions accepted for the measured contest"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "results" -Value $counts.results -Unit "rows" -Basis "contest_submission_result rows for the measured contest"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "scoreboard_applied" -Value $counts.scoreboardApplied -Unit "rows" -Basis "results whose scoreboard_applied_at is set"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "lost_or_incomplete" -Value $Verification.integrity.lostOrIncomplete -Unit "submissions" -Basis "accepted minus results"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "final_result_mismatch" -Value $Verification.integrity.finalResultMismatch -Unit "rows" -Basis "results minus scoreboard applied"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "duplicate_result_rows" -Value $duplicateResultRows -Unit "rows" -Basis "results minus unique submissions, an identity residual rather than a per-row finding"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "duplicate_scoreboard_applications" -Value $duplicateScoreboardApplications -Unit "rows" -Basis "scoreboard applied minus unique submissions, an identity residual rather than a per-row finding"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "judge_invocations" -Value $Verification.workCost.judgeInvocations -Unit "calls" -Basis "contest.judge.invocations; a lower bound on the killed node, complete on the survivor"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "stored_result_republishes" -Value $storedRepublishes -Unit "calls" -Basis "contest.judge.stored_result.republish, incremented only where a redelivered message found its result already committed"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "redelivery_rejudged_residual" -Value $redeliveryDecomposition.rejudgedResidual -Unit "messages" -Basis $redeliveryDecomposition.basis))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "integrity_passed" -Value $integrityPassed -Unit "bool" -Basis "accepted = unique = results = scoreboard applied, with an empty dead-letter queue"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "abnormal_container_restarts" -Value @($watchDoc.abnormalRestarts).Count -Unit "containers" -Basis "containers other than the killed node whose restart count rose above zero"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "oom_killed_containers" -Value @($watchDoc.oomKilledContainers).Count -Unit "containers" -Basis "containers docker reported with OOMKilled true at any tick"))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "artifacts_complete" -Value $artifactsComplete -Unit "bool" -Basis "every mandatory artifact present and carrying at least one data row, with the broker series bracketing the fault and the restart"))
+    foreach ($name in @($cohortTable.Keys)) {
+        $cohort = $cohortTable[$name]
+        if ($cohort.available -eq $false) {
+            $metrics.Add((New-RabbitSummaryMetric -Metric "cohort_$name`_available" -Value $false -Unit "bool" -Basis $cohort.unavailableReason))
+            continue
+        }
+        $metrics.Add((New-RabbitSummaryMetric -Metric "cohort_$name`_n" -Value $cohort.submissionCount -Unit "submissions" -Basis "submissions whose submit instant fell in this cohort's window"))
+        foreach ($metricName in @("L_result_ms", "L_scoreboard_ms", "L_total_ms")) {
+            foreach ($stat in @("p50", "p95", "p99", "max")) {
+                $metrics.Add((New-RabbitSummaryMetric -Metric "cohort_$name`_$metricName`_$stat" -Value $cohort.$metricName.$stat -Unit "ms" -Basis $cohort.estimator))
+            }
+        }
+        foreach ($latencyClass in @("fast", "slow")) {
+            $classDoc = $cohort.byLatencyClass[$latencyClass]
+            $metrics.Add((New-RabbitSummaryMetric -Metric "cohort_$name`_${latencyClass}_n" -Value $classDoc.submissionCount -Unit "submissions" -Basis "the deterministic latency class this run was configured with: 95% at 50ms and 5% at 2000ms, keyed on the code"))
+            if ($latencyClass -eq "fast") {
+                $metrics.Add((New-RabbitSummaryMetric -Metric "cohort_$name`_${latencyClass}_L_result_ms_p95" -Value $classDoc.L_result_ms.p95 -Unit "ms" -Basis "the key user-impact metric for the fault-down cohort: what a fast-class submission arriving while the node was down waited for its result"))
+                $metrics.Add((New-RabbitSummaryMetric -Metric "cohort_$name`_${latencyClass}_L_result_ms_p99" -Value $classDoc.L_result_ms.p99 -Unit "ms" -Basis "nearest-rank p99 over submission-level L_result_ms"))
+            }
+        }
+        $metrics.Add((New-RabbitSummaryMetric -Metric "cohort_$name`_over5s_ratio" -Value $cohort.over5sRatio -Unit "ratio" -Basis "share of the cohort whose L_total exceeded 5s"))
+        $metrics.Add((New-RabbitSummaryMetric -Metric "cohort_$name`_over10s_ratio" -Value $cohort.over10sRatio -Unit "ratio" -Basis "share of the cohort whose L_total exceeded 10s"))
+    }
+    $metrics.Add((New-RabbitSummaryMetric -Metric "single_node_sustainable_verdict" -Value $singleNode.verdict -Unit "verdict" -Basis $singleNode.basis))
+    $metrics.Add((New-RabbitSummaryMetric -Metric "fast_failover_verdict" -Value $fastFailover.verdict -Unit "verdict" -Basis $fastFailover.basis))
+
+    $document.verdicts.singleNodeSustainableCriteria = @($singleNode.criteria)
+    $document.verdicts.fastFailoverCriteria = @($fastFailover.criteria)
+    $document.verdicts.singleNodeSustainableFailedCriteria = @($singleNode.failedCriteria)
+    $document.verdicts.singleNodeSustainableUnavailableCriteria = @($singleNode.unavailableCriteria)
+    $document.verdicts.fastFailoverFailedCriteria = @($fastFailover.failedCriteria)
+    $document.verdicts.fastFailoverUnavailableCriteria = @($fastFailover.unavailableCriteria)
+    # The key user-impact metric is lifted out of the cohort table as well as left in it, because it is
+    # the one number a reader of this run is most likely to want without walking the table.
+    $document.summaryLine = [ordered]@{
+        offeredRpsOutageWindow = $offeredOutage.rps
+        nodeDownResultRps = $nodeDownRps.resultRps
+        preFaultResultRps = $FaultRecovery.preFault.resultRps
+        T_consumerDropSeconds = $recoveryTimes.T_consumerDropSeconds
+        T_firstRedeliverySeconds = $recoveryTimes.T_firstRedeliverySeconds
+        T_throughputRecoverySeconds = $FaultRecovery.throughput.ungatedSecondsAfterFault
+        backlogPeak = $peak.value
+        backlogPeakAt = if ($peak.available) { $peak.at.ToString("o") } else { $null }
+        T_backlogNormalizationSeconds = $FaultRecovery.recoveryTimes.T_backlogNormalizationSeconds
+        backlogNormalizedBeforeRestart = $normalizedBeforeRestart
+        singleNodeSustainable = $singleNode.verdict
+        fastFailover = $fastFailover.verdict
+        faultDownFastClassResultP95Ms = if ($null -ne $keyCohort -and $keyCohort.available) { $keyCohort.byLatencyClass.fast.L_result_ms.p95 } else { $null }
+        faultDownFastClassResultP99Ms = if ($null -ne $keyCohort -and $keyCohort.available) { $keyCohort.byLatencyClass.fast.L_result_ms.p99 } else { $null }
+        lostOrIncomplete = $Verification.integrity.lostOrIncomplete
+        duplicateResultRows = $duplicateResultRows
+        integrityPassed = $integrityPassed
+        deadLetterEnd = $deadLettersEnd
+        abnormalRestartCount = @($watchDoc.abnormalRestarts).Count
+        oomKilledContainerCount = @($watchDoc.oomKilledContainers).Count
+    }
+    $document | ConvertTo-Json -Depth 14 | Set-Content (Join-Path $RunPath "result-summary.json") -Encoding utf8
+    $metrics | Export-Csv (Join-Path $RunPath "result-summary.csv") -NoTypeInformation -Encoding utf8
+    Write-Host "Wrote result-summary.json and result-summary.csv to $RunPath"
+    return $document
 }
 
 # --- staircase helpers, used only when stages.json exists -----------------------------------------
@@ -2399,6 +3145,17 @@ if ($null -ne $faultRecovery) {
 }
 $summary | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $runPath "summary.json") -Encoding utf8
 
+# The rabbit fault run's own reading, and only its own. Section 11 asks for result-summary.json and
+# result-summary.csv in the run directory; section 12 says the existing mysql fault experiment must
+# not be disturbed, so this is written for the rabbit dispatch path alone and a mysql fault run keeps
+# exactly the artifacts it has always had.
+$rabbitFaultExport = $null
+$isRabbitFault = ($null -ne $faultRecovery -and [string]$parameters.dispatchMode -eq "rabbit")
+if ($isRabbitFault) {
+    $rabbitFaultExport = Export-RabbitFaultResultSummary -RunPath $runPath -Parameters $parameters `
+        -Events $events -Verification $verification -FaultRecovery $faultRecovery -Cohorts $cohorts
+}
+
 $isNormalTimeout = ($null -ne $staircase -and $staircase.mode -eq "normal-timeout")
 $isOpenBurst = ($null -ne $staircase -and $staircase.mode -eq "open-burst")
 $isFaultRecovery = ($null -ne $faultRecovery)
@@ -2866,9 +3623,16 @@ if ($null -ne $staircase) {
     $lines += @("", "Theory reference only, not a fitting target: $($knee.theoryReference.note)")
     }
 }
-$lines | Set-Content (Join-Path $runPath "summary.md") -Encoding utf8
-
-Write-Host "Wrote summary.json and summary.md to $runPath"
+# The request for this experiment says no Markdown report is to be written, so the rabbit fault run
+# does not get one: its narrative lives in result-summary.json's criterion-and-measurement pairs and
+# in result-summary.csv, where the request asked for it. Every other run - including the mysql fault
+# runs this branch must not disturb - still writes summary.md exactly as before.
+if ($isRabbitFault) {
+    Write-Host "Wrote summary.json, result-summary.json and result-summary.csv to $runPath (no summary.md: this experiment's request excludes a Markdown report)"
+} else {
+    $lines | Set-Content (Join-Path $runPath "summary.md") -Encoding utf8
+    Write-Host "Wrote summary.json and summary.md to $runPath"
+}
 
 # Without an explicit exit the script leaves $LASTEXITCODE unset, so a caller that reports the code
 # of a completed analysis gets an empty string instead of 0.
