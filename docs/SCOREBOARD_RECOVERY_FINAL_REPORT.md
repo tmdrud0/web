@@ -50,8 +50,11 @@
 
 이 표의 값을 적는 commit(`655838e`)이 그 자체로 diff를 하나 더 만든다 — 그 commit은 이 보고서 한
 파일만 바꾸므로 `b98c83f..655838e`는 `+67 / −21`이고, 최종 HEAD에서 다시 세면 2라운드는 60 files
-+5236/−476, 전체는 102 files +10725/−283이 된다(위 §1의 표가 그 값이다). 세 수치 모두 **보고서
-자신을 포함한다** — 그것이 1라운드의 "clean"이 틀렸던 바로 그 지점이다.
++5236/−476, 전체는 102 files +10725/−283이 된다(위 §1의 표가 그 값이다). §5.2·§8.2의 수치는 그래서
+`b98c83f` 기준으로 표기하고, 그 뒤에 오는 **보고서 문구만 고치는 commit들은 포함하지 않는다** —
+그 commit들은 코드·테스트를 바꾸지 않으므로 "무엇이 구현되었는가"의 수치가 아니라 "이 글을 몇 번
+고쳤는가"의 수치이기 때문이다. 세 수치 모두 **보고서 자신을 포함한다** — 그것이 1라운드의 "clean"이
+틀렸던 바로 그 지점이다.
 
 ## 2. 감사 결과 (요구 14항목: 이전 → 이번 작업 후)
 
@@ -145,7 +148,7 @@ checkpoint에서의 재구독**으로 구현하고(`recoverConsumption`이 롤�
   unit/MySQL, lifecycle, batch-failure Rabbit, requeue 실측 probe, 모드 기동 2종 등
 - **docs 2**: `ARCHITECTURE.md`, `PORTFOLIO_SCOREBOARD_RECOVERY.md`
 
-### 5.2 [정정] 2라운드 (`60d98ec..HEAD`) — 60 files, +5190 / −476
+### 5.2 [정정] 2라운드 (`60d98ec..b98c83f`) — 60 files, +5190 / −476
 
 - **main 신규 11**: `recovery/` 7 (`ContestScoreboardRecoveryStrategy`,
   `StreamOffsetRecoveryStrategy`, `FullReplayRecoveryStrategy`, `RedisSequenceRecoveryStrategy`,
