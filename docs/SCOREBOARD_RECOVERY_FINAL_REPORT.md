@@ -4,12 +4,15 @@
 폐기된 seq 설계와의 차이는 [`PORTFOLIO_SCOREBOARD_RECOVERY.md`](PORTFOLIO_SCOREBOARD_RECOVERY.md)를
 본다.
 
-**이 문서는 세 라운드로 이루어진다.** 1라운드(`0d36f26..60d98ec`)에서 세 모드를 구현했고, 그 결과에
+**이 문서는 네 라운드로 이루어진다.** 1라운드(`0d36f26..60d98ec`)에서 세 모드를 구현했고, 그 결과에
 대한 독립 검토(§9.1)가 **"세 모드가 실제로 분리되어 있지 않다"**는 지적을 포함해 14건을 냈다.
 2라운드(`60d98ec..b98c83f`, §14)에서 그 지적과 함께 나온 다섯 결함을 고쳤다. 3라운드(`b815378..`,
 §16)에서 **owner 설정이 실행 경계가 아니었던 것**, **busy recovery pass가 rollback 재시도를 잃던
-것**, **JVM cold start에서 모드가 격리되지 않던 것** 세 결함을 고쳤다. **라운드별 서술과 뒤에서
-정정된 서술을 구분해서 읽어야 한다** — 정정 대상은 각 절에 `[정정]`으로 표시했다.
+것**, **JVM cold start에서 모드가 격리되지 않던 것** 세 결함을 고쳤다. 4라운드(`54c990e..aa979d2`,
+§17)에서 **cutover 해제가 실패하면 consumer 시작이 영영 사라지던 것**과 **대기 중인 lifecycle이
+Spring 종료 경로에 닿지 못하던 것** 두 결함을 고치고, 그 diff에 대한 읽기 전용 검토(§17.6)의 지적
+중 이번 라운드가 만든 것만 반영했다. **라운드별 서술과 뒤에서 정정된 서술을 구분해서 읽어야 한다**
+— 정정 대상은 각 절에 `[정정]`으로 표시했다.
 
 3라운드가 왜 필요했는지는 §16.0에 한 문단으로 적었다: 앞의 두 라운드가 **rollback(Redis가 살아
 있고 JVM도 살아 있는 상태에서의 회귀)** 만 다루었고, **JVM cold start**(JVM이 다시 뜨는 경우)는
@@ -31,12 +34,15 @@ rollback 경로에 대한 판정이며, **cold start 경로는 그 판정의 범
 | 3라운드 기준 HEAD | `b815378` (기준 + 25 commit) — 3라운드 작업을 시작한 지점. 2라운드 문서 정정 commit 3건(`b6eff86`, `e8a5e8d`, `b815378`)의 마지막 |
 | 3라운드 결과 commit | `ba25145` (기준 + 26 commit) — 세 결함과 검토 지적 수정. 소스 28 files, `+2004 / −144`(그중 신규 4 files = 435 lines) |
 | 그 뒤 | 이 보고서·`ARCHITECTURE.md`의 문구·수치를 고치는 docs commit(§16.9) |
+| 4라운드 기준 HEAD | `54c990e` (기준 + 27 commit) — 4라운드 작업을 시작한 지점 |
+| 4라운드 결과 commit | `aa979d2` (기준 + 28 commit) — 두 결함과 검토 지적 수정. 소스 9 files, `+818 / −41`(그중 신규 1 file = 217 lines) |
+| 그 뒤 | 이 보고서·`ARCHITECTURE.md`의 4라운드 절을 채우는 docs commit(§17) |
 | 작업 트리 | **3라운드 작업이 커밋되기 전에는 dirty였다** — 커밋 후 `git status --short`가 비는지는 §16.9에 적었다 |
+| 원본 checkout | 건드리지 않음. `reset`/`clean`/강제 checkout 사용 안 함 |
 
 마지막 한 commit(`655838e`)은 이 절을 측정값으로 채우는 commit이다 — 즉 위 수치는 그 commit 자신을
 포함하고, `b98c83f..655838e`의 차이는 정확히 그 commit의 `+67 / −21`이다. 이것이 "clean 상태와 변경
 파일 수는 보고서를 커밋한 다음에만 다시 기록한다"를 만족시키는 방식이다.
-| 원본 checkout | 건드리지 않음. `reset`/`clean`/강제 checkout 사용 안 함 |
 
 공개 API 변경 없음. **신규 의존성 없음**(`build.gradle` 무변경).
 
@@ -881,16 +887,26 @@ JVM 수명 동안 영원히 다시 돌지 않을 수 있었고, **gate 획득 �
 | `RETRYABLE_FAILURE` | 시도했고 실패했다(창 소진, 예외, 부분 성공) | 기록하지 않음. 다음 주기에 재시도. `contest.scoreboard.stream.rollback.retry{outcome}` |
 | `UNRECOVERABLE` | 이 기준으로는 원리적으로 못 찾는다 | 기억해 hot loop를 막되 **ERROR 로그 + `rollback.unrecoverable` 지표**로 요란하다 |
 
-`handleRollback`은 `COVERED`일 때만 `true`(답했다)를 반환하고, `recoverConsumption`은 그 `true`일
-때만 쌍을 기록한다. 되감는 모드(`stream-offset`)는 재구독을 수행한 뒤 `true`를 반환한다 — 재구독이
-이 모드의 답이고 그것이 checkpoint를 움직이기 때문이다. `RETRYABLE_FAILURE`는 배치마다가 아니라
-**다음 주기마다** 한 번이다(지표로 세어진다). 예외는 `RETRYABLE_FAILURE`이므로 **나중 재시도
-가능성을 없애지 않는다.**
+`recoverConsumption`은 `handleRollback`이 `true`(답했다)를 반환할 때만 쌍을 기록한다. 그런데
+**`true`는 `COVERED`만이 아니다** — `true`가 나오는 경로는 셋이고, 셋의 "기록 이후"가 서로 다르다.
+
+| 경로 | `true`인가 | 쌍 기록 | `rebuiltThrough` 전진 | 근거 |
+|---|---|---|---|---|
+| `COVERED` | 예 | 함 | **함**(`markRebuiltThrough(appliedOffset)`) | 기준이 구간을 덮었다. 답이 완결됐으므로 다시 묻지 않는다 |
+| `UNRECOVERABLE` | **예** | 함 | **하지 않음** | 이 기준으로는 원리적으로 못 찾는다. 매 주기 같은 ERROR를 되풀이하는 hot loop를 막으려고 **답한 것으로만** 기억한다(ERROR 로그 + `rollback.unrecoverable`) |
+| `BUSY_RETRY_LATER` / `RETRYABLE_FAILURE` | **아니오** | 하지 않음 | 하지 않음 | 시도조차 못 했거나(다른 pass가 gate 점유) 시도가 실패했다. 다음 주기에 다시 묻는다(`rollback.retry{outcome}`) |
+
+되감는 모드(`stream-offset`)는 전략 분기에 들어가기 전에 재구독을 수행하고 `true`를 반환한다 —
+재구독이 이 모드의 답이고 그것이 checkpoint를 움직이기 때문이다. `RETRYABLE_FAILURE`는 배치마다가
+아니라 **다음 주기마다** 한 번이다(지표로 세어진다). 예외는 `RETRYABLE_FAILURE`이므로 **나중
+재시도 가능성을 없애지 않는다.**
 
 **"다음 주기에 실제로 다시 묻는가"의 근거**는 두 가지다. (a) 재시도 가능한 결과에서는 쌍이
 기록되지 않으므로 `recoverConsumption`의 조기 반환(`storedOffset == answered… &&
-appliedOffset == answered…`)이 성립하지 않는다. (b) 그 조기 반환은 `running`일 때만 도달하므로
-consumer가 살아 있는 한 주기마다 다시 묻는다. 새 stream 전달은 필요하지 않다 — 이 재시도는
+appliedOffset == answered…`)이 성립하지 않는다. (b) 그 조기 반환은 컨테이너가 실제로 떠 있을
+때만 도달하므로(`consuming` — 3라운드 당시의 필드명은 `running`이었다. 4라운드에서 대기 중인
+lifecycle을 "시작됨"으로 보고하기 위해 이름과 의미가 갈렸다, §17.2) consumer가 살아 있는 한 주기마다
+다시 묻는다. 새 stream 전달은 필요하지 않다 — 이 재시도는
 **트래픽에 의존하지 않는 트리거**다.
 
 **테스트.**
@@ -1039,7 +1055,7 @@ consumer를 켠 모든 역할에서 쓸 수 없게 되면서, scheduler 자신�
 | startup runner가 무조건 해제 | runner `nothingIsReleasedWhenTheReplayDidNotRun` | 1 |
 | startup runner가 해제를 보고하지 않음 | runner `theReplayReleasesTheHeldConsumerOnceItHasRun` | 1 |
 | 검증기의 consumer 조기 반환 제거(과잉 거부) | summary `allowsAStartupPassTurnedOffOnARoleThatDoesNotConsume` | 1 |
-| `handleRollback`의 재시도 분기가 `true` 반환 | lifecycle 2건 | 2 |
+| `handleRollback`의 재시도 분기(`BUSY_RETRY_LATER`·`RETRYABLE_FAILURE`)가 `true` 반환 | lifecycle 2건 | 2 |
 | 전략의 `orElse(BUSY_RETRY_LATER)` → `orElse(COVERED)` | strategy `aRangeAnotherPassIsAlreadyRebuildingIsNotReportedRebuilt` | 1 |
 | 전략의 예외 분기 → `COVERED` | strategy `anAttemptThatThrewIsRetriedRatherThanRemembered` | 1 |
 | **대기 해제를 pass의 반환 여부로 되돌림**(`coveredTheWholeSet()` → `true`) | scheduler `aCheckThatDidNotCoverTheHistoryDoesNotReleaseTheHeldConsumer`, `aPassThatRanOutOfRoundsDoesNotReleaseTheHeldConsumer` | 2 |
@@ -1166,7 +1182,7 @@ scheduler의 cutover — 이 모든 호출 지점에 반영됐는지는 컴파�
 | 질문 | 판정 | 근거 |
 |---|---|---|
 | ① `owner.enabled=false`가 트리거를 실제로 제거하는가 | **제거 자체는 clean** | 조건과 record가 같은 `Environment`를 같은 기본값(`true`)으로 읽어 **owner 축에는 표기 불일치가 없다**(`DefaultConversionService`·`ApplicationConversionService`가 `yes`/`on`/`1`을 모두 true로 변환하는 것을 jshell로 확인). 트리거 셋 모두에 조건이 붙어 있고, `src/main/java` 어디에도 세 클래스를 등록하는 두 번째 경로(`@Bean`·`@Import`·`@ComponentScan`)가 없다. **공용 full replay 서비스는 조건 없이 남아 있고**, retention-gap fallback(`ContestScoreboardStreamRecoveryService` → `replayAllContests()`)이 그대로 도달한다. owner=false + consumer on은 validator가 기동에서 거부하며, validator는 `SmartInitializingSingleton`이라 `finishRefresh`(lifecycle 시작) **이전**에 실패한다 — 즉 supervisor pass를 조건이 제거할 수 없다는 사실이 이 규칙 위에 서 있다 |
-| ② busy 상태가 rollback 재시도를 잃는가 | **잃지 않는다(수정은 구조적으로 건전)** | 쌍은 `handleRollback`이 true를 반환할 때만 기록되고, true가 아닌 두 outcome(`BUSY_RETRY_LATER`·`RETRYABLE_FAILURE`)에서는 기록되지 않으며 그 쌍을 지우는 조기 반환이 없다. 전략 둘 다 `RuntimeException`을 `RETRYABLE_FAILURE`로 바꾸고, gate는 `finally`에서 해제된다. 재시도는 `offsetCheckInterval`(기본 1s)마다 트래픽 없이 다시 묻는다. gate 점유와 실제 실패는 서로 다른 tag(`busy-retry-later`/`retryable-failure`)로 구분된다. `UNRECOVERABLE`은 관측 쌍당 1회로 기억돼 hot-loop이 되지 않는다 |
+| ② busy 상태가 rollback 재시도를 잃는가 | **잃지 않는다(수정은 구조적으로 건전)** | 쌍은 `handleRollback`이 true를 반환할 때만 기록된다. true는 `COVERED`·`UNRECOVERABLE`·되감기 셋에서 나오므로, 재시도를 잃는지를 정하는 것은 **답하지 않는 쪽**이다 — true가 아닌 두 outcome(`BUSY_RETRY_LATER`·`RETRYABLE_FAILURE`)에서는 기록되지 않으며 그 쌍을 지우는 조기 반환이 없다. `UNRECOVERABLE`은 답으로 기억되지만 `rebuiltThrough`를 전진시키지 않으므로 checkpoint가 미적용 구간을 넘어가지 않고, 관측 쌍당 1회로만 기억돼 hot-loop이 되지 않는다(ERROR + `rollback.unrecoverable`). 전략 둘 다 `RuntimeException`을 `RETRYABLE_FAILURE`로 바꾸고, gate는 `finally`에서 해제된다. 재시도는 `offsetCheckInterval`(기본 1s)마다 트래픽 없이 다시 묻는다. gate 점유와 실제 실패는 서로 다른 tag(`busy-retry-later`/`retryable-failure`)로 구분된다 |
 | ③ cold start에서 non-stream 모드가 Stream 복구와 섞이는가 | **대기 자체는 건전, 해제 기준에 결함(F4)** | 모든 시작 경로가 `startAt`을 지나고 `container.setAutoStartup(false)`이므로 Spring이 대신 시작하지 않는다. `markCovered`는 대기 목록을 monitor 밖에서 실행하고, 등록/해제 경합이 닫혀 있으며, lock 순서 역전이 없다. 종료 중 해제는 `stopping`으로 막힌다. 재개 offset은 저장 checkpoint 포함 지점 그대로(`next`/tail 아님)이고 pass는 offset을 쓰지 않는다 |
 
 **지적 6건과 처리.**
@@ -1214,3 +1230,180 @@ scheduler의 cutover — 이 모든 호출 지점에 반영됐는지는 컴파�
 추정하지도 않았다. RDB 스냅샷 rollback 자체, stream replication/failover, 운영 프로파일 실배포
 기동, 다중 인스턴스 실배포는 여전히 미검증이다. MySQL·Redis·Rabbit 실물 통합 테스트는 실행하지
 않았으며 그 사유는 §16.7에 적었다.
+
+## 17. 4라운드 (`54c990e..`) — cutover 해제와 held 상태의 두 결함
+
+3라운드가 커밋된 뒤(`54c990e`) 같은 구현을 다시 읽어 찾은 **두 결함만** 고쳤다. 세 모드의 의미,
+저장 checkpoint의 **포함** 재개 규칙, 이전 라운드의 결정은 건드리지 않았다. 성능 실험·분산 실행권·
+F6 잔여 위험·무관한 리팩터는 이번 라운드에도 범위가 아니다.
+
+### 17.1 결함 1 — 해제가 실패하면 consumer 시작이 영영 사라진다
+
+**원인.** `ContestScoreboardRecoveryCutover.markCovered`가 "역사를 덮었다"와 "기다리던 동작을
+실행했다"를 **한 상태로** 다뤘다: `covered = true`를 쓰면서 **같은 순간에 대기 목록을 비웠고**, 그
+뒤에 콜백을 돌렸다. 그래서 콜백이 던지면 — `ContestScoreboardStreamLifecycle.startAfterHistoryRecovery`
+의 `repairPending()`, checkpoint 읽기, `container.start()` 중 어느 것이 실패해도 — 그 동작은 **목록에
+도 없고 실행되지도 않은** 상태가 된다. 이후의 모든 보고는 이미 켜진 coverage 플래그에서 조기
+반환하므로, redis-seq의 주기 check이든 retention-gap fallback의 replay든 **다시 시도하지 않는다.**
+consumer는 JVM 수명 동안 내려간 채 남고, 로그에는 "역사를 덮었다"만 남는다.
+
+**수정 — 두 상태로 분리.** coverage는 한 번 쓰이는 사실이고 되돌려지지 않지만, 대기 목록에서
+빠지는 조건은 **성공**이다.
+
+- `release(actions, coveredBy)`가 monitor **밖에서** 실행된다(기존 동시성 보장 유지 — 콜백이 도는
+  동안 다른 스레드의 등록/보고가 막히지 않는다). 성공한 것만 목록에서 빼고, 실패한 것은 남긴다.
+  여러 개가 실패하면 첫 실패를 던지고 나머지는 `addSuppressed`로 묶는다 — **한 동작의 실패가 다른
+  대기를 막지 않는다**(대기는 consumer 하나당 하나다).
+- 실패는 **삼키지 않는다.** `markCovered`는 호출자(pass)에게 예외를 던진다. 삼키면 "역사를
+  덮었다"고 보고하면서 아무것도 시작하지 못한 pass가 조용해진다.
+- **재시도 트리거가 실재한다.** redis-seq에서는 역사를 덮는 **주기 check이 매번 경계를 보고**하므로
+  일시적 실패 뒤 한 주기 뒤에 다시 시도된다. `ContestScoreboardRedisSequenceScheduler.runCheck`는
+  release 실패를 catch해 ERROR로 남긴다 — fixed-delay task가 예외로 취소되면 그 모드의 check 자체가
+  사라지기 때문이다. `ContestScoreboardFullReplayStartupRunner`는 반대로 예외를 그대로 던져 **기동을
+  실패**시킨다(아무것도 소비하지 않으면서 복구했다고 기록된 JVM을 만들지 않는다).
+
+### 17.2 결함 2 — held 상태와 Spring context 종료의 경합
+
+**원인.** 비-stream 모드(`full-replay`·`redis-seq`)에서 `lifecycle.start()`는 consumer를 대기시키고
+`running=false`로 **반환**했다. Spring 6.2.3 `DefaultLifecycleProcessor.doStop`은
+`if (bean.isRunning())` **아래에서만** `smartLifecycle.stop(callback)`을 부르므로(소스 확인:
+`stopBeans()`는 모든 `Lifecycle` 빈을 phase 그룹에 넣지만 stop은 그 조건에서만 부른다), 대기 중인
+lifecycle은 **stop되지 않고** context가 닫힌다. 그 결과 `stopping` 플래그가 서지 않고, 늦게 끝난
+복구 pass의 해제가 **닫히는 context에 `container.start()`를 호출**한다.
+
+**수정 — 두 상태로 분리.**
+
+| 필드 | 뜻 | 누가 읽는가 |
+|---|---|---|
+| `started` | Spring이 start했고 stop하지 않았다 | `isRunning()`. **종료 경로가 이 값을 본다** |
+| `consuming` | listener container가 실제로 떠 있다 | supervisor guard(`consuming()`), 재시작 경로 |
+| `stopping` | context가 내려가는 중이다 | 해제 경로(늦은 시작 차단) |
+
+`stop()`/`stop(Runnable)`은 `started=false`를 **컨테이너를 만지기 전에, 그리고 consuming이 아니어도**
+세운다 — 대기 중인 consumer야말로 이 플래그가 가장 필요한 대상이다. `stop(Runnable)`은 두 경로 모두
+callback을 정확히 한 번 완료한다. 대기 중 시작이 실패하면 `consuming`은 false로 남아 cutover가 그
+동작을 계속 보관한다. supervisor는 `isRunning()`이 아니라 `consuming()`을 본다 — 대기 중인 consumer에게
+재구독할 것도 재읽을 batch도 없다(§16.8 검토 ③이 이미 지적한 방향이다).
+
+### 17.3 추가·수정한 테스트
+
+| 고정하는 것 | 테스트 |
+|---|---|
+| 실패한 해제가 다음 보고에서 **재시도되고 성공**한다 | `ContestScoreboardRecoveryCutoverTests.aDeferredActionThatFailedIsRetriedWhenTheBoundaryIsReportedAgain` |
+| 실패한 동작이 대기 목록에서 **사라지지 않는다** | 같은 테스트의 `awaiting() == 1` 단언 |
+| **성공한** 동작은 이후 보고에서 다시 돌지 않는다 | `….aDeferredActionThatSucceededIsNotRunAgainByALaterReport` |
+| 한 동작의 실패가 다른 대기를 막지 않는다 | `….aFailedActionDoesNotKeepAnotherWaiting` |
+| 콜백 실행 중 lock을 쥐고 있지 않다 | `….theBoundaryIsNotHeldWhileADeferredActionRuns`(다른 스레드에서 `isCovered()`가 5초 안에 답한다) |
+| redis-seq 주기 check이 release 실패를 **재시도**한다 | `ContestScoreboardRedisSequenceSchedulerTests.aCoveringCheckWhoseConsumerCouldNotStartRetriesOnTheNextPeriod` |
+| 기동 runner가 그 실패를 **삼키지 않고** 대기도 유지한다 | `ContestScoreboardFullReplayStartupRunnerTests.aConsumerThatCouldNotBeStartedFailsTheStartupAndStaysWaiting` |
+| 종료 뒤 해제는 container를 **시작하지 않는다**(실제 Spring 경로) | `ContestScoreboardStreamLifecycleContextTests.aConsumerReleasedAfterTheContextHasClosedIsNotStarted` |
+| 정상 해제는 **정확히 한 번** 시작하고 종료가 stop한다 | `….aConsumerReleasedBeforeTheCloseStartsOnceAndIsStoppedWithTheContext` |
+| 대기 중 `isRunning()`은 true, `consuming()`은 false | `ContestScoreboardStreamLifecycleTests.aModeThatRebuildsHistoryFromItsOwnBasisConsumesNothingUntilItsPassHasRun`(§16.5 이후 갱신) |
+| 대기 중 supervisor는 시작·재구독하지 않는다 | `….theSupervisorDoesNotStartAHeldConsumer`(같은 두 상태 단언 추가) |
+| stop 뒤 재시작도 다시 대기한다 | `….aRestartAfterAStopIsHeldAgain`(신규) |
+| `start()`가 돌아왔다고 consumer가 떴다고 보지 않는다 | `….aStartThatLeftNoConsumerIsNotTakenForAStartedConsumer`(신규, §17.6) |
+| 재시작이 실패하면 그 batch를 다시 묻는다 | `….aFailedBatchIsAskedAboutAgainWhenTheResubscribeCouldNotStart`(신규, §17.6) |
+| 동시에 온 두 번째 보고가 같은 동작을 다시 돌리지 않는다 | `….aSecondReportDoesNotRunWhatTheFirstIsAlreadyRunning`(신규, §17.6) |
+
+`ContestScoreboardStreamLifecycleContextTests`는 **실제 `SpringApplication`** 을 띄우고 실제로
+`context.close()`를 부른다 — 이 클래스가 `lifecycle.stop()`을 직접 부르면 결함 2를 되살려도 초록이
+되므로, 그 방법을 쓰지 않았다(작업 지시가 금지한 바로 그 회피다). 컨테이너만 mock이고 그
+`stop(Runnable)`은 실제 컨테이너처럼 callback을 완료한다.
+
+### 17.4 실행 결과와 판별력 실측
+
+```
+.\gradlew.bat test --offline  --tests <명시적 19개 클래스>
+  → BUILD SUCCESSFUL, 19 classes, 155 tests, failures 0, errors 0, skipped 0
+```
+
+3라운드와 같은 목록에 신규 `ContestScoreboardStreamLifecycleContextTests`(+2)를 더했고, cutover
++4 · scheduler +1 · runner +1 · lifecycle +1로 **143 → 152**(+9)다. 그 뒤 §17.6의 검토 수정이
+세 건(cutover +1 · lifecycle +2)을 더해 **최종 155**다. 실행 뒤 JUnit XML 전체에
+`HikariPool|jdbc:mysql|Flyway`가 없음을 확인했다 — **DB 활동 0건**(연결을 열지 않았다).
+
+**수정 전 실측**(요구: 수정 전 실패, 수정 후 통과). 두 결함에 대응하는 테스트만 추려 실행해
+**10건 중 3건 실패**를 확인했다 — `aDeferredActionThatFailedIsRetriedWhenTheBoundaryIsReportedAgain`
+(`AtomicInteger(1)`을 기대값 2와 비교), `aFailedActionDoesNotKeepAnotherWaiting`(`["first"]`만 실행,
+`"third"` 누락), `aConsumerReleasedAfterTheContextHasClosedIsNotStarted`(`NeverWantedButInvoked:
+simpleMessageListenerContainer.start()` — **종료 뒤에 실제로 start가 호출됐다**).
+
+**되돌림 실측**(각 수정이 정말 그 테스트를 잡고 있는지). 모두 **확정된 코드**에서 다시 측정했고,
+매 회차는 5개 클래스 **54건**이다.
+
+| 되돌린 것 | 실패한 테스트 | 개수 |
+|---|---|---|
+| `isRunning()`이 다시 "컨테이너가 떠 있는가"를 답하게 | context `aConsumerReleasedAfterTheContextHasClosedIsNotStarted` + lifecycle 두 상태 단언 2건 | 3 |
+| 실패한 동작을 대기 목록에 **되돌려 놓지 않게** | cutover `aDeferredActionThatFailed…`, runner `aConsumerThatCouldNotBeStarted…`, scheduler `aCoveringCheckWhoseConsumerCouldNotStart…`, lifecycle `aStartThatLeftNoConsumer…` | 4 |
+| `start()`가 돌아왔다는 이유로 consumer가 떴다고 보게(`getActiveConsumerCount()` 검사 제거) | lifecycle `aStartThatLeftNoConsumerIsNotTakenForAStartedConsumer`, `….aFailedBatchIsAskedAboutAgainWhenTheResubscribeCouldNotStart` | 2 |
+| 재구독 재시작 **전에** batch를 handled로 기록하게 | lifecycle `aFailedBatchIsAskedAboutAgainWhenTheResubscribeCouldNotStart` | 1 |
+| 대기 목록을 lock 안에서 **비우지 않게** | cutover `aSecondReportDoesNotRunWhatTheFirstIsAlreadyRunning` | 1 |
+
+각 실측은 **그 수정에 대응하는 테스트에만** 국한됐고, 같은 실행에 포함된 나머지 52·50건은
+통과했다. 되돌린 파일은 저장소 밖 사본(`AppData\Local\Temp\scoreboard-round4\backup2\`)에서
+원복했고, 원복 뒤 19클래스 전체를 다시 초록으로 확인했다. 되돌림 패치는 모두 `MEASUREMENT ONLY`
+표식을 달았고 작업 트리에는 남기지 않았다.
+
+### 17.5 실행하지 않은 검증
+
+- **MySQL·Redis·Rabbit 실물 통합 테스트는 이번에도 실행하지 않았다.** 사유는 §16.7과 같다 —
+  검증에 쓸 수 있는 안전한 MySQL 환경이 없다(`oj-test-mysql`은 침해된 컨테이너이고 `localhost:3306`
+  도 같은 대상이다). **"보안상 실행 중단"** 이며 skip으로 세지 않았다. 따라서 실물 브로커로의 종료
+  경합, 실물 Redis rollback 주입, 실물 batch 중간 실패는 **여전히 미검증**이다.
+- 성능·복구 시간·전략 우위는 측정하지 않았고 추정하지 않았다. RDB 스냅샷 fault injection과 장시간
+  부하 테스트도 범위 밖이다.
+- [정정] **이번 라운드 중 한 번, 검증 제한을 위반한 실행이 있었다.** 넓은 wildcard 필터
+  (`my.oj.web.contest.scoreboard.recovery.*` + `…stream.*`)로 돌린 회차에서
+  `ContestScoreboardRecoveryModeStartupTests`(1건)와
+  `ContestScoreboardSequenceRecoveryMySqlIntegrationTests`(4건)가 **침해된 `oj-test-mysql`에
+  Hikari/Flyway 연결을 열었다**(5건 모두 통과, 11개 Redis/Rabbit 클래스는 skip되어 연결하지 않았다).
+  즉시 명시적 19클래스 목록으로 전환하고 XML 검사로 DB 활동 0을 확인했지만, **그 5건의 통과는 이
+  보고서의 어떤 근거로도 쓰지 않는다.** 이 문단이 그 실행의 유일한 기록이다.
+
+### 17.6 독립 검토 결과 (읽기 전용)
+
+두 결함을 고친 뒤 **별도 에이전트에게 이번 라운드의 diff를 읽기 전용으로 검토**시켰다. 지적을
+그대로 받지 않고 spring-rabbit 3.2.3과 Spring 6.2.3 소스에서 먼저 확인한 뒤, **이번 라운드가 만든
+것에 속하는 지적은 고치고 나머지는 보고만 했다**(작업 지시: 범위를 넓혀 수정하지 않는다).
+
+**소스로 확인한 핵심 사실 — `start()`가 돌아왔다고 consume하는 것이 아니다.**
+`AbstractMessageListenerContainer.start()`(3.2.3, 1397행)는 `isRunning()` 조기 반환 뒤 `doStart()`를
+`catch (Exception)`으로 감싸 `convertRabbitAccessException`으로 던질 뿐 `setNotRunning()`을 부르지
+않는다. `SimpleMessageListenerContainer.doStart()`(570행)는 `super.doStart()`로 `active=true;
+running=true`를 **먼저** 세우고 그 뒤 `initializeConsumers()`(581행)와 `waitForConsumersToStart()`
+(603행, `AmqpIllegalStateException("Fatal exception on listener startup")`)를 부른다. 따라서 **반쯤
+실패한 start는 `isRunning()==true`인데 소비자는 0건**이다. 그래서 `consuming`은 `start()`가
+예외 없이 돌아왔다는 사실이 아니라 **살아 있는 consumer 수**(`getActiveConsumerCount() <= 0`이면
+실패로 취급)로 정한다. 이 검사는 "이미 떠 있는 컨테이너에 대한 start"도 정상으로 통과시키므로,
+`DefaultLifecycleProcessor`가 context 재시작에서 stop했던 빈을 다시 start하는 경우
+(`stoppedBeans`)에 잘못 걸리지 않는다.
+
+**이번 라운드에서 고친 지적.**
+
+| 지적 | 수정 |
+|---|---|
+| `start()` 반환 = 시작됨으로 오판 → 소비자 없는 "실행 중" 상태 | `startAt`이 `getActiveConsumerCount()`로 확인, 0이면 `IllegalStateException`으로 실패 처리 |
+| 재구독 재시작 **전에** batch를 handled로 기록 → 재시도 1회 유실 | `handledFailures = failures`를 재시작 **성공 뒤로** 이동(`startAt`이 던지면 다음 주기가 다시 재시작) |
+| 동시에 온 두 번째 보고가 같은 동작을 다시 실행 | 대기 목록을 lock 안에서 **한 번에 take & clear**(`release()`가 실패분만 되돌린다) |
+| `Error`가 loop를 빠져나가면 미실행 동작이 사라지거나 성공분이 다시 실행됨 | 되돌림 장부를 `finally`로 이동 |
+| 내가 쓴 잘못된 서술 — full-replay runner "나중 보고에도 재시도할 것이 남는다" | 실제대로 정정: 그 모드에서는 **이 runner가 유일한 보고자**이고 재시도는 기동 재실행이다(§17.1) |
+| 테스트 위생 — latch 대기 테스트의 executor 누수, mock에 없는 `getActiveConsumerCount()` 스텁, context 테스트가 **재현하지 못하는 것**에 대한 서술 부재 | 각각 수정(executor는 `finally`에서 `shutdownNow()`, mock 스텁과 한계 서술을 주석·javadoc에 명시) |
+
+**고치지 않고 보고만 하는 지적.**
+
+1. **`consuming`은 창(window)에서 실제와 어긋난다.** 컨테이너가 실제로 떠 있는 순간과 이 필드가
+   서는 순간, 그리고 stop 뒤 필드가 내려가는 순간 사이에 supervisor가 다른 스레드에서
+   `consuming()==false`를 읽을 수 있다. "무엇이 소비 중인가"의 권위는 컨테이너의
+   `getActiveConsumerCount()`이고 이 필드는 근사다. 이번 라운드의 트리거(해제는 `markCovered`가,
+   대기는 `start()`가 같은 스레드에서 수행)로는 재현되지 않지만 **구조적으로 남아 있다.**
+2. **scheduler는 `RuntimeException`만 catch한다.** release가 `Error`를 던지면 fixed-delay task가
+   취소되어 그 모드의 주기 check 자체가 사라진다 — §17.1에서 일부러 `RuntimeException`만 잡은
+   것과 같은 모양의 구멍이다. `Error`는 일시적 브로커 장애의 신호가 아니므로 의도적으로 그대로
+   두었다.
+3. **종료 순서 창(기존 동작).** spring-rabbit의 `stop(Runnable)`은 실제 컨테이너에서 대기를 task
+   executor에 넘기고(`shutdownAndWaitOrCallback`) consumer가 내려가기 전에 돌아올 수 있다. 즉
+   `consuming=false`가 브로커 연결 해제보다 먼저 서고, context close가 끝나도 consumer가 아직
+   내려가는 중일 수 있다. **이번 라운드가 만든 것이 아니라 spring-rabbit의 기존 동작**이며 고치지
+   않았다. `ContestScoreboardStreamLifecycleContextTests`의 javadoc이 mock이 이 순서를 재현하지
+   않는다는 사실을 적어 둔다 — 그 테스트의 `verify(container).stop(...)`은 "종료가 이 lifecycle에
+   도달했다"를 고정할 뿐 "실물 컨테이너가 내려갔다"를 고정하지 않는다.

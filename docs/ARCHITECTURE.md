@@ -192,6 +192,29 @@ pass가 없으므로 대상이 아니다.
 consumer가 시작되어도 아무것도 적용하지 못한다. 대기는 장애가 풀리는 즉시, 그리고 어느 trigger든
 pass가 끝까지 가는 즉시 해제된다.
 
+**해제가 실패하면 대기는 사라지지 않는다 (4라운드).** `markCovered`는 "역사가 덮였다"와 "기다리던
+동작이 성공했다"를 **다른 사실로** 다룬다. 덮인 것은 한 번 쓰이는 사실이고 되돌려지지 않지만, 대기
+목록에서 빠지는 조건은 **성공**이다 — 해제가 던지면(브로커 미도달, checkpoint 읽기 실패) 그 동작은
+목록에 남고 예외는 pass로 그대로 던져진다. 그 예외를 삼키면 "역사를 덮었다"고 보고하면서 아무것도
+시작하지 못한 pass가 조용해진다. 다음 보고가 곧 재시도다: redis-seq에서는 덮는 주기 check이 매번
+경계를 보고하므로 한 주기 뒤에 다시 시도된다.
+
+**대기 중인 lifecycle은 "시작됨"으로 보고된다 (4라운드).** `isRunning()`은 "Spring이 start했고
+stop하지 않았다"를 뜻하고, 컨테이너가 실제로 떠 있는지는 별도 상태(`consuming()`)다. 둘이 갈라지는
+지점이 바로 대기이며, 그 이유는 Spring 6.2.3 `DefaultLifecycleProcessor.doStop`이
+`bean.isRunning()`일 때만 stop을 호출하기 때문이다(`stopBeans`는 모든 `Lifecycle` 빈을 phase 그룹에
+넣지만, stop은 그 조건 아래에서만 부른다) — 대기 중 `isRunning()==false`로 보고하면 context 종료가
+이 빈을 **stop하지 않고** 지나가고, 늦게 끝난 pass의 해제가 닫히는 context에 listener container를
+시작시킨다. 그래서 supervisor의 재구독·판정 guard도 `isRunning()`이 아니라 `consuming()`을 본다 —
+대기 중인 consumer에게 재구독할 것은 없다.
+
+그 상태는 **`start()`가 예외 없이 돌아왔다는 뜻이 아니다.** Spring AMQP 3.2.3의
+`AbstractMessageListenerContainer.start()`는 `doStart()`가 던진 예외를 감싸 던질 뿐 running 플래그를
+지우지 않고, `SimpleMessageListenerContainer.doStart()`는 `super.doStart()`로 그 플래그를 **consumer를
+세우기 전에** 세운다(`initializeConsumers()`·`waitForConsumersToStart()`보다 먼저). 그래서 반쯤 실패한
+start는 `isRunning()==true`인데 소비자가 0건이다. `consuming`은 컨테이너에 **살아 있는 consumer 수**를
+물어 0이면 실패로 처리한 뒤에만 선다 — 누구든 그 start를 요청한 쪽은 계속 기다렸다가 다시 요청한다.
+
 #### 모드에게 주는 질문은 구간이다 — 그리고 그 구간은 양끝으로 말한다
 
 `rebuildHistory`에 넘기는 것은 checkpoint 한 점이 아니라 **잃어버린 구간**(`LostRange`)이다.
