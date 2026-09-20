@@ -28,12 +28,10 @@ public class ContestScoreboardStreamMetrics {
     private volatile Counter failures;
     private volatile Counter offsetGaps;
     private volatile Counter rollbackRestarts;
+    private volatile Counter failureRestarts;
     private volatile Counter tailProbeFailures;
 
-    public ContestScoreboardStreamMetrics(
-            MeterRegistry registry,
-            ContestScoreboardStreamConsumerProperties properties
-    ) {
+    public ContestScoreboardStreamMetrics(MeterRegistry registry) {
         bindTo(registry);
     }
 
@@ -54,13 +52,16 @@ public class ContestScoreboardStreamMetrics {
                 .description("Judged results applied to the scoreboard from RabbitMQ Stream")
                 .register(registry);
         this.failures = Counter.builder("contest.scoreboard.stream.failures")
-                .description("Stream batches left unacknowledged for retry")
+                .description("Stream batches that failed and were left unapplied")
                 .register(registry);
         this.offsetGaps = Counter.builder("contest.scoreboard.stream.offset.gaps")
                 .description("Requested offsets that were outside retained stream history")
                 .register(registry);
         this.rollbackRestarts = Counter.builder("contest.scoreboard.stream.rollback.restarts")
                 .description("Consumer restarts after the Redis offset rolled back")
+                .register(registry);
+        this.failureRestarts = Counter.builder("contest.scoreboard.stream.failure.restarts")
+                .description("Consumer restarts to re-read a failed stream batch the broker does not redeliver")
                 .register(registry);
         this.tailProbeFailures = Counter.builder("contest.scoreboard.stream.tail.probe.failures")
                 .description("AMQP 0.9.1 probes that failed to observe the latest stream offset")
@@ -108,6 +109,10 @@ public class ContestScoreboardStreamMetrics {
 
     void recordRollbackRestart() {
         rollbackRestarts.increment();
+    }
+
+    void recordFailureRestart() {
+        failureRestarts.increment();
     }
 
     void recordTailProbeFailure() {

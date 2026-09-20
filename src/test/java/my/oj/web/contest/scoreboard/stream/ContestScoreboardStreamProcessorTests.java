@@ -12,7 +12,6 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 
@@ -40,8 +39,7 @@ class ContestScoreboardStreamProcessorTests {
     @BeforeEach
     void setUp() {
         registry = new SimpleMeterRegistry();
-        ContestScoreboardStreamConsumerProperties properties = properties();
-        metrics = new ContestScoreboardStreamMetrics(registry, properties);
+        metrics = new ContestScoreboardStreamMetrics(registry);
         metrics.initializeOffset(4L);
         processor = new ContestScoreboardStreamProcessor(
                 applier,
@@ -71,10 +69,16 @@ class ContestScoreboardStreamProcessorTests {
         assertThat(registry.get("contest.scoreboard.applied").counter().count()).isEqualTo(2.0);
     }
 
+    /**
+     * The gap is bridged only because the recovery ran. The recovery's answer is what decides that,
+     * not the gap's own arithmetic - with the fallback switched off the same offsets must leave the
+     * batch unapplied, which is the next test.
+     */
     @Test
     void retentionGapRebuildsBeforeOnlyTheFirstRetainedOffsetMayBridgeGap() {
         when(applier.currentStreamOffset()).thenReturn(4L, 11L);
         when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(recoveryService.recoverRetentionGap(5L, 10L)).thenReturn(true);
 
         processor.process(List.of(event(10L, 110L), event(11L, 111L)));
 
@@ -83,6 +87,29 @@ class ContestScoreboardStreamProcessorTests {
         verify(applier).applyAll(requests.capture());
         assertThat(requests.getValue()).extracting(ContestScoreboardApplier.ApplyRequest::allowOffsetGap)
                 .containsExactly(true, false);
+    }
+
+    /**
+     * A retention gap the recovery declined to bridge - {@code retention-gap-fallback=none} - must
+     * not move the checkpoint. No event is allowed to declare the gap bridged, so the apply the
+     * processor sends fails the script's continuity check and the batch stays unapplied.
+     */
+    @Test
+    void anUnbridgedRetentionGapLeavesTheBatchUnapplied() {
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        when(applier.applyAll(anyList())).thenReturn(List.of(
+                ContestScoreboardApplier.ApplyResult.failure(10L, "stream offset 10 is not 5")
+        ));
+        when(recoveryService.recoverRetentionGap(5L, 10L)).thenReturn(false);
+
+        assertThatThrownBy(() -> processor.process(List.of(event(10L, 110L), event(11L, 111L))))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("stream offset 10 is not 5");
+
+        ArgumentCaptor<List<ContestScoreboardApplier.ApplyRequest>> requests = requestsCaptor();
+        verify(applier).applyAll(requests.capture());
+        assertThat(requests.getValue()).noneMatch(ContestScoreboardApplier.ApplyRequest::allowOffsetGap);
+        verify(completion, never()).complete(anyList());
     }
 
     @Test
@@ -133,12 +160,6 @@ class ContestScoreboardStreamProcessorTests {
                 now,
                 SubmissionResult.ACCEPTED
         ));
-    }
-
-    private static ContestScoreboardStreamConsumerProperties properties() {
-        return new ContestScoreboardStreamConsumerProperties(
-                500, 500, Duration.ofMillis(50), Duration.ofNanos(1), Duration.ofSeconds(1),
-                Duration.ofSeconds(5), Duration.ofMillis(50), Duration.ofSeconds(2), 4096);
     }
 
     @SuppressWarnings("unchecked")

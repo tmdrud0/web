@@ -8,7 +8,6 @@ import my.oj.web.contest.submission.queue.ContestSubmissionBulkMetrics;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRedisSequenceMetrics;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplyMetrics;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardWrongAttemptMetrics;
-import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamConsumerProperties;
 import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamMetrics;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -21,7 +20,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -177,12 +175,7 @@ class PipelineMetricNamesTests {
         new RedisContestScoreboardWrongAttemptMetrics(mock(
                 my.oj.web.contest.scoreboard.redis.ContestRedisKeyValueClient.class))
                 .bindTo(registry);
-        new ContestScoreboardStreamMetrics(
-                registry,
-                new ContestScoreboardStreamConsumerProperties(
-                        500, 500, Duration.ofMillis(50), Duration.ofSeconds(1), Duration.ofSeconds(1),
-                        Duration.ofSeconds(5), Duration.ofMillis(50), Duration.ofSeconds(2), 4096)
-        );
+        new ContestScoreboardStreamMetrics(registry);
 
         // The redis-seq mode's meters register only in that mode, but an operator comparing the three
         // recovery strategies will query them - so the names the dashboard would use have to be the

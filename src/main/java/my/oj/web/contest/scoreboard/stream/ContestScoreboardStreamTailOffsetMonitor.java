@@ -6,7 +6,6 @@ import my.oj.web.contest.submission.messaging.ContestJudgeRabbitTopology;
 import org.springframework.amqp.rabbit.connection.Connection;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -50,7 +49,10 @@ class ContestScoreboardStreamTailOffsetMonitor {
         this.metrics = metrics;
     }
 
-    @Scheduled(fixedDelayString = "${contest.scoreboard.stream.consumer.tail-probe-interval:5s}")
+    /**
+     * Runs on the interval the operator configured, registered by
+     * {@link ContestScoreboardStreamScheduleConfiguration} so the interval has one definition.
+     */
     void observeTailOffset() {
         Channel channel = null;
         String consumerTag = null;

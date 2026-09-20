@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.springframework.amqp.core.AmqpAdmin;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -63,12 +64,53 @@ class ContestScoreboardStreamRedisRabbitIntegrationTests {
     static void redisProperties(DynamicPropertyRegistry registry) {
         registry.add("spring.data.redis.host", () -> "localhost");
         registry.add("spring.data.redis.port", () -> Integer.getInteger("redisPort", 16379));
+        emptyResultStream();
+    }
+
+    /**
+     * Empties the result stream before the context exists, and this has to happen here rather than in
+     * a test method.
+     *
+     * <p>The queue is durable and outlives the JVM, so a previous run's messages are still in it when
+     * the context comes up. The tail monitor probes once at startup - before any test can reset
+     * anything - and records the greatest offset it sees as the stream tail. That record is a running
+     * maximum, so a tail inherited from an earlier run stays the reported tail for the life of the
+     * context and {@code contest.scoreboard.pending} reads the difference against it forever. Starting
+     * from an empty stream is what makes the offsets this test names the offsets the broker issues.</p>
+     */
+    private static void emptyResultStream() {
+        com.rabbitmq.client.ConnectionFactory factory = new com.rabbitmq.client.ConnectionFactory();
+        factory.setHost("localhost");
+        factory.setPort(5672);
+        factory.setUsername("guest");
+        factory.setPassword("guest");
+        try (com.rabbitmq.client.Connection connection = factory.newConnection();
+             com.rabbitmq.client.Channel channel = connection.createChannel()) {
+            channel.queueDelete(ContestJudgeRabbitTopology.RESULT_STREAM_QUEUE);
+            // Declared straight away so the startup probe cannot race the application's own
+            // declaration and find no queue at all. The arguments match the topology bean's.
+            channel.queueDeclare(
+                    ContestJudgeRabbitTopology.RESULT_STREAM_QUEUE,
+                    true,
+                    false,
+                    false,
+                    java.util.Map.of(
+                            "x-queue-type", "stream",
+                            "x-max-age", ContestJudgeRabbitTopology.RESULT_STREAM_MAX_AGE,
+                            "x-max-length-bytes", ContestJudgeRabbitTopology.RESULT_STREAM_MAX_LENGTH_BYTES
+                    )
+            );
+        } catch (Exception failure) {
+            throw new IllegalStateException("Could not empty the result stream before the context starts", failure);
+        }
     }
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
     @Autowired
     private StringRedisTemplate redisTemplate;
+    @Autowired
+    private AmqpAdmin amqpAdmin;
     @Autowired
     private ContestScoreboardApplier applier;
     @Autowired
@@ -83,10 +125,26 @@ class ContestScoreboardStreamRedisRabbitIntegrationTests {
 
     private SeededContest contest;
     private List<Attempt> attempts;
+    /**
+     * The applied counter at the point the queue was recreated. The consumer is a lifecycle bean, so
+     * it is already consuming when the context comes up - before this class can empty the queue - and
+     * whatever a previous run left in the stream is applied and counted then. The assertions below are
+     * about what this test applies, so they read the growth rather than the total.
+     */
+    private double appliedBaseline;
 
     @BeforeEach
     void seed() {
         lifecycle.stop();
+        // The result stream is durable and the broker is not restarted between runs, so anything an
+        // earlier run published is still in it and the offsets named below would start where that run
+        // left off. Recreating the queue is what makes this test repeatable; the assertion confirms the
+        // redeclaration took, so a broker that refuses it fails here rather than as a timeout later.
+        amqpAdmin.deleteQueue(ContestJudgeRabbitTopology.RESULT_STREAM_QUEUE);
+        amqpAdmin.initialize();
+        assertThat(amqpAdmin.getQueueProperties(ContestJudgeRabbitTopology.RESULT_STREAM_QUEUE))
+                .as("the result stream queue was redeclared at offset zero")
+                .isNotNull();
         ContestScoreboardTestData.flushRedis(redisTemplate);
         contest = ContestScoreboardTestData.seedContest(
                 jdbcTemplate, "stream-replay", CONTEST_START, 1, 1);
@@ -100,6 +158,7 @@ class ContestScoreboardStreamRedisRabbitIntegrationTests {
         );
         ContestScoreboardTestData.insertAttempts(
                 jdbcTemplate, contest.contestId(), CONTEST_START, attempts, true);
+        appliedBaseline = appliedCount();
         lifecycle.start();
     }
 
@@ -123,7 +182,7 @@ class ContestScoreboardStreamRedisRabbitIntegrationTests {
         await("initial stream application", () -> applier.currentStreamOffset() == 1L
                 && appliedRows() == 2L
                 && processedRows() == 2L);
-        assertThat(meterRegistry.get("contest.scoreboard.applied").counter().count()).isEqualTo(2.0);
+        assertThat(appliedCount() - appliedBaseline).isEqualTo(2.0);
         tailOffsetMonitor.observeTailOffset();
         assertThat(pendingEvents()).isZero();
         assertDetailedQueueMetricsIncludeStream();
@@ -193,6 +252,10 @@ class ContestScoreboardStreamRedisRabbitIntegrationTests {
 
     private double pendingEvents() {
         return meterRegistry.get("contest.scoreboard.pending").gauge().value();
+    }
+
+    private double appliedCount() {
+        return meterRegistry.get("contest.scoreboard.applied").counter().count();
     }
 
     private static void assertDetailedQueueMetricsIncludeStream() throws Exception {

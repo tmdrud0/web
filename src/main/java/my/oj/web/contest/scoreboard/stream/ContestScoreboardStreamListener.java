@@ -27,6 +27,7 @@ class ContestScoreboardStreamListener implements BatchMessageListener {
     private final ContestScoreboardStreamMetrics metrics;
     private final long retryBackoffNanos;
     private final AtomicLong highestAppliedOffset = new AtomicLong(-1L);
+    private final AtomicLong failedBatches = new AtomicLong();
 
     ContestScoreboardStreamListener(
             @Qualifier("contestJudgeMessageConverter") MessageConverter messageConverter,
@@ -54,7 +55,13 @@ class ContestScoreboardStreamListener implements BatchMessageListener {
             highestAppliedOffset.set(processor.process(events));
         } catch (RuntimeException failure) {
             metrics.recordFailure();
-            log.error("Scoreboard stream batch failed and will remain at the head for retry", failure);
+            failedBatches.incrementAndGet();
+            // Not "at the head for retry": a stream queue accepts a requeueing rejection without
+            // complaint and does not hand the message back to the running consumer, so the retry comes
+            // from ContestScoreboardStreamLifecycle resubscribing at the stored checkpoint. Measured
+            // against a real broker in StreamQueueRequeueRabbitIntegrationTests.
+            log.error("Scoreboard stream batch failed and was left unapplied; the scoreboard stays at offset {} "
+                    + "and the batch is re-read when the consumer resubscribes", highestAppliedOffset.get(), failure);
             LockSupport.parkNanos(retryBackoffNanos);
             if (Thread.interrupted()) {
                 Thread.currentThread().interrupt();
@@ -65,6 +72,11 @@ class ContestScoreboardStreamListener implements BatchMessageListener {
 
     long highestAppliedOffset() {
         return highestAppliedOffset.get();
+    }
+
+    /** How many batches have failed, so the supervisor can tell a new failure from one it has handled. */
+    long failedBatches() {
+        return failedBatches.get();
     }
 
     void initializeOffset(long offset) {

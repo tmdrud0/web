@@ -46,10 +46,12 @@ class ContestScoreboardStreamProcessor {
                 .filter(event -> event.offset() > startingOffset)
                 .findFirst()
                 .orElse(null);
-        boolean recoveredGap = firstNew != null && firstNew.offset() > startingOffset + 1L;
-        if (recoveredGap) {
-            recoveryService.recoverRetentionGap(startingOffset + 1L, firstNew.offset());
-        }
+        // The gap is only bridged if the recovery actually happened: with the fallback turned off the
+        // first retained event is applied as an ordinary one, so the continuity check refuses it and
+        // the batch stays unapplied instead of moving the checkpoint past results it never saw.
+        boolean recoveredGap = firstNew != null
+                && firstNew.offset() > startingOffset + 1L
+                && recoveryService.recoverRetentionGap(startingOffset + 1L, firstNew.offset());
 
         List<ContestScoreboardApplier.ApplyRequest> requests = new ArrayList<>(events.size());
         for (ContestScoreboardStreamEvent event : events) {
