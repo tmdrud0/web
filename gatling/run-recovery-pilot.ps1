@@ -399,6 +399,12 @@ try {
     }
     Write-Output "  stack healthy; batch-1 environment: mode=$($runtime.Mode) deterministic=$($runtime.DeterministicJudging) acceptPermille=$($runtime.AcceptPermille) db=$($runtime.DbHost)/$($runtime.DbName)"
 
+    # The app tier this run measures is new; the edge in front of it may not be. Recreated here, after
+    # the tier is up, so that it resolves web-1 and web-2 to this run's containers rather than to the
+    # ones the previous run's teardown destroyed.
+    Reset-EdgeRouting
+    Write-Output "  edge recreated and routing to this run's app tier"
+
     # The observation pipeline has to be complete before the baseline, and the app tier's targets reach
     # Prometheus about forty seconds after their containers report healthy.
     Wait-PrometheusTargetsHealthy

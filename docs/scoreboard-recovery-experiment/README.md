@@ -198,6 +198,20 @@ docker compose -p oj-loadtest --project-directory . `
 docker compose -p oj-loadtest ... up -d
 ```
 
+**nginx는 앱 tier보다 나중에 떠야 한다.** nginx는 `upstream oj_web { server web-1:8080; server web-2:8080; }`을
+`resolver` 없이 쓰므로 **자기 기동 시점에 한 번만** 이름을 해석하고 그 주소를 계속 쓴다. 앱 tier는 run마다
+새 컨테이너이므로, 이전 run의 nginx가 남아 있으면 **없어진 tier의 주소로 다이얼**한다. 이때 `nginx -t`도
+통과하고 web의 TCP healthcheck도 통과한다 — 새 컨테이너가 8080에서 답하기 때문이다. 이 상태를 처음
+알아채는 것은 스코어보드 조회이고, 그것은 **측정 단계**라서 run 하나가 502로 사라진다.
+
+그래서 run은 앱 tier가 healthy해진 뒤 nginx를 `--force-recreate`로 다시 만들고, 자기 자신을 통해 실제
+요청 하나가 성공할 때까지 기다린다(`Reset-EdgeRouting`). 수동으로 스택을 올릴 때도 앱 tier가 뜬 뒤
+nginx를 재생성한다:
+
+```powershell
+docker compose -p oj-loadtest ... up -d --force-recreate --no-deps nginx
+```
+
 ### 4.5 종료 코드 — run의 완결성이지 모드의 성질이 아니다
 
 | 코드 | 의미 | suite의 처리 |

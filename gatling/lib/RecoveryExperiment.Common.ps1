@@ -645,6 +645,42 @@ function Wait-PilotStackHealthy {
     throw "The pilot stack did not become healthy within $($config.ReadyTimeoutSeconds) seconds: $lastError"
 }
 
+# nginx resolves its upstream once, when it starts, and keeps those addresses for its lifetime: the
+# configuration is `upstream oj_web { server web-1:8080; server web-2:8080; }` with no resolver
+# directive, so the names are looked up as the configuration loads and never again. A run stops the app
+# tier when it finishes and recreates it when the next one starts, while nginx - which is not part of
+# that tier - keeps running with the addresses of the tier that has just been destroyed. Every gate
+# passes anyway: `nginx -t` is satisfied by a configuration that was always fine, and the web nodes
+# answer on 8080, because they are the *new* nodes. The first thing to notice is the first scoreboard
+# read, which is a measurement step, and it reports a 502 - a run lost to a stack detail that nothing
+# looking at the stack could see.
+#
+# So the edge is recreated once the tier it fronts is up, which is a moment when those names resolve to
+# the containers this run will measure, and then made to answer a real request through itself. This is
+# part of bringing the run's stack up: no load has started and no fault has been injected, so there is
+# nothing here that a recovery could hide behind.
+function Reset-EdgeRouting {
+    $config = Get-RecoveryConfig
+
+    [void](Invoke-Compose -Arguments @("up", "-d", "--force-recreate", "--no-deps", "nginx"))
+
+    $uri = "$($config.BaseUrl)/api/contests/$($config.ContestId)/scoreboard?startRank=1&size=1"
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($config.ReadyTimeoutSeconds)
+    $lastError = $null
+    while ([DateTimeOffset]::UtcNow -lt $deadline) {
+        try {
+            [void](Invoke-RestMethod -Uri $uri -TimeoutSec 15)
+            return
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw ("nginx did not route a scoreboard read to the app tier within " +
+        "$($config.ReadyTimeoutSeconds) seconds: $lastError")
+}
+
 # The broker and Redis are started before the resets, and `docker compose up -d` returns when the
 # containers exist rather than when the services inside them answer. On a cold start that gap is real:
 # `rabbitmqctl list_queues` inside it exits 64 with "this command requires the 'rabbit' app to be
