@@ -385,6 +385,86 @@ Test-Case "a leftover row's name is attributed to the run id that wrote it" {
     Assert-Equal $null (Get-RunIdFromUserName -Name "sbrec_fullreplay_1_user_7x") "a trailing character in the index is not a seeded user"
 }
 
+# --- the harness's own sources ---------------------------------------------------------------------
+# The two defects below were found by running the harness and not by reading it, and each of them made a
+# whole calibration suite say something untrue. Both are silent in the way that matters - the first
+# crashed every run of a suite, and the second reported those crashes as three complete runs - so they
+# are checked here rather than left to the next person to rediscover at the cost of a suite each.
+
+function Get-HarnessSourceFiles {
+    $directory = (Get-Item (Join-Path $PSScriptRoot "..")).FullName
+    $files = @(Get-ChildItem -Path $directory -Filter "*.ps1" -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notlike "*\tests\*" -and $_.FullName -notlike "*\build\*" })
+    # Returned through the pipeline, so callers wrap the call in `@(...)`: `, $files` would instead hand
+    # a `foreach` one object that is the whole array, and every file would then be read as a list of
+    # paths rather than one at a time.
+    return $files
+}
+
+# The argument list of every `Invoke-Docker -Arguments @( ... )` in a source file. The scan balances
+# parentheses so that a call nested inside the list - `@(Invoke-Compose ...)` beside it, or a nested
+# `@(...)` - does not end the list early.
+function Get-DockerArgumentLists {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    $lists = New-Object 'System.Collections.Generic.List[string]'
+    $needle = "Invoke-Docker -Arguments @("
+    $index = $Text.IndexOf($needle)
+    while ($index -ge 0) {
+        $start = $index + $needle.Length
+        $depth = 1
+        $position = $start
+        while ($position -lt $Text.Length -and $depth -gt 0) {
+            if ($Text[$position] -eq '(') { $depth++ }
+            elseif ($Text[$position] -eq ')') { $depth-- }
+            $position++
+        }
+        $lists.Add($Text.Substring($start, $position - $start - 1))
+        $index = $Text.IndexOf($needle, $position)
+    }
+    # Same contract as Get-HarnessSourceFiles: callers wrap the call in `@(...)`, so an empty result is
+    # an empty array rather than nothing, and a `foreach` sees the lists rather than one array of them.
+    return $lists.ToArray()
+}
+
+Test-Case "no plain docker exec is given a flag only docker compose exec accepts" {
+    # `-T` turns the pseudo-TTY off, and it belongs to `docker compose exec`. Plain `docker exec` has no
+    # such flag: it exits 125 with 'unknown shorthand flag' instead of running the command, so the two
+    # queue statements that carried it failed every run at step 1. The harness never needs a TTY flag -
+    # nothing it execs is interactive - so none of these should appear at all.
+    $composeOnly = @("-T", "--no-TTY", "-it")
+    $checked = 0
+    foreach ($source in @(Get-HarnessSourceFiles)) {
+        $text = Get-Content -LiteralPath $source.FullName -Raw
+        foreach ($list in @(Get-DockerArgumentLists -Text $text)) {
+            $arguments = @([regex]::Matches($list, '"([^"]*)"') | ForEach-Object { $_.Groups[1].Value })
+            if ($arguments.Count -eq 0 -or $arguments[0] -ne "exec") { continue }
+            $checked++
+            foreach ($flag in $composeOnly) {
+                Assert-True ($arguments -notcontains $flag) `
+                    "$($source.Name) passes '$flag' to docker exec, which rejects the call: docker $($arguments -join ' ')"
+            }
+        }
+    }
+    Assert-True ($checked -ge 3) "the scan found the harness's docker exec calls ($checked found)"
+}
+
+Test-Case "a process whose exit code is read has its handle read first" {
+    # With redirected output, a Process object from `Start-Process -PassThru` reports `ExitCode` as null
+    # until its handle has been touched. One `[int]` parameter then bound that null to 0, which is this
+    # harness's word for a complete run, and a suite of three crashed runs was written down as three
+    # complete ones. The check is ordering: `.Handle` has to come before the first `.ExitCode` in the
+    # same file, because it is the same Process object that both are read from.
+    foreach ($source in @(Get-HarnessSourceFiles)) {
+        $text = Get-Content -LiteralPath $source.FullName -Raw
+        $exitCode = $text.IndexOf(".ExitCode")
+        if ($exitCode -lt 0) { continue }
+        $handle = $text.IndexOf(".Handle")
+        Assert-True ($handle -ge 0 -and $handle -lt $exitCode) `
+            "$($source.Name) reads .ExitCode without reading .Handle first, so the code it reads is null"
+    }
+}
+
 # --- report -------------------------------------------------------------------------------------
 
 Write-TestSummary -Suite "RecoveryExperiment unit tests"

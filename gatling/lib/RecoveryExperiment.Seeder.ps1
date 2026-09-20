@@ -408,6 +408,7 @@ function Reset-ExperimentQueue {
         runId = $config.RunId
         queue = $config.QueueName
         observedAtUtc = [DateTimeOffset]::UtcNow.UtcDateTime.ToString("o")
+        queuePresentBefore = ($null -ne $stream)
         queuesBefore = @($before.Keys | Sort-Object | ForEach-Object {
                 "$_=ready:$($before[$_].Ready),unacked:$($before[$_].Unacked),consumers:$($before[$_].Consumers)"
             })
@@ -415,23 +416,36 @@ function Reset-ExperimentQueue {
         queuesAfter = @()
     }
 
-    if ($stream.Consumers -ne 0) {
+    # `$null -ne` first on each of these, because an absent queue and a queue with no consumers are
+    # different facts and only one of them is this branch's business: absent means the application has
+    # not declared the queues yet, which is a state the reset is happy to produce and nothing for it to
+    # delete. `-and` short-circuits, so the property is only read once the queue is known to be there.
+    if ($null -ne $stream -and $stream.Consumers -ne 0) {
         $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $EvidencePath -Encoding utf8
         throw "Queue '$($config.QueueName)' has $($stream.Consumers) consumer(s). Stop the application " +
         "containers before resetting the queue, so the reset is not what the next run measures."
     }
     $live = $before["contest.judge.live"]
     $dead = $before["contest.judge.dead"]
-    if ($live.Ready -ne 0 -or $live.Unacked -ne 0 -or $dead.Ready -ne 0 -or $dead.Unacked -ne 0) {
+    $liveReady = if ($null -eq $live) { 0L } else { [long]$live.Ready }
+    $liveUnacked = if ($null -eq $live) { 0L } else { [long]$live.Unacked }
+    $deadReady = if ($null -eq $dead) { 0L } else { [long]$dead.Ready }
+    $deadUnacked = if ($null -eq $dead) { 0L } else { [long]$dead.Unacked }
+    if ($liveReady -ne 0 -or $liveUnacked -ne 0 -or $deadReady -ne 0 -or $deadUnacked -ne 0) {
         $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $EvidencePath -Encoding utf8
-        throw "The previous run left work in the judge queues (live ready=$($live.Ready) unacked=$($live.Unacked), " +
-        "dead ready=$($dead.Ready) unacked=$($dead.Unacked)). Draining them is the previous run's result, not this reset's."
+        throw "The previous run left work in the judge queues (live ready=$liveReady unacked=$liveUnacked, " +
+        "dead ready=$deadReady unacked=$deadUnacked). Draining them is the previous run's result, not this reset's."
     }
 
-    [void](Invoke-Docker -Arguments @(
-            "exec", "-T", $config.RabbitContainer, "rabbitmqctl", "delete_queue", $config.QueueName, "-p", "/"))
+    if ($null -ne $stream) {
+        # No `-T`: that is `docker compose exec`'s flag for turning the pseudo-TTY off, and `docker exec`
+        # does not have it - it rejects the command rather than running it, which is how the first
+        # calibration run found this line.
+        [void](Invoke-Docker -Arguments @(
+                "exec", $config.RabbitContainer, "rabbitmqctl", "delete_queue", $config.QueueName, "-p", "/"))
+    }
     $after = Get-RabbitQueueState
-    $record.deleted = $true
+    $record.deleted = ($null -ne $stream)
     $record.queuesAfter = @($after.Keys | Sort-Object | ForEach-Object {
             "$_=ready:$($after[$_].Ready),unacked:$($after[$_].Unacked),consumers:$($after[$_].Consumers)"
         })

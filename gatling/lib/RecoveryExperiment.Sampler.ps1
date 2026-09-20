@@ -158,11 +158,14 @@ function Get-MySqlStatusCounters {
 }
 
 # The queue table as the broker sees it. `docker exec` rather than `compose exec` because the poll runs
-# once a second and compose's service resolution is a measurable part of that second on Windows.
+# once a second and compose's service resolution is a measurable part of that second on Windows. No `-T`
+# for the same reason: it is `docker compose exec`'s flag for turning the pseudo-TTY off, and plain
+# `docker exec` has no such flag - it rejects it outright, so the poll would fail rather than merely be
+# noisy.
 function Get-RabbitQueueState {
     $config = Get-RecoveryConfig
     $lines = @(Invoke-Docker -Arguments @(
-            "exec", "-T", $config.RabbitContainer, "rabbitmqctl", "list_queues", "-q",
+            "exec", $config.RabbitContainer, "rabbitmqctl", "list_queues", "-q",
             "name", "messages_ready", "messages_unacknowledged", "consumers"
         ))
     $queues = [ordered]@{}
@@ -201,11 +204,12 @@ function Assert-OnlyProjectQueues {
         throw "The broker reports queues this project does not declare: $($unexpected -join ', '). " +
         "A reset that removed a queue here could remove someone else's."
     }
-    foreach ($required in Get-ProjectQueueNames) {
-        if (-not $Queues.Contains($required)) {
-            throw "RabbitMQ did not report the project queue '$required'."
-        }
-    }
+    # An absent project queue is not an error. This reads the dedicated `oj-loadtest-rabbitmq` container,
+    # so the queues it does report are this project's by construction, and the reset's purpose is a
+    # stream holding no unprocessed work - which is what an absent stream already is. Requiring all three
+    # to be present made the first run against a broker the application had never started against fail
+    # at step 1, on the exact state the reset exists to produce.
+    # What is checked is the direction that can destroy something: a queue this project never declared.
 }
 
 # --- Prometheus ------------------------------------------------------------------------------------

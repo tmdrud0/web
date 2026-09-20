@@ -121,7 +121,11 @@ function Clear-SuiteLeftovers {
                 })
         }
     }
-    return $cleared.ToArray()
+    # `,` is load-bearing: an empty array returned through the pipeline arrives as nothing at all, and
+    # the caller's `.Count` on that nothing throws under StrictMode. The empty case is the common one -
+    # a first run has no leftovers anywhere - so the unguarded version failed on exactly the runs it
+    # was supposed to be quiet about.
+    return , $cleared.ToArray()
 }
 
 # The artifact directory a finished run wrote, found by the run id its directory name ends with. Read
@@ -156,14 +160,22 @@ function Read-RunSummary {
 
 # The runner's exit codes, each of which means something different about the run and nothing about the
 # mode: it says whether there is a measurement here at all.
+#
+# The parameter is `[object]` and not `[int]` on purpose. A `[int]` parameter turns a missing exit code
+# into 0 - PowerShell binds `$null` to `[int]` as zero - and zero is this function's word for "complete".
+# The first calibration suite reported three crashed runs as three complete ones that way, which is the
+# one error a results table must never make: it would have published a failure as a measurement.
 function Get-ExitMeaning {
-    param([Parameter(Mandatory = $true)][int]$ExitCode)
+    param([AllowNull()][object]$ExitCode)
 
-    switch ($ExitCode) {
+    if ($null -eq $ExitCode) { return "unknown (the run's process reported no exit code)" }
+    $number = 0
+    if (-not [int]::TryParse([string]$ExitCode, [ref]$number)) { return "unknown (exit code '$ExitCode')" }
+    switch ($number) {
         0 { return "complete" }
         2 { return "measured but incomplete" }
         1 { return "failed to measure" }
-        default { return "exited $ExitCode" }
+        default { return "exited $number" }
     }
 }
 
@@ -238,6 +250,11 @@ foreach ($entry in $schedule) {
     $stderrPath = Join-Path $suiteDirectory "$($entry.RunId)-stderr.txt"
     $process = Start-Process -FilePath "powershell.exe" -ArgumentList $runArgumentList -PassThru -NoNewWindow `
         -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    # `Handle` is read before waiting, and that is not decoration: a Process object from `Start-Process
+    # -PassThru` with redirected output reports `ExitCode` as null unless its handle has been touched
+    # first. The first calibration suite lost every exit code that way, so it read three crashed runs as
+    # three complete ones. The handle is never used; reading it is what makes the code readable.
+    $null = $process.Handle
     $process.WaitForExit()
     $exitCode = $process.ExitCode
     $elapsed = [math]::Round((([DateTimeOffset]::UtcNow) - $runStartedAt).TotalMinutes, 2)
@@ -254,7 +271,9 @@ foreach ($entry in $schedule) {
         runId = $entry.RunId
         mode = $entry.Mode
         runIndex = $entry.RunIndex
-        exitCode = $exitCode
+        # Written as `unavailable` rather than left blank, so that a missing code cannot be read as a
+        # zero by whoever opens the CSV next.
+        exitCode = if ($null -eq $exitCode) { "unavailable" } else { $exitCode }
         exitMeaning = Get-ExitMeaning -ExitCode $exitCode
         elapsedMinutes = $elapsed
         artifactDirectory = $artifactDirectory
@@ -329,9 +348,12 @@ Write-Output "suite summary: $suiteSummaryPath"
 Write-Output "suite record:  $(Join-Path $suiteDirectory 'suite-metadata.json')"
 Write-Output ""
 
-$unmeasured = @($results | Where-Object { $_.exitCode -eq 1 })
-$incomplete = @($results | Where-Object { $_.exitCode -eq 2 -or $_.complete -eq "false" })
+# `not measured` is defined as everything that is neither of the two codes this harness produces, so a
+# code it could not read at all lands here rather than in the complete column. Naming only code 1 would
+# have put an unknown code in none of the three counts - which is what the first calibration suite did.
 $measured = @($results | Where-Object { $_.exitCode -eq 0 })
+$incomplete = @($results | Where-Object { $_.exitCode -eq 2 -or $_.complete -eq "false" })
+$unmeasured = @($results | Where-Object { -not ($_.exitCode -eq 0 -or $_.exitCode -eq 2) })
 
 Write-Output "$($measured.Count) complete, $($incomplete.Count) measured but incomplete, $($unmeasured.Count) not measured, of $($results.Count) run(s)."
 if ($incomplete.Count -gt 0) {

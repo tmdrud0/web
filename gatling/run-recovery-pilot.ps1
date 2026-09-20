@@ -466,6 +466,10 @@ try {
     $loadStartedAtUtc = [DateTimeOffset]::UtcNow
     $script:gatlingProcess = Start-Process -FilePath $config.JavaExe -ArgumentList $javaArgs -PassThru -NoNewWindow `
         -RedirectStandardOutput $gatlingStdOut -RedirectStandardError $gatlingStdErr
+    # Read before the process is waited on: with redirected output, a Process object from `Start-Process
+    # -PassThru` reports `ExitCode` as null unless its handle has been touched first, and a null exit code
+    # here would read as "the load generator's assertions failed" on every run.
+    $null = $script:gatlingProcess.Handle
     Write-Output "  load started at $($loadStartedAtUtc.UtcDateTime.ToString('o')) (pid $($script:gatlingProcess.Id))"
 
     # --- 6. baseline ------------------------------------------------------------------------------
@@ -787,7 +791,7 @@ try {
         finalContestSecondsUntilEnd = $finalSeedState.secondsUntilEnd
 
         # --- the load generator's own verdict ------------------------------------------------------
-        gatlingExitCode = $gatlingExitCode
+        gatlingExitCode = if ($null -eq $gatlingExitCode) { "unavailable" } else { $gatlingExitCode }
         gatlingP95Millis = $IngressSloP95Millis
         expectedRequests = $expectedRequests
         minRequests = $minRequests
@@ -841,7 +845,12 @@ try {
     if (-not $finalCompare.Matches) { $incomplete.Add("the final digest still disagrees with the oracle") }
     if (-not $summary["recoveryCompletedInsideLoad"]) { $incomplete.Add("the recovery did not finish before the load's hold ended") }
     if ($null -eq $detection) { $incomplete.Add("batch-1 logged no detection event") }
-    if ($gatlingExitCode -ne 0) { $incomplete.Add("the load generator's assertions failed (exit $gatlingExitCode)") }
+    if ($null -eq $gatlingExitCode) {
+        # Not folded into the line below: "the assertions failed" and "the generator's exit code could
+        # not be read" are different findings, and a run that cannot say which happened should say that.
+        $incomplete.Add("the load generator's exit code could not be read")
+    }
+    elseif ($gatlingExitCode -ne 0) { $incomplete.Add("the load generator's assertions failed (exit $gatlingExitCode)") }
     if ($finalQuiescent.Quiescent -ne $true) { $incomplete.Add("the pipeline was not quiet at the end") }
     $oomKills = Get-RowNumber -Row $finalRow -Name "appCgroupOomKills"
     if ($null -ne $oomKills -and $oomKills -gt 0) { $incomplete.Add("a container was OOM-killed ($oomKills)") }
