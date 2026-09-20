@@ -1,5 +1,13 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
+import my.oj.web.contest.scoreboard.ContestScoreboardSequenceSource;
+import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
+import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -18,11 +26,22 @@ import static org.mockito.Mockito.mock;
  *
  * <p>The replay service itself is deliberately not conditional. Only what <em>triggers</em> a replay
  * depends on the mode, because the retention-gap fallback also replays through this service.</p>
+ *
+ * <p>Unlike the replay service, the sequence recovery is conditional on the mode. Nothing else runs
+ * a sequence check, and the sequence state it reads lives only beside a Redis scoreboard, so an
+ * unconditional service would leave the default {@code store=memory} configuration unable to start.</p>
  */
 class ContestScoreboardRecoveryModeWiringTests {
 
     private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
-            .withUserConfiguration(Dependencies.class, ContestScoreboardFullReplayStartupRunner.class);
+            .withUserConfiguration(
+                    Dependencies.class,
+                    ContestScoreboardFullReplayStartupRunner.class,
+                    ContestScoreboardRedisSequenceConfig.class,
+                    ContestScoreboardRedisSequenceRecoveryService.class,
+                    ContestScoreboardRedisSequenceScheduler.class,
+                    ContestScoreboardRedisSequenceStartupCheck.class
+            );
 
     @Test
     void theReplayServiceIsAvailableInEveryMode() {
@@ -50,6 +69,36 @@ class ContestScoreboardRecoveryModeWiringTests {
                     .run(context -> assertThat(context)
                             .as("mode=%s", mode)
                             .doesNotHaveBean(ContestScoreboardFullReplayStartupRunner.class));
+        }
+    }
+
+    /**
+     * The sequence surface exists in its own mode and nowhere else - the meters included, because a
+     * duplicate counter that is registered by a mode which never checks for duplicates reads as a
+     * healthy zero.
+     */
+    @Test
+    void onlyRedisSeqModeBringsUpTheSequenceCheck() {
+        contextRunner
+                .withPropertyValues("contest.scoreboard.recovery.mode=redis-seq")
+                .run(context -> {
+                    assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceRecoveryService.class);
+                    assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceScheduler.class);
+                    assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceStartupCheck.class);
+                    assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceMetrics.class);
+                });
+
+        for (String mode : new String[]{"stream-offset", "full-replay"}) {
+            contextRunner
+                    .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                    .run(context -> {
+                        assertThat(context)
+                                .as("mode=%s", mode)
+                                .doesNotHaveBean(ContestScoreboardRedisSequenceStartupCheck.class);
+                        assertThat(context)
+                                .as("mode=%s", mode)
+                                .doesNotHaveBean(ContestScoreboardRedisSequenceMetrics.class);
+                    });
         }
     }
 
@@ -90,6 +139,41 @@ class ContestScoreboardRecoveryModeWiringTests {
         @Bean
         ContestScoreboardFullReplayService fullReplayService() {
             return mock(ContestScoreboardFullReplayService.class);
+        }
+
+        @Bean
+        ContestScoreboardApplier scoreboardApplier() {
+            return mock(ContestScoreboardApplier.class);
+        }
+
+        @Bean
+        ContestScoreboardSequenceSource sequenceSource() {
+            return mock(ContestScoreboardSequenceSource.class);
+        }
+
+        @Bean
+        ContestScoreboardApplyLock applyLock() {
+            return mock(ContestScoreboardApplyLock.class);
+        }
+
+        @Bean
+        ContestScoreboardAppliedMarker appliedMarker() {
+            return mock(ContestScoreboardAppliedMarker.class);
+        }
+
+        @Bean
+        ContestSubmissionResultRepository resultRepository() {
+            return mock(ContestSubmissionResultRepository.class);
+        }
+
+        @Bean
+        ContestSubmissionBatchExecutor batchExecutor() {
+            return mock(ContestSubmissionBatchExecutor.class);
+        }
+
+        @Bean
+        MeterRegistry meterRegistry() {
+            return new SimpleMeterRegistry();
         }
     }
 }

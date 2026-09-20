@@ -9,6 +9,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -87,6 +88,34 @@ public class ContestSubmissionBatchExecutor {
                 executeWithRetry(() -> batchConsumer.accept(batch));
             }
             lastProcessedId = batch.get(batch.size() - 1);
+        }
+    }
+
+    /**
+     * The same retry discipline with an operator's own bounds, for a caller whose attempts and
+     * backoff are configuration rather than a constant.
+     *
+     * @param maxAttempts total attempts, so a value of one means no retry at all
+     */
+    public void executeWithRetry(Runnable runnable, int maxAttempts, Duration backoff) {
+        int attempt = 1;
+        while (true) {
+            try {
+                runnable.run();
+                return;
+            } catch (RuntimeException ex) {
+                if (attempt >= Math.max(1, maxAttempts)) {
+                    throw ex;
+                }
+                log.warn("Batch execution failed on attempt {} of {}. Retrying...", attempt, maxAttempts, ex);
+                try {
+                    Thread.sleep(Math.max(0L, backoff.toMillis()) * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw ex;
+                }
+                attempt++;
+            }
         }
     }
 

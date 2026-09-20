@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import my.oj.web.contest.submission.queue.ContestSubmissionBulkMetrics;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRedisSequenceMetrics;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplyMetrics;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardWrongAttemptMetrics;
 import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamConsumerProperties;
@@ -182,6 +183,18 @@ class PipelineMetricNamesTests {
                         500, 500, Duration.ofMillis(50), Duration.ofSeconds(1), Duration.ofSeconds(1),
                         Duration.ofSeconds(5), Duration.ofMillis(50), Duration.ofSeconds(2), 4096)
         );
+
+        // The redis-seq mode's meters register only in that mode, but an operator comparing the three
+        // recovery strategies will query them - so the names the dashboard would use have to be the
+        // names a real scrape exports, whichever mode happens to be running.
+        ContestScoreboardRedisSequenceMetrics sequence = new ContestScoreboardRedisSequenceMetrics(registry);
+        sequence.recordDuplicates(1);
+        sequence.recordReplayed(1);
+        sequence.recordRound();
+        sequence.recordFailedRound();
+        sequence.recordSaturatedWindows();
+        sequence.recordUnresolved();
+        sequence.recordMappedSubmissions(1);
 
         return registry.scrape();
     }

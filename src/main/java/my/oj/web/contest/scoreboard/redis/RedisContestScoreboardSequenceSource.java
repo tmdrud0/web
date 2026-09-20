@@ -18,6 +18,8 @@ public class RedisContestScoreboardSequenceSource implements ContestScoreboardSe
 
     public static final String SUBMISSION_SEQUENCE_KEY = RedisContestScoreboardApplier.SUBMISSION_SEQUENCE_KEY;
 
+    public static final String SEQUENCE_KEY = RedisContestScoreboardApplier.SEQUENCE_KEY;
+
     private final StringRedisTemplate redisTemplate;
 
     public RedisContestScoreboardSequenceSource(StringRedisTemplate redisTemplate) {
@@ -47,5 +49,31 @@ public class RedisContestScoreboardSequenceSource implements ContestScoreboardSe
             }
         }
         return sequences;
+    }
+
+    @Override
+    public long allocatorSequence() {
+        String value = redisTemplate.opsForValue().get(SEQUENCE_KEY);
+        if (value == null || value.isBlank()) {
+            return 0L;
+        }
+        long parsed;
+        try {
+            parsed = Long.parseLong(value.trim());
+        } catch (NumberFormatException exception) {
+            throw new IllegalStateException(
+                    "The scoreboard sequence allocator holds a non-numeric value: " + value, exception);
+        }
+        if (parsed < 0) {
+            throw new IllegalStateException(
+                    "The scoreboard sequence allocator holds a negative value: " + parsed);
+        }
+        return parsed;
+    }
+
+    @Override
+    public long mappedSubmissionCount() {
+        Long size = redisTemplate.opsForHash().size(SUBMISSION_SEQUENCE_KEY);
+        return size == null ? 0L : size;
     }
 }

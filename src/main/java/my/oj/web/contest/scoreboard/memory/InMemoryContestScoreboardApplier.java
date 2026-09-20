@@ -96,6 +96,16 @@ public class InMemoryContestScoreboardApplier implements ContestScoreboardApplie
     }
 
     @Override
+    public synchronized long allocatorSequence() {
+        return sequenceAllocator;
+    }
+
+    @Override
+    public synchronized long mappedSubmissionCount() {
+        return submissionSequences.size();
+    }
+
+    @Override
     public synchronized long currentStreamOffset() {
         return currentStreamOffset;
     }
