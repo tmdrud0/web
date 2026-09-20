@@ -19,7 +19,18 @@ foreach ($directory in $RunDirectory) {
     $runPath = (Resolve-Path $directory).Path
     $summaryPath = Join-Path $runPath "summary.json"
     if (-not (Test-Path $summaryPath)) {
-        $excluded.Add([ordered]@{ runDirectory = $runPath; runId = $null; reason = "the run has no summary.json; run Analyze-TradeoffRun.ps1 on it first" })
+        # An attempted run that failed and one that was never analyzed both lack summary.json, and
+        # they are not the same thing: the first has a failure.txt with its reason and no amount of
+        # re-analysis will produce numbers from it, so say which one this is rather than telling the
+        # reader to run the analyzer.
+        $failurePath = Join-Path $runPath "failure.txt"
+        $reason = if (Test-Path $failurePath) {
+            $failureReason = (@(Get-Content $failurePath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+            "the run failed and was not measured: $failureReason (see failure.txt in the run directory)"
+        } else {
+            "the run has no summary.json; run Analyze-TradeoffRun.ps1 on it first"
+        }
+        $excluded.Add([ordered]@{ runDirectory = $runPath; runId = Split-Path -Leaf $runPath; reason = $reason })
         continue
     }
     $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
@@ -136,7 +147,38 @@ function Format-Value {
     return [string]$Value
 }
 
-$outputRoot = if ($OutputDirectory) { (Resolve-Path $OutputDirectory).Path } else { Split-Path -Parent (Resolve-Path $RunDirectory[0]).Path }
+# The timeout column is a string and it is not always in seconds: an exact 2.5s has to be written in
+# milliseconds because Spring's DurationStyle simple form takes integer digits only. Stripping a
+# trailing "s" and casting the rest therefore leaves "2500m", which a numeric sort cannot read, so
+# the value is converted here instead. A bare number is milliseconds, which is what Spring Boot's
+# simple duration style assumes when no unit is given.
+function Get-TimeoutMillis {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $t = $Text.Trim()
+    if ($t -match '^([+-]?\d+)(ms|s|m|h)?$') {
+        $n = [double]$Matches[1]
+        switch ($Matches[2]) {
+            "ms" { return $n }
+            "s" { return $n * 1000 }
+            "m" { return $n * 60000 }
+            "h" { return $n * 3600000 }
+            default { return $n }
+        }
+    }
+    if ($t -match '^[+-]?[pP]') {
+        try { return ([System.Xml.XmlConvert]::ToTimeSpan($t)).TotalMilliseconds } catch { return $null }
+    }
+    return $null
+}
+
+# Resolving the output path would fail on a directory that does not exist yet, which made the one
+# natural way to run this - point it at a fresh folder - an error. The default stays the first
+# run's own directory, so the comparison lands next to the artifacts it was read from.
+$outputRoot = if ($OutputDirectory) {
+    if (-not (Test-Path $OutputDirectory)) { New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null }
+    (Resolve-Path $OutputDirectory).Path
+} else { Split-Path -Parent (Resolve-Path $RunDirectory[0]).Path }
 $comparisonPath = Join-Path $outputRoot "normal-timeout-comparison.json"
 $markdownPath = Join-Path $outputRoot "normal-timeout-comparison.md"
 
@@ -157,7 +199,7 @@ $lines = @(
     "- Runs in execution order: $((@($runs | ForEach-Object { $_.runId })) -join ' -> ')",
     "- Excluded: $(if ($excluded.Count -eq 0) { 'none' } else { (@($excluded | ForEach-Object { "$($_.runDirectory): $($_.reason)" })) -join '; ' })",
     "",
-    "Raw observations only; no timeout is recommended here. `duplicate claims` is the durable outbox counter (attempts > 1), `duplicate judgements` is the number of judged executions whose result the fence discarded, and the two are different quantities. A `(queueing)` marker on a percentile means that window's backlog grew, so the percentile measures the queue and not service time.",
+    "Raw observations only; no timeout is recommended here. `duplicate claims` is the durable outbox counter (attempts > 1), `duplicate judgements` is the number of judgeSubmission calls beyond one per submission, and the two are different quantities: a reclaimed row is only judged again if the earlier attempt is still running when it is reclaimed. A `(queueing)` marker on a percentile means that window's backlog grew, so the percentile measures the queue and not service time.",
     "",
     "| MIF | target RPS | timeout | accepted | result RPS | backlog growth | duplicate claims | duplicate claims/10k | judge invocations | duplicate judgements | stale token completions | p95 total | p99 total | drain |",
     "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
@@ -193,9 +235,9 @@ foreach ($run in $runs) {
 
 $lines += @(
     "", "## Duplicate accounting per run", "",
-    "`invocations - results` is an upper bound (it also contains failed executions and reclaims answered from the stored result); `stale completions` is the directly attributable duplicate execution count. The residual is `invocations - results - (republish + failure + stale)` and should be 0.",
+    "`duplicate judgements` is `stale completions - republishes - failures` (equivalently `judge invocations - results - failures`): the number of times a submission was judged beyond its first. It is NOT the stale count, which also carries one fenced original execution per reclaimed row. The residual is `invocations + republishes - (results + stale + failures)` and is 0 when every counter recorded.",
     "",
-    "| run id | accepted | results | judge invocations | invocations - results | republishes | failures | stale | residual | duplicate claim ms (lower-upper) | attempts histogram |",
+    "| run id | accepted | results | judge invocations | invocations - results | republishes | failures | stale | residual | duplicate judge ms (lower-upper) | attempts histogram |",
     "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"
 )
 foreach ($run in $runs) {
@@ -226,11 +268,14 @@ foreach ($run in $runs) {
 
 $lines += @("", "## Per max-in-flight groups", "")
 foreach ($mif in @($byMif.Keys | Sort-Object)) {
-    $group = @($byMif[$mif])
-    $ordered = @($group | Sort-Object { [double]($_.mysqlClaimTimeout -replace 's$', '') })
+    # [object[]], not @(): PowerShell 5.1 refuses @() around the List[object] the group is built
+    # in, and the failure reads only as "Argument types do not match".
+    $group = [object[]]$byMif[$mif]
+    $ordered = @($group | Sort-Object { Get-TimeoutMillis $_.mysqlClaimTimeout })
     $lines += "- max-in-flight ${mif}: $(($ordered | ForEach-Object { "$($_.mysqlClaimTimeout) -> duplicate claims $(Format-Value $_.duplicateClaims), duplicate judgements $(Format-Value $_.duplicateJudgeExecutions), result RPS $(Format-Value $_.resultPerSecond), p95 total $(Format-Value $_.p95TotalMs)ms, drain $(Format-Value $_.drainSeconds)s" }) -join ' | ')"
 }
 $lines += @("", "The timeout column is the configured claim timeout, not a measured lease duration: a claim is reclaimed by any later poll once its age passes that value, so the effective lease is the configured timeout plus up to one poll interval.")
+$lines += @("", "Scope of each column, because three different windows are in play and reading them as one is a mistake: `accepted`, `judge invocations`, the duplicate columns and the residual span the run's whole measurement phase (baseline snapshot to end snapshot) - the idle between the warm-up quiescing and the ramp, the 5s ramp, the 63s hold and the drain, about 75s in these runs, not the 63s hold alone; the percentiles span only the 60s steady window inside that hold, with the 5s ramp excluded; the rate columns (`result RPS`, `backlog growth`, the second-half slope) span the same 60s window. The per-10k ratios divide a run-scoped count by a run-scoped denominator, so they are consistent with each other but not with the window-scoped columns beside them.")
 
 $lines | Set-Content $markdownPath -Encoding utf8
 
