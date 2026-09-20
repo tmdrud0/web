@@ -165,11 +165,12 @@ C의 down window는 설정보다 0.402s 길다. harness의 자체 허용치(0.5s
 않도록** 떼어낸 마지막 2초이고, 그 구간에서 시계를 쥐고 있는 것은
 `Run-TradeoffExperiment.ps1:1200`의
 `Wait-UntilDeadline` 하나뿐이다. 이 함수는 I/O를 전혀 하지 않고 `Start-Sleep`을 200ms 이하
-조각으로 나눠 deadline까지만 기다린다. 다만 guard가 막는 것은 관측의 **시작**이므로 deadline
-직전에 시작한 관측은 그 구간으로 넘어올 수 있다. 아래 "관측 수집이 deadline을 지연시키지 않게
-분리한 구조"가 원시 자료로 확인한 결과 **C에서는 실제로 그렇게 됐다** — 마지막 관측의 기록
-시각이 deadline을 0.400s 넘겼고 재기동 요청은 그 0.002s 뒤였다. 초과분은 조용히 흡수되지 않고
-`restartTimingErrorSeconds`로 기록되고 assertion에 걸린다.
+조각으로 나눠 deadline까지만 기다린다. 다만 guard가 막는 것은 관측을 품은 **반복의 시작**이고
+관측의 시작은 막지 못하므로(아래 "관측 수집이 deadline을 지연시키지 않게 분리한 구조"), 13.0s를
+넘겨 시작한 그 마지막 관측이 deadline을 넘겨 끝날 수 있다. 아래 절이 원시 자료로 확인한 결과
+**C에서는 실제로 그렇게 됐다** — 마지막 관측의 반복은 12.509s에 시작했고 그 tick·COUNT가
+약 2.89s를 써서 관측이 deadline을 0.400s 넘겨 끝났으며 재기동 요청은 그 0.002s 뒤였다. 초과분은
+조용히 흡수되지 않고 `restartTimingErrorSeconds`로 기록되고 assertion에 걸린다.
 
 **초과 방향이 중요하다.** down window가 길어지면 C의 from-fault 복구시간도 그만큼 길어진다.
 즉 이 0.402s는 §13에서 10s가 보이는 우위를 **만들지 않고 오히려 0.393s 과소평가**한다.
@@ -195,22 +196,42 @@ claim timeout도 max-in-flight도 지배하지 않는다. §13의 재영점 분�
 
 down window의 권위 있는 시계는 `Wait-UntilDeadline` 하나뿐이고, 이 함수는 I/O도 표본도 하지
 않는다(`Run-TradeoffExperiment.ps1:1894-1922`). down 구간에서도 표본과 관측은 계속 돌지만
-(관측 1회가 1초보다 오래 걸려 실제 간격은 2.7–4.1s다)
+(반복 1회가 1초보다 오래 걸려 실제 간격은 2.7–4.1s다)
 **마지막 2초는 관측에서 떼어낸다**: `downObserveUntil = restartScheduledAt - 2s` 이후에는 그
 분기가 표본도 읽기도 하지 않고 deadline만 기다린다. 실제 down window 관측 횟수는 세 run 모두
 4회이고(`events.json`의 `downWindowObservationCount`), 이는 `backlog.csv`의 `node-down` 행 수와
 일치한다.
 
-**관측이 시작될 수 있는 시각만은 `downObserveUntil`로 유계다.** 그 분기에 들어가는 조건이
+**유계되는 것은 관측이 아니라 그 관측을 품은 반복의 시작이다.** 그 분기에 들어가는 조건이
 `$now -lt $downObserveUntil`이고(`1896`), `$now`는 매 반복의 최상단에서 새로 읽는다(`1798`).
-kill 이후에는 그보다 앞에서 I/O를 하는 분기(A의 trigger 평가, B의 주입)가 모두 닫혀 있으므로
-관측 시작 시각은 그 반복의 `$now`와 같다. 주입 반복만 예외다 — 그 반복의 `$now`는 kill
-**이전에** 읽혔으므로 guard가 열려 있고, `fault` 행을 찍는 관측에 이어 같은 반복에서 곧바로
-`node-down` 관측이 시작한다(`fault` 행의 기록 시각은 fault+2.413s(A)·+1.871s(B)·+2.424s(C)).
-`node-down` phase로 기록되는 행은 `Observe-FaultRecovery`의 `Save-BacklogSample`
-하나뿐이므로, **`downObserveUntil` 이후에 시작한 관측은 존재할 수 없다.**
+그러나 한 반복 안에서는 관측(`Observe-FaultRecovery`, `1901`)보다 **표본 tick이 먼저** 돌고
+(`Step-FaultRecoverySample`, `1900`), 관측은 그 tick이 끝난 뒤에 시작한다. 즉 관측의 시작 시각은
+그 반복의 `$now`가 아니라 **tick의 시작 + `sampleElapsedMs`**이며(`sampleElapsedMs`는
+`Save-StaircaseSample`이 자기 tick의 시작부터 두 gauge read까지를 잰 값이고,
+`timeseries.csv` 행의 `timestamp`가 그 tick의 시작이다), guard는 이 값에 대해 아무것도 말하지
+않는다.
 
-**그러나 유계되는 것은 시작 시각뿐이고, 관측은 deadline을 넘겨 끝났다.** `Save-BacklogSample`은
+| down 구간 관측 4회 (fault 기준) | A | B | C |
+|---|---|---|---|
+| 반복 `$now` = tick 시작 | 2.722 / 6.572 / 9.279 / 12.033 | 2.132 / 6.246 / 9.048 / 11.764 | 2.707 / 6.658 / 9.703 / 12.509 |
+| tick 비용 (`sampleElapsedMs`) | 3415.2 / 2273.8 / 2289.6 / 2306.8ms | 3309.2 / 2318.4 / 2277.0 / 2294.9ms | 3306.2 / 2309.0 / 2309.4 / 2363.7ms |
+| **관측 시작** (tick 시작 + tick 비용) | **6.137 / 8.846 / 11.569 / 14.340** | **5.441 / 8.564 / 11.325 / 14.059** | **6.013 / 8.967 / 12.013 / 14.872** |
+| 두 COUNT 비용 (관측 시작 → 행 기록) | 0.425 / 0.431 / 0.462 / 0.451s | 0.523 / 0.482 / 0.436 / 0.441s | 0.644 / 0.736 / 0.496 / 0.528s |
+
+**네 번 중 마지막 하나만 `downObserveUntil`(13.0s) 뒤에 시작했다** — A 14.340s, B 14.059s,
+C 14.872s로 1.06–1.87s 뒤다. 그 넷째 반복의 `$now`는 A 12.033 / B 11.764 / C 12.509s로 아직
+13.0s 이전이었으므로 guard는 그 반복을 막지 않았고, 그 반복의 관측이 경계를 넘어 시작했다.
+`node-down` phase로 기록되는 행은 `Observe-FaultRecovery`의 `Save-BacklogSample` 하나뿐이므로,
+정확한 진술은 "**`downObserveUntil` 이후에 시작한 반복은 없다**"이다. 관측 시작 시각 자체는
+유계가 아니다.
+
+주입 반복은 A·B·C 분기가 같은 반복에서 순서대로 실행되는 구조상의 예외다 — 그 반복의 `$now`는
+kill **이전에** 읽혔으므로 guard가 열려 있고, `fault` 관측(`1888`)에 이어 같은 반복에서 tick
+(`1900`)과 `node-down` 관측(`1901`)이 실행된다. 두 관측 사이에 그 반복의 tick이 있으므로
+`fault` 행의 기록 시각(fault+2.413s(A)·+1.871s(B)·+2.424s(C))이 첫 `node-down` 관측의 시작이
+아니고, 그 시작은 tick 비용이 지난 뒤다(위 표의 첫 열: +6.137 / +5.441 / +6.013s).
+
+**그 결과 관측은 deadline을 넘겨 시작했고 넘겨 끝났다.** `Save-BacklogSample`은
 두 COUNT 질의가 끝난 뒤에 행을 찍으므로(`615-628`) 기록된 시각은 그 관측의 **끝에 가까운**
 시각이다. 세 run의 down 구간 관측 시각은 `faultInjectedAt` 기준으로 아래와 같고,
 `downObserveUntil`은 세 run 모두 13.0s, `restartScheduledAt`은 세 run 모두 15.0s다.
@@ -221,10 +242,12 @@ kill 이후에는 그보다 앞에서 I/O를 하는 분기(A의 trigger 평가, 
 | B | 14.501s | 13.0s | 0.508s | **+0.009s** |
 | C | **15.400s** | 13.0s | **0.002s** | **+0.402s** |
 
-세 run 모두 마지막 관측이 `downObserveUntil`을 넘겨 끝났다. 그 행이 존재한다는 사실 자체가
-그 관측이 `downObserveUntil` **이전에 시작했다는 증거이면서 동시에 deadline 뒤까지 걸쳤다는
-증거다** — 앞의 유계는 시작에만 걸리므로, 관측 1회의 비용이 남은 시간보다 크면 그 관측은
-그대로 deadline 너머로 흘러간다.
+세 run 모두 마지막 관측이 `downObserveUntil`을 넘겨 끝났다. 위 표가 보이듯 그 관측은
+`downObserveUntil`을 넘겨 **시작**했고(14.340 / 14.059 / 14.872s), 기록된 행의 시각이 경계를
+넘겼다는 사실은 그 관측이 경계 **이전에 시작했다는 증거가 아니다** — 관측의 시작 시각은
+`backlog.csv` 행 시각에서 두 COUNT 비용을 빼서 얻는 값이 아니라 위 표처럼 tick 시작 +
+`sampleElapsedMs`로 얻는다. 즉 관측 1회의 비용(tick 2.27–3.42s + 두 COUNT 0.43–0.74s)이 남은
+시간보다 크면 그 반복은 그대로 deadline 너머로 흘러간다.
 
 A·B에서는 마지막 관측이 deadline 전에 끝나 남은 시간을 `Wait-UntilDeadline`이 흡수했고 초과는
 두 run 모두 정확히 0.009s다. C에서는 마지막 관측의 행이 이미 deadline을 0.400s 지난 시각에
@@ -249,9 +272,15 @@ fault+12.032s(A)·+11.763s(B)·+12.508s(C)다 — 빠지는 것은 설계대로 
 참고로 **down 구간의 관측 간격은 1초가 아니다.** 기록된 관측 행 사이의 간격은 `fault` 행에서
 첫 `node-down` 행까지가 A 4.148 / B 4.093 / C 4.001s이고, 그 뒤 `node-down` 행 사이가
 A 2.715·2.754·2.760s, B 3.082·2.715·2.740s, C 3.043·3.036·2.895s다. 루프는 관측 뒤에
-`Wait-UntilDeadline`으로 그 반복의 `$now + 1s`를 기다리므로, 그 반복의 작업(1초 tick 표본과
-두 COUNT 관측)이 1초보다 오래 걸리면 대기가 즉시 반환되고 **주기가 작업 시간에 묶인다.**
-위 간격은 그 결과다. §13의 `T_stale` 판정과 §20의 해상도 한계가 이 값을 쓴다.
+`Wait-UntilDeadline`으로 그 반복의 `$now + 1s`를 기다리므로, 그 반복의 작업이 1초보다 오래 걸리면
+대기가 즉시 반환되고 **주기가 작업 시간에 묶인다.** 그 작업은 **표본 tick(2.274–3.415s)과 두
+COUNT(0.425–0.736s)**이고(위 표), 간격은 이 둘의 합과 같다. 즉 간격을 지배하는 항은 tick이며,
+관측 자신의 두 COUNT는 그 1/5 남짓이다. **tick 안에서 단일 DB 질의(`docker compose exec` 한 번)와
+judge-1 gauge scrape 중 어느 쪽이 그 2~3초를 쓰는지는 이 계측으로 분해되지 않는다** — 죽은
+노드의 gauge 값이 그 구간 ticks에서 비어 있는 것은 사실이지만, 컨테이너가 다시 뜬 직후의 tick
+(+16.305s(A), judge-1 gauge가 역시 비어 있음)은 275ms밖에 걸리지 않았으므로 "빈 gauge 하나가
+2초를 만든다"로는 설명되지 않는다(§20).
+§13의 `T_stale` 판정과 §20의 해상도 한계가 이 값을 쓴다.
 
 kill 시점 관측은 `faultInjectedAt` **이후**에 시작한다. `killToSnapshotStartSeconds`가 양수라는
 것이 그 순서의 증거이며, A 0.606s / B 0.478s / C 0.625s였다.
@@ -519,7 +548,7 @@ peak은 judge backlog이 지배한다. scoreboard pending peak은 23~30으로 pr
 그친다. 즉 이 outage에서 고객이 기다린 것은 scoreboard 반영이 아니라 **judge 채점 자체**였다.
 
 growth 열은 두 표본의 차이이므로 표본 간격을 물려받는다. pre-fault 구간에서 표본은 1초에 한
-번이지만 outage 구간에서는 관측 1회가 그보다 오래 걸려 간격이 2.7–4.1s로 벌어지므로(§5), 그
+번이지만 outage 구간에서는 표본 tick이 그보다 오래 걸려 간격이 2.7–4.1s로 벌어지므로(§5), 그
 구간의 상승은 더 넓은 격자로만 보인다. 어느 쪽이든 값은 "가장 가파른 상승"이 아니라 그 하한이다.
 **level 열은 level로, growth 열은 방향으로 읽는다.**
 
@@ -549,13 +578,15 @@ C에서 그 차가 5.0s로 줄어든 것이 §13의 재영점 분석과 연결�
 
 `attempts > 1`은 **lease 만료 후의 복구 재claim**이다. claim을 들고 있던 프로세스는 SIGKILL로
 사라졌으므로 그 row가 다시 나가는 동안 채점을 계속하지 않았다. **이것을 동시 중복 CPU 실행이라고
-부르지 않는다.**
+부르지 않는다.** 다만 이 이름은 **이번 세 run에서 확인된 것**이고, `attempts` 자체는 lease 만료
+전용 신호가 아니다 — 그 구분을 무엇이 닫는지는 바로 아래 절에서 다룬다.
 
 | | A | B | C |
 |---|---:|---:|---:|
 | stale reclaim (`SUM(attempts-1)`) | **3** | **20** | **13** |
 | analyzer 계산 reclaimed rows | 3 | 20 | 13 |
 | harness 계산 reclaimed rows | 3 | 20 | 13 |
+| `contest_judge_claim_stale_total` delta | **3** | **20** | **13** |
 | 두 계산 일치 | yes | yes | yes |
 | kill snapshot의 PUBLISHING row | 18 | 50 | 22 |
 | 그중 outage 중 회수된 수 | 3 | 20 | 13 |
@@ -568,6 +599,40 @@ analyzer와 harness가 durable한 outbox `attempts`에서 독립적으로 같은
 
 **stale reclaim이 0인 run은 없다.** 세 run 모두 관측됐으므로 "timeout/fault timing 또는 관측
 오류를 조사한다"는 조건은 발동하지 않았다.
+
+### `SUM(attempts - 1)`이 lease 회수만 세지 않는다는 점과, 이 run들에서 그것이 성립하는 근거
+
+`attempts`는 claim마다 증가하지만 **lease 만료에만 반응하는 값이 아니다.** `completeAll`의 실패
+분기는 row를 `status='PENDING'`으로 되돌리면서 `attempts`를 되돌리지 않으므로
+(`ContestJudgeOutboxStore`: `SET status = 'PENDING', claim_token = NULL, claimed_at = NULL,
+last_error = ?`), 평범한 judge 실패 → 재시도 한 번도 `attempts=2`를 만든다. 즉 하네스가
+`T_stale` 탐지에 쓰는 규칙("fault 이전 값보다 커지면 회수로 기록", `Run-TradeoffExperiment.ps1:634-640`)
+자체는 **일반 재시도와 lease 회수를 구분하지 못한다.**
+
+이번 세 run에서는 두 개의 독립적인 신호가 그 구분을 가능하게 한다.
+
+| | A | B | C |
+|---|---:|---:|---:|
+| durable `SUM(attempts - 1)` (행 수) | 3 | 20 | 13 |
+| `contest_judge_claim_stale_total` delta (claim 시점에 이미 만료된 PUBLISHING을 claim한 횟수) | **3** | **20** | **13** |
+| `completion_total{outcome="failure"}` delta | **0** | **0** | **0** |
+| `attempts` 분포 (`claim-attempts.tsv`) | `1×24375, 2×3` | `1×30444, 2×20` | `1×30452, 2×13` |
+
+- `contest.judge.claim.stale`(`MysqlContestJudgeMetrics`)은 claim SELECT가 고른 row가 이미 만료된
+  PUBLISHING이었을 때만 증가한다(`ClaimedEvent.staleReclaim`). 실패 경로의 재시도는 **PENDING**
+  row를 claim하므로 이 counter를 올리지 않는다. 이 counter의 delta가 durable `SUM(attempts-1)`과
+  정확히 일치한다.
+- `completion{outcome=failure}`가 세 run 모두 0이다. 두 counter 모두 judge-2의 전 수명과 재기동
+  후 judge-1 구간을 덮으므로, 그 구간에서 실패한 실행이 없다는 뜻이다. judge-1이 kill 이전에
+  실패를 냈다면 그 counter는 유실되지만, 그 실패의 재시도는 durable한 `SUM(attempts-1)`에 남아
+  위 일치를 깨뜨렸을 것이다.
+- `attempts` 분포에 3 이상이 없고 fault 이전 회수(`staleAttemptsBeforeFault`)가 0이므로, 이
+  row들은 각각 정확히 한 번 재claim됐다.
+
+그러므로 **이 세 run의 reclaimed cohort는 lease 만료 회수이며**, 그 안에 평범한 실패→재시도가
+섞여 있지 않다. 다만 이것은 **코드 경로가 존재하지 않는다는 뜻이 아니라 이번 실행에서 그 경로가
+발화하지 않았다는 뜻**이고, 탐지 규칙 자체의 한계는 §12에 남긴다. 정확한 신호는 claim 시점의
+`staleReclaim` 플래그이고, 위 표의 두 번째 행이 그 플래그의 집계다.
 
 ### kill 시점 claimed_at age 분포와 lease 만료 시각
 
@@ -585,25 +650,30 @@ kill snapshot의 실제 age 분포는 다음과 같다.
 | `reclaimedRowsSubmittedDuringOrAfterTheFault` | 0 | 0 | 0 |
 | `staleAttemptsBeforeFault` | 0 | 0 | 0 |
 | 설정 timeout | 2.5s | 4s | 10s |
-| **snapshot 잔존 최고령 claim의 lease 만료 시각** (`snapshot−fault + timeout − maxAge`) | 0.743s | 2.542s | 7.723s |
-| **가장 이른 lease 만료** (A는 재claim 시각이 상한, B·C는 위 값이 하한) | **≤0.461s** | **2.542s** | **7.723s** |
+| DB 시각을 그대로 쓴 값 (`dbNow − faultInjectedAt + timeout − maxAge`) | 0.743s | 2.542s | 7.723s |
+| **host 시계만 쓴 보수적 하한** (`killToSnapshotStartSeconds + timeout − maxAge`) | 0.493s | 2.377s | 7.474s |
+| **가장 이른 lease 만료** (A는 재claim 시각이 상한, B·C는 host 하한) | **≤0.461s** | **2.377s** | **7.474s** |
 | **관측 `T_stale`** | **2.712s** | **6.238s** | **9.702s** |
-| 하한 초과분 | **≥2.251s** | 3.696s | 1.979s |
+| 하한 초과분 (A는 상한 ≤0.461s 기준 / B·C는 host 하한 기준; 괄호는 DB 값 기준) | **≥2.251s** | **3.861s** / 3.696s | **2.228s** / 1.979s |
 
-`age`는 **snapshot 시각 기준**(`dbNow − claimed_at`)이므로, snapshot에 남아 있는 가장 오래된
-claim의 lease 만료 시각은 `snapshot−fault + timeout − maxAge`다(세 run 모두 양수이므로 0으로
-자르는 항이 필요 없다). **그러나 이 값이 "가장 이른 lease 만료"인 것은 아니다.** kill snapshot은
-kill 이후에 찍히고(`Run-TradeoffExperiment.ps1:1877-1881`; `killToSnapshotStartSeconds`가 그
-오프셋), 그 사이에 회수된 row는 `claimed_at`이 재claim 시각으로 **재설정**되고 `attempts`만
-증가한다(`ContestJudgeOutboxStore`: `SET claimed_at = CURRENT_TIMESTAMP(6), attempts = attempts + 1`).
+`age`는 `dbNow` 시각 기준(`dbNow − claimed_at`)이고, snapshot에 남아 있는 가장 오래된 claim의
+lease 만료 시각은 그 시계에서 `dbNow + timeout − maxAge`다(세 run 모두 양수이므로 0으로 자르는
+항이 필요 없다). DB 시각으로 쓴 값이 표의 0.743/2.542/7.723s이고, `faultInjectedAt`을 host
+시계로 두고 같은 계산을 하면 0.493/2.377/7.474s다. **그러나 이 값이 "가장 이른 lease 만료"인
+것은 아니다.** kill snapshot은 kill 이후에 찍히고(`Run-TradeoffExperiment.ps1:1877-1881`;
+`killToSnapshotStartSeconds`가 그 오프셋), 그 사이에 회수된 row는 `claimed_at`이 재claim 시각으로
+**재설정**되고 `attempts`만 증가한다(`ContestJudgeOutboxStore`: `SET claimed_at =
+CURRENT_TIMESTAMP(6), attempts = attempts + 1`).
 
 A의 snapshot에는 그런 row가 하나 있고(`attempts` 분포 `2×1, 1×17`), 그 `claimedAt`은
 `fault+0.461s`다. claim 술어는 `status='PUBLISHING' AND claimed_at < now − lease`이므로 재claim은
 lease 만료를 전제한다. 즉 **A에서는 fault+0.461s 이전에 이미 lease가 만료된 claim이 있었다.**
 그 원래 claim의 나이는 어디에도 남지 않는다(재설정된 `claimed_at`은 snapshot에서 0.396s짜리로
 보인다). 따라서 snapshot의 `maxAge` 2.613s는 kill 순간 최고령 claim의 나이가 아니고, A의
-0.743s는 하한이 아니다. B·C의 snapshot에는 `attempts=2` row가 없어(각각 `1×50`, `1×22`)
-snapshot 이전에 재claim이 일어나지 않았으므로, 두 run에서는 2.542s·7.723s가 유효한 하한이다.
+0.743s·0.493s는 하한이 아니다 — A에 대해 이 표가 주는 것은 "관측 `T_stale`보다 최소 2.251s
+먼저 회수가 시작됐다"는 상한 쪽 사실이다. B·C의 snapshot에는 `attempts=2` row가 없어
+(각각 `1×50`, `1×22`) snapshot 이전에 재claim이 일어나지 않았으므로, 두 run에서는
+2.377s·7.474s(host 기준)가 유효한 하한이다.
 
 `reclaimedRowsStrandedByTheKill`/`...SubmittedDuringOrAfterTheFault`와 `staleAttemptsBeforeFault`는
 artifact의 guard 필드이며, 이 cohort가 전부 kill이 고아로 만든 행이고 fault 이전 회수가 0임을
@@ -615,7 +685,8 @@ artifact의 guard 필드이며, 이 cohort가 전부 kill이 고아로 만든 �
    가설 1은 측정으로 지지된다.
 2. **kill 순간에 만료되지 않은 claim만 보면, 남아 있는 것 중 가장 오래된 claim도 아직 만료
    전이었다.** snapshot 잔존 최고령 claim의 age 2.613s는 snapshot 시각(fault+0.856s) 기준이므로
-   kill 순간의 age는 1.757s(= timeout의 70%)이고, 그 lease는 fault 후 **0.743s**에 만료된다.
+   kill 순간의 age는 1.757s(= timeout의 70%)이고, 그 lease는 fault 후 **0.743s**(DB 시각 기준;
+   host 시계 기준 0.493s — 어느 쪽이든 양수)에 만료된다.
    즉 그 claim의 만료는 kill보다 **뒤**다. (A에는 이보다 이른 만료가 있었다 — 위 문단.)
    kill snapshot에 있는 `attempts=2` row의 `claimedAt` 05:25:58.350588은 kill **이후**이므로,
    kill 이전에 만료된 lease의 증거가 아니라 kill 후 0.46s에 일어난 재claim의 증거다. **이 문단이
@@ -631,7 +702,30 @@ artifact의 guard 필드이며, 이 cohort가 전부 kill이 고아로 만든 �
 
 이 하한은 `cluster-wide` 상한집합에서 계산한 값이다. outbox에 `claimed_by`가 없으므로
 snapshot의 row가 judge-1의 것인지 알 수 없고, 따라서 이 하한도 cluster-wide 하한이다.
-또 DB 시각과 host 시각을 함께 쓰므로 소량의 clock offset이 섞인다.
+
+**두 시계를 섞지 않은 값이 host 시계만 쓴 보수적 하한이다.** `maxAge`는 DB 시각(`dbNow`)에서
+`claimed_at`을 뺀 값이고 `faultInjectedAt`·`killToSnapshotStartSeconds`·`T_stale`은 host 시각이므로,
+`dbNow − faultInjectedAt`을 그대로 더하면 그 합에는 **`dbNow`를 읽는 exec의 지연**과 두 시계의
+차이 δ가 함께 들어간다. `dbNow`는 `Save-FaultSnapshot`의 첫 statement이므로 그 read는 snapshot
+시작(host)보다 최소 exec 한 번만큼 뒤에 완료되고, 두 값의 차이 0.250/0.165/0.249s는 그 exec
+지연과 δ의 합이다. 같은 순간에 두 시계를 함께 읽은 기록이 없으므로 **이 계측은 둘을 분리하지
+못한다** — 따라서 "DB 시계가 몇 초 앞선다"는 식의 offset을 여기서 주장하지 않는다.
+
+대신 host 시계만 쓴 값은 offset 가정이 아예 필요 없다. `dbNow`는 어떤 host 시각 t_h ≥ snapshot
+시작에 읽혔고, 그 claim의 만료는 두 시계 어느 쪽으로도 `claimed_at + timeout`이므로 host frame의
+만료 시각은 `t_h + timeout − age ≥ snapshot 시작 + timeout − age`다. 즉
+`killToSnapshotStartSeconds + timeout − maxAge`는 **δ와 무관하게 성립하는 host frame 하한**이고,
+값도 두 값 중 작은 쪽(=더 보수적인 쪽)이다. 그래서 위 표는 두 값을 함께 보고한다: DB 시각을
+그대로 쓴 0.743/2.542/7.723s와, host 시계만 쓴 0.493/2.377/7.474s. **A에 대해서는 어느 값도
+하한이 아니고**(아래 문단), B·C에 대해서는 host 시계만 쓴 값이 더 보수적이다. §13의 B vs C
+논증과 §16·§17의 수치는 이 보수적인 쪽(2.377s, 7.474s)을 쓴다.
+
+`ageSeconds`는 `Save-ClaimSnapshot`(`1880`)이 읽은 row 목록에 `Save-FaultSnapshot`의 `dbNow`를
+적용해 계산한다. 두 읽기 사이에 시차가 있으므로 그 사이에 회수된 row는 목록에서 빠지고(A의
+`attempts=2` row가 그 경우다), 목록에 남은 row의 age는 `dbNow` 시점 기준으로 계산된다. 이는
+하한을 **낮추는** 방향(보수적 방향)으로만 작용한다 — `dbNow + timeout − age`는 `dbNow`가 언제
+읽혔는지와 무관하게 그 claim의 만료 시각을 주고(=`claimed_at + timeout`), age가 크면 만료 시각은
+작아진다. 즉 이 시차 때문에 하한이 실제보다 **커지지는 않는다**.
 
 ### SIGKILL된 노드의 counter
 
@@ -650,6 +744,13 @@ judge invocations와 그것에서 파생된 모든 값은 세 run 모두 **하�
 데려갔으므로 마지막 scrape와 kill 사이의 증가분은 프로세스와 함께 사라졌다. **사라진 counter는
 0이 아니고, 이 보고서는 그것을 0으로 읽지 않는다.** durable한 증거는 outbox의 `attempts` 열과
 최종 row 상태이며, 위 표의 stale reclaim 열이 그 값이다.
+
+위 표의 stale reclaim 열은 durable하지만 **그 자체로 lease 회수를 증명하지는 않는다.**
+`SUM(attempts - 1)`은 평범한 실패→재시도(=`attempts`를 되돌리지 않는 PENDING 복귀)도 세므로,
+하네스의 `T_stale` 탐지 규칙은 두 사건을 구분하지 못한다. 이번 세 run에서 그 구분을 닫는 것은
+claim 시점의 `staleReclaim` 플래그를 세는 `contest_judge_claim_stale_total`(3 / 20 / 13, durable
+`SUM`과 일치)과 `completion{outcome=failure}` delta 0이다(§10). 따라서 **이 run들에서는**
+`attempts > 1`이 복구 재claim이고, **어느 run에서도** 동시 중복 CPU 실행이 아니다.
 
 `cluster-wide claimed unfinished upper bound`는 **cluster-wide 상한**이며 **judge-1의 active
 claims가 아니다.** outbox에 `claimed_by`가 없으므로 snapshot은 어느 노드가 어느 row를 들고
@@ -752,13 +853,15 @@ comparer가 낸 verdict 그대로다.
 
 - B의 회수는 관측 시각인 **6.238s 이하**다. 관측된 `attempts`는 durable하므로 그 시각까지
   회수가 이미 완료돼 있었다.
-- C의 회수는 **7.723s보다 빠를 수 없다.** kill 순간 PUBLISHING이던 claim 중 가장 이른 만료가
-  7.723s이고(§10의 lease 만료 시각), kill 이후에 새로 획득된 claim은 `claimed_at ≥ fault`이므로
-  10s timeout에서 만료가 fault+10s 이상이다.
+- C의 회수는 **7.474s보다 빠를 수 없다.** kill 순간 PUBLISHING이던 claim 중 가장 이른 만료가
+  7.474s이고(§10의 host 시계만 쓴 보수적 하한), kill 이후에 새로 획득된 claim은
+  `claimed_at ≥ fault`이므로 10s timeout에서 만료가 fault+10s 이상이다.
 
 두 구간이 겹치지 않으므로 **B의 회수가 C의 회수보다 먼저 일어났음이 관측 격자와 무관하게
-성립**하고, 그 최소 여유는 7.723 − 6.238 = **1.485s**다. 이 절의 `T_stale` 판정은 이 논증에
-근거하며 2.094s band는 여기에 쓰이지 않는다.
+성립**하고, 그 최소 여유는 7.474 − 6.238 = **1.236s**다. 두 시계를 분리하지 않고 DB 시각을 그대로
+쓴 값을 쓰면 7.723 − 6.238 = 1.485s가 되지만, 그 값에는 `dbNow`를 읽는 exec 지연(과 분리되지
+않는 clock offset)이 더해져 있으므로 **보수적인 1.236s를 쓴다**(§10). 이 절의 `T_stale` 판정은
+이 논증에 근거하며 2.094s band는 여기에 쓰이지 않는다.
 
 ### 재영점: "10s가 더 빠르다" 두 판정은 재기동 타이밍 교란이다
 
@@ -814,9 +917,9 @@ PUBLISHING 상태였던 row 수가 달랐기 때문이며(50 대 22), 이 값은
 
 **이 측정이 지지하는 판정: 장애 복구 축에서는 4s가 더 나은 설정이다.** 근거는 lease에 귀속되는
 유일한 차이(`T_stale` 3.464s, 관측 격자와 무관하게 lease 만료로 유계됨)와 reclaimed cohort의
-`L_total`이다. comparer가 "10s가
-빠르다"고 표시한 throughput·backlog 두 항목은 node ready 기준으로 재영점하면 band 안으로
-들어가고, 그 차이의 대부분은 이 실험이 제어하지 않는 재기동 타이밍이다.
+`L_total`이다. comparer가 "10s가 빠르다"고 표시한 throughput·backlog 두 항목은 node ready
+기준으로 재영점하면 band 안으로 들어가고, 그 차이의 대부분은 이 실험이 제어하지 않는 재기동
+타이밍이다.
 
 이 판정은 **회수 지연과 그 지연을 기다린 소수의 지연**에 근거한다. 두 run의 전체 처리량이나
 전체 무결성에는 차이가 없었고(§6), backlog peak에도 우열이 없었다.
@@ -939,8 +1042,8 @@ A 10.541 / B 12.99 / C 13.448 rows/s.
    scoreboardApplied가 A 24378, B 30464, C 30465이고, `lostOrIncomplete` 0,
    `finalResultMismatch` 0, HTTP 429/500/503 전부 0, drain 성공이다. 가설 5는 지지된다.
 2. **세 run 모두 fault 순간 실제 active work가 있었다.** judge-1의 running/reserved는
-   A 4/4, B 9/9, C 8/8이었고, primary 조건(`reserved >= 4`)에서 0.279s 이내에 주입됐다.
-   `faultNotInjectedWithActiveWork`는 세 run 모두 false다.
+   A 4/4, B 9/9, C 8/8이었고, primary 조건(`reserved >= 4`)은 window가 열린 뒤 0.279s 이내에
+   충족됐다(§4). `faultNotInjectedWithActiveWork`는 세 run 모두 false다.
 3. **down window는 A 15.009s, B 15.009s, C 15.402s다.** A·B는 설정과 0.009s 차이고, C는
    0.402s 초과했으나 harness 자체 허용치 0.5s 안이다. 세 run 모두 `restartRequestedAt`이
    `faultInjectedAt`에 정박되어 있어 관측이 느려도 outage가 짧아지지 않고 길어진다. C의 초과는
@@ -951,7 +1054,8 @@ A 10.541 / B 12.99 / C 13.448 rows/s.
    B 34.510s, C 29.838s를 차지한다.
 5. **관측 `T_stale`은 timeout에 대해 단조 증가한다**: 2.712s(2.5s), 6.238s(4s),
    9.702s(10s). 가설 1은 세 점에서 지지된다.
-6. **세 run 모두 자기 lease 만료 시각보다 늦게 회수했다**(초과분 ≥2.251s / 3.696s / 1.979s).
+6. **세 run 모두 자기 lease 만료 시각보다 늦게 회수했다**(초과분: A는 관측 상한 ≤0.461s 기준
+   ≥2.251s, B **3.861s**, C **2.228s** — B·C는 §10의 host 시계만 쓴 보수적 하한 기준).
    timeout은 회수 지연의 하한을 정하지 회수 지연 자체를 정하지 않는다.
 7. **stale reclaim은 3 / 20 / 13건이다.** analyzer와 harness가 durable outbox에서 독립적으로
    같은 수를 얻었다. `storedResultRepublishes`와 `staleTokenCompletions`는 세 run 모두 0이다.
@@ -965,7 +1069,7 @@ A 10.541 / B 12.99 / C 13.448 rows/s.
    backlog 정상화 40.503 / 26.311 / 25.079s다. 가설 4는 지지된다: 회복 시간의 대부분은
    down window와 재기동이며 claim timeout의 기여는 그 위의 작은 항이다.
 10. **MIF64 짝에서 `T_stale`은 4s가 3.464s 빠르다.** 이 판정은 관측 격자가 아니라 lease 만료로
-    유계된다: B의 관측 상한 6.238s와 C의 lease 하한 7.723s가 겹치지 않으므로 최소 여유 1.485s가
+    유계된다: B의 관측 상한 6.238s와 C의 lease 하한 7.474s가 겹치지 않으므로 최소 여유 1.236s가
     격자와 무관하게 성립한다(§13). band(2.094s)는 hold 평균 간격에서 나온 값이라 outage 구간의
     해상도(약 5.4–8.2s)를 과대평가한다.
 11. **MIF64 짝에서 backlog peak 차이(+31)는 band(104.718) 안이고, fault-down cohort `L_result`
@@ -995,8 +1099,8 @@ A 10.541 / B 12.99 / C 13.448 rows/s.
    노드의 poll이 claim할 여유를 가진 순간에 일어나므로 후보 기제는 poll 간격 100ms, 생존
    노드의 부하, 그리고 `mif − reserved`인 per-poll claim 여유다. 그런데 kill 직전 judge-2는
    A 3 running / 3 reserved(mif 16, 여유 13), B 15/15(mif 64, 여유 49), C 16/16(mif 64, 여유 48)로
-   **B·C의 여유가 A보다 훨씬 컸는데도 초과분은 A의 하한 2.251s와 C의 1.979s가 2s 근처에
-   몰리고 B만 3.696s로 단조가 아니다.**
+   **B·C의 여유가 A보다 훨씬 컸는데도 초과분은 A의 관측 상한 기준 2.251s와 C의 2.228s가 2s 근처에
+   몰리고 B만 3.861s로 단조가 아니다.**
    더 근본적으로는 **이 초과분이 자기 관측 불확실성보다 작다**: T_stale을 읽는 관측의 간격이
    outage 중 2.7~4.1초이므로(§20) 1.7초짜리 초과분 차이에는 아무것도 읽을 수 없다. 즉 이
    초과분은 위 후보 중 어느 하나에도 귀속되지 않으며, 세 run 모두 T_stale이 timeout에 대해
@@ -1029,7 +1133,8 @@ A 10.541 / B 12.99 / C 13.448 rows/s.
    어디에 얼마가 걸렸는지는 이 계측으로 분해되지 않는다.
 5. **`T_stale`의 정확한 시각.** outage 구간의 poll 간격이 2.7–4.1s이고(§5), A에서는 첫 poll이
    이미 회수를 보았으므로 A의 관측값 2.712s에는 관측이 주는 하한이 없다. 그래서 §10은 lease
-   만료 하한과 durable `attempts`로 따로 논증한다. B·C의 구간 폭은 3.696s·1.979s다.
+   만료 하한과 durable `attempts`로 따로 논증한다. B·C의 구간 폭은 3.861s·2.228s다(host 시계만
+   쓴 보수적 하한 기준. 두 시계를 그대로 더한 값으로는 3.696s·1.979s다 — §10).
 6. **재claim이 실제로 시작된 시각과 그 순간의 queue 상태.** 1초 표본 사이의 사건이다.
 7. **MIF16/2500ms와 MIF64 두 run의 raw RPS·raw latency 우열.** offered load가 다르다.
 8. **mif와 stranded의 비례 관계.** 세 run에서 mif와 도착 타이밍과 부하가 함께 변했다.
@@ -1056,8 +1161,8 @@ A 10.541 / B 12.99 / C 13.448 rows/s.
    늘리는 것보다 backlog 정상화에 더 큰 효과를 낼 수 있다. 관측할 것: 같은 세 조건에서
    readiness 시간을 줄였을 때 from-fault 회복 시간의 변화.
 4. **회수 지연의 초과분을 정하는 요인.** §16 추론 3이 분리하지 못한 부분을 직접 시험한다.
-   kill 순간 생존 노드의 per-poll claim 여유는 A 13, B 49, C 48이었는데 초과분은 A의 하한
-   2.251s와 C의 1.979s가 2s 근처에 몰리고 B만 3.696s로 단조가 아니었다. mif와 offered load를
+   kill 순간 생존 노드의 per-poll claim 여유는 A 13, B 49, C 48이었는데 초과분은 A의 관측 상한
+   기준 2.251s와 C의 2.228s가 2s 근처에 몰리고 B만 3.861s로 단조가 아니었다. mif와 offered load를
    각각 고정·변화시켜 후보 기제(poll 간격 100ms, 생존 노드의 부하, `mif − reserved` 여유)를
    하나씩 분리해야 한다.
 5. **MIF64/4s의 정상상태 여유 재확인.** 4s는 MIF64에서 중복 0이 확인된 가장 짧은 값이라
@@ -1065,10 +1170,11 @@ A 10.541 / B 12.99 / C 13.448 rows/s.
    hold와 더 높은 RPS에서 4s의 정상상태 중복이 0으로 유지되는지 확인해야 한다.
 6. **timeout을 연속 축으로.** 2.5s·4s·10s 세 점은 단조성을 보였지만 최적값을 주지 않는다.
    같은 mif·같은 RPS에서 3s·5s·6s를 측정하면 `T_stale`과 reclaimed `L_total`의 곡선을 얻는다.
-7. **하네스 down window guard 수정 후 재측정.** 현재 guard는 관측의 시작만 deadline 앞으로
-   제한하므로(§5, §18), 세 run 모두 마지막 관측이 deadline을 넘겼고 C는 재기동 요청을 0.400s
-   늦췄다. 관측을 deadline **안에서 끝내도록** 고치면(예: 남은 시간이 COUNT 왕복보다 짧으면
-   관측을 건너뛰고, `downWindowObservationBasis` 문장도 실제 동작에 맞게 다시 쓴다) down
+7. **하네스 down window guard 수정 후 재측정.** 현재 guard가 유계하는 것은 관측을 품은
+   **반복의 시작**이고 관측의 시작은 아니다(그 사이에 표본 tick이 있다 — §5, §18). 그래서 세 run
+   모두 마지막 관측이 13.0s 경계를 넘겨 시작해 deadline을 넘겨 끝났고, C는 재기동 요청을 0.400s
+   늦췄다. 관측을 deadline **안에서 끝내도록** 고치면(예: 남은 시간이 tick + COUNT 왕복보다 짧으면
+   그 반복의 관측을 건너뛰고, `downWindowObservationBasis` 문장도 실제 동작에 맞게 다시 쓴다) down
    duration이 정확히 15s가 되고 C의 from-fault 회복 시간이 그만큼 짧아진다. 수정은 측정값을
    바꾸므로 분석기 재계산으로 흡수할 수 없다 — 새 RunId로 다시 측정해야 하고, 그러면 위 1~6과
    같은 이유로 **이번 라운드의 3조건 고정 행렬 밖**이다.
@@ -1109,13 +1215,15 @@ cohort C가 n=0으로 비었다. 수정 후 같은 원시 데이터에서 n=15�
 `9D5D59...` 하나이며, 이 값은 위 수정을 포함한 상태다. **측정을 다시 돌리지 않았으므로 다시
 실행한 것처럼 표현하지 않는다.**
 
-**측정 후 하네스 결함도 하나 드러났으나 고치지 않았다.** down window의 관측 guard는 관측의
-**시작**만 deadline 앞으로 제한하고, `Save-BacklogSample`은 두 COUNT 뒤에 행을 찍으므로 마지막
-관측이 deadline을 넘길 수 있다(§5, §20). 세 run 모두 마지막 관측이 `downObserveUntil`을 넘겼고
-C는 `restartScheduledAt`까지 0.400s 넘겨 재기동 요청을 그만큼 늦췄다. 이 결함은 **측정값 자체를
-바꾸는 종류**이므로 분석기 수정처럼 같은 원시 데이터에서 다시 계산할 수 없다. 고친 harness로
-다시 측정하면 down duration·`restartTimingErrorSeconds`·C의 throughput recovery가 달라지지만,
-그것은 **네 번째·다섯 번째 run을 새로 만드는 일**이고 이 라운드의 3조건 고정 행렬을 벗어난다.
+**측정 후 하네스 결함도 하나 드러났으나 고치지 않았다.** down window의 관측 guard는 관측을 품은
+반복의 **시작**만 deadline 앞으로 제한하고, 관측은 그 반복의 표본 tick 뒤에 시작하며,
+`Save-BacklogSample`은 두 COUNT 뒤에 행을 찍으므로 마지막 관측이 deadline을 넘겨 **시작하고**
+끝날 수 있다(§5, §20). 실제로 세 run 모두 마지막 관측이 `downObserveUntil`을 1.06–1.87s 넘겨
+시작했고, C는 `restartScheduledAt`까지 0.400s 넘겨 재기동 요청을 그만큼 늦췄다. 이 결함은
+**측정값 자체를 바꾸는 종류**이므로 분석기 수정처럼 같은 원시 데이터에서 다시 계산할 수 없다.
+고친 harness로 다시 측정하면 down duration·`restartTimingErrorSeconds`·C의 throughput recovery가
+달라지지만, 그것은 **네 번째·다섯 번째 run을 새로 만드는 일**이고 이 라운드의 3조건 고정 행렬을
+벗어난다.
 따라서 수정은 §17 후속 후보로만 남기고, **이 문서의 수치는 위 harness SHA가 만든 그대로**임을
 명시한다. 세 run을 이 결함 기준으로 다시 실행한 적은 없다.
 
@@ -1179,12 +1287,19 @@ B의 1차 시도는 `fault-recovery-matrix-outcomes.json`의 `conditions[1].reru
 - **단일 호스트, 컨테이너 2개, slow 비율 5%.** 재기동 32~37s와 포화 거동은 이 환경의 값이다.
 - **`T_stale`의 관측 격자는 1초가 아니다.** pre-fault 구간은 1초지만 outage 구간에서 관측 1회는
   2.7–4.1s를 쓴다. A는 첫 poll이 이미 회수를 보았으므로 관측만으로는 회수 시각이 분해되지 않고,
-  B·C의 구간 폭은 3.696s·1.979s다. §13의 B vs C 판정은 이 격자가 아니라 lease 만료 하한과 관측
-  상한이 겹치지 않는다는 사실에 근거한다. §5.
-- **down window의 마지막 2초 guard는 관측의 시작 시각만 제약한다.** `downObserveUntil`은 관측
-  1회가 남은 시간보다 짧다는 가정 위에 서 있고, 세 run 모두 마지막 관측이 그 경계를 넘겨 끝났다
-  (A 14.791s / B 14.501s / C 15.400s). C에서는 그 관측이 `restartScheduledAt`(15.0s)까지 넘겨
-  재기동 요청이 0.402s 밀렸다. §5.
+  B·C의 구간 폭은 3.861s·2.228s다(host 시계만 쓴 보수적 하한 기준). §13의 B vs C 판정은 이 격자가
+  아니라 lease 만료 하한과 관측 상한이 겹치지 않는다는 사실에 근거한다. §5.
+- **outage 구간의 표본 간격을 지배하는 항은 표본 tick이다.** tick 2.274–3.415s + 두 COUNT
+  0.425–0.736s이고, **tick 안에서 단일 DB 질의와 죽은 judge-1 gauge scrape 중 어느 쪽이 그 2~3초를
+  쓰는지는 이 계측으로 분해되지 않는다.** 두 후보를 구분할 근거는 이만큼이다: 죽은 노드의 gauge
+  값은 그 구간 ticks에서 비어 있지만, 컨테이너가 다시 뜬 직후의 tick(A +16.305s)도 gauge가 비어
+  있으면서 275ms밖에 걸리지 않았다 — "빈 gauge 하나가 2초를 만든다"로는 설명되지 않고, 그렇다고
+  DB 단일 질의가 원인이라고 말할 근거도 없다(관측의 두 COUNT는 같은 구간에서 정상 비용이었다). §5.
+- **down window의 마지막 2초 guard는 관측을 품은 반복의 시작만 제약한다.** 관측은 그 반복의
+  표본 tick 뒤에 시작하므로 guard는 관측의 시작을 유계하지 못하고, 세 run 모두 마지막 관측이
+  13.0s 경계를 넘겨 시작해 경계를 넘겨 끝났다(A 14.340s→14.791s / B 14.059s→14.501s /
+  C 14.872s→15.400s). C에서는 그 관측이 `restartScheduledAt`(15.0s)까지 넘겨 재기동 요청이
+  0.402s 밀렸다. §5.
 - **backlog peak과 growth는 표본에서 나온다.** pre-fault 구간의 표본 간격은 1초이고, 1초 안의
   상승은 보이지 않으며 growth는 하한이다. outage 구간의 표본 간격은 2.7–4.1s이므로 그 구간
   peak의 해상도는 100 RPS에서 270–410행이다.
@@ -1192,9 +1307,14 @@ B의 1차 시도는 `fault-recovery-matrix-outcomes.json`의 `conditions[1].reru
 - **judge-1의 counter는 하한이고, judge-1의 claim 귀속은 불가능하다.** §12.
 - **cohort C의 n이 3/20/13이다.** 이 cohort의 percentile은 소수 관측이며 p99는 최대값이다.
 - **`cluster-wide claimed unfinished upper bound`는 두 번 상한이다.** §10.
-- **DB 시각과 host 시각을 함께 쓰는 계산에 소량의 clock offset이 섞인다.** lease 만료 시각
-  (§10의 하한)이 그런 계산이다.
-- **`attempts > 1`은 복구 재claim이다.** 동시 중복 CPU 실행이 아니다. §12.
+- **DB 시각과 host 시각을 함께 쓰는 계산에는 offset과 read 지연이 섞인다.** lease 만료 시각(§10의
+  하한)이 그런 계산이고, 이 계측은 `dbNow` read 지연과 clock offset δ를 분리하지 못하므로(§10)
+  offset 값을 주장하지 않는다. 그래서 §10·§13·§16·§17은 offset 가정이 필요 없는 host 시계 단독
+  하한(2.377s·7.474s, 여유 1.236s)을 쓴다.
+- **`attempts > 1`은 복구 재claim이다.** 동시 중복 CPU 실행이 아니다. 이 구분은 이번 세 run에서
+  `contest_judge_claim_stale_total`(3/20/13)과 `completion{outcome=failure}` 0으로 닫혔지만
+  (즉 평범한 실패→재시도가 섞이지 않았다), `SUM(attempts - 1)`이라는 탐지 규칙 자체는 두 사건을
+  구분하지 못한다 — 실패 분기가 `attempts`를 되돌리지 않기 때문이다. §10, §12.
 - **timeout의 최적값은 이 실험이 답하지 않는다.** 4s와 10s 두 점만 비교했다.
 
 ## 21. 산출물
