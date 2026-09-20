@@ -55,6 +55,23 @@ if ($TargetRps -le 0 -or $DurationSeconds -lt 5 -or $RampSeconds -lt 0) { throw 
 if ($WorkerCount -lt 1 -or $MySqlClaimBatchSize -lt 1 -or $MySqlMaxInFlight -lt 1 -or $RabbitPrefetch -lt 1) { throw "Worker, batch, in-flight, and prefetch values must be positive." }
 if ($FaultEnabled -and ($FaultAtSeconds -le 0 -or $FaultAtSeconds -ge ($RampSeconds + $DurationSeconds))) { throw "FaultAtSeconds must fall inside the Gatling run." }
 
+# Spring Boot binds this property with DurationStyle, whose simple form is
+# ^([+-]?\d+)([a-zA-Z]{0,2})$ - digits only, no decimal point - so a fractional value written the
+# natural way, such as "2.5s", fails to bind and the app does not start. The simple form does accept
+# a millisecond unit, so a fractional second is passed as whole milliseconds, which is the same
+# Duration exactly rather than a rounded one. The requested value is what the run and the document
+# report; the property form is recorded alongside it so the binding is auditable.
+if ($MySqlClaimTimeout -match '^([+-]?\d+)([a-zA-Z]{0,2})$') {
+    $claimTimeoutProperty = $MySqlClaimTimeout
+} elseif ($MySqlClaimTimeout -match '^(\d+(?:\.\d+)?)s$') {
+    $claimTimeoutProperty = "{0}ms" -f [long][math]::Round([double]$Matches[1] * 1000)
+} elseif ($MySqlClaimTimeout -match '^[+-]?[pP]') {
+    # ISO-8601, the other form DurationStyle detects, passed through unchanged.
+    $claimTimeoutProperty = $MySqlClaimTimeout
+} else {
+    throw "-MySqlClaimTimeout '$MySqlClaimTimeout' is not bindable: use a whole number of milliseconds, seconds, minutes or hours (for example 2500ms), or an ISO-8601 duration such as PT2.5S."
+}
+
 $stageRpsList = @()
 if ($Staircase) {
     if ($FaultEnabled) { throw "-Staircase measures steady-state capacity and does not inject faults." }
@@ -168,6 +185,7 @@ $parameters = [ordered]@{
     targetRps = $TargetRps; durationSeconds = $DurationSeconds; rampSeconds = $RampSeconds
     workerCountPerNode = $WorkerCount; mysqlClaimBatchSize = $MySqlClaimBatchSize
     mysqlMaxInFlightPerNode = $MySqlMaxInFlight; mysqlClaimTimeout = $MySqlClaimTimeout
+    mysqlClaimTimeoutProperty = $claimTimeoutProperty
     mysqlPollInterval = $MySqlPollInterval; rabbitPrefetch = $RabbitPrefetch
     rabbitReservedPerNode = $WorkerCount * $RabbitPrefetch
     deterministicLatencySeed = $LatencySeed; latency = @{ baseMillis = 50; slowMillis = 2000; slowRatio = 0.05 }
@@ -889,7 +907,7 @@ $env:CONTEST_JUDGE_PREFETCH = "$RabbitPrefetch"
 $env:CONTEST_JUDGE_MYSQL_WORKERS = "$WorkerCount"
 $env:CONTEST_JUDGE_MYSQL_CLAIM_BATCH_SIZE = "$MySqlClaimBatchSize"
 $env:CONTEST_JUDGE_MYSQL_MAX_IN_FLIGHT = "$MySqlMaxInFlight"
-$env:CONTEST_JUDGE_MYSQL_CLAIM_TIMEOUT = $MySqlClaimTimeout
+$env:CONTEST_JUDGE_MYSQL_CLAIM_TIMEOUT = $claimTimeoutProperty
 $env:CONTEST_JUDGE_MYSQL_POLL_INTERVAL = $MySqlPollInterval
 $env:JUDGE_LATENCY_ENABLED = "true"
 $env:JUDGE_LATENCY_SEED = "$LatencySeed"
