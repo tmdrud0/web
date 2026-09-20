@@ -59,6 +59,19 @@ function Get-LatencySummary {
     return $result
 }
 
+function Get-LatencyClassSummary {
+    param([object[]]$Rows)
+    $result = [ordered]@{}
+    foreach ($latencyClass in @("fast", "slow")) {
+        $classRows = @($Rows | Where-Object { $_.latencyClass -eq $latencyClass })
+        $result[$latencyClass] = Get-LatencySummary $classRows
+        $result[$latencyClass]["submissionCount"] = $classRows.Count
+    }
+    $unclassified = @($Rows | Where-Object { @("fast", "slow") -notcontains $_.latencyClass }).Count
+    $result["unclassifiedSubmissionCount"] = $unclassified
+    return $result
+}
+
 # --- staircase helpers, used only when stages.json exists -----------------------------------------
 
 function Get-EpochMillis {
@@ -563,7 +576,7 @@ if (Test-Path $stagesPath) {
             maxIntervalMs = if ($tickIntervals.Count -gt 0) { [math]::Round((($tickIntervals | Measure-Object -Maximum).Maximum), 3) } else { $null }
             meanIntervalMs = if ($tickIntervals.Count -gt 0) { [math]::Round((($tickIntervals | Measure-Object -Average).Average), 3) } else { $null }
             ticksSlowerThan1500Ms = @($tickIntervals | Where-Object { $_ -gt 1500 }).Count
-            maxBoundaryLagMs = (@($stage.prometheusStartLagMs, $stage.prometheusEndLagMs) |
+            maxBoundaryLagMs = (@($stage.prometheusStartLagMs, $stage.prometheusMeasurementStartLagMs, $stage.prometheusEndLagMs) |
                 Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ } |
                 Measure-Object -Maximum).Maximum
         }
@@ -571,6 +584,37 @@ if (Test-Path $stagesPath) {
         $stageLatencyRows = @($latencyIndexed | Where-Object {
             $null -ne $_.millis -and $_.millis -ge $mStart -and $_.millis -lt $mEnd } | ForEach-Object { $_.row })
         $latency = Get-LatencySummary $stageLatencyRows
+        $latencyByClass = Get-LatencyClassSummary $stageLatencyRows
+
+        # The guard-adjusted scrape was added for this experiment. Existing counters retain their
+        # hold-wide start label for backwards compatibility, while these class metrics span the same
+        # 60-second window as the cohort percentiles and throughput rows.
+        $classMetricStartLabel = if ($stage.prometheusMeasurementStartLabel) {
+            [string]$stage.prometheusMeasurementStartLabel
+        } else { [string]$stage.prometheusStartLabel }
+        $judgeWorkByClass = [ordered]@{}
+        foreach ($latencyClass in @("fast", "slow")) {
+            $tag = 'latency_class="' + $latencyClass + '"'
+            $classInvocations = Get-PromDelta $classMetricStartLabel $stage.prometheusEndLabel `
+                "contest_judge_latency_class_invocations_total" $tag
+            $classDurationSeconds = Get-PromDelta $classMetricStartLabel $stage.prometheusEndLabel `
+                "contest_judge_latency_class_duration_seconds_sum" $tag
+            $judgeWorkByClass[$latencyClass] = [ordered]@{
+                invocations = $classInvocations
+                actualDurationSeconds = $classDurationSeconds
+                actualDurationMillis = if ($null -eq $classDurationSeconds) { $null } else { [math]::Round(1000.0 * $classDurationSeconds, 3) }
+            }
+        }
+        $classActualJudgeSeconds = if (@($judgeWorkByClass.fast.actualDurationSeconds, $judgeWorkByClass.slow.actualDurationSeconds) -contains $null) {
+            $null
+        } else { [math]::Round($judgeWorkByClass.fast.actualDurationSeconds + $judgeWorkByClass.slow.actualDurationSeconds, 6) }
+        $availableWorkerSeconds = [math]::Round($mSeconds * 2 * [int]$parameters.workerCountPerNode, 3)
+        $judgeWorkByClass["total"] = [ordered]@{
+            actualDurationSeconds = $classActualJudgeSeconds
+            availableWorkerSeconds = $availableWorkerSeconds
+            actualDurationPerAvailableWorkerSecond = if ($null -eq $classActualJudgeSeconds -or $availableWorkerSeconds -le 0) { $null } else { [math]::Round($classActualJudgeSeconds / $availableWorkerSeconds, 6) }
+            windowBasis = "guard-adjusted measurement window; class counters use the measurement-start and hold-end Prometheus snapshots"
+        }
 
         $reclaimInStage = @($reclaimMillis | Where-Object { $_ -ge $mStart -and $_ -lt $mEnd }).Count
         $staleCompletions = Get-PromDelta $stage.prometheusStartLabel $stage.prometheusEndLabel "contest_judge_completion_total" 'outcome="stale"'
@@ -688,8 +732,10 @@ if (Test-Path $stagesPath) {
             measurementSeconds = $mSeconds
             traceSegmentIndex = $stage.traceSegmentIndex
             prometheusStartLabel = $stage.prometheusStartLabel
+            prometheusMeasurementStartLabel = $stage.prometheusMeasurementStartLabel
             prometheusEndLabel = $stage.prometheusEndLabel
             prometheusStartLagMs = $stage.prometheusStartLagMs
+            prometheusMeasurementStartLagMs = $stage.prometheusMeasurementStartLagMs
             prometheusEndLagMs = $stage.prometheusEndLagMs
             classification = $classification
             classificationReason = $classificationReason
@@ -705,6 +751,7 @@ if (Test-Path $stagesPath) {
                 judgeStart = $judgeGrowth.start; judgeEnd = $judgeGrowth.end
                 scoreboardStart = $scoreboardGrowth.start; scoreboardEnd = $scoreboardGrowth.end
                 totalStart = $totalGrowth.start; totalEnd = $totalGrowth.end
+                totalPeak = (Get-ColumnStats $series "total").max
                 seconds = $totalGrowth.seconds
             }
             backlogByHalf = [ordered]@{
@@ -731,6 +778,8 @@ if (Test-Path $stagesPath) {
             refusedShare = $refusedShare
             apiRateLimitPolluted = $polluted
             latency = $latency
+            latencyByClass = $latencyByClass
+            judgeWorkByLatencyClass = $judgeWorkByClass
             reliableAsSteadyStateLatency = $reliable
             reliableAsSteadyStateLatencyReason = $reliableReason
             overloadQueueingResults = ($classification -eq "overloaded")
@@ -1052,6 +1101,82 @@ if (Test-Path $stagesPath) {
             $duplicateJudgementsFromStale * $DuplicateJudgeMillisCeiling
         }
 
+        # Exact class accounting over the complete measurement-contest scope. The start scrape is
+        # taken only after the separate warm-up contest has quiesced, and the end scrape is taken
+        # after drain, so every accepted measurement submission and every invocation it caused fall
+        # inside the same pair of counter snapshots. This makes invocation - unique submission a
+        # valid class-specific duplicate count when failed executions are zero.
+        $classAccounting = [ordered]@{}
+        $uniqueExpectedMillisTotal = 0.0
+        $actualInvocationMillisTotal = 0.0
+        $profileDuplicateMillisTotal = 0.0
+        $classInvocationsTotal = 0.0
+        $classDuplicatesTotal = 0.0
+        $classAccountingAvailable = $true
+        foreach ($latencyClass in @("fast", "slow")) {
+            $classRows = @($rows | Where-Object { $_.latencyClass -eq $latencyClass })
+            $uniqueClassSubmissions = $classRows.Count
+            $classMillis = if ($latencyClass -eq "fast") {
+                [double]$parameters.latency.baseMillis
+            } else { [double]$parameters.latency.slowMillis }
+            $tag = 'latency_class="' + $latencyClass + '"'
+            $classInvocations = Get-PromDelta "start" "end" `
+                "contest_judge_latency_class_invocations_total" $tag
+            $classDurationSeconds = Get-PromDelta "start" "end" `
+                "contest_judge_latency_class_duration_seconds_sum" $tag
+            $classDuplicates = if ($null -eq $classInvocations -or $null -eq $failedExecutions -or [long]$failedExecutions -ne 0) {
+                $null
+            } else { [long]$classInvocations - $uniqueClassSubmissions }
+            $uniqueExpectedMillis = $uniqueClassSubmissions * $classMillis
+            $actualInvocationMillis = if ($null -eq $classDurationSeconds) { $null } else { [math]::Round(1000.0 * $classDurationSeconds, 3) }
+            $profileDuplicateMillis = if ($null -eq $classDuplicates) { $null } else { $classDuplicates * $classMillis }
+            if ($null -eq $classInvocations -or $null -eq $actualInvocationMillis -or $null -eq $profileDuplicateMillis) {
+                $classAccountingAvailable = $false
+            } else {
+                $classInvocationsTotal += $classInvocations
+                $actualInvocationMillisTotal += $actualInvocationMillis
+                $profileDuplicateMillisTotal += $profileDuplicateMillis
+                $classDuplicatesTotal += $classDuplicates
+            }
+            $uniqueExpectedMillisTotal += $uniqueExpectedMillis
+            $classAccounting[$latencyClass] = [ordered]@{
+                uniqueSubmissions = $uniqueClassSubmissions
+                judgeInvocations = $classInvocations
+                duplicateJudgeExecutions = $classDuplicates
+                uniqueExpectedJudgeMillis = $uniqueExpectedMillis
+                actualJudgeInvocationMillis = $actualInvocationMillis
+                profileDuplicateJudgeMillis = $profileDuplicateMillis
+                actualMinusProfileUniqueMillis = if ($null -eq $actualInvocationMillis) { $null } else { [math]::Round($actualInvocationMillis - $uniqueExpectedMillis, 3) }
+            }
+        }
+        $classUnclassified = @($rows | Where-Object { @("fast", "slow") -notcontains $_.latencyClass }).Count
+        $measurementScopeSeconds = $null
+        if ($events.measurementBaselineAt -and $events.measurementEndSnapshotAt) {
+            $measurementScopeSeconds = [math]::Round(
+                ([datetimeoffset]::Parse($events.measurementEndSnapshotAt) -
+                 [datetimeoffset]::Parse($events.measurementBaselineAt)).TotalSeconds, 3)
+        }
+        $availableWorkerSeconds = if ($null -eq $measurementScopeSeconds) { $null } else {
+            [math]::Round($measurementScopeSeconds * 2 * [int]$parameters.workerCountPerNode, 3)
+        }
+        $classAccounting["total"] = [ordered]@{
+            uniqueSubmissions = $rows.Count
+            judgeInvocations = if ($classAccountingAvailable) { $classInvocationsTotal } else { $null }
+            duplicateJudgeExecutions = if ($classAccountingAvailable) { $classDuplicatesTotal } else { $null }
+            uniqueExpectedJudgeMillis = [math]::Round($uniqueExpectedMillisTotal, 3)
+            actualJudgeInvocationMillis = if ($classAccountingAvailable) { [math]::Round($actualInvocationMillisTotal, 3) } else { $null }
+            profileDuplicateJudgeMillis = if ($classAccountingAvailable) { [math]::Round($profileDuplicateMillisTotal, 3) } else { $null }
+            duplicateJudgeMillisPerUniqueExpectedJudgeMillis = if (-not $classAccountingAvailable -or $uniqueExpectedMillisTotal -le 0) { $null } else { [math]::Round($profileDuplicateMillisTotal / $uniqueExpectedMillisTotal, 6) }
+            actualJudgeSeconds = if ($classAccountingAvailable) { [math]::Round($actualInvocationMillisTotal / 1000.0, 6) } else { $null }
+            measurementScopeSeconds = $measurementScopeSeconds
+            availableWorkerSeconds = $availableWorkerSeconds
+            actualJudgeSecondsPerAvailableWorkerSecond = if (-not $classAccountingAvailable -or $null -eq $availableWorkerSeconds -or $availableWorkerSeconds -le 0) { $null } else { [math]::Round(($actualInvocationMillisTotal / 1000.0) / $availableWorkerSeconds, 6) }
+            unclassifiedSubmissions = $classUnclassified
+            invocationClassesMatchGlobal = if (-not $classAccountingAvailable -or $null -eq $invocations) { $null } else { $classInvocationsTotal -eq [double]$invocations }
+            duplicateClassesMatchGlobal = if (-not $classAccountingAvailable -or $null -eq $duplicateJudgementsFromInvocations) { $null } else { $classDuplicatesTotal -eq [double]$duplicateJudgementsFromInvocations }
+            basis = "start snapshot after warm-up quiescence through end snapshot after drain. Actual invocation millis are Micrometer timer sums; unique expected and duplicate millis are deterministic-profile calculations, not measured duplicate durations. Class-specific duplicate counts require failedExecutions=0."
+        }
+
         # Everything below decides whether the six-run comparison may read this run as a steady
         # state. Each criterion is stored with its own answer, so a run that fails one is flagged on
         # that criterion rather than dropped silently.
@@ -1096,6 +1221,7 @@ if (Test-Path $stagesPath) {
             uniqueSubmissions = $verification.counts.uniqueSubmissions
             mysqlClaimTimeout = $parameters.mysqlClaimTimeout
             mysqlMaxInFlightPerNode = $parameters.mysqlMaxInFlightPerNode
+            latencyClassAccounting = $classAccounting
             # 1. Durable duplicate claim: read from the outbox rows of the measurement contest. The
             # warm-up contest is a different contest and cannot contribute to any of these counts.
             durableDuplicateClaim = [ordered]@{

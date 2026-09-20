@@ -42,6 +42,38 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# The application assigns a latency class with FNV-1a over Java UTF-16 characters followed by
+# SplitMix64. Keep the raw latency export independently reproducible by using the same bit-level
+# algorithm here rather than inferring a class from an observed duration or an outbox attempt.
+if ($null -eq ("MysqlJudgeTradeoff.LatencyClassifier" -as [type])) {
+    Add-Type -TypeDefinition @"
+namespace MysqlJudgeTradeoff {
+    public static class LatencyClassifier {
+        public static bool IsSlow(long seed, string value, double slowRatio) {
+            ulong hash = 0xcbf29ce484222325UL;
+            unchecked {
+                foreach (char character in value) {
+                    hash ^= character;
+                    hash *= 0x100000001b3UL;
+                }
+                ulong mixed = ((ulong)seed) ^ hash;
+                mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9UL;
+                mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebUL;
+                mixed ^= mixed >> 31;
+                double draw = (mixed >> 11) * (1.0 / 9007199254740992.0);
+                return draw < slowRatio;
+            }
+        }
+    }
+}
+"@
+}
+if ([MysqlJudgeTradeoff.LatencyClassifier]::IsSlow(20260920, "stable-work-item", 0.05) -or
+    -not [MysqlJudgeTradeoff.LatencyClassifier]::IsSlow(20260920, "fixture-15", 0.05)) {
+    throw "PowerShell latency classifier does not match the Java deterministic-class fixture."
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $composeArgs = @("-p", "oj-loadtest", "-f", "compose.yaml", "-f", "compose.loadtest.yaml")
 $baseUrl = "http://127.0.0.1:18080"
@@ -205,9 +237,14 @@ $gitCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
 # flag says whether the tree it came from also held uncommitted changes elsewhere.
 $harnessHash = (Get-FileHash -Algorithm SHA256 -Path $PSCommandPath).Hash
 $harnessDirty = @(& git -C $repoRoot status --porcelain -- scripts/mysql-judge-tradeoff).Count -gt 0
+$gitTreeDirty = @(& git -C $repoRoot status --porcelain).Count -gt 0
+$analyzerPath = Join-Path $PSScriptRoot "Analyze-TradeoffRun.ps1"
+$analyzerHash = (Get-FileHash -Algorithm SHA256 -Path $analyzerPath).Hash
 $parameters = [ordered]@{
     runId = $RunId; gitCommit = $gitCommit
+    gitTreeDirty = $gitTreeDirty
     harnessScriptSha256 = $harnessHash; harnessTreeDirty = $harnessDirty
+    analyzerScriptSha256 = $analyzerHash
     dispatchMode = $DispatchMode
     targetRps = $TargetRps; durationSeconds = $DurationSeconds; rampSeconds = $RampSeconds
     workerCountPerNode = $WorkerCount; mysqlClaimBatchSize = $MySqlClaimBatchSize
@@ -215,10 +252,11 @@ $parameters = [ordered]@{
     mysqlClaimTimeoutProperty = $claimTimeoutProperty
     mysqlPollInterval = $MySqlPollInterval; rabbitPrefetch = $RabbitPrefetch
     rabbitReservedPerNode = $WorkerCount * $RabbitPrefetch
-    deterministicLatencySeed = $LatencySeed; latency = @{ baseMillis = 50; slowMillis = 2000; slowRatio = 0.05 }
+    deterministicLatencySeed = $LatencySeed; latency = @{ baseMillis = 50; slowMillis = 2000; slowRatio = 0.05; keySource = "code" }
     faultEnabled = [bool]$FaultEnabled; faultAtSeconds = $FaultAtSeconds
     killedNode = $KilledNode; downDurationSeconds = $DownDurationSeconds
-    userCount = $UserCount; generatedAt = [datetimeoffset]::UtcNow.ToString("o")
+    userCount = $UserCount; drainTimeoutSeconds = $DrainTimeoutSeconds
+    judgeNodeCount = 2; generatedAt = [datetimeoffset]::UtcNow.ToString("o")
 }
 if ($Staircase) {
     $parameters.staircase = [ordered]@{
@@ -454,7 +492,7 @@ SELECT cs.id, cs.submitted_time, csr.result_saved_at, csr.scoreboard_applied_at,
        TIMESTAMPDIFF(MICROSECOND, cs.submitted_time, csr.result_saved_at) / 1000.0,
        TIMESTAMPDIFF(MICROSECOND, csr.result_saved_at, csr.scoreboard_applied_at) / 1000.0,
        TIMESTAMPDIFF(MICROSECOND, cs.submitted_time, csr.scoreboard_applied_at) / 1000.0,
-       o.attempts, o.updated_at
+       o.attempts, o.updated_at, HEX(cs.code)
 FROM contest_submission cs
 LEFT JOIN contest_submission_result csr ON csr.submission_id = cs.id
 LEFT JOIN contest_judge_outbox o ON o.submission_id = cs.id
@@ -469,9 +507,15 @@ ORDER BY cs.id;
         # String.Split preserves the tabular fields emitted by mysql -B, including NULL markers.
         $p = $line.Split([char]9)
         $submitted = [datetimeoffset]::MinValue
-        if ($p.Count -lt 9 -or -not [datetimeoffset]::TryParse($p[1] + "Z", [ref]$submitted)) {
+        if ($p.Count -lt 10 -or -not [datetimeoffset]::TryParse($p[1] + "Z", [ref]$submitted)) {
             continue
         }
+        $codeBytes = New-Object byte[] ($p[9].Length / 2)
+        for ($index = 0; $index -lt $codeBytes.Length; $index++) {
+            $codeBytes[$index] = [Convert]::ToByte($p[9].Substring($index * 2, 2), 16)
+        }
+        $code = [Text.Encoding]::UTF8.GetString($codeBytes)
+        $latencyClass = if ([MysqlJudgeTradeoff.LatencyClassifier]::IsSlow($LatencySeed, $code, 0.05)) { "slow" } else { "fast" }
         $cohorts = New-Object System.Collections.Generic.List[string]
         if ($fault) {
             if ($submitted -lt $fault.AddSeconds(-5)) { $cohorts.Add("pre-fault-normal") }
@@ -482,7 +526,7 @@ ORDER BY cs.id;
         [pscustomobject]@{
             submissionId=$p[0]; submittedAt=$p[1]; resultSavedAt=$p[2]; scoreboardAppliedAt=$p[3]
             L_result_ms=$p[4]; L_scoreboard_ms=$p[5]; L_total_ms=$p[6]; attempts=$p[7]
-            outboxUpdatedAt=$p[8]; cohorts=($cohorts -join ";")
+            outboxUpdatedAt=$p[8]; latencyClass=$latencyClass; cohorts=($cohorts -join ";")
         }
     }
     $objects | Export-Csv (Join-Path $runDirectory "latency.csv") -NoTypeInformation -Encoding utf8
@@ -772,6 +816,7 @@ function Get-StaircaseStages {
             measurementEndMillis = [long]$segment.endMillis
             traceSegmentIndex = $segment.index
             prometheusStartLabel = "seg-$($segment.index)-start"
+            prometheusMeasurementStartLabel = "seg-$($segment.index)-measurement-start"
             prometheusEndLabel = "seg-$($segment.index)-end"
         })
     }
@@ -887,6 +932,16 @@ function Save-StaircaseBoundarySnapshots {
             Save-MetricsSnapshot $label
             $Captured[$label] = $NowMillis
         }
+        if ($segment.kind -eq "hold") {
+            $measurementStart = [math]::Min(
+                    [long]$segment.startMillis + ($SteadyGuardSeconds * 1000),
+                    [long]$segment.endMillis)
+            $label = "seg-$($segment.index)-measurement-start"
+            if (-not $Captured.ContainsKey($label) -and $NowMillis -ge $measurementStart) {
+                Save-MetricsSnapshot $label
+                $Captured[$label] = $NowMillis
+            }
+        }
     }
 }
 
@@ -979,7 +1034,7 @@ if ($DryRun) {
     exit 0
 }
 
-$events = [ordered]@{ runStartedAt=$null; loadStartedAt=$null; faultScheduledAt=$null; faultInjectedAt=$null; faultTimingErrorSeconds=$null; staleAttemptsBeforeFault=0; firstStaleReclaimObservedAt=$null; restartRequestedAt=$null; nodeRestartedAt=$null; nodeReadyAt=$null; loadEndedAt=$null; runEndedAt=$null; contestId=$null }
+$events = [ordered]@{ runStartedAt=$null; loadStartedAt=$null; faultScheduledAt=$null; faultInjectedAt=$null; faultTimingErrorSeconds=$null; staleAttemptsBeforeFault=0; firstStaleReclaimObservedAt=$null; restartRequestedAt=$null; nodeRestartedAt=$null; nodeReadyAt=$null; loadEndedAt=$null; runEndedAt=$null; contestId=$null; measurementBaselineAt=$null; measurementEndSnapshotAt=$null }
 $events.warmupEndedAt = $null; $events.measurementStartedAt = $null
 $events.drainStartedAt = $null; $events.drainEndedAt = $null; $events.drainSeconds = $null
 $events.traceAnchorUtc = $null; $events.tracePlanEndUtc = $null; $events.stageWindowAlignment = $null
@@ -1084,6 +1139,7 @@ try {
         $events.warmupQuiescedAt = [datetimeoffset]::UtcNow.ToString("o")
         $events.warmupQuiescenceSeconds = $warmupQuiescence.seconds
         Save-MetricsSnapshot "start"
+        $events.measurementBaselineAt = [datetimeoffset]::UtcNow.ToString("o")
         $warmupAcceptedAtBaseline = $warmupQuiescence.accepted
     }
 
@@ -1221,6 +1277,12 @@ try {
         }
     }
     $gatling.WaitForExit()
+    if ($stagedLoad) {
+        # Capture a final boundary that may have landed between the last sampler tick and process
+        # exit. Missing it would make all counter deltas for the final hold unavailable.
+        Save-StaircaseBoundarySnapshots -Trace $staircaseTrace `
+            -NowMillis ([datetimeoffset]::UtcNow.ToUnixTimeMilliseconds()) -Captured $capturedBoundaries
+    }
     $events.loadEndedAt = [datetimeoffset]::UtcNow.ToString("o")
     $events.gatlingExitCode = $gatling.ExitCode
     # An unreadable exit code means the outcome is unknown, which is neither a pass nor a failure.
@@ -1269,6 +1331,7 @@ try {
     }
     if ($backlog -ne 0) { throw "Pipeline did not drain within $DrainTimeoutSeconds seconds." }
     Save-MetricsSnapshot "end"
+    $events.measurementEndSnapshotAt = [datetimeoffset]::UtcNow.ToString("o")
     if ($NormalTimeout) {
         # The measured window's judge-invocation delta is end minus start, so warm-up work that ran
         # after the baseline would be charged to the measurement. The baseline was taken at
@@ -1308,6 +1371,7 @@ try {
         })
         $stagesDocument = @($staircaseStages | ForEach-Object {
             $startLabel = $_.prometheusStartLabel
+            $measurementStartLabel = $_.prometheusMeasurementStartLabel
             $endLabel = $_.prometheusEndLabel
             [ordered]@{
                 stageIndex = $_.stageIndex; label = $_.label; isWarmup = $_.isWarmup
@@ -1319,8 +1383,11 @@ try {
                 end = [datetimeoffset]::FromUnixTimeMilliseconds($_.endMillis).ToString("o")
                 measurementStart = [datetimeoffset]::FromUnixTimeMilliseconds($_.measurementStartMillis).ToString("o")
                 measurementEnd = [datetimeoffset]::FromUnixTimeMilliseconds($_.measurementEndMillis).ToString("o")
-                prometheusStartLabel = $startLabel; prometheusEndLabel = $endLabel
+                prometheusStartLabel = $startLabel
+                prometheusMeasurementStartLabel = $measurementStartLabel
+                prometheusEndLabel = $endLabel
                 prometheusStartLagMs = if ($capturedBoundaries.ContainsKey($startLabel)) { $capturedBoundaries[$startLabel] - $_.startMillis } else { $null }
+                prometheusMeasurementStartLagMs = if ($capturedBoundaries.ContainsKey($measurementStartLabel)) { $capturedBoundaries[$measurementStartLabel] - $_.measurementStartMillis } else { $null }
                 prometheusEndLagMs = if ($capturedBoundaries.ContainsKey($endLabel)) { $capturedBoundaries[$endLabel] - $_.endMillis } else { $null }
             }
         })

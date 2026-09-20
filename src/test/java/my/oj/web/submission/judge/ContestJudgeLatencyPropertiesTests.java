@@ -62,4 +62,15 @@ class ContestJudgeLatencyPropertiesTests {
         assertThat(properties.deterministicDraw(1L, "other-work-item"))
                 .isNotEqualTo(properties.deterministicDraw(1L, "stable-work-item"));
     }
+
+    @Test
+    void codeKeyMatchesThePowerShellAnalyzerFixture() {
+        ContestJudgeLatencyProperties properties =
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 20260920L, "code");
+
+        assertThat(properties.isSlow(properties.deterministicDraw(1L, "stable-work-item")))
+                .isFalse();
+        assertThat(properties.isSlow(properties.deterministicDraw(1L, "fixture-15")))
+                .isTrue();
+    }
 }

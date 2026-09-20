@@ -33,9 +33,12 @@ import java.util.concurrent.ThreadLocalRandom;
 public class LatencyProfileContestJudgement implements ContestSubmissionJudgement {
 
     private final ContestJudgeLatencyProperties properties;
+    private final ContestJudgeLatencyClassMetrics latencyClassMetrics;
 
-    public LatencyProfileContestJudgement(ContestJudgeLatencyProperties properties) {
+    public LatencyProfileContestJudgement(ContestJudgeLatencyProperties properties,
+                                          ContestJudgeLatencyClassMetrics latencyClassMetrics) {
         this.properties = properties;
+        this.latencyClassMetrics = latencyClassMetrics;
     }
 
     @Override
@@ -43,9 +46,16 @@ public class LatencyProfileContestJudgement implements ContestSubmissionJudgemen
         double draw = properties.seed() == null
                 ? ThreadLocalRandom.current().nextDouble()
                 : properties.deterministicDraw(submission.getSubmissionId(), submission.getCode());
-        sleep(properties.isSlow(draw)
-                ? properties.effectiveSlowMillis()
-                : properties.effectiveBaseMillis());
+        boolean slow = properties.isSlow(draw);
+        String latencyClass = slow
+                ? ContestJudgeLatencyClassMetrics.SLOW
+                : ContestJudgeLatencyClassMetrics.FAST;
+        long started = System.nanoTime();
+        try {
+            sleep(slow ? properties.effectiveSlowMillis() : properties.effectiveBaseMillis());
+        } finally {
+            latencyClassMetrics.record(latencyClass, System.nanoTime() - started);
+        }
         return SubmissionResult.PARTIAL_ACCEPTED;
     }
 

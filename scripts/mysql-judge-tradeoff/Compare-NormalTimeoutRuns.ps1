@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory = $true)][string[]]$RunDirectory,
     # Defaults to the folder that holds the runs, so the comparison lands beside them. The file names
     # are specific to this experiment so that running it cannot overwrite the staircase comparison.
-    [string]$OutputDirectory = ""
+    [string]$OutputDirectory = "",
+    [ValidatePattern('^[A-Za-z0-9._-]+$')][string]$OutputBaseName = "normal-timeout-comparison"
 )
 
 $ErrorActionPreference = "Stop"
@@ -84,10 +85,16 @@ foreach ($directory in $RunDirectory) {
         results = $summary.counts.results
         scoreboardApplied = $summary.counts.scoreboardApplied
         completedHttpRequests = $summary.counts.completedHttpRequests
+        scheduledRequests = if ($null -ne $stage) { [math]::Round([double]$duplication.targetRps * [double]$stage.measurementSeconds, 0) } else { $null }
+        completedWindowRequests = if ($null -ne $stage) { $stage.http.offered } else { $null }
         resultPerSecond = if ($null -ne $stage) { $stage.resultsCompleted.perSecond } else { $null }
         acceptedPerSecond = if ($null -ne $stage) { $stage.accepted.perSecond } else { $null }
+        scoreboardAppliedPerSecond = if ($null -ne $stage) { $stage.scoreboardApplied.perSecond } else { $null }
         backlogGrowthRowsPerSec = if ($null -ne $stage) { $stage.backlogGrowth.totalRowsPerSec } else { $null }
         backlogGrowthSecondHalfRowsPerSec = if ($null -ne $stage) { $stage.backlogByHalf.secondHalfRowsPerSec } else { $null }
+        backlogStart = if ($null -ne $stage) { $stage.backlogGrowth.totalStart } else { $null }
+        backlogEnd = if ($null -ne $stage) { $stage.backlogGrowth.totalEnd } else { $null }
+        backlogPeak = if ($null -ne $stage) { $stage.backlogGrowth.totalPeak } else { $null }
         classification = if ($null -ne $stage) { $stage.classification } else { $null }
         growthVerdictRobust = if ($null -ne $stage) { $stage.growthRobustness.stable } else { $null }
         p50TotalMs = if ($null -ne $stage) { $stage.latency.L_total_ms.p50 } else { $null }
@@ -95,6 +102,10 @@ foreach ($directory in $RunDirectory) {
         p99TotalMs = if ($null -ne $stage) { $stage.latency.L_total_ms.p99 } else { $null }
         p95ResultMs = if ($null -ne $stage) { $stage.latency.L_result_ms.p95 } else { $null }
         p95ScoreboardMs = if ($null -ne $stage) { $stage.latency.L_scoreboard_ms.p95 } else { $null }
+        fastLatency = if ($null -ne $stage) { $stage.latencyByClass.fast } else { $null }
+        slowLatency = if ($null -ne $stage) { $stage.latencyByClass.slow } else { $null }
+        measurementJudgeWorkByLatencyClass = if ($null -ne $stage) { $stage.judgeWorkByLatencyClass } else { $null }
+        latencyClassAccounting = $duplication.latencyClassAccounting
         latencyReadableAsServiceTime = $steady
         latencyMarker = $latencyMarker
         drainSeconds = $summary.events.drainSeconds
@@ -103,6 +114,8 @@ foreach ($directory in $RunDirectory) {
         ko500 = if ($null -ne $stage) { $stage.http.ko500 } else { $null }
         apiRateLimitPolluted = if ($null -ne $stage) { $stage.apiRateLimitPolluted } else { $null }
         executorCaps = if ($null -ne $stage) { $stage.executorCaps } else { $null }
+        executor = if ($null -ne $stage) { $stage.executor } else { $null }
+        claim = if ($null -ne $stage) { $stage.claim } else { $null }
         duplicateClaims = $dc.count
         duplicateClaimsPer10kAccepted = $dc.per10kAccepted
         duplicateClaimRatePerAccepted = $dc.ratePerAccepted
@@ -179,8 +192,8 @@ $outputRoot = if ($OutputDirectory) {
     if (-not (Test-Path $OutputDirectory)) { New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null }
     (Resolve-Path $OutputDirectory).Path
 } else { Split-Path -Parent (Resolve-Path $RunDirectory[0]).Path }
-$comparisonPath = Join-Path $outputRoot "normal-timeout-comparison.json"
-$markdownPath = Join-Path $outputRoot "normal-timeout-comparison.md"
+$comparisonPath = Join-Path $outputRoot "$OutputBaseName.json"
+$markdownPath = Join-Path $outputRoot "$OutputBaseName.md"
 
 $comparison = [ordered]@{
     generatedAt = [datetimeoffset]::UtcNow.ToString("o")
@@ -195,7 +208,7 @@ foreach ($mif in @($byMif.Keys | Sort-Object)) {
 $comparison | ConvertTo-Json -Depth 10 | Set-Content $comparisonPath -Encoding utf8
 
 $lines = @(
-    "# MySQL claim timeout - normal steady-state comparison", "",
+    "# MySQL claim timeout comparison", "",
     "- Runs in execution order: $((@($runs | ForEach-Object { $_.runId })) -join ' -> ')",
     "- Excluded: $(if ($excluded.Count -eq 0) { 'none' } else { (@($excluded | ForEach-Object { "$($_.runDirectory): $($_.reason)" })) -join '; ' })",
     "",
@@ -264,6 +277,53 @@ foreach ($run in $runs) {
         "$(Format-Value $run.classification) | $(Format-Value $run.growthVerdictRobust) | $(Format-Value $run.p50TotalMs) | $(Format-Value $run.p95TotalMs) | $(Format-Value $run.p99TotalMs) | " +
         "$(Format-Value $run.p95ResultMs) | $(Format-Value $run.p95ScoreboardMs) | $(Format-Value $run.latencyReadableAsServiceTime) | " +
         "$(Format-Value $run.ko429) | $(Format-Value $run.ko503) | $(Format-Value $run.ko500) | $(Format-Value $run.drainSeconds) |"
+}
+
+$lines += @(
+    "", "## Latency by deterministic class", "",
+    "| run id | class | samples | L_result p50/p95/p99/max ms | L_scoreboard p50/p95/p99/max ms | L_total p50/p95/p99/max ms |",
+    "|---|---|---:|---|---|---|"
+)
+foreach ($run in $runs) {
+    foreach ($latencyClass in @("fast", "slow")) {
+        $latency = if ($latencyClass -eq "fast") { $run.fastLatency } else { $run.slowLatency }
+        $lines += "| $($run.runId) | $latencyClass | $(Format-Value $latency.submissionCount) | " +
+            "$(Format-Value $latency.L_result_ms.p50)/$(Format-Value $latency.L_result_ms.p95)/$(Format-Value $latency.L_result_ms.p99)/$(Format-Value $latency.L_result_ms.max) | " +
+            "$(Format-Value $latency.L_scoreboard_ms.p50)/$(Format-Value $latency.L_scoreboard_ms.p95)/$(Format-Value $latency.L_scoreboard_ms.p99)/$(Format-Value $latency.L_scoreboard_ms.max) | " +
+            "$(Format-Value $latency.L_total_ms.p50)/$(Format-Value $latency.L_total_ms.p95)/$(Format-Value $latency.L_total_ms.p99)/$(Format-Value $latency.L_total_ms.max) |"
+    }
+}
+
+$lines += @(
+    "", "## Latency-class invocation and worker cost", "",
+    "Run-scope accounting spans the clean post-warm-up baseline through drain. Actual milliseconds are timer measurements. Expected and duplicate milliseconds multiply the deterministic 50ms/2000ms profile and are calculations, not measured duplicate durations.", "",
+    "| run id | class | unique submissions | invocations | duplicate executions | unique expected ms | actual invocation ms | profile duplicate ms |",
+    "|---|---|---:|---:|---:|---:|---:|---:|"
+)
+foreach ($run in $runs) {
+    foreach ($latencyClass in @("fast", "slow")) {
+        $account = if ($latencyClass -eq "fast") { $run.latencyClassAccounting.fast } else { $run.latencyClassAccounting.slow }
+        $lines += "| $($run.runId) | $latencyClass | $(Format-Value $account.uniqueSubmissions) | " +
+            "$(Format-Value $account.judgeInvocations) | $(Format-Value $account.duplicateJudgeExecutions) | " +
+            "$(Format-Value $account.uniqueExpectedJudgeMillis) | $(Format-Value $account.actualJudgeInvocationMillis) | " +
+            "$(Format-Value $account.profileDuplicateJudgeMillis) |"
+    }
+    $total = $run.latencyClassAccounting.total
+    $lines += "| $($run.runId) | total | $(Format-Value $total.uniqueSubmissions) | $(Format-Value $total.judgeInvocations) | " +
+        "$(Format-Value $total.duplicateJudgeExecutions) | $(Format-Value $total.uniqueExpectedJudgeMillis) | " +
+        "$(Format-Value $total.actualJudgeInvocationMillis) | $(Format-Value $total.profileDuplicateJudgeMillis) |"
+}
+
+$lines += @(
+    "", "## Throughput and backlog endpoints", "",
+    "| run id | scheduled target requests | completed window requests | accepted RPS | result RPS | scoreboard RPS | backlog start/end/peak | overall / second-half growth rows/s | drain s |",
+    "|---|---:|---:|---:|---:|---:|---|---|---:|"
+)
+foreach ($run in $runs) {
+    $lines += "| $($run.runId) | $(Format-Value $run.scheduledRequests) | $(Format-Value $run.completedWindowRequests) | " +
+        "$(Format-Value $run.acceptedPerSecond) | $(Format-Value $run.resultPerSecond) | $(Format-Value $run.scoreboardAppliedPerSecond) | " +
+        "$(Format-Value $run.backlogStart)/$(Format-Value $run.backlogEnd)/$(Format-Value $run.backlogPeak) | " +
+        "$(Format-Value $run.backlogGrowthRowsPerSec) / $(Format-Value $run.backlogGrowthSecondHalfRowsPerSec) | $(Format-Value $run.drainSeconds) |"
 }
 
 $lines += @("", "## Per max-in-flight groups", "")
