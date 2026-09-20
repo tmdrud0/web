@@ -192,7 +192,10 @@ function Get-SubmissionWindow {
 }
 
 function Get-CohortLatency {
-    param([object[]]$Rows)
+    param(
+        [object[]]$Rows,
+        [string]$UnavailableReason
+    )
     $summary = Get-LatencySummary $Rows
     $totals = @($Rows | ForEach-Object {
         $value = 0.0
@@ -210,6 +213,19 @@ function Get-CohortLatency {
     $summary["over10sRatio"] = Get-RatioOrNull $over10s $Rows.Count
     $summary["byLatencyClass"] = Get-LatencyClassSummary $Rows
     $summary["available"] = ($Rows.Count -gt 0)
+    # The estimator travels with every percentile block. These are nearest-rank percentiles over
+    # submission counts in the thousands, but in a small cohort the top rank IS the largest observation:
+    # p99 is the max for any cohort of 100 or fewer, and a cohort of one reports that single submission
+    # as its whole quartet. A reader comparing "p99" across cohorts of different sizes is comparing two
+    # different statistics unless that is stated where the numbers are.
+    $summary["estimator"] = "nearest-rank percentiles over submission-level L_*_ms; p99 is the largest observation for any cohort of 100 or fewer, and a cohort of one reports that one submission as its whole quartet"
+    if (-not $summary["available"]) {
+        # An empty cohort states why it is empty. Without this, a cohort that is unavailable for a
+        # specific reason prints as unavailable with no reason at all.
+        $summary["unavailableReason"] = if ([string]::IsNullOrWhiteSpace($UnavailableReason)) {
+            "the cohort matched no submissions in the measured load"
+        } else { $UnavailableReason }
+    }
     return $summary
 }
 
@@ -333,8 +349,9 @@ function Get-FaultRecoveryAnalysis {
     $maxWindowSpanSeconds = 10
     # The reported instants are searched from max(faultInjectedAt, nodeReadyAt): cohort D is defined as
     # nodeReadyAt -> backlogNormalizedAt, and nothing before the replacement node was serving can be
-    # the end of the outage. The ungated search is run as well and reported when it lands earlier, since
-    # a surviving node draining the backlog alone is a finding about the lease rather than an artefact.
+    # the end of the outage. The ungated search is run as well and reported regardless of where it lands,
+    # since a surviving node draining the backlog alone is a finding about the lease rather than an
+    # artefact - and a reader has to be able to tell "the ungated search agrees" from "it was never run".
     $searchFromAt = $faultAt
     if ($null -ne $faultAt -and $null -ne $nodeReadyAt -and $nodeReadyAt -gt $faultAt) { $searchFromAt = $nodeReadyAt }
     $gated = Get-BacklogNormalizationFrom -Samples $samples -From $searchFromAt -JudgeP95 $judgeP95 `
@@ -344,11 +361,17 @@ function Get-FaultRecoveryAnalysis {
     $judgeNormalizedAt = $gated.judgeNormalizedAt
     $scoreboardNormalizedAt = $gated.scoreboardNormalizedAt
     $recomputedNormalizedAt = $gated.combinedNormalizedAt
-    $earliestNormalizedAt = $null
-    if ($null -ne $ungated.combinedNormalizedAt -and
-        ($null -eq $recomputedNormalizedAt -or $ungated.combinedNormalizedAt -lt $recomputedNormalizedAt)) {
-        $earliestNormalizedAt = $ungated.combinedNormalizedAt
-    }
+    # The same search run from the fault instead of from readiness, kept per backlog as well as combined.
+    # The combined instant is the later of the two backlogs, so starting the search earlier can leave it
+    # unchanged - an earlier start cannot push the later backlog later. Reporting only the strictly-earlier
+    # case, as this once did, therefore printed "unavailable" for a run whose ungated answer was
+    # computable and simply equal to the gated one, which reads as a missing measurement instead of as
+    # two searches agreeing. The value is always reported; the two comparisons are stated beside it.
+    $earliestNormalizedAt = $ungated.combinedNormalizedAt
+    $earliestJudgeNormalizedAt = $ungated.judgeNormalizedAt
+    $earliestScoreboardNormalizedAt = $ungated.scoreboardNormalizedAt
+    $earliestNormalizedPrecedesNodeReady = ($null -ne $ungated.combinedNormalizedAt -and $null -ne $nodeReadyAt -and $ungated.combinedNormalizedAt -lt $nodeReadyAt)
+    $earliestNormalizedPrecedesGated = ($null -ne $ungated.combinedNormalizedAt -and $null -ne $recomputedNormalizedAt -and $ungated.combinedNormalizedAt -lt $recomputedNormalizedAt)
 
     $rolling = New-Object System.Collections.Generic.List[object]
     $recomputedRecoveredAt = $null
@@ -383,17 +406,35 @@ function Get-FaultRecoveryAnalysis {
         }
     }
 
-    # Cohort C is built from the durable attempts column, not from the kill snapshot. The snapshot has
-    # no claim owner, so its submission list holds every node's in-flight rows and using it here would
-    # put the surviving node's ordinary work into the killed node's cohort; the snapshot count is kept
-    # beside this one as an upper bound instead.
-    $reclaimed = @($LatencyIndexed | Where-Object {
-        if ($null -eq $_.millis) { return $false }
+    # Cohort C is the durable attempts column. The snapshot has no claim owner, so its submission list
+    # holds every node's in-flight rows and using it here would put the surviving node's ordinary work
+    # into the killed node's cohort; the snapshot count is kept beside this one as an upper bound instead.
+    #
+    # The submission time deliberately does not filter this cohort. The rows a kill strands were
+    # submitted BEFORE it - that is what makes them stranded, and the wait they then serve (the rest of
+    # the lease plus the reclaim) is the cost this cohort exists to measure. An earlier version required
+    # submittedAt >= faultInjectedAt, which kept the one row that happened to arrive during the outage
+    # and dropped every row the kill actually orphaned, so the cohort reported the least relevant row in
+    # the run as its whole population.
+    #
+    # A reclaim that predates the fault would be indistinguishable from these, so the harness's own
+    # pre-fault reading travels with the cohort: staleAttemptsBeforeFault is 0 in a clean run, and a run
+    # that reclaimed before the fault is called out rather than silently pooled.
+    $faultMillis = if ($null -eq $faultAt) { $null } else { $faultAt.ToUnixTimeMilliseconds() }
+    $reclaimedIndexed = @($LatencyIndexed | Where-Object {
         $attempts = ConvertTo-LongOrNull $_.row.attempts
-        if ($null -eq $attempts -or $attempts -le 1) { return $false }
-        if ($null -eq $faultAt) { return $false }
-        return ([long]$_.millis -ge $faultAt.ToUnixTimeMilliseconds())
-    } | ForEach-Object { $_.row })
+        return ($null -ne $attempts -and $attempts -gt 1)
+    })
+    $reclaimed = @($reclaimedIndexed | ForEach-Object { $_.row })
+    # Both halves are reclaimed submissions, but they are not the same event: one was stranded by the
+    # kill and waited out the lease, the other was submitted to a live node whose own execution overran
+    # the lease. Pooled without the split, one can be read as the other.
+    $reclaimedStranded = @($reclaimedIndexed | Where-Object {
+        return ($null -ne $_.millis -and $null -ne $faultMillis -and [long]$_.millis -lt $faultMillis)
+    })
+    $reclaimedAfterFault = @($reclaimedIndexed | Where-Object {
+        return ($null -ne $_.millis -and $null -ne $faultMillis -and [long]$_.millis -ge $faultMillis)
+    })
 
     $cohortsFault = [ordered]@{}
     # A. pre-fault steady, B. fault/down arrivals, C. reclaimed, D. post-restart recovery,
@@ -407,7 +448,20 @@ function Get-FaultRecoveryAnalysis {
     # Cohort D ends at the recomputed instant, not the run's own reading: a run whose reading is null
     # because the normalisation landed in the drain would otherwise make cohort D the whole tail of the
     # run rather than the recovery interval it is defined as.
-    $cohortsFault["post-restart-recovery"] = Get-CohortLatency (Get-SubmissionWindow $LatencyIndexed $nodeReadyAt $recomputedNormalizedAt)
+    #
+    # And when the recomputed instant is also null the interval never closed, so the defined cohort has
+    # no population at all. Letting the window fall through to the end of the load instead would tabulate
+    # the censored tail of an outage as a measured recovery interval - the run's own recoveryTimeout=true
+    # would sit in the summary beside a full percentile quartet for "post-restart recovery". The tail is
+    # kept under its own name so nothing is hidden, and the defined cohort reports why it is empty
+    # rather than being quietly populated with rows from outside its own definition.
+    $censoredTail = $null
+    if ($null -eq $recomputedNormalizedAt) {
+        $censoredTail = Get-CohortLatency (Get-SubmissionWindow $LatencyIndexed $nodeReadyAt $null)
+        $cohortsFault["post-restart-recovery"] = Get-CohortLatency @() -UnavailableReason "no backlog normalisation was observed, so the interval this cohort is defined over (nodeReadyAt to backlogNormalizedAt) never closed; the rows after nodeReadyAt are reported under post-restart-censored-tail instead, where they are named for what they are"
+    } else {
+        $cohortsFault["post-restart-recovery"] = Get-CohortLatency (Get-SubmissionWindow $LatencyIndexed $nodeReadyAt $recomputedNormalizedAt)
+    }
     # The post-recovery window is recomputed here rather than read from the run. The run decided it while
     # the measurement was still going, from a normalisation it could only have seen before the load
     # stopped; a normalisation that lands in the drain is therefore reported by the run as "never", which
@@ -467,8 +521,16 @@ function Get-FaultRecoveryAnalysis {
             basis = "backlogNormalizedAt + preWindowDelaySeconds to the end of the measured load; reported only when at least minimumWindowSeconds of measured load remained. Two separate numbers: the delay before the window opens and the minimum length it must reach"
         }
     } else {
-        $cohortsFault["post-recovery-steady"] = [ordered]@{ available = $false; reason = $postRecovery.reason }
+        # `unavailableReason`, not `reason`: every other cohort block names its unavailability this way,
+        # and a block that spells it differently reads downstream as unavailable with no reason given.
+        $cohortsFault["post-recovery-steady"] = [ordered]@{
+            available = $false
+            sampleCount = 0
+            unavailableReason = $postRecovery.reason
+            estimator = "nearest-rank percentiles over submission-level L_*_ms; p99 is the largest observation for any cohort of 100 or fewer, and a cohort of one reports that one submission as its whole quartet"
+        }
     }
+    if ($null -ne $censoredTail) { $cohortsFault["post-restart-censored-tail"] = $censoredTail }
 
     # The claimed_at age at the kill, recomputed here from the preserved rows so it does not depend on
     # the harness having had time to compute it before the kill.
@@ -572,7 +634,15 @@ function Get-FaultRecoveryAnalysis {
             sampleSourceBasis = "recovery-samples.csv is the fault phase's own denser series and is preferred; the drain samples the sampler wrote to timeseries.csv after that series ended are appended, and the count is reported as drainSamplesAppended"
         }
         trigger = $verification.faultRecovery.trigger
-        runValidForRecovery = $verification.faultRecovery.runValidForRecovery
+        # Recomputed for exactly the reason recoveryTimeout below is. The harness decided this while the
+        # run was still going, from a series that stops with the fault phase, so a normalisation that
+        # landed in the drain left this false - and a false here is what holds a run out of the
+        # comparison altogether, so a run whose only fault was that its backlog finished draining after
+        # the load stopped would have been dropped from every table. The harness's own reading travels
+        # beside it rather than being preferred or discarded.
+        runValidForRecovery = (($null -ne $recomputedNormalizedAt) -and ($events.faultNotInjectedWithActiveWork -ne $true))
+        runValidForRecoveryBasis = "true when the fault landed on active work and a backlog normalisation was observed within the measured load and the drain that follows it; recomputed here from the whole sample series rather than taken from the run, because the run's own reading cannot see the drain. This says the recovery timings are measurable, not that the post-recovery steady cohort exists: a normalisation landing too near the end of the load leaves that cohort unavailable while this stays true, and the cohort states its own availability"
+        harnessRunValidForRecovery = $verification.faultRecovery.runValidForRecovery
         faultNotInjectedWithActiveWork = $events.faultNotInjectedWithActiveWork
         # The harness derived this during the run from the series it had then, which stops with the fault
         # phase and therefore cannot contain a normalisation that landed in the drain. The value reported
@@ -599,7 +669,11 @@ function Get-FaultRecoveryAnalysis {
             scoreboardBacklogNormalizedAt = if ($null -eq $scoreboardNormalizedAt) { $null } else { $scoreboardNormalizedAt.ToString("o") }
             backlogNormalizedAt = if ($null -eq $recomputedNormalizedAt) { $null } else { $recomputedNormalizedAt.ToString("o") }
             earliestNormalizedAt = if ($null -eq $earliestNormalizedAt) { $null } else { $earliestNormalizedAt.ToString("o") }
-            earliestNormalizedBasis = "the same search run from faultInjectedAt instead, so it can precede nodeReadyAt: the surviving node alone can drain the backlog while the killed node is still down"
+            earliestJudgeBacklogNormalizedAt = if ($null -eq $earliestJudgeNormalizedAt) { $null } else { $earliestJudgeNormalizedAt.ToString("o") }
+            earliestScoreboardBacklogNormalizedAt = if ($null -eq $earliestScoreboardNormalizedAt) { $null } else { $earliestScoreboardNormalizedAt.ToString("o") }
+            earliestNormalizedPrecedesNodeReady = $earliestNormalizedPrecedesNodeReady
+            earliestNormalizedPrecedesGated = $earliestNormalizedPrecedesGated
+            earliestNormalizedBasis = "the same search run from faultInjectedAt instead of from readiness, reported always so that agreement and absence are distinguishable. Both backlogs are reported individually as well as combined, because the combined instant is the later of the two and so cannot land earlier than the later backlog does: when earliestNormalizedAt equals backlogNormalizedAt the two searches agree, and what can still differ is whether either backlog alone came back before nodeReadyAt, which is the surviving node draining without the replacement - read earliestNormalizedPrecedesNodeReady and the two per-backlog instants for that. This instant is a search-origin reading and NOT an achieved recovery: with the killed node down the surviving node is not fed the work the dead one would have taken, so a backlog can sit below its baseline for the required hold because less is arriving rather than because more is being drained, and it can rise again when the replacement returns and the re-claimed rows are republished in bulk. The gated instant reported as backlogNormalizedAt is the authoritative one for that reason, and a pre-readiness instant is evidence about the search origin that has to be read next to the load's own arrivals rather than as a recovery that beat the restart"
             searchFromAt = if ($null -eq $searchFromAt) { $null } else { $searchFromAt.ToString("o") }
             sustainSeconds = $sustainSeconds
             sustainSpanSeconds = $gated.sustainSpanSeconds
@@ -638,6 +712,10 @@ function Get-FaultRecoveryAnalysis {
         }
         reclaimAccounting = [ordered]@{
             reclaimedRowsAfterFault = $reclaimed.Count
+            reclaimedRowsStrandedByTheKill = $reclaimedStranded.Count
+            reclaimedRowsSubmittedDuringOrAfterTheFault = $reclaimedAfterFault.Count
+            staleAttemptsBeforeFault = $events.staleAttemptsBeforeFault
+            reclaimSplitBasis = "reclaimedRowsAfterFault is every submission whose durable attempts counter exceeded 1; the split says which side of the kill it was submitted on. A row submitted before the fault was stranded by the kill and waited out the lease plus the reclaim; a row submitted during the outage was held by a live node whose own execution overran the lease. They are different events and are not pooled in the report. A row whose submittedAt could not be read is counted in the total but in neither half, so the two halves can sum to less than the total, and that difference is the unreadable count. staleAttemptsBeforeFault is the harness's pre-fault reading of the same counter: when it is 0 no reclaim in this cohort predates the fault, and a non-zero value means some of these rows were reclaimed before the kill and are not recovery at all"
             reclaimedRowsHarnessEstimate = $verification.faultRecovery.reclaimAccounting.reclaimedRowsAfterFault
             label = "attempts > 1 = recovery re-claims after the lease expired, NOT concurrent duplicate CPU execution"
             sigkillCounterLoss = $verification.faultRecovery.reclaimAccounting.sigkillCounterLoss
@@ -2085,7 +2163,7 @@ if ($isNormalTimeout) {
         "- First stale reclaim observed after fault: $(if ($null -eq $faultRecovery.recoveryTimes.T_staleSeconds) { 'unavailable' } else { [string]$faultRecovery.recoveryTimes.T_staleSeconds + 's' })",
         "- Node ready after the restart request: $(if ($null -eq $faultRecovery.recoveryTimes.T_nodeReadySeconds) { 'unavailable' } else { [string]$faultRecovery.recoveryTimes.T_nodeReadySeconds + 's' })",
         "- Backlog normalization after fault: $(if ($null -eq $faultRecovery.recoveryTimes.T_backlogNormalizationSeconds) { 'unavailable' } else { [string]$faultRecovery.recoveryTimes.T_backlogNormalizationSeconds + 's' })",
-        "- Run valid for recovery comparison: $($faultRecovery.runValidForRecovery)"
+        "- Run valid for recovery comparison: $($faultRecovery.runValidForRecovery) (recomputed over the measured load and the drain; the run's own reading taken while the load was still going was $($faultRecovery.harnessRunValidForRecovery) and cannot see a normalisation that landed in the drain)"
     )
 } else {
     $lines += @(
@@ -2161,10 +2239,13 @@ if ($isFaultRecovery) {
         "| result RPS | $($faultRecovery.preFault.resultRps) | |",
         "",
         "Backlog normalization: judge backlog at $($faultRecovery.normalization.judgeSecondsAfterFault)s, scoreboard pending at $($faultRecovery.normalization.scoreboardSecondsAfterFault)s, combined at $($faultRecovery.recoveryTimes.T_backlogNormalizationSeconds)s after the fault.",
+        "Normalization searched from $($faultRecovery.normalization.searchFromAt); the same search run from the fault gives a combined instant at $(if ($null -eq $faultRecovery.normalization.earliestNormalizedAt) { 'unavailable' } else { $faultRecovery.normalization.earliestNormalizedAt }), judge $(if ($null -eq $faultRecovery.normalization.earliestJudgeBacklogNormalizedAt) { 'unavailable' } else { $faultRecovery.normalization.earliestJudgeBacklogNormalizedAt }) and scoreboard $(if ($null -eq $faultRecovery.normalization.earliestScoreboardBacklogNormalizedAt) { 'unavailable' } else { $faultRecovery.normalization.earliestScoreboardBacklogNormalizedAt }), which precedes readiness: $($faultRecovery.normalization.earliestNormalizedPrecedesNodeReady). That search-origin reading is not an achieved recovery - see the basis recorded with it in summary.json.",
         "Throughput recovery: $($faultRecovery.recoveryTimes.T_throughputRecoverySeconds)s after the fault, threshold $($faultRecovery.throughput.thresholdRps) RPS over $($faultRecovery.throughput.windowSeconds)s rolling windows.",
-        "Reclaimed rows: $($faultRecovery.reclaimAccounting.reclaimedRowsAfterFault) ($($faultRecovery.reclaimAccounting.label)); last reclaimed result at $($faultRecovery.recoveryTimes.T_lastReclaimedResultSeconds)s and its scoreboard at $($faultRecovery.recoveryTimes.T_lastReclaimedScoreboardSeconds)s after the fault.",
+        "Reclaimed rows: $($faultRecovery.reclaimAccounting.reclaimedRowsAfterFault) ($($faultRecovery.reclaimAccounting.label)); of those, $($faultRecovery.reclaimAccounting.reclaimedRowsStrandedByTheKill) were submitted before the kill and stranded by it, and $($faultRecovery.reclaimAccounting.reclaimedRowsSubmittedDuringOrAfterTheFault) arrived during or after it. Last reclaimed result at $($faultRecovery.recoveryTimes.T_lastReclaimedResultSeconds)s and its scoreboard at $($faultRecovery.recoveryTimes.T_lastReclaimedScoreboardSeconds)s after the fault. Reclaims before the fault (harness reading of the same counter): $($faultRecovery.reclaimAccounting.staleAttemptsBeforeFault).",
         "",
         "### Cohort detail",
+        "",
+        "Percentiles are nearest-rank over submission-level L_*_ms, so the p99 is the largest observation for any cohort of 100 or fewer and a cohort of one reports that one submission as its whole quartet; the sample count is the `n` column.",
         "",
         "| Cohort | n | fast / slow | L_total p50 | p95 | p99 | max | over-5s share | over-10s share | available |",
         "|---|---:|---|---:|---:|---:|---:|---:|---:|---|"
@@ -2172,7 +2253,7 @@ if ($isFaultRecovery) {
     foreach ($cohortName in @($faultRecovery.cohorts.Keys)) {
         $cohort = $faultRecovery.cohorts[$cohortName]
         if ($cohort.available -eq $false) {
-            $lines += "| $cohortName | 0 | | | | | | | | no: $($cohort.reason) |"
+            $lines += "| $cohortName | 0 | | | | | | | | no: $($cohort.unavailableReason) |"
             continue
         }
         $total = $cohort.L_total_ms

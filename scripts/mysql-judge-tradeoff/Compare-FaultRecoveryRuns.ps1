@@ -210,9 +210,17 @@ function Get-LatencyReading {
     param($Cohort)
     if ($null -eq $Cohort) { return $null }
     $available = Get-Field -Object $Cohort -Name @('available')
+    # A cohort the analyzer marked unavailable is unavailable whatever else sits in the block: its
+    # percentiles are absent rather than zero, and a block that also happened to carry a count would
+    # otherwise let this reader hand out a reading for a cohort that measured nothing.
     if ($null -ne $available -and -not [bool]$available) { return $null }
     $reading = [ordered]@{
-        available = $true
+        # The block's own availability flag, kept so a table can say whether availability was stated
+        # by the analyzer or has to be inferred from the sample counts below.
+        availableStated = $(if ($null -eq $available) { $null } else { [bool]$available })
+        # The estimator travels with the percentile blocks it describes, so the caveat about what a
+        # p99 means at this cohort's size is carried wherever those percentiles are printed.
+        estimator = Get-Field -Object $Cohort -Name @('estimator')
         # The run-level cohorts carry no submissionCount (their L_* blocks carry a count instead),
         # so the sample count is taken from whichever of the two this cohort actually has.
         sampleCount = Get-Field -Object $Cohort -Name @('submissionCount')
@@ -226,15 +234,50 @@ function Get-LatencyReading {
         window = Get-Field -Object $Cohort -Name @('window')
     }
     if ($null -eq $reading.sampleCount) { $reading.sampleCount = Get-Field -Object $reading.total -Name @('count') }
+    # A block with no availability flag is only available if it carries at least one sample: every
+    # percentile in it is computed over its own submissions, so a block with none has no percentile
+    # to report, and calling it available would put "yes" in the availability column of a cohort with
+    # no population - the count would read as a measurement of zero rather than as an absence.
+    if ($null -eq $available) {
+        $sampleCountValue = ConvertTo-DoubleOrNull $reading.sampleCount
+        if ($null -eq $sampleCountValue -or $sampleCountValue -le 0) { return $null }
+    }
     return $reading
 }
 
 function Get-CohortUnavailableReason {
     param($Cohort)
     if ($null -eq $Cohort) { return "the cohort is not in this summary at all" }
-    $reason = Get-Field -Object $Cohort -Name @('reason')
+    # `unavailableReason` is the analyzer's own name for this; `reason` is what the run-level
+    # placeholder cohorts are written with and what an older summary carries, so it is read second
+    # rather than not at all - a cohort that prints as unavailable with no reason given is exactly
+    # what this function exists to prevent.
+    $reason = Get-Field -Object $Cohort -Name @('unavailableReason')
+    if ($null -eq $reason) { $reason = Get-Field -Object $Cohort -Name @('reason') }
     if ($null -ne $reason) { return [string]$reason }
+    $count = Get-Field -Object $Cohort -Name @('submissionCount')
+    if ($null -eq $count) { $count = Get-Field -Object $Cohort -Name @('L_total_ms', 'count') }
+    $countValue = ConvertTo-DoubleOrNull $count
+    if ($null -eq $countValue) { return "the cohort is present but carries neither an availability flag nor a readable sample count, so whether it measured anything cannot be established" }
+    if ($countValue -le 0) { return "the cohort matched no submissions, so it has no percentile to report" }
     return "the cohort is present but carries no reason"
+}
+
+# A percentile quartet is only a distribution above one sample, and the top rank IS the largest
+# observation on a cohort this experiment produces. Both facts belong in the cell that carries the
+# count rather than in a footnote, so a reader who quotes one row cannot take a single submission's
+# latency as a p95 without the cell having said so.
+function Get-SampleCell {
+    param($Reading)
+    $cell = Format-Value $Reading.sampleCount
+    $count = ConvertTo-DoubleOrNull $Reading.sampleCount
+    if ($null -eq $count) { return $cell }
+    # Zero is checked before the single-sample case, because "one observation" and "no observation"
+    # are not the same reading and the explanation for the first would be false for the second.
+    if ($count -le 0) { return "$cell (no submissions in this cohort: there is no percentile to report, and the quartets beside this cell are absent rather than zero)" }
+    if ($count -lt 2) { return "$cell (single sample: every rank resolves to that one observation, so the quartet is one value and not a spread)" }
+    if ($count -le 100) { return "$cell (n<=100: p99 IS the largest observation, and p95 approaches it as n falls)" }
+    return $cell
 }
 
 # The deterministic latency profile makes L_result land on one of two steps, so a cohort percentile
@@ -339,7 +382,7 @@ function Get-LatencyDeltaVerdict {
 # recomputed from the throughput series.
 # ---------------------------------------------------------------------------
 function Get-BacklogSeriesReading {
-    param([string]$RunPath, $Missing)
+    param([string]$RunPath, $Missing, $FaultAt)
     $samplesPath = Join-Path $RunPath "recovery-samples.csv"
     if (-not (Test-Path $samplesPath)) {
         if ($null -ne $Missing) { $Missing.Add("backlog peak (recovery-samples.csv is not in the run directory, so neither judgeBacklog nor scoreboardPending was ever written to a file this comparer reads)") }
@@ -350,11 +393,36 @@ function Get-BacklogSeriesReading {
         if ($null -ne $Missing) { $Missing.Add("backlog peak (recovery-samples.csv is present but empty)") }
         return $null
     }
+    # Both the peak and the growth rates are described as readings of the outage, so both are taken
+    # over the samples at or after the fault instant. The series itself starts before the fault - it
+    # covers the whole measurement phase - and a rise inside that pre-fault steady state is the ramp
+    # of the offered load, not the outage: taking the maximum over the whole file would report the
+    # steepest pre-fault second as the steepest part of the outage whenever the run's own ramp was
+    # sharper than the kill. A run whose fault instant is not in the summary has no window to take
+    # these over, so they are reported as unavailable rather than computed over the wrong one.
+    $faultAtValue = ConvertTo-DateTimeOrNull $FaultAt
+    $faultMillis = $null
+    if ($null -ne $faultAtValue) { $faultMillis = $faultAtValue.ToUnixTimeMilliseconds() }
+    $windowBasis = "every sample at or after faultRecovery.anchors.faultInjectedAt"
+    if ($null -eq $faultMillis) {
+        if ($null -ne $Missing) { $Missing.Add("backlog peak and peak growth (faultRecovery.anchors.faultInjectedAt is not in the summary, so the samples after the kill cannot be separated from the pre-fault ramp and neither the peak nor the growth rate has an outage window to be taken over)") }
+        return [ordered]@{
+            source = "recovery-samples.csv"
+            sampleCount = 0
+            windowBasis = "unavailable: faultRecovery.anchors.faultInjectedAt is not in the summary"
+            judgeBacklogPeak = $null
+            scoreboardPendingPeak = $null
+            combinedPeak = $null
+            judgeBacklogPeakGrowthRowsPerSec = $null
+            scoreboardPendingPeakGrowthRowsPerSec = $null
+        }
+    }
     $judgePeak = $null
     $scoreboardPeak = $null
     $judgePeakGrowth = $null
     $scoreboardPeakGrowth = $null
     $sampleCount = 0
+    $outageSampleCount = 0
     $previousAt = $null
     $previousJudge = $null
     $previousScoreboard = $null
@@ -364,6 +432,8 @@ function Get-BacklogSeriesReading {
         $scoreboard = ConvertTo-DoubleOrNull $row.scoreboardPending
         if ($null -eq $at) { continue }
         $sampleCount++
+        if ($at.ToUnixTimeMilliseconds() -lt $faultMillis) { continue }
+        $outageSampleCount++
         if ($null -ne $judge) {
             if ($null -eq $judgePeak -or $judge -gt $judgePeak) { $judgePeak = $judge }
         }
@@ -394,11 +464,27 @@ function Get-BacklogSeriesReading {
         if ($null -ne $Missing) { $Missing.Add("backlog peak (recovery-samples.csv has no row with a readable timestamp)") }
         return $null
     }
+    if ($outageSampleCount -eq 0) {
+        if ($null -ne $Missing) { $Missing.Add("backlog peak and peak growth (recovery-samples.csv has no sample at or after faultRecovery.anchors.faultInjectedAt, so the file covers the pre-fault phase only)") }
+        return [ordered]@{
+            source = "recovery-samples.csv"
+            sampleCount = $sampleCount
+            outageSampleCount = 0
+            windowBasis = "$windowBasis; no sample in this file falls inside that window"
+            judgeBacklogPeak = $null
+            scoreboardPendingPeak = $null
+            combinedPeak = $null
+            judgeBacklogPeakGrowthRowsPerSec = $null
+            scoreboardPendingPeakGrowthRowsPerSec = $null
+        }
+    }
     $combinedPeak = $null
     if ($null -ne $judgePeak -and $null -ne $scoreboardPeak) { $combinedPeak = $judgePeak + $scoreboardPeak }
     return [ordered]@{
         source = "recovery-samples.csv"
         sampleCount = $sampleCount
+        outageSampleCount = $outageSampleCount
+        windowBasis = $windowBasis
         judgeBacklogPeak = $judgePeak
         scoreboardPendingPeak = $scoreboardPeak
         combinedPeak = $combinedPeak
@@ -409,30 +495,56 @@ function Get-BacklogSeriesReading {
 
 # ---------------------------------------------------------------------------
 # Per-run extraction.
+#
+# Each run's parsed summary is kept here as it is read. The limits section needs the same summaries
+# again, and re-reading the files would put a second unguarded ConvertFrom-Json on a file that has
+# already been parsed once - a file that changed between the two reads, or a run directory that was
+# removed mid-run, would take the whole comparison down after it had already succeeded.
 # ---------------------------------------------------------------------------
+$summaryCache = @{}
 foreach ($directory in $RunDirectory) {
     if (-not (Test-Path $directory)) {
         $excluded.Add([ordered]@{ runDirectory = $directory; runId = Split-Path -Leaf $directory; reason = "the run directory does not exist, so nothing was measured here" })
         continue
     }
     $runPath = (Resolve-Path $directory).Path
+    # failure.txt is checked before summary.json, and on its own, because the two are not exclusive:
+    # the harness writes summary.json as soon as the measured phase ends but keeps writing the
+    # recovery and verification sections afterwards, so a run that aborted during recovery can leave
+    # a complete-looking summary.json beside the failure.txt that says it aborted. A run that failed
+    # is not a measurement of anything, whatever else it left behind.
+    $failurePath = Join-Path $runPath "failure.txt"
+    if (Test-Path $failurePath) {
+        $failureReason = (@(Get-Content $failurePath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+        $excluded.Add([ordered]@{
+            runDirectory = $runPath; runId = Split-Path -Leaf $runPath
+            reason = "the run failed: $failureReason (see failure.txt in the run directory), so nothing in this directory is reported as a measurement"
+        })
+        continue
+    }
     $summaryPath = Join-Path $runPath "summary.json"
     if (-not (Test-Path $summaryPath)) {
         # An attempted run that failed and one that was never analyzed both lack summary.json, and
-        # they are not the same thing: the first has a failure.txt with its reason and no amount of
-        # re-analysis will produce numbers from it, so say which one this is rather than telling the
-        # reader to run the analyzer.
-        $failurePath = Join-Path $runPath "failure.txt"
-        $reason = if (Test-Path $failurePath) {
-            $failureReason = (@(Get-Content $failurePath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
-            "the run failed and was not measured: $failureReason (see failure.txt in the run directory)"
-        } else {
-            "the run has no summary.json; run Analyze-TradeoffRun.ps1 on it first"
-        }
-        $excluded.Add([ordered]@{ runDirectory = $runPath; runId = Split-Path -Leaf $runPath; reason = $reason })
+        # they are not the same thing: the failure case is already handled above, so what is left here
+        # is a directory the analyzer has not been run on.
+        $excluded.Add([ordered]@{
+            runDirectory = $runPath; runId = Split-Path -Leaf $runPath
+            reason = "the run has no summary.json and no failure.txt; run Analyze-TradeoffRun.ps1 on it first"
+        })
         continue
     }
-    $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
+    # An unparseable summary is reported as a run with no reading rather than allowed to abort the
+    # whole comparison: the other runs were measured and their report should not depend on this one.
+    try {
+        $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
+    } catch {
+        $excluded.Add([ordered]@{
+            runDirectory = $runPath; runId = Split-Path -Leaf $runPath
+            reason = "summary.json could not be parsed ($($_.Exception.Message)), so this run has no reading and nothing was substituted for one"
+        })
+        continue
+    }
+    $summaryCache[$runPath] = $summary
     # Anything this run's summary does not carry is recorded with the path it was looked for at, so
     # the report can say which value is missing and why rather than only that it is.
     $missing = New-Object System.Collections.Generic.List[string]
@@ -446,32 +558,77 @@ foreach ($directory in $RunDirectory) {
         continue
     }
 
-    # Two disqualifications, kept apart from the missing-summary case above because the run was in
+    # Three disqualifications, kept apart from the missing-summary case above because the run was in
     # fact measured: a run whose fault was injected without any observed work under it never had the
-    # failure it claims to measure, and a run whose recovery exceeded the harness's own timeout was
-    # cut off while still down. Either one still carries numbers, and those numbers would read like
-    # a recovery result, so neither is reported as one.
+    # failure it claims to measure, a run whose recovery exceeded the harness's own timeout was cut
+    # off while still down, and a run whose validity the summary does not state at all. Each of the
+    # first two still carries numbers, and those numbers would read like a recovery result, so none of
+    # the three is reported as one.
+    #
+    # The verdict is read first but never on its own. `runValidForRecovery` is the harness's composite
+    # of the other two conditions, and a summary that predates the field carries neither the verdict
+    # nor any evidence for it - reading absence as "not false" is how a run that never recovered gets
+    # reported as a measured recovery, so the conditions are checked here whether the verdict is
+    # present or not.
     $runValidForRecovery = Get-Field -Object $fault -Name @('runValidForRecovery')
-    if ($null -ne $runValidForRecovery -and -not [bool]$runValidForRecovery) {
+    $faultNotInjectedWithActiveWork = Get-Field -Object $fault -Name @('faultNotInjectedWithActiveWork')
+    if ($null -ne $faultNotInjectedWithActiveWork -and [bool]$faultNotInjectedWithActiveWork) {
         $excluded.Add([ordered]@{
             runDirectory = $runPath; runId = $summary.runId
-            reason = "faultRecovery.runValidForRecovery is false: the fault was not injected under observed work (faultNotInjectedWithActiveWork=$(Format-Value (Get-Field -Object $fault -Name @('faultNotInjectedWithActiveWork')))), so the run does not measure a recovery"
+            reason = "faultNotInjectedWithActiveWork is true: the fault was injected with no observed work under it, so the run never had the failure it claims to measure"
         })
         continue
     }
-    $recoveryTimeout = Get-Field -Object $fault -Name @('recoveryTimeout')
-    if ($null -eq $recoveryTimeout) { $recoveryTimeout = Get-Field -Object $summary -Name @('events', 'recoveryTimeout') }
+    if ($null -ne $runValidForRecovery -and -not [bool]$runValidForRecovery) {
+        $excluded.Add([ordered]@{
+            runDirectory = $runPath; runId = $summary.runId
+            reason = "faultRecovery.runValidForRecovery is false: the run does not measure a recovery (faultNotInjectedWithActiveWork=$(Format-Value $faultNotInjectedWithActiveWork), recoveryTimeout=$(Format-Value (Get-Field -Object $fault -Name @('recoveryTimeout'))))"
+        })
+        continue
+    }
+    # Only the analyzer's recomputed reading disqualifies. The harness records its own timeout while the
+    # run is still going, from a series that stops with the fault phase, so a run whose backlog finished
+    # draining after the load stopped carries events.recoveryTimeout = true while having recovered
+    # completely. Gating on that reading would drop a healthy run from every table - and it would drop
+    # precisely the run whose recovery is fully measured, since the drain is part of the measurement.
+    # The harness's reading is carried beside the recomputed one so a difference stays visible.
+    $recoveryTimeoutAnalyzer = Get-Field -Object $fault -Name @('recoveryTimeout')
+    $recoveryTimeoutHarness = Get-Field -Object $fault -Name @('harnessRecoveryTimeout')
+    if ($null -eq $recoveryTimeoutHarness) { $recoveryTimeoutHarness = Get-Field -Object $summary -Name @('events', 'recoveryTimeout') }
+    $recoveryTimeout = $recoveryTimeoutAnalyzer
+    if ($null -eq $recoveryTimeout) {
+        # No recomputed reading to trust, so the harness's own is used: an absent reading must not be
+        # read as "recovered".
+        $recoveryTimeout = $recoveryTimeoutHarness
+    }
     if ($null -ne $recoveryTimeout -and [bool]$recoveryTimeout) {
         $excluded.Add([ordered]@{
             runDirectory = $runPath; runId = $summary.runId
-            reason = "recoveryTimeout is true: the run was cut off at the harness's recovery deadline while the node had not recovered, so its backlog never normalised and its recovery times are censored rather than measured"
+            reason = "recoveryTimeout is true (recomputed over the measured load and the drain=$(Format-Value $recoveryTimeoutAnalyzer), the run's own during-run reading=$(Format-Value $recoveryTimeoutHarness)): the backlog had not come back inside its pre-fault baseline before the measured load and the drain both ended, so its recovery times are censored rather than measured"
         })
         continue
+    }
+    $runValidityStated = ($null -ne $runValidForRecovery)
+    if (-not $runValidityStated) {
+        # The verdict is absent and no re-analysis will recover it, because the analyzer copies it
+        # from the harness's verification file. The run is still reported - its own conditions were
+        # checked above and passed - but its validity column says so instead of printing a pass the
+        # summary never claimed.
+        $missing.Add("faultRecovery.runValidForRecovery (the summary does not state whether this run is valid for recovery comparison; its components were checked here instead: faultNotInjectedWithActiveWork=$(Format-Value $faultNotInjectedWithActiveWork), recoveryTimeout absent)")
     }
 
     $parametersPath = Join-Path $runPath "parameters.json"
     $parameters = $null
-    if (Test-Path $parametersPath) { $parameters = Get-Content $parametersPath -Raw | ConvertFrom-Json }
+    if (Test-Path $parametersPath) {
+        try {
+            $parameters = Get-Content $parametersPath -Raw | ConvertFrom-Json
+        } catch {
+            # parameters.json is only ever a fallback for the configuration, so a corrupt one leaves
+            # those values to the summary and is recorded rather than allowed to abort the run.
+            $parameters = $null
+            $missing.Add("parameters.json (present but could not be parsed: $($_.Exception.Message))")
+        }
+    }
 
     # The max-in-flight and the claim timeout are read from the summary first and from parameters.json
     # only as a fallback: the summary is the analyzer's own reading of the run, while parameters.json
@@ -494,8 +651,20 @@ foreach ($directory in $RunDirectory) {
         $configurationSource = "unavailable"
     }
 
-    $stageRps = @(Get-Field -Object $summary -Name @('staircase', 'stageRps'))
-    $offeredRps = $(if ($stageRps.Count -gt 0) { $stageRps[0] } else { Get-Field -Object $parameters -Name @('targetRps') })
+    # The stage list is read into a local and its emptiness tested against $null before being indexed.
+    # `@(Get-Field ...)` cannot make that test: on this PowerShell an array subexpression around a
+    # $null is a one-element array holding $null, so a summary with no stageRps would index to $null
+    # and the parameters.json fallback below would never run - the offered rate would print as
+    # unavailable on a run whose parameters.json carries it, and every comparison that depends on two
+    # runs having been offered the same load would refuse for the wrong reason.
+    $stageRps = Get-Field -Object $summary -Name @('staircase', 'stageRps')
+    $offeredRps = $null
+    if ($null -ne $stageRps) {
+        $stageRpsArray = [object[]]$stageRps
+        if ($stageRpsArray.Count -gt 0) { $offeredRps = $stageRpsArray[0] }
+    }
+    if ($null -eq $offeredRps) { $offeredRps = Get-Field -Object $parameters -Name @('targetRps') }
+    if ($null -eq $offeredRps) { $missing.Add("offered RPS (neither summary.staircase.stageRps nor parameters.json.targetRps carries it, so this run cannot be shown to have been offered the same load as any other)") }
     $samplingIntervalMs = Get-Field -Object $summary -Name @('staircase', 'samplingInterval', 'meanIntervalMs')
     $timeBandSeconds = Get-TimeBandSeconds -SamplingIntervalMs $samplingIntervalMs
     $backlogBandRows = Get-BacklogBandRows -TargetRps $offeredRps -SamplingIntervalMs $samplingIntervalMs
@@ -525,10 +694,19 @@ foreach ($directory in $RunDirectory) {
             ([double]$counts.accepted -eq [double]$counts.results) -and
             ([double]$counts.accepted -eq [double]$counts.scoreboardApplied)
     }
-    $integrityPassed = [bool](Get-Field -Object $summary -Name @('integrity', 'passed'))
+    # The verdict is kept as $null when the summary does not carry it instead of being cast to false:
+    # a cast makes an absent field print as FAILED, which is a claim about the run that nothing in the
+    # summary supports, and it is the same value the inventory and the exclusion below are driven by.
+    # Absence still excludes the run from the comparison tables - a correctness chain that cannot be
+    # confirmed is not a pass - but it says which of the two it is.
+    $integrityPassedValue = Get-Field -Object $summary -Name @('integrity', 'passed')
+    $integrityPassed = $null
+    if ($null -ne $integrityPassedValue) { $integrityPassed = [bool]$integrityPassedValue } else { $missing.Add("integrity.passed (the summary carries no integrity verdict, so the counts chain is the only correctness evidence this run has)") }
     $integrityReason = $null
     if ($missingCounts.Count -gt 0) {
         $integrityReason = "verification counts are missing for $($missingCounts.ToArray() -join ', '), so the chain accepted = uniqueSubmissions = results = scoreboardApplied could not be evaluated"
+    } elseif ($null -eq $integrityPassed) {
+        $integrityReason = "integrity.passed is not in this summary, so the analyzer's own verdict is unavailable and the chain above is the only correctness evidence; an absent verdict is not a pass"
     } elseif (-not $integrityPassed) {
         $integrityReason = "integrity failed: lostOrIncomplete=$(Format-Value (Get-Field -Object $summary -Name @('integrity','lostOrIncomplete'))), finalResultMismatch=$(Format-Value (Get-Field -Object $summary -Name @('integrity','finalResultMismatch')))"
     }
@@ -575,8 +753,13 @@ foreach ($directory in $RunDirectory) {
     $normalization = Get-Field -Object $fault -Name @('normalization')
     $recovery = Get-Field -Object $summary -Name @('recovery')
 
-    $tStale = Read-Field -Object $recoveryTimes -Name @('T_staleSeconds') -Label "first stale reclaim time (T_stale)" -Missing $missing
-    if ($null -eq $tStale) { $tStale = Read-Field -Object $recovery -Name @('firstStaleReclaimSeconds') -Label "first stale reclaim time (recovery.firstStaleReclaimSeconds)" -Missing (New-Object System.Collections.Generic.List[string]) }
+    # The first read records nothing and the fallback records: the two are the same quantity read from
+    # two places, and recording the first miss before trying the second puts a value in the report's
+    # "not carried" list that the run did in fact carry under its other name.
+    $tStale = Read-Field -Object $recoveryTimes -Name @('T_staleSeconds') -Label "first stale reclaim time (T_stale)" -Missing $null
+    if ($null -eq $tStale) {
+        $tStale = Read-Field -Object $recovery -Name @('firstStaleReclaimSeconds') -Label "first stale reclaim time (T_stale; looked for at faultRecovery.recoveryTimes.T_staleSeconds and recovery.firstStaleReclaimSeconds)" -Missing $missing
+    }
     $tRestartRequested = Read-Field -Object $recoveryTimes -Name @('T_restartRequestedSeconds') -Label "restart requested time (T_restartRequested)" -Missing $missing
     $tContainerRunning = Read-Field -Object $recoveryTimes -Name @('T_containerRunningSeconds') -Label "container running time (T_container_running)" -Missing $missing
     $tNodeReady = Read-Field -Object $recoveryTimes -Name @('T_nodeReadySeconds') -Label "node ready time (T_node_ready)" -Missing $missing
@@ -613,6 +796,20 @@ foreach ($directory in $RunDirectory) {
             $missing.Add("faultRecovery.cohorts.$cohortName")
         }
     }
+    # The censored tail is not one of the specification's cohorts. The analyzer writes it only when
+    # backlogNormalizedAt was never observed, which is also when cohort D's own interval never closed
+    # and D is empty: the rows after nodeReadyAt have to be reported somewhere, and reporting them as
+    # D would tabulate the censored tail of an outage as a measured recovery interval. It is listed
+    # after D under its own label for that reason, never merged into D's row.
+    $censoredTailName = "post-restart-censored-tail"
+    $censoredTail = Get-Field -Object $faultCohortSource -Name @($censoredTailName)
+    if ($null -ne $censoredTail) {
+        $faultCohorts[$censoredTailName] = [ordered]@{
+            letter = "D-censored (not cohort D)"
+            reading = Get-LatencyReading -Cohort $censoredTail
+            unavailableReason = $(if ($null -eq (Get-LatencyReading -Cohort $censoredTail)) { Get-CohortUnavailableReason -Cohort $censoredTail } else { $null })
+        }
+    }
     $generalCohortSource = Get-Field -Object $summary -Name @('cohorts')
     $generalCohortReadings = [ordered]@{}
     foreach ($cohortName in $generalCohorts) {
@@ -626,7 +823,9 @@ foreach ($directory in $RunDirectory) {
     # --- throughput and the pre-fault baseline ---------------------------------------------------
     $throughput = Get-Field -Object $fault -Name @('throughput')
     $preFault = Get-Field -Object $fault -Name @('preFault')
-    $preFaultResultRps = Read-Field -Object $throughput -Name @('preFaultResultRps') -Label "pre-fault result RPS (faultRecovery.throughput.preFaultResultRps)" -Missing (New-Object System.Collections.Generic.List[string])
+    # As with T_stale: the absence is recorded once, by whichever of the two reads came up empty, so a
+    # value the run carries under the second name is not also listed as one it never carried.
+    $preFaultResultRps = Read-Field -Object $throughput -Name @('preFaultResultRps') -Label "pre-fault result RPS (faultRecovery.throughput.preFaultResultRps)" -Missing $null
     if ($null -eq $preFaultResultRps) {
         $preFaultResultRps = Get-Field -Object $preFault -Name @('resultRps')
         if ($null -eq $preFaultResultRps) { $missing.Add("pre-fault result RPS (faultRecovery.preFault.resultRps)") }
@@ -651,7 +850,10 @@ foreach ($directory in $RunDirectory) {
     $strandedShare = Get-Ratio -Numerator $strandedUpperBound -Denominator $maxInFlightClusterWide -Missing $missing -Label "stranded claimed rows / max-in-flight"
 
     # --- backlog peak ----------------------------------------------------------------------------
-    $backlogSeries = Get-BacklogSeriesReading -RunPath $runPath -Missing $missing
+    # The fault instant is passed in so the peak and the growth rates are computed over the outage
+    # they are described as covering; see the reader for why the whole series is not it.
+    $faultInjectedAt = Get-Field -Object $anchors -Name @('faultInjectedAt', 'value')
+    $backlogSeries = Get-BacklogSeriesReading -RunPath $runPath -Missing $missing -FaultAt $faultInjectedAt
     $preFaultJudgeP95 = Get-Field -Object $preFault -Name @('judgeBacklogP95')
     $preFaultScoreboardP95 = Get-Field -Object $preFault -Name @('scoreboardPendingP95')
     $preFaultCombinedP95 = $null
@@ -696,7 +898,9 @@ foreach ($directory in $RunDirectory) {
     # rate, and it is labelled that way wherever it is printed.
     $measuredPhaseSeconds = Get-SecondsBetween -From (Get-Field -Object $summary -Name @('events', 'measurementStartedAt')) -To (Get-Field -Object $summary -Name @('events', 'drainEndedAt'))
     if ($null -eq $measuredPhaseSeconds) { $missing.Add("measured phase duration (events.measurementStartedAt to events.drainEndedAt)") }
-    $measuredPhaseAcceptedRps = Get-Ratio -Numerator $counts.accepted -Denominator $measuredPhaseSeconds -Missing (New-Object System.Collections.Generic.List[string]) -Label "measured phase accepted RPS"
+    # -Missing $null rather than a throwaway list: both sides of this ratio are recorded as missing by
+    # the reads that produced them above, and a second record here would duplicate those entries.
+    $measuredPhaseAcceptedRps = Get-Ratio -Numerator $counts.accepted -Denominator $measuredPhaseSeconds -Missing $null -Label "measured phase accepted RPS"
 
     # --- operational surface ---------------------------------------------------------------------
     $faultRecoveryParameters = Get-Field -Object $parameters -Name @('faultRecovery')
@@ -744,8 +948,14 @@ foreach ($directory in $RunDirectory) {
         sampleSource = Get-Field -Object $fault -Name @('source', 'sampleSource')
         sampleCount = Get-Field -Object $fault -Name @('source', 'sampleCount')
         runValidForRecovery = $runValidForRecovery
+        runValidityStated = $runValidityStated
+        # Two readings of the same question, both kept: the recomputed one is what the tables gate on,
+        # the run's own during-run reading is what the summary reported, and the report shows both when
+        # they differ rather than letting the reader assume they agree.
         recoveryTimeout = $recoveryTimeout
-        faultNotInjectedWithActiveWork = Get-Field -Object $fault -Name @('faultNotInjectedWithActiveWork')
+        recoveryTimeoutRecomputed = $recoveryTimeoutAnalyzer
+        recoveryTimeoutDuringRun = $recoveryTimeoutHarness
+        faultNotInjectedWithActiveWork = $faultNotInjectedWithActiveWork
         latencyProfile = Get-Field -Object $parameters -Name @('latency')
         accepted = $counts.accepted
         uniqueSubmissions = $counts.uniqueSubmissions
@@ -763,11 +973,13 @@ foreach ($directory in $RunDirectory) {
         ko429 = $ko429
         ko500 = $ko500
         ko503 = $ko503
-        # A run whose integrity failed is not a measurement of anything, so it is kept out of the
-        # comparison tables and listed with its reason instead of contributing numbers that would
-        # read like results. It is not moved to excluded[]: it was measured, and the reason it does
-        # not count is a property of its own numbers rather than a reason it has none.
-        excludedFromComparison = (-not $integrityPassed -or $missingCounts.Count -gt 0 -or $null -eq $chainHolds)
+        # A run whose integrity failed, whose counts are incomplete, or whose integrity verdict the
+        # summary does not carry at all is not a measurement of anything: it is kept out of the
+        # comparison tables and listed with its reason instead of contributing numbers that would read
+        # like results. An absent verdict lands on the same side as a failed one - a chain nothing
+        # confirmed is not a chain that held. It is not moved to excluded[]: it was measured, and the
+        # reason it does not count is a property of its own numbers rather than a reason it has none.
+        excludedFromComparison = (($null -eq $integrityPassed) -or (-not $integrityPassed) -or $missingCounts.Count -gt 0 -or $null -eq $chainHolds)
         recoveryTimes = [ordered]@{
             T_staleSeconds = $tStale
             T_restartRequestedSeconds = $tRestartRequested
@@ -787,13 +999,19 @@ foreach ($directory in $RunDirectory) {
         }
         # Whether the two recovery instants were pinned down by samples or by a gap in them. These are
         # three readings of the same searches: where the search started, how wide the holding streak
-        # actually was, and whether the ungated search (from faultInjectedAt rather than from
-        # max(fault, nodeReady)) landed earlier because the surviving node drained the backlog alone.
+        # actually was, and where the ungated search (from faultInjectedAt rather than from
+        # max(fault, nodeReady)) landed. The ungated value is always populated, so an equal instant means
+        # the two searches agree rather than that the second one was skipped - the per-backlog instants
+        # and the precedes-nodeReady flag are what distinguish a surviving node draining alone.
         normalizationSearchFromAt = Get-Field -Object $normalization -Name @('searchFromAt')
         normalizationSustainSpanSeconds = Get-Field -Object $normalization -Name @('sustainSpanSeconds')
         normalizationMaxSampleGapSeconds = Get-Field -Object $normalization -Name @('maxSampleGapSeconds')
         normalizationSustainSampleCount = Get-Field -Object $normalization -Name @('sustainSampleCount')
         earliestNormalizedAt = Get-Field -Object $normalization -Name @('earliestNormalizedAt')
+        earliestJudgeNormalizedAt = Get-Field -Object $normalization -Name @('earliestJudgeBacklogNormalizedAt')
+        earliestScoreboardNormalizedAt = Get-Field -Object $normalization -Name @('earliestScoreboardBacklogNormalizedAt')
+        earliestNormalizedPrecedesNodeReady = Get-Field -Object $normalization -Name @('earliestNormalizedPrecedesNodeReady')
+        earliestNormalizedPrecedesGated = Get-Field -Object $normalization -Name @('earliestNormalizedPrecedesGated')
         throughputRollingSpanMaxSeconds = Get-Field -Object $throughput -Name @('rollingSpanMaxSeconds')
         anchors = [ordered]@{
             faultInjectedAt = Get-Field -Object $anchors -Name @('faultInjectedAt')
@@ -866,31 +1084,63 @@ foreach ($directory in $RunDirectory) {
 # ---------------------------------------------------------------------------
 # Grouping and the direct 4s-versus-10s delta.
 # ---------------------------------------------------------------------------
+# The comparison tables read this list, not $runs. The two lists differ only by the runs held out for
+# their own numbers - a failed integrity chain, an incomplete set of counts - and those runs are kept
+# in $runs because the inventory and section 1 are where their numbers and the reason they are held
+# out belong. Every table that puts two runs side by side and calls the difference a reading uses this
+# one, so "held out" is a statement the report keeps rather than one it makes and then ignores.
+$comparisonRuns = [object[]]@($runs | Where-Object { -not $_.excludedFromComparison })
+
 $byMaxInFlight = @{}
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $groupKey = "mif=$(Format-Value $run.mysqlMaxInFlightPerNode)"
     if (-not $byMaxInFlight.ContainsKey($groupKey)) { $byMaxInFlight[$groupKey] = New-Object System.Collections.Generic.List[object] }
     $byMaxInFlight[$groupKey].Add($run)
 }
 
-# The pair the direct comparison is about, found by the configuration the specification names: the
-# same max-in-flight per node (64) at the two claim timeouts (4s and 10s). Matching on the parsed
-# millisecond value rather than on the literal "4s"/"10s" text means an equivalent spelling such as
-# "4000ms" - which the harness writes when the timeout has no exact second form - still finds its run.
-function Get-RunByConfiguration {
+# Runs of one configuration, of which there must be exactly one for it to be compared. Matching on the
+# parsed millisecond value rather than on the literal "4s"/"10s" text means an equivalent spelling such
+# as "4000ms" - which the harness writes when the timeout has no exact second form - still finds its
+# run. Every match is returned rather than the first: two runs that answer to the same configuration
+# are two measurements of it, and picking one of them silently would compare a run against a
+# configuration while naming it as another run's pair.
+function Get-RunsByConfiguration {
     param($RunList, $MaxInFlight, $TimeoutMillis)
+    $matches = New-Object System.Collections.Generic.List[object]
     foreach ($candidate in $RunList) {
         $candidateMif = ConvertTo-DoubleOrNull $candidate.mysqlMaxInFlightPerNode
         $candidateTimeout = ConvertTo-DoubleOrNull $candidate.mysqlClaimTimeoutMillis
         if ($null -eq $candidateMif -or $null -eq $candidateTimeout) { continue }
-        if ($candidateMif -eq $MaxInFlight -and $candidateTimeout -eq $TimeoutMillis) { return $candidate }
+        if ($candidateMif -eq $MaxInFlight -and $candidateTimeout -eq $TimeoutMillis) { $matches.Add($candidate) }
+    }
+    # [object[]], not @(): PowerShell 5.1 refuses @() around the List[object] built above, and the
+    # failure reads only as "Argument types do not match".
+    return [object[]]$matches
+}
+
+# Filled by the function below and read by the sections that quote a configuration: a configuration
+# that more than one run answers to produces no run at all rather than an arbitrary one.
+$configurationAmbiguity = @{}
+
+# The single run of a configuration, or $null with the reason it is not single. The ambiguity case is
+# recorded rather than resolved here so the sections that need the run can print it.
+function Get-SingleRunByConfiguration {
+    param($RunList, $MaxInFlight, $TimeoutMillis, [string]$ConfigurationLabel)
+    # Wrapped in @() at the call site because PowerShell unrolls a one-element array on the way out of
+    # a function: a configuration with exactly one run came back as the run object itself, whose .Count
+    # is its number of fields rather than one, so the single-run case read as an ambiguity listing a
+    # single run id. Every result of this function goes through here, so the wrap belongs here.
+    $matches = @(Get-RunsByConfiguration -RunList $RunList -MaxInFlight $MaxInFlight -TimeoutMillis $TimeoutMillis)
+    if ($matches.Count -eq 1) { return $matches[0] }
+    if ($matches.Count -gt 1) {
+        $script:configurationAmbiguity[$ConfigurationLabel] = "$ConfigurationLabel matches more than one run in the comparison ($(@($matches | ForEach-Object { $_.runId }) -join ', ')), so which of them is the run for that configuration cannot be established and neither the direct comparison nor the separate interpretation is made from them"
     }
     return $null
 }
 
-$runFourSeconds = Get-RunByConfiguration -RunList $runs -MaxInFlight 64 -TimeoutMillis 4000
-$runTenSeconds = Get-RunByConfiguration -RunList $runs -MaxInFlight 64 -TimeoutMillis 10000
-$runSixteen = Get-RunByConfiguration -RunList $runs -MaxInFlight 16 -TimeoutMillis 2500
+$runFourSeconds = Get-SingleRunByConfiguration -RunList $comparisonRuns -MaxInFlight 64 -TimeoutMillis 4000 -ConfigurationLabel "max-in-flight 64 at a 4s claim timeout"
+$runTenSeconds = Get-SingleRunByConfiguration -RunList $comparisonRuns -MaxInFlight 64 -TimeoutMillis 10000 -ConfigurationLabel "max-in-flight 64 at a 10s claim timeout"
+$runSixteen = Get-SingleRunByConfiguration -RunList $comparisonRuns -MaxInFlight 16 -TimeoutMillis 2500 -ConfigurationLabel "max-in-flight 16 at a 2500ms claim timeout"
 
 function New-DeltaRow {
     param([string]$Metric, $ValueA, $ValueB, $Band, [string]$Units, [string]$Verdict)
@@ -913,7 +1163,30 @@ $deltaRows = New-Object System.Collections.Generic.List[object]
 $deltaNormalizedRows = New-Object System.Collections.Generic.List[object]
 $deltaAvailable = ($null -ne $runFourSeconds -and $null -ne $runTenSeconds)
 $loadComparable = $false
-$loadComparableReason = "one of the two MIF64 runs is not in the comparison at all, so nothing can be compared"
+# What the reader is told when the pair is not available: which of the two is absent, or that a
+# configuration matched more than one run so the pair could not be formed. The ambiguity text is read
+# out of the map the selection filled rather than reconstructed from the two run ids.
+$deltaPairProblem = "one of the two MIF64 runs is not in the comparison at all, so nothing can be compared"
+if (-not $deltaAvailable) {
+    $pairReasons = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @("max-in-flight 64 at a 4s claim timeout", "max-in-flight 64 at a 10s claim timeout")) {
+        if ($configurationAmbiguity.ContainsKey($key)) { $pairReasons.Add($configurationAmbiguity[$key]) }
+    }
+    if ($pairReasons.Count -eq 0) {
+        # Neither configuration was ambiguous, so the reason is which of the two runs the comparison
+        # does not have - and that includes the runs it has but cannot compare: a run held out for its
+        # integrity or its counts is present and is still not a member of the pair.
+        $pairReasons.Add($(if ($null -eq $runFourSeconds -and $null -eq $runTenSeconds) {
+            "neither a max-in-flight 64 run at a 4s claim timeout nor one at a 10s claim timeout is among the runs this comparer can compare (a run held out for its integrity chain or its counts cannot stand in for either)"
+        } elseif ($null -eq $runFourSeconds) {
+            "the max-in-flight 64 run at a 4s claim timeout is not among the runs this comparer can compare (held out, or not given to it)"
+        } else {
+            "the max-in-flight 64 run at a 10s claim timeout is not among the runs this comparer can compare (held out, or not given to it)"
+        }))
+    }
+    $deltaPairProblem = $pairReasons.ToArray() -join '; '
+}
+$loadComparableReason = $deltaPairProblem
 if ($deltaAvailable) {
     $offered4s = ConvertTo-DoubleOrNull $runFourSeconds.offeredRps
     $offered10s = ConvertTo-DoubleOrNull $runTenSeconds.offeredRps
@@ -1024,7 +1297,10 @@ $limitStatements = @(
 $limitEntries = New-Object System.Collections.Generic.List[object]
 $seenLimitText = @{}
 foreach ($run in $runs) {
-    $summary = Get-Content (Join-Path $run.runDirectory "summary.json") -Raw | ConvertFrom-Json
+    # The summary parsed for this run above, not a second read of the file: this is the same document,
+    # and a run that reached $runs has already been parsed successfully once.
+    $summary = $summaryCache[$run.runDirectory]
+    if ($null -eq $summary) { continue }
     # The entry's origin is read into a local before the inner loop, so the run id it is attributed
     # to is this run's and not whatever $_ happens to be inside the loop below.
     $originRunId = $run.runId
@@ -1146,16 +1422,33 @@ function Get-CohortRow {
         return "| $($Run.runId) | $Letter $CohortName | $reason | unavailable | unavailable | unavailable | unavailable | unavailable |"
     }
     $reading = $CohortEntry.reading
-    return "| $($Run.runId) | $Letter $CohortName | $(Format-Value $reading.sampleCount) | " +
+    return "| $($Run.runId) | $Letter $CohortName | $(Get-SampleCell $reading) | " +
         "$(Format-PercentileQuad $reading.total) | $(Format-PercentileQuad $reading.result) | $(Format-PercentileQuad $reading.scoreboard) | " +
         "$(Format-RatioPercent $reading.over5sRatio) | $(Format-RatioPercent $reading.over10sRatio) |"
+}
+
+# Runs in one table can have been offered different loads, and a latency percentile is a queueing
+# reading that scales with the offered rate. Printing two of them side by side without saying so
+# invites a comparison the direct-comparison section refuses outright, so the paragraph this returns
+# names the rates in play and what may be read across them. It returns $null when every run in the
+# table was offered the same rate, because then there is nothing to warn about.
+function Get-LoadDifferenceNote {
+    param($RunList, [string]$TableName)
+    $rates = [object[]]@($RunList | ForEach-Object { ConvertTo-DoubleOrNull $_.offeredRps } | Where-Object { $null -ne $_ } | Sort-Object -Unique)
+    if ($rates.Count -lt 2) { return $null }
+    $byRate = New-Object System.Collections.Generic.List[string]
+    foreach ($rate in $rates) {
+        $byRate.Add("$(Format-Number $rate) RPS: $(@($RunList | Where-Object { (ConvertTo-DoubleOrNull $_.offeredRps) -eq $rate } | ForEach-Object { $_.runId }) -join ', ')")
+    }
+    return "The runs in $TableName were not all offered the same load - $($byRate.ToArray() -join '; ') - and a cohort percentile is a queueing reading that grows with the offered rate and with the share of the run's submissions that arrived during the outage. The sample count in each row is that cohort's own denominator, and the cohorts do not cover the same share of their runs: a raw percentile is therefore only readable between runs that share a configuration and an offered rate, which is the rule the direct-comparison section applies to its own pair. Across rates, read the normalized metrics, each of which divides by that run's own baseline."
 }
 
 $lines = New-Object System.Collections.Generic.List[string]
 
 $lines.Add("# MySQL judge fault recovery comparison")
 $lines.Add("")
-$lines.Add("- Runs in comparison order: $((@($runs | ForEach-Object { $_.runId })) -join ' -> ')")
+$runsIdList = @($runs | ForEach-Object { $_.runId })
+$lines.Add("- Runs read: $(if ($runsIdList.Count -eq 0) { 'none - every directory given to this comparer was excluded, and the reasons are below' } else { $runsIdList -join ' -> ' })")
 $lines.Add("- Generated at: $($comparison.generatedAt)")
 $lines.Add("- Excluded: $(if ($excluded.Count -eq 0) { 'none' } else { (@($excluded | ForEach-Object { "$($_.runDirectory): $($_.reason)" })) -join '; ' })")
 $lines.Add("- Section order, fixed by the experiment specification: $(for ($i = 0; $i -lt $sectionOrder.Count; $i++) { "$($i + 1). $($sectionOrder[$i])" }) ")
@@ -1168,19 +1461,22 @@ $lines.Add("")
 # --- inventory -------------------------------------------------------------------------------------
 $lines.Add("## Run inventory")
 $lines.Add("")
-$lines.Add("| # | run id | dispatch | MIF/node | claim timeout | batch | workers/node | offered RPS | killed node | down s (configured) | integrity | valid for recovery | config read from |")
-$lines.Add("|---:|---|---|---:|---|---:|---:|---|---|---:|---|---|---|")
+$lines.Add("| # | run id | dispatch | MIF/node | claim timeout | batch | workers/node | offered RPS | killed node | down s (configured) | integrity | valid for recovery | in comparison tables | config read from |")
+$lines.Add("|---:|---|---|---:|---|---:|---:|---|---|---:|---|---|---|---|")
 $inventoryIndex = 0
 foreach ($run in $runs) {
     $inventoryIndex++
     $downConfigured = Get-Field -Object $run.recoveryTimes -Name @('downDurationConfiguredSeconds')
     $validForRecovery = Get-Field -Object $run -Name @('runValidForRecovery')
+    $inComparisonCell = $(if ($run.excludedFromComparison) { "no: $($run.integrityReason)" } else { "yes" })
     $lines.Add("| $inventoryIndex | $($run.runId) | $(Format-Value $run.dispatchMode) | $(Format-Value $run.mysqlMaxInFlightPerNode) | $(Format-Value $run.mysqlClaimTimeout) | " +
         "$(Format-Value $run.mysqlClaimBatchSize) | $(Format-Value $run.workerCountPerNode) | $(Format-Value $run.offeredRps) | $(Format-Value $run.killedNode) | $(Format-Value $downConfigured) | " +
-        "$(if ($run.integrityPassed) { 'passed' } else { 'FAILED' }) | $(Format-Value $validForRecovery) | $($run.configurationSource) |")
+        "$(Format-Value $run.integrityPassed) | $(Format-Value $validForRecovery) | $inComparisonCell | $($run.configurationSource) |")
 }
 $lines.Add("")
 $lines.Add("The comparison order above is the order this file was given the run directories in. Max-in-flight and the claim timeout are read from `summary.staircase` first and from `parameters.json` only when the summary does not carry them; the last column says which one answered, because on a regenerated analysis the two can disagree and the reader needs to know which number is being discussed.")
+$lines.Add("")
+$lines.Add('The integrity column is the analyzer''s own verdict, and `unavailable` there means the summary does not carry one: that is not a pass, and such a run is held out of the comparison tables for the same reason a failed one is. The same holds for `valid for recovery`: when the summary does not state `faultRecovery.runValidForRecovery`, the run''s own conditions are checked here instead (a fault injected under no observed work, and a backlog that never came back inside its pre-fault baseline, are both disqualifying on their own) and the column says the verdict was not carried rather than printing a pass the summary never claimed. The backlog test is the analyzer''s recomputation over the measured load and the drain; the run''s own during-run reading is not used to gate anything, because it is taken before the drain and reads a backlog that finished draining after the load stopped as never having drained.')
 $lines.Add("")
 
 # --- excluded --------------------------------------------------------------------------------------
@@ -1190,9 +1486,9 @@ if ($excluded.Count -eq 0) {
     # Single-quoted on purpose: this paragraph carries Markdown code spans, and a backtick followed
     # by a, b, f, n, r, t or v is a PowerShell escape inside a double-quoted string, so "`f..." would
     # silently become a form feed and the code span would vanish from the report.
-    $lines.Add('None. Every run directory given to this comparer carried a summary.json, a true `faultRecovery.runValidForRecovery` and a false `recoveryTimeout`, so every one of them is reported below as a measured recovery.')
+    $lines.Add('None. Every run directory given to this comparer carried a summary.json, no run directory carried a failure.txt, and no run was disqualified for a fault injected under no observed work or for a backlog that never came back inside its pre-fault baseline - the latter read from the analyzer''s recomputation over the measured load and the drain, whether or not the summary states a `faultRecovery.runValidForRecovery` verdict.')
 } else {
-    $lines.Add("These directories are not reported as successes anywhere in this file. A run that failed, a run that was never analyzed, a run whose fault was not injected under observed work and a run that hit the harness's recovery deadline are four different situations, and each is stated rather than folded into one.")
+    $lines.Add("These directories are not reported as successes anywhere in this file. A run that failed, a run that was never analyzed, a run that carries a summary.json that cannot be parsed, a run whose fault was not injected under observed work and a run that hit the harness's recovery deadline are different situations, and each is stated rather than folded into one.")
     $lines.Add("")
     $lines.Add("| run directory | run id | reason |")
     $lines.Add("|---|---|---|")
@@ -1227,18 +1523,29 @@ if ($httpUnavailableRuns.Count -gt 0) {
 $integrityFailedRuns = @($runs | Where-Object { $_.excludedFromComparison })
 if ($integrityFailedRuns.Count -gt 0) {
     $lines.Add("")
-    $lines.Add("Runs whose integrity check did not confirm the chain are listed here with their reason and are held out of the comparison tables below, because their counts cannot establish that the work they timed was complete: $(@($integrityFailedRuns | ForEach-Object { "$($_.runId) - $($_.integrityReason)" }) -join '; ').")
+    $lines.Add("Runs whose correctness check did not confirm the chain are listed here with their reason and are held out of the comparison tables below, because their counts cannot establish that the work they timed was complete: $(@($integrityFailedRuns | ForEach-Object { "$($_.runId) - $($_.integrityReason)" }) -join '; ').")
 }
 $lines.Add("")
+
+# --- the runs the tables below are built from -------------------------------------------------------
+if ($comparisonRuns.Count -eq 0) {
+    # Said once, before the first table, because every table below is empty for this reason and a
+    # reader who scrolls to section 2 otherwise finds headers with no rows and no explanation.
+    $lines.Add("No run reached the comparison tables: every directory given to this comparer was excluded above, or was measured with a correctness chain that could not be confirmed. The exclusions are listed above with their reasons, and nothing below is a measurement of theirs.")
+    $lines.Add("")
+} else {
+    $lines.Add("The tables below are built from $(@($comparisonRuns | ForEach-Object { $_.runId }) -join ', '); any run listed in the inventory but not here was measured and is held out, and section 1 gives its reason. The run inventory and section 1 report every run given to the comparer, because that is where a held-out run's numbers belong.")
+    $lines.Add("")
+}
 
 # --- 2. backlog recovery time ----------------------------------------------------------------------
 $lines.Add("## 2. Backlog recovery time")
 $lines.Add("")
-$lines.Add('Each row is one definition of "how long the recovery took", measured from `faultInjectedAt` unless the definition says otherwise. They are reported side by side because they answer different questions and the spread between them is the interesting part: the lease-expiry instant is not the same as the node being back, and the node being back is not the same as the queue being empty. None of these is an assumed value - `T_stale` in particular is NOT assumed to equal the configured claim timeout, because the lease expires at `claimed_at + timeout` and the claim was already older than that at the kill instant.')
+$lines.Add('Each row is one definition of "how long the recovery took". Most are measured from `faultInjectedAt`; the two columns whose headings say so are measured from `restartRequestedAt` instead. They are reported side by side because they answer different questions and the spread between them is the interesting part: the lease-expiry instant is not the same as the node being back, and the node being back is not the same as the queue being empty. None of these is an assumed value - `T_stale` in particular is NOT assumed to equal the configured claim timeout, because the lease expires at `claimed_at + timeout` and the claim was already older than that at the kill instant.')
 $lines.Add("")
-$lines.Add("| run id | T_stale (first stale reclaim) | T_restart_requested | T_container_running | T_node_ready | throughput recovery | backlog normalization (judge) | backlog normalization (scoreboard) | backlog normalization (combined) | T_last_reclaimed_result | T_last_reclaimed_scoreboard | drain |")
+$lines.Add("| run id | T_stale (first stale reclaim) | T_restart_requested | T_container_running (from restart requested) | T_node_ready (from restart requested) | throughput recovery | backlog normalization (judge) | backlog normalization (scoreboard) | backlog normalization (combined) | T_last_reclaimed_result | T_last_reclaimed_scoreboard | drain |")
 $lines.Add("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $recoveryTimeCells = $run.recoveryTimes
     $lines.Add("| $($run.runId) | $(Format-Seconds $recoveryTimeCells.T_staleSeconds) | $(Format-Seconds $recoveryTimeCells.T_restartRequestedSeconds) | " +
         "$(Format-Seconds $recoveryTimeCells.T_containerRunningSeconds) | $(Format-Seconds $recoveryTimeCells.T_nodeReadySeconds) | $(Format-Seconds $recoveryTimeCells.T_throughputRecoverySeconds) | " +
@@ -1247,8 +1554,8 @@ foreach ($run in $runs) {
         "$(Format-Seconds $recoveryTimeCells.T_lastReclaimedScoreboardSeconds) | $(Format-Seconds $recoveryTimeCells.drainSeconds) |")
 }
 $lines.Add("")
-$lines.Add("`T_stale` is read from the durable `SUM(attempts - 1)` crossing its pre-fault value, polled about once a second, so it is bounded below by the poll interval and is not the instant the lease was actually acquired. `T_container_running` is `docker inspect` reporting `State.Running`, which is not readiness: `T_node_ready` is the first instant the container was running AND the readiness endpoint was UP AND Prometheus was scrapable AND the claim counter was observed to advance. The two backlog-normalization columns are the judge backlog and the scoreboard pending backlog each reaching and holding at or below their own pre-fault p95; the combined column is the later of the two and is the one the specification calls the backlog normalization time. `T_last_reclaimed_*` is the last reclaimed submission's result row and scoreboard application, which is when the customers of the re-claimed work finally saw it. Drain is the harness's own loop reaching a zero backlog, and it is measured after the load stops, so it is not comparable with the columns before it.")
-foreach ($run in $runs) {
+$lines.Add('`T_stale` is read from the durable `SUM(attempts - 1)` crossing its pre-fault value, polled about once a second, so it is bounded below by the poll interval and is not the instant the lease was actually acquired. `T_container_running` is `docker inspect` reporting `State.Running`, which is not readiness: `T_node_ready` is the first instant the container was running AND the readiness endpoint was UP AND Prometheus was scrapable AND the claim counter was observed to advance. Those two columns are on a different zero from the rest of the table: the harness records them as seconds after the RESTART WAS REQUESTED, not after the fault, so `T_node_ready` is not the time from the kill to readiness and adding either column to `T_stale` is meaningless. The gap between the two zeros is the measured down window, `restartRequestedAt - faultInjectedAt`, reported as `down window measured s` in section 8. The two backlog-normalization columns are the judge backlog and the scoreboard pending backlog each reaching and holding at or below their own pre-fault p95; the combined column is the later of the two and is the one the specification calls the backlog normalization time. `T_last_reclaimed_*` is the last reclaimed submission''s result row and scoreboard application, which is when the customers of the re-claimed work finally saw it. Drain is the harness''s own loop reaching a zero backlog, and it is measured after the load stops, so it is not comparable with the columns before it.')
+foreach ($run in $comparisonRuns) {
     $staleBasis = Get-Field -Object $run.recoveryTimes -Name @('T_staleBasis')
     if ($null -ne $staleBasis) {
         $lines.Add("")
@@ -1256,14 +1563,26 @@ foreach ($run in $runs) {
     }
 }
 $lines.Add("")
-$lines.Add('Two readings that say whether the two recovery instants above were pinned down by samples or by a gap in them. `backlog norm search from` is the instant both backlog searches started at, and `earliest` is the same search run from `faultInjectedAt` instead: when it lands earlier, the surviving node drained the backlog before the killed one was serving again, and the combined column above deliberately does not use it. `judge sustain span s` is how much wall clock the accepted hold actually covered and `widest gap s` is the widest gap between two samples inside it, so a hold confirmed by six consecutive 1s samples is told apart from one confirmed by three samples across a 2.5s gap: the second is still a hold under the documented 2.5s limit, but it rests on fewer observations and now says so. `rolling span max` is the widest 5s throughput window that survived the span bound, so it shows how much of the rolling rate rests on a sampling gap rather than on five consecutive seconds.')
+$lines.Add('Two readings that say whether the two recovery instants above were pinned down by samples or by a gap in them. `backlog norm search from` is the instant both backlog searches started at, and `earliest` is the same search run from `faultInjectedAt` instead, which is always reported: the combined instant is the later of the two backlogs, so an earlier search origin cannot push it later and an equal value is the two searches agreeing rather than a missing measurement. The `earlier than readiness` column is set when that ungated combined instant precedes `nodeReadyAt`; the combined column above deliberately does not use it, because with the killed node down the surviving one is not fed the work the dead one would have taken, so a backlog can hold below its baseline because less is arriving rather than because more is being drained, and it can rise again when the replacement returns and the re-claimed rows are republished in bulk. Read that column next to the arrivals the run itself reports rather than as a recovery that beat the restart; the per-backlog ungated instants in `summary.json` are where a surviving node draining alone would actually show up. `judge sustain span s` is how much wall clock the accepted hold actually covered and `widest gap s` is the widest gap between two samples inside it, so a hold confirmed by six consecutive 1s samples is told apart from one confirmed by three samples across a 2.5s gap: the second is still a hold under the documented 2.5s limit, but it rests on fewer observations and now says so. `rolling span max` is the widest 5s throughput window that survived the span bound, so it shows how much of the rolling rate rests on a sampling gap rather than on five consecutive seconds.')
 $lines.Add("")
-$lines.Add("| run id | backlog norm search from | judge sustain span s | widest gap s | hold samples | earliest normalization (ungated) | rolling span max s | rolling windows |")
-$lines.Add("|---|---|---:|---:|---:|---|---:|---:|")
-foreach ($run in $runs) {
-    $throughputBlock = Get-Field -Object $run.summary -Name @('faultRecovery', 'throughput')
-    $rowsCell = Format-Value (Get-Field -Object $throughputBlock -Name @('rollingWindowCount'))
-    $lines.Add("| $($run.runId) | $(Format-Value $run.normalizationSearchFromAt) | $(Format-Value $run.normalizationSustainSpanSeconds) | $(Format-Value $run.normalizationMaxSampleGapSeconds) | $(Format-Value $run.normalizationSustainSampleCount) | $(Format-Value $run.earliestNormalizedAt) | $(Format-Value $run.throughputRollingSpanMaxSeconds) | $rowsCell |")
+$lines.Add("| run id | backlog norm search from | judge sustain span s | widest gap s | hold samples | earliest normalization (ungated) | earlier than readiness | rolling span max s | rolling windows |")
+$lines.Add("|---|---|---:|---:|---:|---|---|---:|---:|")
+foreach ($run in $comparisonRuns) {
+    # Read from the run object this script built, not from a `summary` property on it: the run object
+    # carries the throughput block it read out of the summary under `throughput`, and looking for the
+    # summary again under a name it was never stored under yielded $null for every run, which printed
+    # as an unavailable count in every row whether or not the summary carried one.
+    $rowsCell = Format-Value $run.throughput.rollingWindowCount
+    # An ungated instant equal to the combined one above is the two searches agreeing, not a missing
+    # value, so the cell says which of the two it is instead of leaving a bare timestamp to be read
+    # either way. Whether the ungated search lands before readiness is the finding; whether it lands
+    # before the gated instant is the weaker statement that the search origin mattered at all.
+    $earliestCell = Format-Value $run.earliestNormalizedAt
+    if ($null -ne $run.earliestNormalizedAt) {
+        if ($run.earliestNormalizedPrecedesGated -eq $true) { $earliestCell = "$earliestCell (earlier than the gated search)" }
+        else { $earliestCell = "$earliestCell (agrees with the gated search)" }
+    }
+    $lines.Add("| $($run.runId) | $(Format-Value $run.normalizationSearchFromAt) | $(Format-Value $run.normalizationSustainSpanSeconds) | $(Format-Value $run.normalizationMaxSampleGapSeconds) | $(Format-Value $run.normalizationSustainSampleCount) | $earliestCell | $(Format-Value $run.earliestNormalizedPrecedesNodeReady) | $(Format-Value $run.throughputRollingSpanMaxSeconds) | $rowsCell |")
 }
 $lines.Add("")
 
@@ -1274,7 +1593,7 @@ $lines.Add('The `reclaimed-after-fault` cohort is the submissions whose outbox r
 $lines.Add("")
 $lines.Add("| run id | L_total p50/p95/p99/max ms | L_result p50/p95/p99/max ms | L_scoreboard p50/p95/p99/max ms | submissions | over 5s | over 10s |")
 $lines.Add("|---|---|---|---|---:|---:|---:|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $entry = $run.faultCohorts["reclaimed-after-fault"]
     if ($null -eq $entry -or $null -eq $entry.reading) {
         $reasonCell = "unavailable"
@@ -1284,9 +1603,11 @@ foreach ($run in $runs) {
     }
     $reading = $entry.reading
     $lines.Add("| $($run.runId) | $(Format-PercentileQuad $reading.total) | $(Format-PercentileQuad $reading.result) | $(Format-PercentileQuad $reading.scoreboard) | " +
-        "$(Format-Value $reading.sampleCount) | $(Format-RatioPercent $reading.over5sRatio) | $(Format-RatioPercent $reading.over10sRatio) |")
+        "$(Get-SampleCell $reading) | $(Format-RatioPercent $reading.over5sRatio) | $(Format-RatioPercent $reading.over10sRatio) |")
 }
 $lines.Add("")
+$cohortLoadNote = Get-LoadDifferenceNote -RunList $comparisonRuns -TableName "this section"
+if ($null -ne $cohortLoadNote) { $lines.Add($cohortLoadNote); $lines.Add("") }
 
 # --- 4. fault/down cohort fast class ----------------------------------------------------------------
 $lines.Add("## 4. Fault/down cohort fast p95/p99")
@@ -1295,7 +1616,7 @@ $lines.Add('The `fault-down-arrivals` cohort is the submissions that arrived bet
 $lines.Add("")
 $lines.Add("| run id | class | L_total p50/p95/p99/max ms | L_result p50/p95/p99/max ms | L_scoreboard p50/p95/p99/max ms | submissions |")
 $lines.Add("|---|---|---|---|---:|---:|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $entry = $run.faultCohorts["fault-down-arrivals"]
     if ($null -eq $entry -or $null -eq $entry.reading) {
         $reasonCell = "unavailable"
@@ -1310,13 +1631,15 @@ foreach ($run in $runs) {
             $lines.Add("| $($run.runId) | $latencyClass | not in this summary |  |  |  |")
             continue
         }
+        $classBlockReading = [ordered]@{ sampleCount = Get-Field -Object $classBlock -Name @('submissionCount') }
         $lines.Add("| $($run.runId) | $latencyClass | $(Format-PercentileQuad $classBlock.L_total_ms) | $(Format-PercentileQuad $classBlock.L_result_ms) | " +
-            "$(Format-PercentileQuad $classBlock.L_scoreboard_ms) | $(Format-Value $classBlock.submissionCount) |")
+            "$(Format-PercentileQuad $classBlock.L_scoreboard_ms) | $(Get-SampleCell $classBlockReading) |")
     }
-    $lines.Add("| $($run.runId) | whole cohort | $(Format-PercentileQuad $reading.total) | $(Format-PercentileQuad $reading.result) | $(Format-PercentileQuad $reading.scoreboard) | $(Format-Value $reading.sampleCount) |")
+    $lines.Add("| $($run.runId) | whole cohort | $(Format-PercentileQuad $reading.total) | $(Format-PercentileQuad $reading.result) | $(Format-PercentileQuad $reading.scoreboard) | $(Get-SampleCell $reading) |")
 }
 $lines.Add("")
-$lines.Add("The p99 is the column to compare across runs, and only against the configured claim timeout of the same run: the cohort is small (tens of submissions), so its p99 is the largest one or two observations and can move by a whole latency class between runs at the same configuration. It is step-valued, not continuous.")
+$lines.Add("The p99 is the column to compare, and only between runs that share a configuration AND an offered rate - the rule the direct-comparison section applies to its own pair - and only against the configured claim timeout of the same run. It is not a percentile over a population of this size: the cohort is small (tens of submissions), so its p99 is the largest one or two observations, and the samples column says so in the row. It is step-valued, not continuous, so a difference smaller than one latency class is the same amount of judge work and the verdicts elsewhere in this report refuse to call it.")
+if ($null -ne $cohortLoadNote) { $lines.Add($cohortLoadNote); $lines.Add("") }
 $lines.Add("")
 
 # --- 5. throughput recovery time -------------------------------------------------------------------
@@ -1326,7 +1649,7 @@ $lines.Add('Throughput recovery is defined by a rule, not by an eyeball: the fir
 $lines.Add("")
 $lines.Add("| run id | pre-fault result RPS | threshold (90%) RPS | window s | consecutive windows | rolling windows | recovery after fault | recovery after node ready | harness and analyzer agree |")
 $lines.Add("|---|---:|---:|---:|---:|---:|---:|---:|---|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $throughputReading = $run.throughput
     $lines.Add("| $($run.runId) | $(Format-Value $throughputReading.preFaultResultRps) | $(Format-Value $throughputReading.thresholdRps) | " +
         "$(Format-Value $throughputReading.windowSeconds) | $(Format-Value $throughputReading.consecutiveWindows) | $(Format-Value $throughputReading.rollingWindowCount) | " +
@@ -1339,11 +1662,11 @@ $lines.Add("")
 # --- 6. backlog peak and the time series -----------------------------------------------------------
 $lines.Add("## 6. Backlog peak and time series summary")
 $lines.Add("")
-$lines.Add('The peak is the largest backlog either queue reached after the kill, and it is not in summary.json: the summary carries the pre-fault percentiles the normalisation rule compares against and the instant normalisation completed, but not the maximum in between. It is read from `recovery-samples.csv` in the run directory, as the maximum of the `judgeBacklog` column and separately of the `scoreboardPending` column. That is the only file outside summary.json this comparer reads, and it is read for this one quantity. Where the file is absent the peak is `unavailable` and was NOT reconstructed from a throughput series.')
+$lines.Add('The peak and the growth rates are taken over the outage window only - every sample from the fault instant up to the last one available - and not over the whole file, because a sample taken before the kill or after the drain is not part of the outage and a maximum over the whole series would silently be measuring the run rather than the fault. This is not in summary.json: the summary carries the pre-fault percentiles the normalisation rule compares against and the instant normalisation completed, but not the maximum in between. It is read from `recovery-samples.csv` in the run directory, as the maximum of the `judgeBacklog` column and separately of the `scoreboardPending` column. That is the only file outside summary.json this comparer reads, and it is read for this one quantity. Where the file is absent, the fault instant is unreadable, or no sample falls at or after the fault instant, every column below is `unavailable` with the window it would have used stated in the row, and the peak was NOT reconstructed from a throughput series.')
 $lines.Add("")
-$lines.Add("| run id | judge backlog pre-fault p95 | scoreboard pending pre-fault p95 | combined pre-fault p95 | judge backlog peak | scoreboard pending peak | combined peak | peak / pre-fault p95 (combined) | peak judge backlog growth rows/s | peak scoreboard growth rows/s | samples |")
-$lines.Add("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-foreach ($run in $runs) {
+$lines.Add("| run id | judge backlog pre-fault p95 | scoreboard pending pre-fault p95 | combined pre-fault p95 | judge backlog peak | scoreboard pending peak | combined peak | peak / pre-fault p95 (combined) | peak judge backlog growth rows/s | peak scoreboard growth rows/s | outage samples | window |")
+$lines.Add("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+foreach ($run in $comparisonRuns) {
     $preFaultJudge = Get-Field -Object $run.preFault -Name @('judgeBacklogP95')
     $preFaultScoreboard = Get-Field -Object $run.preFault -Name @('scoreboardPendingP95')
     $series = $run.backlogSeries
@@ -1363,13 +1686,16 @@ foreach ($run in $runs) {
         $combinedPeakCell = Format-Value $series.combinedPeak
         $judgeGrowthCell = Format-Number $series.judgeBacklogPeakGrowthRowsPerSec
         $scoreboardGrowthCell = Format-Number $series.scoreboardPendingPeakGrowthRowsPerSec
-        $seriesSampleCell = Format-Value $series.sampleCount
+        $seriesSampleCell = Format-Value $series.outageSampleCount
     }
     $lines.Add("| $($run.runId) | $(Format-Value $preFaultJudge) | $(Format-Value $preFaultScoreboard) | $(Format-Value $run.preFaultCombinedP95) | " +
-        "$judgePeakCell | $scoreboardPeakCell | $combinedPeakCell | $(Format-Number $peakMultiple) | $judgeGrowthCell | $scoreboardGrowthCell | $seriesSampleCell |")
+        "$judgePeakCell | $scoreboardPeakCell | $combinedPeakCell | $(Format-Number $peakMultiple) | $judgeGrowthCell | $scoreboardGrowthCell | $seriesSampleCell | " +
+        "$(Format-Value (Get-Field -Object $series -Name @('windowBasis'))) |")
 }
 $lines.Add("")
-$lines.Add("The two growth columns are the largest rise between two consecutive samples of that queue, in rows per second: the steepest part of the outage, which is what a reader asking how fast this went wrong wants, and a property of the sampled series rather than of the run as a whole. The peak-over-pre-fault-p95 multiple is what makes two runs at different offered rates comparable at all, because the baseline is each run's own.")
+$lines.Add("The two growth columns are the largest rise between two consecutive outage samples of that queue, in rows per second: the steepest part of the outage, which is what a reader asking how fast this went wrong wants, and a property of the sampled series rather than of the run as a whole. The peak-over-pre-fault-p95 multiple is what makes two runs at different offered rates comparable at all, because the baseline is each run's own.")
+$lines.Add("")
+$lines.Add('A growth rate is the only column here that is a difference of two samples rather than a level, so it inherits the sampling interval: a file sampled once a second cannot show a rise that happened inside one second, and the value is a floor on the steepest rise rather than the rise itself. Read the peak columns as levels and the growth columns as directions, and do not compare a growth column between runs whose sampling intervals differ.')
 $lines.Add("")
 $lines.Add("### Throughput time series, as far as the summary carries it")
 $lines.Add("")
@@ -1377,7 +1703,7 @@ $lines.Add('Only the summary own fields are used here: the pre-fault result RPS 
 $lines.Add("")
 $lines.Add("| run id | pre-fault result RPS | measured phase s | accepted in the phase | phase-average accepted RPS | results | scoreboard applied | drain s | backlog normalized at |")
 $lines.Add("|---|---:|---:|---:|---:|---:|---:|---:|---|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $phase = $run.measuredPhase
     $normalizedAt = Get-Field -Object $run.anchors -Name @('backlogNormalizedAt', 'value')
     $lines.Add("| $($run.runId) | $(Format-Value $run.throughput.preFaultResultRps) | $(Format-Value $phase.seconds) | $(Format-Value $run.accepted) | " +
@@ -1394,7 +1720,7 @@ $lines.Add("First the state at the kill instant, because it is what the extra cl
 $lines.Add("")
 $lines.Add("| run id | trigger window opened | trigger observed | waited s | escalation | primary condition | fallback condition | judge-1 running/reserved/queued | judge-2 running/reserved/queued | active work seen |")
 $lines.Add("|---|---|---|---:|---|---|---|---|---|---|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $triggerBlock = $run.trigger
     $judge1 = Get-Field -Object $triggerBlock -Name @('judge1')
     $judge2 = Get-Field -Object $triggerBlock -Name @('judge2')
@@ -1410,7 +1736,7 @@ $lines.Add('`running` is work actually executing on that node and `reserved` is 
 $lines.Add("")
 $lines.Add("| run id | cluster-wide claimed unfinished upper bound | max-in-flight (2 nodes) | stranded claimed rows / max-in-flight | attribution exact | age at kill p50/p95/max s | claimed unfinished exact |")
 $lines.Add("|---|---:|---:|---:|---|---|---|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $claimed = $run.claimedUnfinishedAtKill
     $age = Get-Field -Object $claimed -Name @('ageSecondsAtKill')
     $ageQuad = "$(Format-Number (Get-Field -Object $age -Name @('p50')))/$(Format-Number (Get-Field -Object $age -Name @('p95')))/$(Format-Number (Get-Field -Object $age -Name @('max')))"
@@ -1422,7 +1748,7 @@ $lines.Add('The claimed-unfinished count is a CLUSTER-WIDE UPPER BOUND and is ne
 $lines.Add("")
 $lines.Add("| run id | judge invocations | invocations are a lower bound | stale re-claims (attempts > 1) | stored result republishes | stale token completions | completion failures | claim calls | claimed rows | duplicate claim estimate | reclaimed rows after fault | harness estimate |")
 $lines.Add("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $workCostBlock = $run.workCost
     $reclaimBlock = $run.reclaimAccounting
     $lines.Add("| $($run.runId) | $(Format-Value (Get-Field -Object $workCostBlock -Name @('judgeInvocations'))) | $(Format-Value (Get-Field -Object $workCostBlock -Name @('judgeInvocationsLowerBound'))) | " +
@@ -1445,7 +1771,7 @@ $lines.Add("This section is the count of things an operator has to understand fo
 $lines.Add("")
 $lines.Add("| run id | configured fault-recovery knobs | trigger gate | escalation | node-ready gate | restart is automatic | down window configured s | down window measured s | drain s | sampling interval ms |")
 $lines.Add("|---|---:|---|---|---|---|---:|---:|---:|---:|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $recoveryTimeCells = $run.recoveryTimes
     $nodeReadyBasis = Get-Field -Object $run.anchors -Name @('nodeReadyAt', 'basis')
     $lines.Add("| $($run.runId) | $(Format-Value $run.faultRecoveryKnobCount) | $(Format-Value (Get-Field -Object $run.trigger -Name @('primaryCondition'))) | " +
@@ -1466,18 +1792,31 @@ $lines.Add("Mechanisms in play, each one with its own failure mode and none of t
 $lines.Add("")
 foreach ($mechanism in $mechanisms) { $lines.Add("- $mechanism") }
 $lines.Add("")
+# The guard has to be about the table's own contents, so the rows are gathered here from every run in
+# comparison rather than read from the variable the extraction loop last assigned: that one described a
+# single run, and a run whose capacity branch is absent would have removed every other run's gauges
+# from the report without saying so.
+$capacityRows = New-Object System.Collections.Generic.List[object]
+foreach ($run in $comparisonRuns) {
+    if ($null -ne $run.capacity) { foreach ($capacityRow in $run.capacity) { $capacityRows.Add($capacityRow) } }
+}
 if ($capacityRows.Count -gt 0) {
     $lines.Add("Executor capacity during the measured phase, from the sampler gauges. This is the operational envelope the recovery had to work inside: after the kill, whichever node survived has to carry the whole offered load on its own, so its running gauge sitting at its configured maximum is expected rather than a finding.")
     $lines.Add("")
     $lines.Add("| run id | node | metric | samples | max | average |")
     $lines.Add("|---|---|---|---:|---:|---:|")
-    foreach ($run in $runs) {
-        foreach ($capacityRow in @($run.capacity)) {
+    foreach ($run in $comparisonRuns) {
+        if ($null -eq $run.capacity) { continue }
+        foreach ($capacityRow in $run.capacity) {
             $lines.Add("| $($run.runId) | $($capacityRow.node) | $($capacityRow.metric) | $(Format-Value $capacityRow.samples) | $(Format-Value $capacityRow.max) | $(Format-Number $capacityRow.average) |")
         }
     }
     $lines.Add("")
-    $capacityScopeText = Get-Field -Object $runs[0] -Name @('capacityScope')
+    $capacityScopeText = $null
+    foreach ($run in $comparisonRuns) {
+        if ($null -ne $capacityScopeText) { break }
+        $capacityScopeText = Get-Field -Object $run -Name @('capacityScope')
+    }
     $lines.Add("Scope of those readings, quoted from the summary: $(Format-Value $capacityScopeText)")
 } else {
     $lines.Add("Executor capacity gauges are unavailable for these runs: summary.capacity is absent, so nothing is reported about how saturated the surviving node was.")
@@ -1487,19 +1826,25 @@ $lines.Add("")
 # --- cohorts A-E -----------------------------------------------------------------------------------
 $lines.Add("## Fault-recovery cohorts A-E")
 $lines.Add("")
-$lines.Add("The five cohorts partition the measurement contest around the fault, in the order they happen. They are what this run measured instead of a steady state: the analyzer marks the run-level `measurement-steady` cohort unavailable on a fault-recovery run for exactly that reason, so these are the latency readings that replace it. Each is reported with its `L_total` percentiles and the share of its submissions that waited more than 5s and more than 10s, because the share is what an operator reasons about and the percentile is what a capacity argument needs.")
+$lines.Add('The five cohorts partition the measurement contest around the fault, in the order they happen, and a sixth row appears on a run whose backlog never normalised: the analyzer writes `post-restart-censored-tail` for the submissions after node readiness when `backlogNormalizedAt` was never observed, which is exactly when cohort D interval never closed and D is empty. That row is labelled as not being cohort D and is never merged into it, because the observations D is missing are the ones it carries: a reader who saw D empty and nothing beside it would take "no recovery interval" for "nothing arrived to measure". They are what this run measured instead of a steady state: the analyzer marks the run-level `measurement-steady` cohort unavailable on a fault-recovery run for exactly that reason, so these are the latency readings that replace it. Each is reported with its `L_total` percentiles and the share of its submissions that waited more than 5s and more than 10s, because the share is what an operator reasons about and the percentile is what a capacity argument needs.')
 $lines.Add("")
 $lines.Add("| run id | cohort | samples | L_total p50/p95/p99/max ms | L_result p50/p95/p99/max ms | L_scoreboard p50/p95/p99/max ms | over 5s | over 10s |")
 $lines.Add("|---|---|---:|---|---|---|---:|---:|")
-foreach ($run in $runs) {
-    foreach ($cohortName in $cohortLetters.Keys) {
+foreach ($run in $comparisonRuns) {
+    # The row set is the run's own fault cohorts rather than the A-E letter list, because the analyzer
+    # now also emits `post-restart-censored-tail` when a run's backlog never normalised. That cohort is
+    # NOT part of D and must not be folded into it - it is the observations D is missing, so a reader
+    # who saw only the four labelled cohorts would read D's absence as "nothing to report" when the
+    # data underneath it exists under another name. It is labelled in the row as not being cohort D.
+    foreach ($cohortName in $run.faultCohorts.Keys) {
         $letter = $cohortLetters[$cohortName]
         $cohortEntry = $run.faultCohorts[$cohortName]
+        if ($null -eq $letter) { $letter = Get-Field -Object $cohortEntry -Name @('letter') }
         $lines.Add((Get-CohortRow -Run $run -CohortName $cohortName -Letter $letter -CohortEntry $cohortEntry))
     }
 }
 $lines.Add("")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $postRecovery = $run.faultCohorts["post-recovery-steady"]
     if ($null -ne $postRecovery -and $null -ne $postRecovery.reading -and $null -ne $postRecovery.reading.window) {
         $windowBlock = $postRecovery.reading.window
@@ -1507,21 +1852,30 @@ foreach ($run in $runs) {
     }
 }
 $lines.Add("")
+$lines.Add('A cohort whose row says unavailable was not measured, and the reason is the analyzer own: the reasons differ in kind - a cohort with no submissions at all, a cohort whose window never opened, and a cohort the analyzer replaced with the censored tail - and a reader deciding whether the run covers that phase has to be able to tell them apart, so the reason is printed rather than an empty row.')
+$lines.Add("")
+$cohortTableLoadNote = Get-LoadDifferenceNote -RunList $comparisonRuns -TableName "the cohort table above"
+if ($null -ne $cohortTableLoadNote) { $lines.Add($cohortTableLoadNote); $lines.Add("") }
 $lines.Add("### Run-level cohorts, for the two readings that span the fault")
 $lines.Add("")
 $lines.Add('These are the analyzer own partitions of the same contest. `post-fault-arrivals` is the whole outage as one cohort and `all` is the entire measured contest; both are reported here because a reader who wants one number for the outage will look for them, and both are queueing measurements for the same reason as above.')
 $lines.Add("")
 $lines.Add("| run id | cohort | samples | L_total p50/p95/p99/max ms | L_result p50/p95/p99/max ms | L_scoreboard p50/p95/p99/max ms | available | reason when unavailable |")
 $lines.Add("|---|---|---:|---|---|---|---|---|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     foreach ($cohortName in $generalCohorts) {
         $generalEntry = $run.generalCohorts[$cohortName]
-        if ($null -eq $generalEntry.reading) {
-            $lines.Add("| $($run.runId) | $cohortName | unavailable | unavailable | unavailable | unavailable | no | $($generalEntry.unavailableReason) |")
+        # The availability column is the cohort's own statement, not a reading of whether a reading
+        # object happens to be present: the analyzer states `available` on the placeholders it knows are
+        # unavailable, so a cohort that is present but empty is reported as unavailable with its reason.
+        $availableStated = Get-Field -Object $generalEntry -Name @('available')
+        if ($null -eq $generalEntry.reading -or ($null -ne $availableStated -and -not [bool]$availableStated)) {
+            $reason = Get-CohortUnavailableReason -Cohort $generalEntry
+            $lines.Add("| $($run.runId) | $cohortName | unavailable | unavailable | unavailable | unavailable | no | $reason |")
             continue
         }
         $reading = $generalEntry.reading
-        $lines.Add("| $($run.runId) | $cohortName | $(Format-Value $reading.sampleCount) | $(Format-PercentileQuad $reading.total) | $(Format-PercentileQuad $reading.result) | " +
+        $lines.Add("| $($run.runId) | $cohortName | $(Get-SampleCell $reading) | $(Format-PercentileQuad $reading.total) | $(Format-PercentileQuad $reading.result) | " +
             "$(Format-PercentileQuad $reading.scoreboard) | yes | - |")
     }
 }
@@ -1531,7 +1885,7 @@ $lines.Add("")
 $lines.Add("## Direct comparison: MIF64 / 4s versus MIF64 / 10s")
 $lines.Add("")
 if (-not $deltaAvailable) {
-    $lines.Add("This comparison cannot be made from the runs given to this comparer: a max-in-flight-64 run at a 4s claim timeout and one at a 10s claim timeout are both required, and $(if ($null -eq $runFourSeconds) { 'the 4s run is missing' } else { 'the 10s run is missing' }). Nothing is substituted for it.")
+    $lines.Add("This comparison cannot be made from the runs given to this comparer: a max-in-flight-64 run at a 4s claim timeout and one at a 10s claim timeout are both required, and $deltaPairProblem. Nothing is substituted for it, and no metric below is printed as a zero to stand in for the one that could not be formed.")
 } else {
     $lines.Add("- 4s run: $($runFourSeconds.runId)")
     $lines.Add("- 10s run: $($runTenSeconds.runId)")
@@ -1623,7 +1977,7 @@ $lines.Add('- `recovery time / pre-fault throughput` - the combined backlog norm
 $lines.Add("")
 $lines.Add("| run id | backlog peak / accepted RPS | judge backlog peak / accepted RPS | scoreboard pending peak / accepted RPS | recovered rows / second | backlog drain rows / second | fault cohort p99 / configured timeout | stranded claimed rows / max-in-flight | recovery time / pre-fault throughput |")
 $lines.Add("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-foreach ($run in $runs) {
+foreach ($run in $comparisonRuns) {
     $normalizedBlock = $run.normalized
     $lines.Add("| $($run.runId) | $(Format-Number $normalizedBlock.backlogPeakOverAcceptedRps) | $(Format-Number $normalizedBlock.judgeBacklogPeakOverAcceptedRps) | " +
         "$(Format-Number $normalizedBlock.scoreboardPendingPeakOverAcceptedRps) | $(Format-Number $normalizedBlock.recoveredRowsPerSecond) | " +
@@ -1642,7 +1996,14 @@ $lines.Add("")
 $lines.Add("Each run's own unavailable[] entries, deduplicated across runs because the same reason is written into every summary. These are the statements the analyzer makes about what its own numbers do not cover, reproduced rather than paraphrased.")
 $lines.Add("")
 if ($limitEntries.Count -eq 0) {
-    $lines.Add("None of the runs carried an unavailable[] entry.")
+    # "None" is only true of runs whose unavailable[] list could be read. When every directory was
+    # excluded, no summary reached this point and the list was never consulted, so saying none of the
+    # runs carried an entry would be asserting something about runs that were never read.
+    if ($runs.Count -eq 0) {
+        $lines.Add("No unavailable[] list was read: every directory given to this comparer was excluded above before its summary was examined, so there are no analyzer statements to reproduce here. That is not the same as the runs having carried none.")
+    } else {
+        $lines.Add("None of the runs carried an unavailable[] entry.")
+    }
 } else {
     $lines.Add("| source | first run carrying it | entry |")
     $lines.Add("|---|---|---|")
@@ -1656,7 +2017,14 @@ $lines.Add("")
 $lines.Add("## Values the summaries did not carry")
 $lines.Add("")
 if ($unavailableValues.Count -eq 0) {
-    $lines.Add("None. Every value this report prints was read from a summary.json field or from recovery-samples.csv.")
+    # Same rule as the unavailable[] list above: the sentence is about runs that were read, so on a
+    # comparison with no runs in it the honest statement is that nothing was examined, not that
+    # nothing was missing.
+    if ($runs.Count -eq 0) {
+        $lines.Add("Nothing was read: every directory given to this comparer was excluded above before its summary was examined, so this report prints no value from any run and there is no list of absent ones. The exclusions and their reasons are in the `## Excluded runs` section.")
+    } else {
+        $lines.Add("None. Every value this report prints was read from a summary.json field or from recovery-samples.csv.")
+    }
 } else {
     $lines.Add('These are printed as `unavailable` above and as `null` in the JSON. Each entry names the field and the summary.json path it was looked for at, or the file that was absent. Nothing in this list was estimated, defaulted or computed from a different file.')
     $lines.Add("")
@@ -1674,6 +2042,12 @@ $lines.Add("")
 $lines.Add("Three different windows are in play and reading them as one is the mistake this section exists to prevent. The recovery times are measured from the fault instant, so they contain the down window. The cohort percentiles cover the cohorts defined around the fault and not a steady state, because there is no steady state in a run with a kill inside its measured window - the analyzer marks the run-level measurement-steady cohort unavailable for exactly that reason, and the fault-recovery cohorts are what replaces it. The counts (accepted, results, scoreboard applied, reclaimed rows) span the whole measured phase, which includes the drain, so they are not consistent with either of the other two windows.")
 $lines.Add("")
 $lines.Add("What this comparison can support: whether the correctness chain held, how the recovery times and the peak backlog differed between configurations at the same offered load, and how the extra claim and DB work scaled. What it cannot support: a claim about concurrent duplicate CPU execution or about fencing (the killed process was not running), a claim about the SIGKILLed node's own counters (they died with the process and what remains is a lower bound), and any raw RPS or latency comparison between runs that were not offered the same load.")
+if ($runs.Count -eq 0) {
+    # The paragraph above is about what a comparison made of these runs could support. No comparison
+    # was made, so the reader is told that here rather than left to infer it from the empty tables.
+    $lines.Add("")
+    $lines.Add("None of that is supported by this file: no run reached the point of being read, so nothing above was measured, compared or checked. What this file records is which directories were given to it and why each was excluded.")
+}
 $lines.Add("")
 
 $lines | Set-Content $markdownPath -Encoding utf8
