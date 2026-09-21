@@ -232,7 +232,10 @@ poll 간격 때문에 몇 건 달라질 수 있으므로 매 run 실측값을 �
 2. **seed** — `sbrec_<runId>_` prefix로 contest / problems / users 생성, Flyway 18 assert
 3. **기동** — `CONTEST_SCOREBOARD_RECOVERY_MODE`와 함께 앱 tier 기동 → 15개 컨테이너 healthy →
    컨테이너 환경에서 모드 재확인 + DB 이름 일치 확인
-4. **pre-run 검증** — pipeline quiescent → oracle 전제 → clock frame → digest 일치 (불일치면 run 실패)
+4. **pre-run 검증** — pipeline quiescent → oracle 전제 → clock frame → digest 일치 (불일치면 run 실패) →
+   **실제 로그인 1회**: `POST /api/login`을 edge(`-BaseUrl`)로, seeder가 만든 feeder 사용자로 보내
+   200 + 세션 쿠키를 요구한다. 200인데 쿠키가 없으면 실패로 본다. 부하가 인증하는 방식과 같은 경로이므로
+   여기서 401·무응답이면 그 run의 유입 수치는 모드가 아니라 인증을 측정한 것이 된다 — ramp 전에 멈춘다
 5. **부하 시작** — Gatling을 백그라운드로 기동. **이 시점부터 run 종료까지 유입이 계속된다**
 6. **baseline 구간** — 적용 결과 수가 `-BaselineResults`에 도달할 때까지 대기 → `-BaselineWindowSeconds`
    동안 정상 상태 지연 분포 측정

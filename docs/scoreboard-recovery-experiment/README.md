@@ -39,6 +39,37 @@ $env:DB_PASSWORD = '<password>'
 
 세 가지 중 하나라도 없으면 **수치를 만들지 않는다.** §7을 본다.
 
+### 1.2 harness 자체 점검 (측정 전에 돌릴 것)
+
+수치를 만드는 harness도 검증 대상이다. 네 suite가 각각 다른 것을 증명하며, **측정을 시작하기 전에**
+전부 통과해야 한다 — harness 결함으로 만들어진 수치는 모드의 성질이 아니라 harness의 성질을 보고한다.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File gatling\tests\RecoveryExperiment.UnitTests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File gatling\tests\RecoveryExperiment.SummarizerTests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File gatling\tests\RecoveryExperiment.RedisTests.ps1
+$env:DB_PASSWORD = '<password>'   # 같은 셸에서. MySqlTests는 없으면 exit 3
+powershell -NoProfile -ExecutionPolicy Bypass -File gatling\tests\RecoveryExperiment.MySqlTests.ps1
+```
+
+| suite | 필요한 것 | 증명하는 것 |
+|---|---|---|
+| `UnitTests` | 없음 (순수 함수 + 소스 가드) | 파생값·정렬·digest 정규화·CSV 규약·제품 로그 패턴 인식 |
+| `SummarizerTests` | 없음 (임시 디렉터리에 가짜 suite를 만들어 실행) | 요약기가 **측정된** run을 실제로 요약하는지 — 조건·commit·run 수를 어디서 읽는지 |
+| `RedisTests` | docker (throwaway 컨테이너) | DUMP/RESTORE 왕복, 0x0A payload, TTL, rollback 경계, 손실 방향 |
+| `MySqlTests` | `DB_PASSWORD` (공유 `oj_test`) | seeder 문장과 oracle SQL이 실제 행에서 규칙대로 나오는지, 정리 경로가 자기 행만 지우는지 |
+
+세 가지 주의:
+
+- **측정 중에 `gradlew test`를 돌리지 않는다.** `build.gradle`이 모든 `gradlew test`에 `test`
+  프로필을 강제하고 그 프로필은 `oj_test`를 대상으로 `clean-on-validation-error=true`를 켜므로,
+  돌리는 순간 진행 중인 run의 schema가 날아간다. 매 poll의 Flyway 18 assert가 그 상황을 잡아내지만
+  잡아내는 것과 피하는 것은 다르다.
+- `MySqlTests`는 공유 `oj_test`를 쓰므로 스스로 만든 행만 지우고, 이 실험이 소유하지 않은 잔여 행은
+  건드리지 않는다(사전·사후 비교를 assert한다). 실행하면 그 run의 stdout에 삭제 건수와 SQL이 찍힌다.
+- `RedisTests`는 이 프로젝트의 Compose 라벨을 단 **일회용** 컨테이너만 쓴다. 공유 `oj-test-redis`는
+  건드리지 않는다.
+
 ---
 
 ## 2. 이 실험이 기존 DB를 어떻게 쓰는가
