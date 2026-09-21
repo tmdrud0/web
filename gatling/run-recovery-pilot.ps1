@@ -477,6 +477,44 @@ try {
             "Stopping: no figure from this run would be about a recovery.")
     }
     Write-Output "  pre-load: scoreboard and oracle agree, clock frame: $clockSkew, pipeline quiescent"
+
+    # One real login through the edge, as the load generator's own first user.
+    #
+    # The seeder already checks that the name the load will ask for is the name it inserted, but nothing
+    # until now asked the application whether that name and password authenticate: a wrong password
+    # encoding, a moved endpoint or an edge route left over from a previous stack would all first appear
+    # as every session in the load answering 401 - which is twenty minutes later, at the end of the ramp,
+    # and reads as an ingress failure rather than as a broken precondition. This costs one request.
+    #
+    # It goes through `$config.BaseUrl` (the edge) rather than a container directly, because the edge is
+    # what the load uses.
+    $loginUser = "$($script:seed.FeederUserPrefix)_user_1"
+    $loginBody = @{ userName = $loginUser; pass = $script:seed.Password } | ConvertTo-Json -Compress
+    $loginSession = $null
+    try {
+        $loginResponse = Invoke-WebRequest -Uri "$($config.BaseUrl)/api/login" -Method Post `
+            -ContentType "application/json" -Body $loginBody -UseBasicParsing `
+            -SessionVariable loginSession -TimeoutSec 30
+    }
+    catch {
+        $status = ""
+        if ($null -ne $_.Exception.Response) { $status = " (HTTP $([int]$_.Exception.Response.StatusCode))" }
+        throw ("A real login as '$loginUser' through the edge failed before the load started$status. " +
+            "The load authenticates every session the same way, so its 401s would be the whole of what " +
+            "this run measured. Stopping before the ramp rather than producing ingress figures for it. " +
+            "Underlying error: $($_.Exception.Message)")
+    }
+    if ([int]$loginResponse.StatusCode -ne 200) {
+        throw "The login as '$loginUser' answered HTTP $([int]$loginResponse.StatusCode) rather than 200."
+    }
+    # The session is the useful part of a login: a 200 that set no cookie would leave every later request
+    # in the load unauthenticated, which is the same failure one step further along.
+    $loginCookies = @($loginSession.Cookies.GetCookies($config.BaseUrl))
+    if ($loginCookies.Count -lt 1) {
+        throw ("The login as '$loginUser' answered 200 but set no session cookie, so the load's later " +
+            "requests would not be authenticated as anyone.")
+    }
+    Write-Output "  pre-load: login as '$loginUser' answered 200 and set $($loginCookies.Count) session cookie(s)"
     Write-Output ""
 
     # --- 5. load ----------------------------------------------------------------------------------
