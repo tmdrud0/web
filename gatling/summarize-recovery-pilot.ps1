@@ -68,18 +68,39 @@ function Get-Median {
     return $sorted[[int][math]::Floor(($sorted.Count - 1) / 2)]
 }
 
+# One run's value for one figure. Most figures are a column of the run row; a few are a ratio of two of
+# them, because the cost counters are totals over a window whose length is the mode's own fault-to-
+# consistent span and therefore differs between modes by design. Comparing those totals directly would
+# credit the mode that recovered faster with doing less work. A ratio of two columns is a different
+# quantity from a ratio of two medians, so it is taken per run and then summarized like any other figure.
+function Get-RunFigureValue {
+    param(
+        [Parameter(Mandatory = $true)]$Run,
+        [Parameter(Mandatory = $true)]$Figure
+    )
+
+    # Asked for by presence rather than read directly: under `Set-StrictMode -Version Latest` a figure that
+    # declares no `Ratio` would throw on the read rather than answer "not a ratio".
+    $ratio = $Figure.PSObject.Properties["Ratio"]
+    if ($null -eq $ratio -or $null -eq $ratio.Value) { return Get-Number $Run.$($Figure.Name) }
+    $numerator = Get-Number $Run.$($ratio.Value.Numerator)
+    $denominator = Get-Number $Run.$($ratio.Value.Denominator)
+    if ($null -eq $numerator -or $null -eq $denominator -or $denominator -le 0) { return $null }
+    return $numerator / $denominator
+}
+
 function Get-ModeColumn {
     param(
         [Parameter(Mandatory = $true)][object[]]$Runs,
-        [Parameter(Mandatory = $true)][string]$Column
+        [Parameter(Mandatory = $true)]$Figure
     )
 
     $values = New-Object 'System.Collections.Generic.List[double]'
     $missing = 0
     foreach ($run in $Runs) {
-        $number = Get-Number $run.$Column
+        $number = Get-RunFigureValue -Run $run -Figure $Figure
         if ($null -eq $number) { $missing++; continue }
-        $values.Add($number)
+        $values.Add([double]$number)
     }
     return [pscustomobject][ordered]@{
         Count = $values.Count
@@ -114,6 +135,15 @@ if (-not (Test-Path -LiteralPath $suiteMetadataPath)) {
     throw "Suite directory '$SuiteDirectory' has no suite-metadata.json, so its conditions are unknown."
 }
 $suite = Get-Content -LiteralPath $suiteMetadataPath -Raw | ConvertFrom-Json
+
+# The suite records the conditions its runs actually ran under. The parameters are kept so a reader can
+# override what is printed, but when one is left alone the suite is authoritative: a parameter default
+# that happens to differ from the suite would print conditions the runs did not run under - and this
+# table's whole job is to be readable without the suite at hand.
+$conditionUserCount = if ($PSBoundParameters.ContainsKey("UserCount")) { $UserCount } else { [int]$suite.userCount }
+$conditionProblemCount = if ($PSBoundParameters.ContainsKey("ProblemCount")) { $ProblemCount } else { [int]$suite.problemCount }
+$conditionTargetRps = if ($PSBoundParameters.ContainsKey("TargetRps")) { $TargetRps } else { [double]$suite.targetRps }
+$conditionHoldSeconds = if ($PSBoundParameters.ContainsKey("HoldSeconds")) { $HoldSeconds } else { [int]$suite.holdSeconds }
 
 # The runs are read from their own artifact directories rather than from the suite's own table, so a
 # column added to a run's summary appears here without this script being changed to carry it.
@@ -157,7 +187,20 @@ foreach ($mode in $modes) {
     $modeRuns = @($runs | Where-Object { [string]$_.mode -eq $mode })
     if ($modeRuns.Count -eq 0) { continue }
     $modesPresent.Add($mode)
-    $summary.Add([pscustomobject][ordered]@{ Mode = $mode; Runs = $modeRuns.ToArray() })
+    # `$modeRuns` is already an array - `@(...)` above - and an array in PowerShell has no `ToArray`
+    # method, so calling one threw the moment a measured run reached here. Every other `.ToArray()` in
+    # this harness is on a `List[...]`, which does have it; this was the only one on an `@()`.
+    $summary.Add([pscustomobject][ordered]@{ Mode = $mode; Runs = $modeRuns })
+}
+
+# How many runs the mode was *given*, which is the denominator every count below is reported against. The
+# measured runs alone would make a mode that ran three times and measured once read as fully covered, so
+# the planned count is taken from the suite's own run list and never allowed below the measured count.
+$plannedByMode = [ordered]@{}
+foreach ($mode in $modesPresent) {
+    $planned = @($suite.runs | Where-Object { [string]$_.mode -eq $mode }).Count
+    $measured = @(($summary | Where-Object { $_.Mode -eq $mode })[0].Runs).Count
+    $plannedByMode[$mode] = if ($planned -lt $measured) { $measured } else { $planned }
 }
 
 # --- the table ----------------------------------------------------------------------------------------
@@ -171,6 +214,7 @@ $figures = @(
     [pscustomobject]@{ Name = "backlogDrainMs"; Unit = "ms"; Note = "T_backlog_drained - T_fault: how long until the pipeline was quiet" }
     [pscustomobject]@{ Name = "repairDurationMs"; Unit = "ms"; Note = "T_backlog_drained - T_consistent: the repair cost after the scoreboard was right" }
     [pscustomobject]@{ Name = "fullRecoveryMs"; Unit = "ms"; Note = "the later of the two ends, measured from the fault" }
+    [pscustomobject]@{ Name = "recoveryWindowSeconds"; Unit = "s"; Note = "the span every cost delta below is a total over. It is the mode's own, so it differs by design - which is why the per-second figures exist" }
     [pscustomobject]@{ Name = "recoveryLagP50Ms"; Unit = "ms"; Note = "new judged results reflected on the scoreboard while it was wrong, p50" }
     [pscustomobject]@{ Name = "recoveryLagP95Ms"; Unit = "ms"; Note = "the same, p95" }
     [pscustomobject]@{ Name = "recoveryLagMaxMs"; Unit = "ms"; Note = "the same, worst single result" }
@@ -182,15 +226,20 @@ $figures = @(
     [pscustomobject]@{ Name = "maxUnappliedResults"; Unit = "results"; Note = "judged results MySQL held that the scoreboard had not applied" }
     [pscustomobject]@{ Name = "pollsWithoutConsumer"; Unit = "polls"; Note = "how many polls found no consumer on the stream" }
     [pscustomobject]@{ Name = "appliedDeltaDuringRecovery"; Unit = "results"; Note = "how many results the scoreboard took while it was recovering" }
-    [pscustomobject]@{ Name = "mysqlQuestionsDelta"; Unit = "queries"; Note = "MySQL Questions over the recovery window" }
-    [pscustomobject]@{ Name = "mysqlRowsReadDelta"; Unit = "rows"; Note = "Innodb_rows_read over the recovery window" }
-    [pscustomobject]@{ Name = "redisTotalCommandsDelta"; Unit = "commands"; Note = "Redis commands over the recovery window" }
-    [pscustomobject]@{ Name = "redisEvalCallsDelta"; Unit = "calls"; Note = "scoreboard Lua evaluations over the recovery window" }
+    [pscustomobject]@{ Name = "appliedPerSecondDuringRecovery"; Unit = "results/s"; Note = "the same per second of the mode's own recovery window"; Ratio = @{ Numerator = "appliedDeltaDuringRecovery"; Denominator = "recoveryWindowSeconds" } }
+    [pscustomobject]@{ Name = "mysqlQuestionsDelta"; Unit = "queries"; Note = "MySQL Questions over the recovery window - a total, see the per-second rows" }
+    [pscustomobject]@{ Name = "mysqlQuestionsPerSecond"; Unit = "queries/s"; Note = "MySQL Questions per second of the mode's own recovery window"; Ratio = @{ Numerator = "mysqlQuestionsDelta"; Denominator = "recoveryWindowSeconds" } }
+    [pscustomobject]@{ Name = "mysqlRowsReadDelta"; Unit = "rows"; Note = "Innodb_rows_read over the recovery window - a total" }
+    [pscustomobject]@{ Name = "mysqlRowsReadPerSecond"; Unit = "rows/s"; Note = "Innodb_rows_read per second of the mode's own recovery window"; Ratio = @{ Numerator = "mysqlRowsReadDelta"; Denominator = "recoveryWindowSeconds" } }
+    [pscustomobject]@{ Name = "redisTotalCommandsDelta"; Unit = "commands"; Note = "Redis commands over the recovery window - a total" }
+    [pscustomobject]@{ Name = "redisTotalCommandsPerSecond"; Unit = "commands/s"; Note = "Redis commands per second of the mode's own recovery window"; Ratio = @{ Numerator = "redisTotalCommandsDelta"; Denominator = "recoveryWindowSeconds" } }
+    [pscustomobject]@{ Name = "redisEvalCallsDelta"; Unit = "calls"; Note = "scoreboard Lua evaluations over the recovery window - a total" }
+    [pscustomobject]@{ Name = "redisEvalCallsPerSecond"; Unit = "calls/s"; Note = "scoreboard Lua evaluations per second of the mode's own recovery window"; Ratio = @{ Numerator = "redisEvalCallsDelta"; Denominator = "recoveryWindowSeconds" } }
     [pscustomobject]@{ Name = "redisRestoreCallsDelta"; Unit = "calls"; Note = "RESTORE calls - the injector's own footprint, in every mode" }
     [pscustomobject]@{ Name = "redisDelCallsDelta"; Unit = "calls"; Note = "DEL calls - the injector's own footprint, in every mode" }
     [pscustomobject]@{ Name = "sequenceRoundsDelta"; Unit = "rounds"; Note = "redis-seq only: allocator rounds" }
     [pscustomobject]@{ Name = "sequenceReplayedDelta"; Unit = "results"; Note = "redis-seq only: results replayed from the duplicate window" }
-    [pscustomobject]@{ Name = "rollbackObservedDelta"; Unit = "events"; Note = "how many times the consumer saw the offset go backwards" }
+    [pscustomobject]@{ Name = "rollbackObservedDelta"; Unit = "events"; Note = "the two non-rewinding modes only: how many rollbacks the batch role answered by rebuilding in place. stream-offset rewinds instead and never records this counter, so its 0 here is the design, not a missed detection" }
     [pscustomobject]@{ Name = "rollbackRestartsDelta"; Unit = "restarts"; Note = "how many times a mode stopped and restarted its consumer to repair" }
     [pscustomobject]@{ Name = "maxAppProcessCpu"; Unit = "ratio"; Note = "batch-1 process CPU at its peak" }
     [pscustomobject]@{ Name = "gatlingSuccessPercent"; Unit = "%"; Note = "the share of new submissions the ingress accepted" }
@@ -216,8 +265,8 @@ foreach ($figure in $figures) {
     $cells = @($figure.Name, $figure.Unit, $figure.Note)
     foreach ($mode in $modesPresent) {
         $modeRuns = @(($summary | Where-Object { $_.Mode -eq $mode })[0].Runs)
-        $column = Get-ModeColumn -Runs $modeRuns -Column $figure.Name
-        $cells += @((Format-Cell $column.Median), (Format-Cell $column.Min), (Format-Cell $column.Max), "$($column.Count)/$($modeRuns.Count)")
+        $column = Get-ModeColumn -Runs $modeRuns -Figure $figure
+        $cells += @((Format-Cell $column.Median), (Format-Cell $column.Min), (Format-Cell $column.Max), "$($column.Count)/$($plannedByMode[$mode])")
     }
     [void]$builder.AppendLine((@($cells | ForEach-Object {
                     if ([string]$_ -match '[,"]') { '"' + ([string]$_).Replace('"', '""') + '"' } else { [string]$_ }
@@ -251,8 +300,8 @@ if ($unmeasured.Count -gt 0) {
 }
 Write-Output ""
 Write-Output ("conditions: " + (@(
-            "users=$UserCount", "problems=$ProblemCount", "targetRps=$TargetRps",
-            "holdSeconds=$HoldSeconds", "pollIntervalSeconds=$($suite.pollIntervalSeconds)"
+            "users=$conditionUserCount", "problems=$conditionProblemCount", "targetRps=$conditionTargetRps",
+            "holdSeconds=$conditionHoldSeconds", "pollIntervalSeconds=$($suite.pollIntervalSeconds)"
         ) -join " "))
 Write-Output ""
 
@@ -261,7 +310,7 @@ foreach ($figure in $figures) {
     $line = "{0,-$width}  " -f $figure.Name
     foreach ($mode in $modesPresent) {
         $modeRuns = @(($summary | Where-Object { $_.Mode -eq $mode })[0].Runs)
-        $column = Get-ModeColumn -Runs $modeRuns -Column $figure.Name
+        $column = Get-ModeColumn -Runs $modeRuns -Figure $figure
         $cell = if ($column.Count -eq 0) {
             "unavailable"
         }
@@ -279,7 +328,13 @@ Write-Output ""
 foreach ($mode in $modesPresent) {
     $modeRuns = @(($summary | Where-Object { $_.Mode -eq $mode })[0].Runs)
     $complete = @($modeRuns | Where-Object { [string]$_.complete -eq "True" }).Count
-    Write-Output "$mode : $complete of $($modeRuns.Count) runs complete"
+    # The suite's runs are the denominator, not the ones that were measured. Counting the measured subset
+    # makes a mode whose two other runs failed to measure read as "1 of 1 runs complete" - the opposite of
+    # what the runs with no figures are there to say.
+    $planned = $plannedByMode[$mode]
+    $noFigures = $planned - $modeRuns.Count
+    $qualifier = if ($noFigures -gt 0) { " ($noFigures produced no figures)" } else { "" }
+    Write-Output "$mode : $complete of $planned runs complete$qualifier"
 }
 
 if (-not [string]::IsNullOrWhiteSpace($OutputDirectory)) {
@@ -297,10 +352,10 @@ if (-not [string]::IsNullOrWhiteSpace($OutputDirectory)) {
         suiteDirectoryIsUntracked = $true
         note = "The raw per-poll samples, container logs and the load generator's reports are in the suite and run directories above. They are not committed: they are large, and this table is what they were reduced to."
         conditions = [pscustomobject][ordered]@{
-            userCount = $UserCount
-            problemCount = $ProblemCount
-            targetRps = $TargetRps
-            holdSeconds = $HoldSeconds
+            userCount = $conditionUserCount
+            problemCount = $conditionProblemCount
+            targetRps = $conditionTargetRps
+            holdSeconds = $conditionHoldSeconds
             pollIntervalSeconds = $suite.pollIntervalSeconds
             submitIntervalMillis = $suite.submitIntervalMillis
             rampSeconds = $suite.rampSeconds
@@ -325,7 +380,13 @@ if (-not [string]::IsNullOrWhiteSpace($OutputDirectory)) {
                     kProcessedCount = [string]$_.kProcessedCount
                     kCheckpoint = [string]$_.kCheckpoint
                     finalDigestMatches = [string]$_.finalDigestMatches
-                    gitHead = [string]$_.gitHead
+                    # The suite's commit rather than the row's. `recovery-summary.csv` has no gitHead
+                    # column - the runner writes it once per run into that run's `run-metadata.json` - so
+                    # reading it from the row asked for a property that does not exist and threw under
+                    # StrictMode, after summary.csv and runs.csv had already been copied into the results
+                    # directory. The curated set was left incomplete and the command exited non-zero at
+                    # the last step of a summarisation that had otherwise succeeded.
+                    gitHead = [string]$suite.gitHead
                 }
             })
         runsWithNoFigures = $unmeasured.ToArray()

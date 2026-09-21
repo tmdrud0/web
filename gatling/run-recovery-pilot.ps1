@@ -141,6 +141,29 @@ function Get-RowTruth {
     return ([string]$Row.$Name -eq "true")
 }
 
+# The instant a poll observed the fact it is being read for, rather than the instant the poll began.
+#
+# A poll stamps its start and then spends 2.3-3.2s reading Prometheus, Redis, the pipeline, MySQL and the
+# API, so a moment placed at the poll's start is placed up to a poll period early - and `T_consistent`,
+# `T_backlog_drained` and everything derived from them are exactly such moments. The sampler records the
+# observation instants as its readings land, so a figure taken from them describes the recovery instead
+# of the harness's polling.
+#
+# A row recorded before these columns existed, or a poll where the reader did not run, has no value for
+# them; both answer the fallback, so a figure degrades to what the harness reported before rather than
+# failing outright.
+function Get-PollObservationInstant {
+    param(
+        [Parameter(Mandatory = $true)]$Row,
+        [Parameter(Mandatory = $true)][string]$Field,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$Fallback
+    )
+
+    $value = [string]$Row.$Field
+    if ([string]::IsNullOrWhiteSpace($value) -or $value -eq "unavailable") { return $Fallback }
+    return [DateTimeOffset]$value
+}
+
 function Get-MaxAcross {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Rows,
@@ -589,8 +612,12 @@ try {
             param($row)
             (Get-RowTruth -Row $row -Name "digestMatches") -and (Get-RowTruth -Row $row -Name "lostComplete")
         }
-    $consistentAtUtc = [DateTimeOffset]$recoveryRow.timestampUtc
-    Write-Output "  consistent again at $($recoveryRow.timestampUtc): digest $($recoveryRow.apiDigest.Substring(0, 12))..., $($recoveryRow.lostReapplied)/$($recoveryRow.lostTotal) lost results back"
+    # The instant the predicate was seen to hold, not the instant the poll that saw it began: the digest
+    # and the lost set are read partway through a poll that takes seconds, and the difference lands
+    # directly in `consistencyOutageMs`.
+    $consistentAtUtc = Get-PollObservationInstant -Row $recoveryRow -Field "consistencyObservedAtUtc" `
+        -Fallback ([DateTimeOffset]$recoveryRow.timestampUtc)
+    Write-Output "  consistent again at $($consistentAtUtc.UtcDateTime.ToString('o')): digest $($recoveryRow.apiDigest.Substring(0, 12))..., $($recoveryRow.lostReapplied)/$($recoveryRow.lostTotal) lost submissions delivered again"
 
     # Quiescence is a different question from consistency and is asked separately, because they are not
     # the same instant: a mode can rebuild the scoreboard from MySQL while the stream still holds events
@@ -599,8 +626,10 @@ try {
     $drainedRow = Wait-PilotCondition -Phase "recovery" -TimeoutSeconds $DrainTimeoutSeconds `
         -Description "the pipeline to be quiet again" -Lost $lost.Lost `
         -Predicate { param($row) Get-RowTruth -Row $row -Name "quiescent" }
-    $drainedAtUtc = [DateTimeOffset]$drainedRow.timestampUtc
-    Write-Output "  pipeline quiet again at $($drainedRow.timestampUtc)"
+    # Same again, for the quiescence facts.
+    $drainedAtUtc = Get-PollObservationInstant -Row $drainedRow -Field "quiescentObservedAtUtc" `
+        -Fallback ([DateTimeOffset]$drainedRow.timestampUtc)
+    Write-Output "  pipeline quiet again at $($drainedAtUtc.UtcDateTime.ToString('o'))"
 
     # --- 10. finish -------------------------------------------------------------------------------
 
@@ -627,6 +656,15 @@ try {
 
     $script:recoveryEvents = @(Get-BatchRecoveryTimeline -SinceUtc $faultAtUtc.AddSeconds(-10).UtcDateTime.ToString("o"))
     $detection = Get-FirstRecoveryEvent -Events $script:recoveryEvents -Kinds @("detected-rewinding", "detected-nonrewinding")
+    # A detection earlier than the fault is not a detection, and it must not become a negative latency in
+    # a published column. The window above opens ten seconds before the fault on purpose - a log line can
+    # be stamped by a container whose clock is a little behind - so the event is kept as evidence and the
+    # figure is withdrawn rather than reported with the sign it happens to carry.
+    $detectionPrecedesFault = $null -ne $detection -and $detection.Instant -lt $faultAtUtc
+    if ($detectionPrecedesFault) {
+        Write-Output "  batch-1's first detection event is stamped $($detection.Instant.UtcDateTime.ToString('o')), before the fault at $($faultAtUtc.UtcDateTime.ToString('o')): reported as unavailable rather than as a negative latency"
+        $detection = $null
+    }
 
     Write-Output ""
     Write-Output "  final: digestMatches=$($finalCompare.Matches) quiescent=$($finalQuiescent.Quiescent) processed=$($finalRow.processedCardinality) applied=$($finalRow.oracleAppliedResults)"
@@ -641,9 +679,6 @@ try {
     # --- the run's figures -------------------------------------------------------------------------
 
     $recoveryPolls = @($script:polls | Where-Object { $_.phase -eq "recovery" })
-    $recoveryWindowPolls = @($script:polls | Where-Object {
-            $_.phase -eq "recovery"
-        })
     $faultIndex = 0
     for ($i = 0; $i -lt $script:polls.Count; $i++) {
         if ([DateTimeOffset]$script:polls[$i].timestampUtc -le $faultAtUtc) { $faultIndex = $i }
@@ -653,6 +688,10 @@ try {
         if ([DateTimeOffset]$script:polls[$i].timestampUtc -le $consistentAtUtc) { $consistentIndex = $i }
     }
     $recoveryWindow = @($script:polls[$faultIndex..$consistentIndex])
+    # How long the window the cost counters are taken over lasts. It is the mode's own fault-to-consistent
+    # span, so it differs between modes by design - that span is the thing being measured - which is
+    # exactly why the deltas over it cannot be compared with each other as they stand.
+    $recoveryWindowSeconds = ($consistentAtUtc - $faultAtUtc).TotalSeconds
     $observedTotal = Get-DeltaAcross -Rows $recoveryWindow -Name "rollbackObservedTotal"
     $restartsTotal = Get-DeltaAcross -Rows $recoveryWindow -Name "rollbackRestartsTotal"
     $unrecoverableTotal = Get-DeltaAcross -Rows $recoveryWindow -Name "rollbackUnrecoverableTotal"
@@ -684,6 +723,10 @@ try {
         faultAtMysql = $faultAtMysql
         detectedAtUtc = if ($null -eq $detection) { "unavailable" } else { $detection.Instant.UtcDateTime.ToString("o") }
         detectedKind = if ($null -eq $detection) { "unavailable" } else { $detection.Kind }
+        # True when batch-1's first recovery log line is stamped before the fault was injected, which is the
+        # one thing that makes `T_detected` meaningless rather than merely imprecise. Recorded so that a
+        # withdrawn detection reads as a clock or log-order question rather than as a mode that never noticed.
+        detectionPrecedesFault = $detectionPrecedesFault
         consistentAtUtc = $consistentAtUtc.UtcDateTime.ToString("o")
         consistentAtMysql = $recoveryRow.timestampMysql
         drainedAtUtc = $drainedAtUtc.UtcDateTime.ToString("o")
@@ -773,6 +816,13 @@ try {
             }).Count
 
         # --- what the recovery cost ----------------------------------------------------------------
+        #
+        # Every counter below is a delta over `recoveryWindow`, whose length is the mode's own
+        # fault-to-consistent span and therefore differs between modes - deliberately, because that span is
+        # the thing being measured. A raw delta is a total and not a rate, so a mode that took twice as long
+        # shows roughly twice the work for that reason alone. `recoveryWindowSeconds` is recorded beside
+        # them so the comparison can be made per second, and the summariser presents the ratio.
+        recoveryWindowSeconds = Format-PilotNumber ($recoveryWindowSeconds)
         appliedDeltaDuringRecovery = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "appliedTotal")
         mysqlQuestionsDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "mysqlQuestions")
         mysqlRowsReadDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "mysqlRowsRead")
@@ -805,7 +855,7 @@ try {
         # applications together and cannot be split.
         replayOfferedCount = "unavailable"
         replayFoundAlreadyAppliedCount = "unavailable"
-        replayMarkerFailuresDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "rollbackUnrecoverableTotal")
+        replayMarkerFailuresDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "replayMarkerFailuresTotal")
 
         # --- consistency ---------------------------------------------------------------------------
         finalDigestMatches = $finalCompare.Matches

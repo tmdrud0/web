@@ -814,16 +814,19 @@ function Get-SampleColumnNames {
         "streamOldestReadySeconds", "streamDbPending", "rankingCardinality", "processedCardinality",
         "scoreboardKeyCount", "appliedTotal", "rollbackObservedTotal", "rollbackRestartsTotal",
         "rollbackUnrecoverableTotal", "rollbackRetryBusyTotal", "rollbackRetryRetryableTotal",
+        "replayMarkerFailuresTotal",
         "streamFailuresTotal", "streamOffsetGapsTotal", "streamFailureRestartsTotal",
         "streamUnappliedRefusalsTotal", "streamTailProbeFailuresTotal", "redisLuaErrorsTotal",
         "sequenceRoundsTotal", "sequenceDuplicatesTotal", "sequenceReplayedTotal",
         "sequenceFailedTotal", "sequenceWindowsSaturatedTotal", "sequenceUnresolvedTotal",
         "sequenceMappingSize", "judgeOutboxNonPublished", "unappliedResults", "rabbitLiveReady",
         "rabbitLiveUnacked", "rabbitDeadReady", "rabbitDeadUnacked", "streamQueueReady",
-        "streamQueueUnacked", "streamQueueConsumers", "quiescent", "oracleObservedAtUtc",
+        "streamQueueUnacked", "streamQueueConsumers", "quiescent", "quiescentObservedAtUtc",
+        "oracleObservedAtUtc",
         "oracleDigest", "oracleParticipants", "oracleAppliedResults", "oracleResolvedResults",
         "digestObservedAtUtc", "apiDigest", "apiParticipants", "apiEntries", "apiPages",
         "digestMatches", "lostTotal", "lostReapplied", "lostRemaining", "lostComplete",
+        "consistencyObservedAtUtc",
         "mysqlQuestions", "mysqlComSelect", "mysqlRowsRead", "mysqlInnodbBufferPoolReadRequests",
         "mysqlInnodbBufferPoolReads", "mysqlThreadsConnected", "mysqlThreadsRunning",
         "mysqlSlowQueries", "redisTotalCommands", "redisInstantaneousOps", "redisKeyspaceHits",
@@ -1020,6 +1023,11 @@ function Get-RecoveryObservation {
     $observation["rollbackObservedTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_rollback_observed_total"
     $observation["rollbackRestartsTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_rollback_restarts_total"
     $observation["rollbackUnrecoverableTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_rollback_unrecoverable_total"
+    # The replay's own failure counter, which is a different event from the one above: this is a replayed
+    # chunk whose applied marker could not be written to MySQL, while the rollback counter counts ranges a
+    # mode's basis could not rebuild at all. The summary used to publish the rollback counter under this
+    # name, which read as "the marker write failed" for a run where no marker write had failed.
+    $observation["replayMarkerFailuresTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_recovery_marker_failed_total"
     $observation["rollbackRetryBusyTotal"] = Get-MetricValue -Metrics $roleBusyRetryMetrics -Name "contest_scoreboard_stream_rollback_retry_total"
     $observation["rollbackRetryRetryableTotal"] = Get-MetricValue -Metrics $roleRetryableRetryMetrics -Name "contest_scoreboard_stream_rollback_retry_total"
     $observation["streamFailuresTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_stream_failures_total"
@@ -1053,6 +1061,12 @@ function Get-RecoveryObservation {
     $observation["rabbitPublishedTotal"] = Get-DictionaryValue -Map $rabbitMetrics -Name "rabbitmq_detailed_queue_exchange_messages_published_total"
 
     $pipeline = Get-PipelineOperationalState
+    # When the quiescence facts were all read, which is when a drained backlog was observed rather than
+    # when the poll that observed it began. The poll stamps its start and then spends 2.3-3.2s reading
+    # Prometheus, Redis, the pipeline, MySQL and the API, so an instant taken from the start places every
+    # event up to a poll period early - and `T_backlog_drained` is derived from this one, so the error
+    # would land in the figure rather than in the noise around it.
+    $observation["quiescentObservedAtUtc"] = [DateTimeOffset]::UtcNow.UtcDateTime.ToString("o")
     $observation["rabbitPollMs"] = $pipeline.RabbitPollMs
     $observation["pipelinePollMs"] = $pipeline.DurationMs
     $observation["judgeOutboxNonPublished"] = $pipeline.JudgeNonPublished
@@ -1118,6 +1132,12 @@ function Get-RecoveryObservation {
         $observation["lostRemaining"] = $progress.LostCount - $progress.ReappliedCount
         $observation["lostComplete"] = $progress.Complete
     }
+
+    # When the recovery predicate's own facts were all read: the digest above and the lost set just below.
+    # `T_consistent` is the first poll whose predicate held, and this is the instant at which it was seen
+    # to hold - not the instant the poll began, which is up to a poll period earlier and would credit the
+    # mode with a recovery it had not made yet.
+    $observation["consistencyObservedAtUtc"] = [DateTimeOffset]::UtcNow.UtcDateTime.ToString("o")
 
     $observation["pollDurationMs"] = $pollWatch.ElapsedMilliseconds
     return $observation

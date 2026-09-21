@@ -525,9 +525,16 @@ function Get-LostResultSet {
     }
 }
 
-# How much of the lost set the scoreboard holds again, and what it now holds that the fault-time reading
-# did not - the second being results that arrived after the rollback, which is the ingress the run was
-# supposed to keep applying.
+# How much of the lost set the scoreboard's `processed` set holds again, and what it now holds that the
+# fault-time reading did not - the second being results that arrived after the rollback, which is the
+# ingress the run was supposed to keep applying.
+#
+# "Back" means back in `processed`, which is not the same as back in the standings. The product adds a
+# submission to `processed` outside the guard that decides whether its result moves anything, so a
+# delivery whose result is still PENDING marks the submission processed without touching a rank. A
+# `Complete = $true` here therefore says every lost submission has been delivered again - not that the
+# scoreboard is right. That is why the caller's predicate is a conjunction of this and the digest match
+# against MySQL, and why a report should never read this count as the scoreboard's own recovery.
 function Get-LostSetProgress {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lost,
