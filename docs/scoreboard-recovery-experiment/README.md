@@ -56,7 +56,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File gatling\tests\RecoveryExperi
 |---|---|---|
 | `UnitTests` | 없음 (순수 함수 + 소스 가드) | 파생값·정렬·digest 정규화·CSV 규약·제품 로그 패턴 인식 |
 | `SummarizerTests` | 없음 (임시 디렉터리에 가짜 suite를 만들어 실행) | 요약기가 **측정된** run을 실제로 요약하는지 — 조건·commit·run 수를 어디서 읽는지 |
-| `RedisTests` | docker (throwaway 컨테이너) | DUMP/RESTORE 왕복, 0x0A payload, TTL, rollback 경계, 손실 방향 |
+| `RedisTests` | docker (throwaway 컨테이너) | DUMP/RESTORE 왕복, 0x0A payload, TTL, rollback 경계, 손실 방향, **해시 테이블 인코딩이 바이트로는 재현되지 않는다는 성질**(§5.4) |
 | `MySqlTests` | `DB_PASSWORD` (공유 `oj_test`) | seeder 문장과 oracle SQL이 실제 행에서 규칙대로 나오는지, 정리 경로가 자기 행만 지우는지 |
 
 세 가지 주의:
@@ -277,23 +277,25 @@ suite 자체도 같은 규약으로 종료한다: 수치를 못 낸 run이 있�
 ### 5.1 K 캡처 (7단계)
 
 1. batch-1 `docker pause` — checkpoint와 스코어보드 내용을 **자기정합**하게 만든다 (torn state 방지)
-2. `SCAN MATCH contest:scoreboard:*`로 키 목록 수집 → 키별 `TYPE` / `DUMP` / `PTTL` 캡처
+2. `SCAN MATCH contest:scoreboard:*`로 키 목록 수집 → 키별 `TYPE` / `OBJECT ENCODING` / `DUMP` / `PTTL` /
+   **타입별 canonical 내용**(문자열은 값, list는 순서, set은 정렬된 멤버, hash·zset은 필드별 정렬) 캡처
 3. MySQL에서 oracle digest + 적용 결과 수 스냅샷
 4. **K 시점 digest == 제품 API digest** 확인 (다르면 run 실패 — 측정 한계가 아니라 harness 결함 신호)
 5. `docker unpause`
 
-증거: `k-snapshot.json`.
+증거: `k-snapshot.json` (type/encoding 분포 포함).
 
 ### 5.2 장애 주입 (8단계)
 
 1. K 대비 **적용 결과 수가 `-TailResults` 이상**이 되는 순간 batch-1 `docker pause`
 2. `contest:scoreboard:*` 전체 `DEL`
 3. 캡처한 payload를 `RESTORE key <pttl|0> payload REPLACE`
-4. **검증**: 키 집합 일치 + payload 바이트 단위 일치 + `storedOffset == K`
+4. **검증**: 키 집합 일치 + 타입·인코딩 일치 + canonical 내용 일치(전 키) + **payload 바이트 일치**
+   (`hashtable` 인코딩 키는 제외 — §5.4) + `storedOffset == K`
 5. `T_fault` 기록
 6. `docker unpause` — **이후에도 신규 유입은 계속된다**
 
-증거: `rollback.json`.
+증거: `rollback.json`. 검증에서 바이트 대신 내용으로 판정한 키 수를 함께 기록하며, run stdout에도 찍는다.
 
 ### 5.3 무엇을 재현하고, 무엇을 재현하지 않는가
 
@@ -308,6 +310,33 @@ suite 자체도 같은 규약으로 종료한다: 수치를 못 낸 run이 있�
 
 이 한계는 **세 모드에 동일하게 적용**되므로 모드 간 비교는 성립한다. 다만 결과를 "RDB에서 로드했을
 때의 복구 시간"으로 일반화할 수 없다. `docker pause` 구간은 주입기 footprint로 별도 기록한다.
+
+### 5.4 검증이 무엇을 증명하고, 무엇을 증명하지 않는가
+
+복원 검증은 **키 집합·타입·인코딩·내용(canonical)** 을 전 키에 대해 확인하고, **payload 바이트**는
+인코딩이 재현 가능한 키에 대해서만 확인한다. 이 구분은 harness의 편의가 아니라 **Redis의 성질**이다.
+
+`DUMP`는 해시 테이블 인코딩된 set·hash에서 **버킷 순회 순서**로 멤버를 쓴다. `RESTORE`는 그 순서대로
+다시 삽입하므로 해시 테이블이 재구성되는데, 그 결과 버킷 배치는 원래의 삽입 이력이 만든 배치와
+같아지지 않는다. **내용은 정확히 보존되고 바이트는 보존되지 않는다.** 이 이미지(`redis:7-alpine`)에서
+실측한 결과:
+
+| 키 | 인코딩 | reload 후 내용 | reload 후 payload 바이트 |
+|---|---|---|---|
+| 정수 멤버 50·512개 set | `intset` | 동일 | **동일** |
+| 정수 멤버 513·1266개 set | `hashtable` | 동일 | **다름** |
+| 필드 200개 hash(긴 값) | `hashtable` | 동일 | **다름** |
+| 짧은 hash / `listpack` hash / `skiplist` zset / list / string | 그 밖 | 동일 | 동일 |
+
+이 구분이 없던 첫 calibration run은 `processed` set(멤버 1266개 → `hashtable`)에서 **복원이 정확했는데도
+검증 실패로 기록**되었다. 즉 **바이트 일치는 이 인코딩에서 달성 불가능한 기준**이며, 달성 가능한 기준으로
+판정해야 한다. 검증 강도를 낮춘 것이 아니라 **주장의 범위를 실제와 맞춘 것**이다.
+
+바이트 비교는 지금도 유효한 모든 키에 적용되고, 그 수를 `SBRE_COMPARE_CANON_ONLY`로 세어
+`rollback.json`에 남긴다. 그러므로 "전 키 검증"은 "대부분 검증"으로 읽히지 않는다.
+
+**증명하지 않는 것**: 이 검증은 Redis가 **메모리 안에서** 같은 상태가 되었음을 증명한다. RDB 파일에서
+로드했을 때와 동일하다는 것, 즉 디스크 경로까지 같다는 것은 증명하지 않는다(§5.3의 한계와 같은 이유).
 
 ---
 
@@ -351,6 +380,26 @@ raw는 commit하지 않는다.
 2. `oj-loadtest-*` 이미지 5개가 있는가 — 없으면 `-Build`, 그래도 없으면 사전 조건 미충족
 3. Gatling 클래스가 컴파일돼 있는가 — `gatling\classpath.txt` + `build\classes`
 4. 전용 Redis에 rollback을 걸 수 있는가 — `Assert-RedisIsDedicated`가 거부하면 격리가 안 된 것
+5. **이전 run이 judge 큐에 남긴 작업** — reset은 `contest.judge.live`/`dead`가 비어 있지 않으면
+   **일부러 중단**한다(`Draining them is the previous run's result, not this reset's`). 중단된 run은
+   채점 대기 메시지를 남기므로 다음 run이 시작조차 못 한다. harness가 자동으로 비우지 **않는** 이유는
+   그것이 이전 run의 결과를 이번 측정에 섞는 일이기 때문이고, 그래서 **앱 tier가 멈춘 유휴 시점에
+   사람이** 한다:
+
+   ```powershell
+   # 전용 인스턴스인지 먼저 확인한다 (project=oj-loadtest, service=rabbitmq, published port 없음)
+   docker inspect oj-loadtest-rabbitmq --format 'project={{index .Config.Labels "com.docker.compose.project"}} service={{index .Config.Labels "com.docker.compose.service"}}'
+
+   # 건수를 기록한 뒤 judge 큐 하나만 비운다 (전체 queue 삭제도 vhost 초기화도 아니다)
+   docker exec oj-loadtest-rabbitmq rabbitmqctl list_queues name type messages_ready messages_unacknowledged
+   docker exec oj-loadtest-rabbitmq rabbitmqctl purge_queue contest.judge.live -p /
+   docker exec oj-loadtest-rabbitmq rabbitmqctl list_queues name type messages_ready messages_unacknowledged
+   ```
+
+   `-p /`를 Git Bash에서 쓰면 경로가 `C:/Program Files/Git/`로 바뀌어 **없는 vhost**를 가리키고
+   `Object was not found`로 끝난다 — 조용히 아무것도 지우지 않으므로 `MSYS_NO_PATHCONV=1`을 준다.
+   `contest.judge.live`는 **quorum** 큐라 비운 직후 조회가 잠깐 옛 값을 보여줄 수 있다.
+   `contest.judge.result.stream`은 건드리지 않는다 — 다음 run의 reset이 삭제·재선언한다.
 
 각 경우에 **필요한 실행 명령을 `PILOT_REPORT.md`에 그대로 적는다.**
 

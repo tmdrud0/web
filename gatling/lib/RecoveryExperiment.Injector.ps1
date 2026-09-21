@@ -41,13 +41,50 @@ rm -rf "$out"
 mkdir -p "$out"
 redis-cli --raw --scan --pattern "$pattern" | LC_ALL=C sort > "$out/keys.txt"
 : > "$out/manifest.txt"
+
+# The canonical form of a key's content, per type: the part of a key that is *state*, with the layout
+# Redis happened to choose taken out. Run on the server so that a set of a thousand members is sorted
+# where it already is rather than being shipped to the shell to be sorted there.
+#
+# It exists because a payload is not always reproducible: `DUMP` of a hash-table-encoded set or hash
+# iterates the table's buckets, and a reload rebuilds that table by inserting the members in the order
+# they were serialized, which does not always reproduce the original bucket layout. The content survives
+# the round trip exactly; the bytes do not. Measured on redis:7-alpine for a set of integer members:
+# intset (up to `set-max-intset-entries`, 512) reloads byte-identically, hashtable (513 and up) does not,
+# and the same holds for a hash past `hash-max-listpack-entries`. So the canonical form is what decides
+# whether the restore reproduced the snapshot's state, and the payload comparison is kept for every
+# encoding that *is* reproducible - which is all of them except `hashtable`.
+CANON='
+local k = KEYS[1]
+local t = redis.call("TYPE", k)["ok"]
+if t == "string" then
+    return redis.call("GET", k)
+elseif t == "list" then
+    return table.concat(redis.call("LRANGE", k, 0, -1), "\n")
+elseif t == "set" then
+    local m = redis.call("SMEMBERS", k)
+    table.sort(m)
+    return table.concat(m, "\n")
+elseif t == "hash" or t == "zset" then
+    local flat
+    if t == "hash" then flat = redis.call("HGETALL", k) else flat = redis.call("ZRANGE", k, 0, -1, "WITHSCORES") end
+    local rows = {}
+    for i = 1, #flat, 2 do rows[#rows + 1] = flat[i] .. "\t" .. flat[i + 1] end
+    table.sort(rows)
+    return table.concat(rows, "\n")
+end
+return nil
+'
+
 count=0
 while IFS= read -r key; do
     count=$((count + 1))
     name=$(printf '%06d' "$count")
     type=$(redis-cli --raw TYPE "$key")
+    enc=$(redis-cli --raw OBJECT ENCODING "$key")
     pttl=$(redis-cli --raw PTTL "$key")
     printf '%s\n' "$type" > "$out/$name.type"
+    printf '%s\n' "$enc" > "$out/$name.enc"
     printf '%s\n' "$pttl" > "$out/$name.pttl"
     redis-cli --raw DUMP "$key" > "$out/$name.raw"
     size=$(wc -c < "$out/$name.raw")
@@ -57,7 +94,18 @@ while IFS= read -r key; do
     fi
     head -c $((size - 1)) "$out/$name.raw" > "$out/$name.bin"
     rm -f "$out/$name.raw"
-    printf '%s\t%s\t%s\t%s\n' "$key" "$type" "$pttl" "$name" >> "$out/manifest.txt"
+    redis-cli --raw EVAL "$CANON" 1 "$key" > "$out/$name.canon.raw"
+    csize=$(wc -c < "$out/$name.canon.raw")
+    if [ "$csize" -lt 1 ]; then
+        # A type the script above does not know, so this key is left to the payload comparison alone.
+        # Written as an empty file rather than a sentinel: an empty container of a known type also
+        # produces an empty canonical form, and comparing two empties is the right answer for both.
+        : > "$out/$name.canon"
+    else
+        head -c $((csize - 1)) "$out/$name.canon.raw" > "$out/$name.canon"
+    fi
+    rm -f "$out/$name.canon.raw"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$key" "$type" "$pttl" "$name" "$enc" >> "$out/manifest.txt"
 done < "$out/keys.txt"
 echo "SBRE_CAPTURE_KEYS=$count"
 '@
@@ -94,7 +142,9 @@ fi
 restoreFile="$out/restore.resp"
 : > "$restoreFile"
 IFS=$(printf '\t')
-while read -r key type pttl name; do
+# Five fields, and the fifth is read even though the restore does not use it: with a shorter list the
+# trailing field would be appended to `name`, and `name` is the payload's file name.
+while read -r key type pttl name enc; do
     plen=$(wc -c < "$out/$name.bin")
     klen=$(printf %s "$key" | wc -c)
     if [ "$pttl" -lt 0 ]; then ttl=0; else ttl=$pttl; fi
@@ -133,13 +183,28 @@ if ! cmp -s "$a/keys.txt" "$b/keys.txt"; then
     exit 1
 fi
 diffs=0
+canonOnly=0
 IFS=$(printf '\t')
-while read -r key type pttl name; do
+while read -r key type pttl name enc; do
     if ! cmp -s "$a/$name.type" "$b/$name.type"; then
         echo "SBRE_COMPARE_FAILED type differs for $key" >&2
         diffs=$((diffs + 1))
     fi
-    if ! cmp -s "$a/$name.bin" "$b/$name.bin"; then
+    if ! cmp -s "$a/$name.enc" "$b/$name.enc"; then
+        echo "SBRE_COMPARE_FAILED encoding differs for $key" >&2
+        diffs=$((diffs + 1))
+    fi
+    if ! cmp -s "$a/$name.canon" "$b/$name.canon"; then
+        echo "SBRE_COMPARE_FAILED content differs for $key" >&2
+        diffs=$((diffs + 1))
+    fi
+    # The payload comparison is the stronger one and is asked for wherever it is meaningful. It is not
+    # meaningful for `hashtable`: `DUMP` walks the hash table's buckets, so the same membership can
+    # serialize in a different order after a reload. Those keys are decided by their content above, and
+    # are counted so that a run saying "verified byte for byte" cannot quietly mean "for most of them".
+    if [ "$enc" = "hashtable" ]; then
+        canonOnly=$((canonOnly + 1))
+    elif ! cmp -s "$a/$name.bin" "$b/$name.bin"; then
         echo "SBRE_COMPARE_FAILED payload differs for $key" >&2
         diffs=$((diffs + 1))
     fi
@@ -148,6 +213,7 @@ if [ "$diffs" -ne 0 ]; then
     exit 1
 fi
 echo "SBRE_COMPARE_OK=$(wc -l < "$a/manifest.txt")"
+echo "SBRE_COMPARE_CANON_ONLY=$canonOnly"
 '@
 
 function Assert-RedisIsDedicated {
@@ -311,12 +377,19 @@ function Export-ScoreboardSnapshot {
 
     $manifest = @(Get-Content -LiteralPath (Join-Path $hostDirectory "manifest.txt") -ErrorAction SilentlyContinue)
     $typeHistogram = @{}
+    $encodingHistogram = @{}
     $payloadBytes = 0L
     foreach ($line in $manifest) {
         $fields = @(([string]$line -split "`t", -1))
         if ($fields.Count -lt 4) { continue }
         if (-not $typeHistogram.ContainsKey($fields[1])) { $typeHistogram[$fields[1]] = 0 }
         $typeHistogram[$fields[1]] = $typeHistogram[$fields[1]] + 1
+        # The encoding decides which comparison the rollback verification will hold this key to, so the
+        # snapshot records the distribution of them rather than only the types.
+        if ($fields.Count -ge 5) {
+            if (-not $encodingHistogram.ContainsKey($fields[4])) { $encodingHistogram[$fields[4]] = 0 }
+            $encodingHistogram[$fields[4]] = $encodingHistogram[$fields[4]] + 1
+        }
         $payloadBytes += (Get-Item -LiteralPath (Join-Path $hostDirectory "$($fields[3]).bin")).Length
     }
     if ($manifest.Count -ne $keyCount) {
@@ -344,6 +417,7 @@ function Export-ScoreboardSnapshot {
         KeyCount = $keyCount
         PayloadBytes = $payloadBytes
         TypeHistogram = @($typeHistogram.Keys | Sort-Object | ForEach-Object { "$_=$($typeHistogram[$_])" })
+        EncodingHistogram = @($encodingHistogram.Keys | Sort-Object | ForEach-Object { "$_=$($encodingHistogram[$_])" })
         ProcessedCount = $processed.Count
         ProcessedPath = $processedPath
         Processed = $processed
@@ -354,7 +428,9 @@ function Export-ScoreboardSnapshot {
 }
 
 # The rollback itself: delete the namespace, write the snapshot back, and prove it took by capturing
-# the namespace again and comparing it with the snapshot byte for byte.
+# the namespace again and comparing it with the snapshot - content for every key, and payload bytes for
+# every key whose encoding Redis reproduces across a reload (`SBRE_COMPARE_CANON_ONLY` counts the ones
+# it does not, so the evidence says which comparison each key was held to).
 #
 # The returned instant is the host clock's. The database's own clock is deliberately not read here: the
 # fault is a Redis fact, and a function that needs a database connection in order to annotate it cannot
@@ -391,8 +467,10 @@ function Invoke-ScoreboardRollback {
         -ScriptArguments @($containerDirectory, $verifyContainerDirectory)
 
     $verifiedKeys = $null
+    $canonicalOnlyKeys = 0L
     foreach ($line in $compareOutput) {
         if ([string]$line -match '^SBRE_COMPARE_OK=(\d+)$') { $verifiedKeys = [long]$Matches[1] }
+        if ([string]$line -match '^SBRE_COMPARE_CANON_ONLY=(\d+)$') { $canonicalOnlyKeys = [long]$Matches[1] }
     }
     if ($null -eq $verifiedKeys -or $verifiedKeys -ne $restored) {
         throw "Post-rollback verification did not confirm $restored key(s): $($compareOutput -join ' | ')"
@@ -404,6 +482,7 @@ function Invoke-ScoreboardRollback {
         DeletedKeys = $deleted
         RestoredKeys = $restored
         VerifiedKeys = $verifiedKeys
+        CanonicalOnlyKeys = $canonicalOnlyKeys
         Checkpoint = $checkpoint
         ObservedAtUtc = [DateTimeOffset]::UtcNow.UtcDateTime.ToString("o")
     }

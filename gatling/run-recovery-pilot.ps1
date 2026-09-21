@@ -639,6 +639,9 @@ try {
             "There is no backlog to measure, so no recovery figure from this run would mean anything.")
     }
     Write-Output "  fault injected at $($faultAtUtc.UtcDateTime.ToString('o')): $($rollback.DeletedKeys) key(s) deleted, $($rollback.RestoredKeys) restored and verified, checkpoint $($rollback.Checkpoint)"
+    if ($rollback.CanonicalOnlyKeys -gt 0) {
+        Write-Output "    of those, $($rollback.CanonicalOnlyKeys) hash-table-encoded key(s) were verified by content, not payload bytes (Redis does not serialize that encoding reproducibly)"
+    }
     Write-Output "  lost set: $($lost.LostCount) result(s) the rollback erased"
 
     # --- 9. observe -------------------------------------------------------------------------------
@@ -947,10 +950,18 @@ try {
         $globalStatsPath = Join-Path $report.FullName "js\global_stats.json"
         if (Test-Path -LiteralPath $globalStatsPath) {
             $stats = Get-Content -LiteralPath $globalStatsPath -Raw | ConvertFrom-Json
-            $summary["gatlingTotalRequests"] = [int64]$stats.numberOfRequests.total
-            $summary["gatlingSuccessfulRequests"] = [int64]$stats.numberOfRequests.ok
+            $gatlingTotal = [int64]$stats.numberOfRequests.total
+            $gatlingOk = [int64]$stats.numberOfRequests.ok
+            $summary["gatlingTotalRequests"] = $gatlingTotal
+            $summary["gatlingSuccessfulRequests"] = $gatlingOk
             $summary["gatlingFailedRequests"] = [int64]$stats.numberOfRequests.ko
-            $summary["gatlingSuccessPercent"] = [math]::Round(100d * [int64]$stats.numberOfRequests.ok / [int64]$stats.numberOfRequests.total, 4)
+            # A generator that injected nothing has no success percentage, and 0/0 is a terminating error
+            # in PowerShell rather than a NaN. `unavailable` is this experiment's word for a value that
+            # cannot be collected; the counts above still say 0, which is the real fact about that run.
+            $summary["gatlingSuccessPercent"] = if ($gatlingTotal -gt 0) {
+                [math]::Round(100d * $gatlingOk / $gatlingTotal, 4)
+            }
+            else { "unavailable" }
             $summary["gatlingObservedP95Millis"] = [int64]$stats.percentiles3.total
             $summary["gatlingObservedMaxMillis"] = [int64]$stats.maxResponseTime.total
         }

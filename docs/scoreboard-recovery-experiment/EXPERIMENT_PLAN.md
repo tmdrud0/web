@@ -242,8 +242,8 @@ poll 간격 때문에 몇 건 달라질 수 있으므로 매 run 실측값을 �
 7. **K 캡처** — batch-1 pause → 키별 `TYPE`/`DUMP`/`PTTL` 캡처 + checkpoint + oracle digest +
    적용 결과 수 → digest 일치 확인 → unpause
 8. **tail → fault 주입** — 적용 결과 수가 K 대비 `-TailResults` 이상이 되는 순간 batch-1 pause →
-   `contest:scoreboard:*` 전체 `DEL` → 캡처 payload `RESTORE ... REPLACE` → **키 집합·payload 바이트
-   단위 검증** → `T_fault` 기록 → unpause
+   `contest:scoreboard:*` 전체 `DEL` → 캡처 payload `RESTORE ... REPLACE` → **키 집합·타입·인코딩·내용 일치
+   검증 + payload 바이트 일치 검증(재현 가능한 인코딩에 한해)** → `T_fault` 기록 → unpause
 9. **관측** — `-PollIntervalSeconds`마다 poll. digest 일치 + 유실 집합 전부 재적용 → `T_consistent`,
    pipeline quiescent → `T_backlog_drained`
 10. **종료·검증** — Gatling 종료 대기 → 잔여 부하 정지 → 최종 digest / seed 상태 / clock frame 재검증
@@ -257,6 +257,11 @@ poll 간격 때문에 몇 건 달라질 수 있으므로 매 run 실측값을 �
   교란하지 않는다.** 전체 인스턴스 RDB 교체는 컨테이너 kill로 수 초의 Redis 무응답을 만들고, 그것이
   "신규 유입 실패"에 섞인다.
 - `RESTORE`는 K 시점 키의 직렬화 바이트를 그대로 되돌리므로 "과거 RDB snapshot과 동등한 상태"다.
+  다만 **해시 테이블 인코딩(`hashtable`)된 set·hash에서는 바이트가 재현되지 않는다** — 내용은 정확히
+  보존되지만 `DUMP`가 버킷 순회 순서를 쓰기 때문이다. 이 인코딩의 키는 **내용(canonical) 일치**로
+  판정하고, 그 수를 `rollback.json`과 run stdout에 남긴다. 실측 근거와 경계는
+  [`README.md`](README.md) §5.4에 있다. 이 구분이 없던 첫 calibration run은 복원이 정확했는데도
+  검증 실패로 기록되었다.
 - **한계(문서화 대상)**: RDB 로드 경로 자체와 세션·dedup 상태의 rollback은 재현하지 않는다. **세 모드에
   동일하게 적용**되므로 모드 간 비교는 성립하지만, "RDB에서 로드했을 때의 복구 시간"으로 일반화할 수
   없다.

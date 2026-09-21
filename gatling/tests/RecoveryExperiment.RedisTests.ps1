@@ -38,6 +38,9 @@ $ErrorActionPreference = "Stop"
 $script:snapshot = $null
 $script:lost = $null
 $script:newlineValue = $null
+$script:rollback = $null
+$script:largeSetMembers = $null
+$script:largeSetKey = "contest:scoreboard:1:processed:large"
 
 $root = (Get-Item "$PSScriptRoot\..\..").FullName
 $workDirectory = Join-Path ([IO.Path]::GetTempPath()) ("sbrec-redistest-" + [Guid]::NewGuid().ToString("N"))
@@ -45,14 +48,14 @@ $containerName = "sbrec-redis-test"
 $containerStarted = $false
 
 # The namespace the seed below creates: 40 probe keys, the key the 0x0A search leaves behind, and one key
-# for each shape the injector has to carry - a ranking, a processed set, two summary hashes, the
-# checkpoint, a key with an expiry and a value large enough to leave the short-string encoding. Plus one
-# key from another namespace, which the injector must not touch.
+# for each shape the injector has to carry - a ranking, a processed set, a set past the hash-table
+# threshold, two summary hashes, the checkpoint, a key with an expiry and a value large enough to leave
+# the short-string encoding. Plus one key from another namespace, which the injector must not touch.
 #
 # `Get-RedisSetMembers` returns its array wrapped with `,` so that PowerShell does not unroll it, so
 # `@(Get-RedisSetMembers ...)` would produce a one-element array holding the set. Call it bare.
 $probeCount = 40
-$expectedScoreboardKeys = $probeCount + 8
+$expectedScoreboardKeys = $probeCount + 9
 $expectedDbsize = $expectedScoreboardKeys + 1
 
 function Get-PilotRedisImage {
@@ -120,6 +123,15 @@ while [ "$i" -le 50 ]; do
     redis-cli SADD "contest:scoreboard:1:processed" "$i" > /dev/null
     i=$((i + 1))
 done
+# A set past `set-max-intset-entries` (512), so it is hash-table-encoded and its payload is NOT
+# reproducible across a reload - the case further down measures that on this image. It is here because
+# the whole fixture was once below that threshold, and a snapshot whose every key serializes
+# reproducibly cannot tell a verification that compares content from one that compares bytes.
+i=1
+while [ "$i" -le 600 ]; do
+    redis-cli SADD "contest:scoreboard:1:processed:large" "90000000000000$i" > /dev/null
+    i=$((i + 1))
+done
 redis-cli HSET "contest:scoreboard:1:u:10" solved 3 penalty 145 > /dev/null
 redis-cli HSET "contest:scoreboard:1:p:1" accepted 1 wrong 2 > /dev/null
 redis-cli SET "contest:scoreboard:stream:offset" 100 > /dev/null
@@ -129,6 +141,10 @@ redis-cli SET "spring:session:s1" "untouched" > /dev/null
 echo SEEDED
 '@)
     Assert-True (@($seedOutput | Where-Object { [string]$_ -match 'SEEDED' }).Count -eq 1) "the throwaway namespace was seeded"
+    # Read once and kept: nothing in this test rewrites this key, so this is both its seeded state and
+    # the state the snapshot captured, and the rollback has to bring its content back to it.
+    $script:largeSetMembers = Get-RedisSetMembers -Key $script:largeSetKey
+    Assert-Equal 600 $script:largeSetMembers.Count "the set past the hash-table threshold was seeded"
 
     # A value whose DUMP payload ends in 0x0A. The payload depends on the value's trailing CRC64, so the
     # search is over values rather than over keys, and it keeps one key: 256 tries on average, and the
@@ -265,10 +281,16 @@ echo ADVANCED
 
     Test-Case "the rollback restores the captured bytes and removes what came after" {
         if ($null -eq $script:snapshot) { throw "the snapshot was not captured, so this case cannot run" }
-        $rollback = Invoke-ScoreboardRollback -SnapshotLabel "k"
+        $script:rollback = Invoke-ScoreboardRollback -SnapshotLabel "k"
+        $rollback = $script:rollback
         Assert-True ($rollback.DeletedKeys -ge 1) "the current namespace was deleted first ($($rollback.DeletedKeys) keys)"
         Assert-Equal $script:snapshot.KeyCount $rollback.RestoredKeys "every captured key was restored"
-        Assert-Equal $script:snapshot.KeyCount $rollback.VerifiedKeys "every restored key was verified byte for byte by the injector's own comparison"
+        Assert-Equal $script:snapshot.KeyCount $rollback.VerifiedKeys "every restored key was verified by the injector's own comparison"
+        # The hash-table-encoded key is necessarily verified by content instead of by payload, because
+        # this image does not reproduce its payload across a reload - the case below is that measurement.
+        # Asserted as a number rather than left implicit, so that "every key was verified" can never
+        # quietly come to mean "every key was verified by whichever comparison was convenient".
+        Assert-Equal 1 $rollback.CanonicalOnlyKeys "exactly the one hash-table-encoded key was verified by content"
     }
 
     Test-Case "the restored namespace is exactly the snapshot" {
@@ -281,6 +303,113 @@ echo ADVANCED
         $extra = @($actual | Where-Object { $expected -notcontains $_ })
         Assert-Equal 0 $missing.Count "no captured key is missing (missing: $($missing -join ', '))"
         Assert-Equal 0 $extra.Count "no key created after the snapshot survived (extra: $($extra -join ', '))"
+    }
+
+    # The property the injector's comparison is shaped around, measured rather than assumed: a
+    # hash-table-encoded set keeps its content across a save/reload and does not keep its bytes. `DUMP`
+    # walks the table's buckets, and the reload rebuilds the table by inserting members in the order
+    # they were serialized, which does not reproduce the original bucket layout.
+    #
+    # It is in the suite because the alternative is a run report that says the rollback verification
+    # failed, on a restore that was correct - which is what happened, on a snapshot of 1266 processed
+    # results, before this comparison existed. Pinned here so that a later reader who finds the
+    # content comparison surprising can see the measurement that requires it.
+    Test-Case "a hash-table-encoded set keeps its content across a reload but not its payload" {
+        $probeOutput = @(Invoke-ContainerScript -Container $containerName -Description "hash-table payload reproducibility probe" -ScriptText @'
+set -e
+seed() {
+    redis-cli DEL "$1" > /dev/null
+    i=1
+    while [ "$i" -le 600 ]; do
+        redis-cli SADD "$1" "90000000000000$i" > /dev/null
+        i=$((i + 1))
+    done
+}
+content() { redis-cli --raw SMEMBERS "$1" | LC_ALL=C sort | sha256sum | cut -d" " -f1; }
+payload_to() {
+    redis-cli --raw DUMP "$1" > /tmp/sbrec-probe.dump
+    size=$(wc -c < /tmp/sbrec-probe.dump)
+    head -c $((size - 1)) /tmp/sbrec-probe.dump > "$2"
+}
+seed "probe:canon"
+echo "SBRE_ENC=$(redis-cli --raw OBJECT ENCODING probe:canon)"
+echo "SBRE_BEFORE=$(content probe:canon)"
+payload_to "probe:canon" /tmp/sbrec-probe.before.bin
+redis-cli DEL "probe:canon" > /dev/null
+cat /tmp/sbrec-probe.before.bin | redis-cli -x RESTORE "probe:canon" 0 > /dev/null
+echo "SBRE_AFTER=$(content probe:canon)"
+payload_to "probe:canon" /tmp/sbrec-probe.after.bin
+if cmp -s /tmp/sbrec-probe.before.bin /tmp/sbrec-probe.after.bin; then
+    echo "SBRE_PAYLOAD=same"
+else
+    echo "SBRE_PAYLOAD=differs"
+fi
+redis-cli DEL "probe:canon" > /dev/null
+'@)
+        $encoding = $null
+        $before = $null
+        $after = $null
+        $payload = $null
+        foreach ($line in $probeOutput) {
+            if ([string]$line -match '^SBRE_ENC=(.+)$') { $encoding = $Matches[1] }
+            if ([string]$line -match '^SBRE_BEFORE=(.+)$') { $before = $Matches[1] }
+            if ([string]$line -match '^SBRE_AFTER=(.+)$') { $after = $Matches[1] }
+            if ([string]$line -match '^SBRE_PAYLOAD=(.+)$') { $payload = $Matches[1] }
+        }
+        Assert-Equal "hashtable" $encoding "a set of 600 members is past the intset threshold, so it is hash-table-encoded"
+        Assert-Equal $before $after "the reload preserved the set's content exactly"
+        Assert-Equal "differs" $payload "and did not preserve its bytes, which is why content is what the injector compares"
+        # The same probe with a set under the threshold is the control: without it, `differs` above would
+        # be consistent with every payload being unreproducible, and the payload comparison would look
+        # like a check worth deleting rather than one worth keeping wherever it holds.
+        $controlOutput = @(Invoke-ContainerScript -Container $containerName -Description "intset payload reproducibility control" -ScriptText @'
+set -e
+redis-cli DEL probe:canon > /dev/null
+i=1
+while [ "$i" -le 50 ]; do
+    redis-cli SADD probe:canon "$i" > /dev/null
+    i=$((i + 1))
+done
+echo "SBRE_ENC=$(redis-cli --raw OBJECT ENCODING probe:canon)"
+redis-cli --raw DUMP probe:canon > /tmp/sbrec-probe.dump
+size=$(wc -c < /tmp/sbrec-probe.dump)
+head -c $((size - 1)) /tmp/sbrec-probe.dump > /tmp/sbrec-probe.before.bin
+redis-cli DEL probe:canon > /dev/null
+cat /tmp/sbrec-probe.before.bin | redis-cli -x RESTORE probe:canon 0 > /dev/null
+redis-cli --raw DUMP probe:canon > /tmp/sbrec-probe.dump2
+size=$(wc -c < /tmp/sbrec-probe.dump2)
+head -c $((size - 1)) /tmp/sbrec-probe.dump2 > /tmp/sbrec-probe.after.bin
+if cmp -s /tmp/sbrec-probe.before.bin /tmp/sbrec-probe.after.bin; then
+    echo "SBRE_PAYLOAD=same"
+else
+    echo "SBRE_PAYLOAD=differs"
+fi
+redis-cli DEL probe:canon > /dev/null
+'@)
+        $controlEncoding = $null
+        $controlPayload = $null
+        foreach ($line in $controlOutput) {
+            if ([string]$line -match '^SBRE_ENC=(.+)$') { $controlEncoding = $Matches[1] }
+            if ([string]$line -match '^SBRE_PAYLOAD=(.+)$') { $controlPayload = $Matches[1] }
+        }
+        Assert-Equal "intset" $controlEncoding "a set of 50 integer members is intset-encoded"
+        Assert-Equal "same" $controlPayload "and that encoding does reproduce its payload, which is why the byte comparison stays"
+    }
+
+    Test-Case "the hash-table-encoded key is back at the snapshot's content" {
+        if ($null -eq $script:largeSetMembers) { throw "the large set was not read after seeding, so this case cannot run" }
+        $encoding = @(Invoke-RedisText -RedisArguments @("OBJECT", "ENCODING", $script:largeSetKey)) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Last 1
+        Assert-Equal "hashtable" ([string]$encoding) "the key verified by content is the hash-table-encoded one"
+        $after = Get-RedisSetMembers -Key $script:largeSetKey
+        Assert-Equal 600 $after.Count "the set is the snapshot's size again"
+        $missing = @($script:largeSetMembers | Where-Object { $after -notcontains $_ })
+        $extra = @($after | Where-Object { $script:largeSetMembers -notcontains $_ })
+        # Compared as sorted member lists rather than as digests computed in two languages: PowerShell
+        # sort order and LC_ALL=C are not the same order, and a mismatch between them would read as a
+        # restore failure.
+        Assert-Equal 0 $missing.Count "no member of the snapshot's set is missing (missing: $($missing -join ', '))"
+        Assert-Equal 0 $extra.Count "no member outside the snapshot's set survived (extra: $($extra -join ', '))"
     }
 
     Test-Case "a value changed after the snapshot is back to the byte the snapshot held" {
