@@ -70,7 +70,7 @@ batch-1 컨테이너의 환경변수 `CONTEST_SCOREBOARD_RECOVERY_MODE`로 주�
 |---|---|---|
 | MySQL 데이터 | 동일 | run마다 같은 seed에서 시작. 결정론적 판정기 + 결정론적 payload로 9회의 데이터가 같아진다 |
 | contest 규모 | `-UserCount`, `-ProblemCount` | suite 파라미터, 9회 동일 |
-| rollback 지점 | 판정 결과 개수 기준 `-BaselineResults`, `-TailResults` | wall-clock이 아니라 **적용된 결과 수**로 고정 |
+| rollback 지점 | tail은 판정 결과 개수 기준 `-TailResults`, baseline 창은 `-BaselineResults` 하한 + 고정 `-BaselineWindowSeconds` | tail은 **적용된 결과 수**로 정확히 고정한다. baseline은 결과 수 하한에 도달한 뒤 고정 길이 창을 재는 방식이라 **창의 길이는 고정되지만 K 시점의 결과 수는 유입 순서에 따라 달라진다** → K의 결과 수를 매 run 실측 기록하고, 회차 간 차이가 있으면 그대로 보고한다 |
 | Redis snapshot 상태 | K 캡처 시점 | batch-1 pause 중 캡처 → checkpoint와 스코어보드 내용이 자기정합 |
 | rollback으로 사라지는 결과 집합 | `lostCount` | 매 run 실측 기록. 회차 간 차이가 있으면 **그대로 보고**한다 |
 | 신규 결과 이벤트 순서 | 동일 | payload가 `(userName, submissionIndex)`의 순수 함수 |
@@ -94,7 +94,7 @@ batch-1 컨테이너의 환경변수 `CONTEST_SCOREBOARD_RECOVERY_MODE`로 주�
 | 이름 | 정의 | 측정 방법 |
 |---|---|---|
 | `T_fault` | rollback이 완료되어 스코어보드가 과거 상태가 된 시각 | 주입기가 RESTORE 검증을 통과한 직후. MySQL 시계로도 함께 기록 |
-| `T_detected` | batch-1이 offset 회귀를 **로그로 보고한** 시각 | batch-1 컨테이너 로그에서 `detected-rewinding` / `detected-nonrewinding` 최초 발생. `contest_scoreboard_stream_rollback_observed_total` 증분과 교차확인. 로그에 없으면 `unavailable` (0으로 적지 않는다) |
+| `T_detected` | batch-1이 offset 회귀를 **로그로 보고한** 시각 | batch-1 컨테이너 로그에서 제품의 `Redis scoreboard offset rolled back from A to B` 최초 발생(harness가 두 분기를 `detected-nonrewinding` / `detected-rewinding`으로 이름 붙인다). 교차확인 `contest_scoreboard_stream_rollback_observed_total` 증분은 **rewind하지 않는 두 모드에만 유효하다** — `stream-offset`은 rewind 분기로 가고 제품이 그 카운터를 rewind 분기에서 기록하지 않으므로 **0이 설계다(감지 실패 아님)**. 로그에 없으면 `unavailable` (0으로 적지 않는다) |
 | `T_consistent` | 스코어보드가 MySQL과 **처음 일치한** 시각 | 제품 API digest == oracle digest 가 처음 성립한 poll. **복구 메서드의 반환값이나 로그만으로 완료를 판정하지 않는다** |
 | `T_backlog_drained` | 파이프라인이 처음 조용해진 시각 | judge outbox 미발행 0 + `scoreboard_applied_at IS NULL` 0 + rabbit live/dead ready·unacked 0 + pending events 0 이 처음 동시에 성립한 poll |
 
@@ -170,6 +170,13 @@ digest 일치 시각, 누락 결과 수, 중복 적용, 잘못된 score·penalty
 `duplicate applications`는 별도 카운터가 없으므로 `sequenceDuplicatesTotal`(redis-seq 전용)과
 `processedCardinality` 대비 `oracleAppliedResults` 초과분으로 판단한다.
 
+**`lostReapplied` / `lostComplete`의 의미(오독 주의).** 이 값은 rollback으로 사라진 제출 id가 제품의
+`processed` set에 **다시 들어왔는지**를 센다. 제품은 `processed`를 결과가 순위를 움직이는지 판정하는
+guard **바깥에서** 쓰므로, 아직 `PENDING`인 전달도 제출을 processed로 표시하고 순위는 건드리지 않는다.
+따라서 `lostComplete = true`는 "사라진 제출이 전부 다시 전달되었다"는 뜻이지 "스코어보드가 맞다"는 뜻이
+아니다. 실행 harness의 `T_consistent` 판정 predicate는 `digestMatches` **와** `lostComplete`의 논리곱이라
+거짓 일치가 생기지 않지만, 이 카운터 하나만 인용해서는 복구 성공으로 읽으면 안 된다.
+
 ### 6.4 자원
 
 | 지표 | 수집원 |
@@ -206,9 +213,13 @@ digest 일치 시각, 누락 결과 수, 중복 적용, 잘못된 score·penalty
 
 ### 7.1 baseline 동일성
 
-9회의 K 시점 oracle digest가 모두 같아야 한다. 다르면 그 사실과 편차를 **그대로** 리포트에 적는다
-(숨기지 않는다). rollback 목표 깊이는 고정이지만 실제 `lostCount`는 poll 간격 때문에 몇 건 달라질 수
-있으므로, 매 run 실측값을 기록하고 편차를 보고한다.
+9회의 K 시점 oracle digest(`kOracleDigest`)가 모두 같아야 한다. 다르면 그 사실과 편차를 **그대로**
+리포트에 적는다(숨기지 않는다). 다만 §3.2의 고정 방식상 **K의 결과 수가 회차마다 몇 건 달라질 수 있다**:
+tail은 `-TailResults`로 정확히 고정되지만 K는 `-BaselineResults` 하한 뒤 **고정 길이 창**(`-BaselineWindowSeconds`)이
+끝나는 시점이라, 창 안에 도착한 판정 수가 유입 순서에 따라 달라진다. 그러므로 `kOracleDigest`가 갈리는 것은
+곧 버그가 아니라 **고정 변수의 한계**이며, 어느 쪽이든 `kOracleDigest`·`kAppliedResults`·`kProcessedCount`를
+매 run 기록해 편차의 크기를 숫자로 남긴다. rollback 목표 깊이는 `-TailResults`로 고정이고, 실제 `lostCount`는
+poll 간격 때문에 몇 건 달라질 수 있으므로 매 run 실측값을 기록하고 편차를 보고한다.
 
 ---
 
