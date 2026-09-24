@@ -49,6 +49,9 @@ param(
     # then `oj_test`. Passed down explicitly once resolved, so every run of the suite measures one
     # schema - and each run checks it against the one the batch role actually connected to.
     [string]$DbName = "",
+    # Resolved and passed down the same way, so the whole suite - and the curated summary that quotes it -
+    # reports the endpoint the application was actually pointed at. See the runner for why it is checked.
+    [string]$DbPort = "",
     [switch]$Build,
     # Stop after the first run that could not be measured at all, so a broken prerequisite is diagnosed
     # once instead of nine times. Runs that were measured but came out incomplete do not stop the suite:
@@ -72,6 +75,10 @@ if ([string]::IsNullOrWhiteSpace($DbName)) {
     $DbName = if (-not [string]::IsNullOrWhiteSpace($env:RECOVERY_PILOT_DB_NAME)) { $env:RECOVERY_PILOT_DB_NAME }
     elseif (-not [string]::IsNullOrWhiteSpace($env:DB_NAME)) { $env:DB_NAME }
     else { "oj_test" }
+}
+
+if ([string]::IsNullOrWhiteSpace($DbPort)) {
+    $DbPort = if (-not [string]::IsNullOrWhiteSpace($env:DB_PORT)) { $env:DB_PORT } else { "3306" }
 }
 
 function Get-SuiteRunId {
@@ -111,7 +118,8 @@ function Clear-SuiteLeftovers {
     foreach ($entry in $Schedule) {
         [void](Initialize-RecoveryExperiment -WorktreeRoot $repoRoot `
                 -ArtifactDirectory (Join-Path $EvidenceDirectory $entry.RunId) `
-                -RunId $entry.RunId -Mode $entry.Mode -DbPassword $env:DB_PASSWORD -DbName $DbName)
+                -RunId $entry.RunId -Mode $entry.Mode -DbPassword $env:DB_PASSWORD -DbName $DbName `
+                -DbPort $DbPort)
         $record = Remove-ExperimentLeftovers -EvidenceDirectory (Join-Path $EvidenceDirectory $entry.RunId)
         if ($record.cleaned) {
             $cleared.Add([pscustomobject][ordered]@{
@@ -235,7 +243,8 @@ foreach ($entry in $schedule) {
         "-GatlingTimeoutSeconds", $GatlingTimeoutSeconds,
         "-IngressSloP95Millis", $IngressSloP95Millis,
         "-ArtifactRoot", $ArtifactRoot,
-        "-DbName", $DbName
+        "-DbName", $DbName,
+        "-DbPort", $DbPort
     )
     if ($Build) { $runArgumentList += "-Build" }
     foreach ($argument in $runArgumentList) {
@@ -338,6 +347,7 @@ $conditions = [pscustomobject][ordered]@{
     gatlingTimeoutSeconds = $GatlingTimeoutSeconds
     ingressSloP95Millis = $IngressSloP95Millis
     dbName = $DbName
+    dbPort = $DbPort
     gitHead = (& git -C $repoRoot rev-parse HEAD 2>$null | Select-Object -First 1)
     gitStatusPorcelain = @(& git -C $repoRoot status --porcelain 2>$null)
     runs = $results.ToArray()

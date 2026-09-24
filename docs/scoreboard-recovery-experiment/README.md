@@ -22,7 +22,8 @@ stream **전송 방식** 비교용이고 rollback 전에 부하를 멈춘다. �
 | Docker | 실행 중, `oj-loadtest-*` 이미지 5개 빌드됨 | `docker images oj-loadtest-web-1` |
 | JDK | Gatling을 띄울 `java.exe` (기본 `C:\Program Files\Java\jdk-17\bin\java.exe`) | `& $javaExe -version` |
 | Gatling 클래스 | `gatling\build\classes` 컴파일 완료 | `gatling\classpath.txt` 존재 + `DeterministicPayload.class` 등 |
-| MySQL | **기존 인스턴스**(`oj-test-mysql`, 3306)가 이미 실행 중이고 `oj_test` schema에 Flyway 18개 적용됨 | 접속 후 `select count(*) from flyway_schema_history` = 18 |
+| MySQL | **기존 인스턴스**(`oj-test-mysql`)가 이미 실행 중이고 `oj_test` schema에 Flyway 18개 적용됨 | 접속 후 `select count(*) from flyway_schema_history` = 18 |
+| DB 포트 | `DB_PORT` 환경변수. **스택과 harness가 같은 값에서 해석한다** — overlay가 `${DB_PORT:-3306}`을 앱 tier에 넣고, harness는 실행에 쓴 포트를 metadata에 기록하며 batch 컨테이너의 값과 다르면 거부한다 | 미설정이면 3306. 이 호스트는 `MySQL80`이 3306을 쥐고 있어 3307이다 |
 | Redis / RabbitMQ | 실험이 **전용 컨테이너**(`oj-loadtest-redis`, `oj-loadtest-rabbitmq`)를 직접 띄운다 | 별도 준비 불필요 |
 | 비밀번호 | `DB_PASSWORD` 환경변수. **파일에서 읽지 않는다** | `$env:DB_PASSWORD` |
 
@@ -32,12 +33,17 @@ stream **전송 방식** 비교용이고 rollback 전에 부하를 멈춘다. �
 ### 1.1 먼저 확인할 것
 
 ```powershell
-docker ps --format '{{.Names}}\t{{.Ports}}'          # oj-test-mysql 이 3306 으로 보여야 한다
+docker ps --format '{{.Names}}\t{{.Ports}}'          # oj-test-mysql 이 3307 로 보여야 한다 (loopback)
 docker images --format '{{.Repository}}' | Select-String oj-loadtest
 $env:DB_PASSWORD = '<password>'
+$env:DB_PORT = '3307'                                 # 미설정이면 overlay와 harness 모두 3306으로 본다
 ```
 
 세 가지 중 하나라도 없으면 **수치를 만들지 않는다.** §7을 본다.
+
+`DB_PORT`를 빼고 돌리면 스택은 3306의 다른 서버에 붙고 harness는 3307을 읽는다 — 하필 이 호스트가
+그렇게 생겼다. 그래서 run은 batch 컨테이너가 실제로 들고 있는 `DB_PORT`를 읽어 자기 값과 대조하고,
+다르면 **측정 전에 멈춘다.**
 
 ### 1.2 harness 자체 점검 (측정 전에 돌릴 것)
 
@@ -263,6 +269,7 @@ suite 자체도 같은 규약으로 종료한다: 수치를 못 낸 run이 있�
 | `-StopOnFirstFailure` | 첫 측정 실패에서 중단. 깨진 사전 조건을 9번 진단하지 않기 위해 |
 | `-ArtifactRoot` | 산출물 루트 (기본 `var\scoreboard-recovery`) |
 | `-DbName` | 비우면 `RECOVERY_PILOT_DB_NAME` → `DB_NAME` → `oj_test` 순으로 해석 |
+| `-DbPort` | 비우면 `DB_PORT` → `3306`(overlay의 기본값) 순으로 해석. 앱 tier가 실제로 그 포트를 들고 있는지 run이 검사한다 |
 
 `-DbName`을 비워 두면 harness가 읽는 schema와 스택이 접속하는 schema가 **같은 곳에서 해석된다.**
 그래도 run은 batch 역할이 실제 접속한 DB 이름과 대조해 다르면 실패한다 — 한쪽만 다른 schema를 보면

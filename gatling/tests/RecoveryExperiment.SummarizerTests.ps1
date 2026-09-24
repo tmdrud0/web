@@ -122,6 +122,7 @@ function New-SummarizerSuite {
         gatlingTimeoutSeconds  = 900
         ingressSloP95Millis    = 60000
         dbName                 = "oj_test"
+        dbPort                 = "3306"
         gitHead                = $GitHead
         runs                   = $Runs
     }

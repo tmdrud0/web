@@ -363,6 +363,7 @@ if (-not [string]::IsNullOrWhiteSpace($OutputDirectory)) {
             tailResults = $suite.tailResults
             contestDurationMinutes = $suite.contestDurationMinutes
             dbName = $suite.dbName
+            dbPort = $suite.dbPort
         }
         gitHead = $suite.gitHead
         runs = @($runs | ForEach-Object {

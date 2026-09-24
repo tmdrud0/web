@@ -637,6 +637,7 @@ function Get-BatchRuntimeConfig {
         AcceptPermille = if ($environment.Contains("JUDGE_ACCEPT_PERMILLE")) { $environment["JUDGE_ACCEPT_PERMILLE"] } else { $null }
         DbHost = if ($environment.Contains("DB_HOST")) { $environment["DB_HOST"] } else { $null }
         DbName = if ($environment.Contains("DB_NAME")) { $environment["DB_NAME"] } else { $null }
+        DbPort = if ($environment.Contains("DB_PORT")) { $environment["DB_PORT"] } else { $null }
         ConsumerEnabled = if ($environment.Contains("CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED")) { $environment["CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED"] } else { $null }
     }
 }

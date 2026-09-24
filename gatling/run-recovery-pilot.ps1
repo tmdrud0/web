@@ -76,6 +76,10 @@ param(
     # from the same place. The overlay names it `RECOVERY_PILOT_DB_NAME`, and a run whose harness read
     # one schema while the application wrote another would report a scoreboard that never moved.
     [string]$DbName = "",
+    # Resolved the same way, because the same variable sets it on both sides - the overlay interpolates
+    # `${DB_PORT:-3306}` into the application's environment. Left empty so that unset means unset on both
+    # sides and a run that moved the port has to say so in one place rather than two that can disagree.
+    [string]$DbPort = "",
     # Rebuild the five application images first. Off by default because it costs minutes and nothing in
     # this experiment changes the application between runs.
     [switch]$Build,
@@ -259,8 +263,15 @@ elseif (-not [string]::IsNullOrWhiteSpace($env:RECOVERY_PILOT_DB_NAME)) { $env:R
 elseif (-not [string]::IsNullOrWhiteSpace($env:DB_NAME)) { $env:DB_NAME }
 else { "oj_test" }
 
+# `3306` is the overlay's own default, not a choice of this harness: when DB_PORT is unset the container
+# gets 3306, so resolving it to anything else here would make an unset port fail its own comparison.
+$resolvedDbPort = if (-not [string]::IsNullOrWhiteSpace($DbPort)) { $DbPort }
+elseif (-not [string]::IsNullOrWhiteSpace($env:DB_PORT)) { $env:DB_PORT }
+else { "3306" }
+
 [void](Initialize-RecoveryExperiment -WorktreeRoot $repoRoot -ArtifactDirectory $artifacts `
-        -RunId $runId -Mode $Mode -DbPassword $env:DB_PASSWORD -DbName $resolvedDbName)
+        -RunId $runId -Mode $Mode -DbPassword $env:DB_PASSWORD -DbName $resolvedDbName `
+        -DbPort $resolvedDbPort)
 $config = Get-RecoveryConfig
 
 $concurrentUsers = [long][math]::Ceiling($TargetRps * $SubmitIntervalMillis / 1000.0)
@@ -284,6 +295,7 @@ $runRecord = [ordered]@{
     worktreeRoot = $repoRoot
     artifactDirectory = $artifacts
     dbName = $config.DbName
+    dbPort = $config.DbPort
     targetRps = $TargetRps
     submitIntervalMillis = $SubmitIntervalMillis
     concurrentUsers = $concurrentUsers
@@ -449,7 +461,15 @@ try {
             "'$($config.DbName)'. Point both at the same schema - the overlay takes " +
             "RECOVERY_PILOT_DB_NAME or the harness takes -DbName - before measuring anything.")
     }
-    Write-Output "  stack healthy; batch-1 environment: mode=$($runtime.Mode) deterministic=$($runtime.DeterministicJudging) acceptPermille=$($runtime.AcceptPermille) db=$($runtime.DbHost)/$($runtime.DbName)"
+    if ([string]$runtime.DbPort -ne $config.DbPort) {
+        # The same check one level up. A schema name can only be wrong if it names a database that
+        # exists; a port can be wrong by pointing at an entirely different server, which is the failure
+        # this host is set up to produce - the overlay defaults to 3306 and a host service holds it.
+        throw ("The batch role dials port '$($runtime.DbPort)' but this run expects '$($config.DbPort)'. " +
+            "Unset or matching DB_PORT points both at the same server; a mismatch means the application " +
+            "was writing to a database this harness never reads.")
+    }
+    Write-Output "  stack healthy; batch-1 environment: mode=$($runtime.Mode) deterministic=$($runtime.DeterministicJudging) acceptPermille=$($runtime.AcceptPermille) db=$($runtime.DbHost):$($runtime.DbPort)/$($runtime.DbName)"
 
     # The app tier this run measures is new; the edge in front of it may not be. Recreated here, after
     # the tier is up, so that it resolves web-1 and web-2 to this run's containers rather than to the

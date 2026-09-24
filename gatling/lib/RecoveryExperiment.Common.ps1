@@ -83,6 +83,13 @@ function Initialize-RecoveryExperiment {
         [string]$ProjectName = "oj-loadtest",
         [string]$DbContainer = "oj-test-mysql",
         [string]$DbName = "oj_test",
+        # The host port the application tier dials. The harness's own SQL client never uses it - it runs
+        # `docker exec` inside the database container, with no TCP hop - so this value exists only to be
+        # compared against the port the batch role actually carries. It is worth comparing because the
+        # overlay defaults to 3306: on a host where some other server holds 3306, an unset DB_PORT sends
+        # the application to one database while the harness reads another, and the sole symptom is a
+        # scoreboard that never moves.
+        [string]$DbPort = "3306",
         [string]$DbUser = "root",
         [long]$ContestId = 1,
         [long]$ProblemIdStart = 1,
@@ -128,6 +135,7 @@ function Initialize-RecoveryExperiment {
         )
         DbContainer = $DbContainer
         DbName = $DbName
+        DbPort = $DbPort
         DbUser = $DbUser
         DbPassword = $DbPassword
         ContestId = $ContestId
