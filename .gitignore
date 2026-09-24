@@ -55,6 +55,12 @@ Redis-x64-3.0.504/
 results/
 results-standalone/
 var/
+# The recovery experiment's curated output is the exception to the two rules above: it is a small
+# summary meant to be read and cited, not a raw artifact. `results/` matches a directory of that name
+# at any depth, so the directory has to be re-included before its contents can be.
+# See docs/scoreboard-recovery-experiment/README.md §6.2.
+!docs/scoreboard-recovery-experiment/results/
+!docs/scoreboard-recovery-experiment/results/**
 
 ### Generated performance data ###
 /batch_updates.sql
