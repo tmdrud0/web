@@ -31,7 +31,7 @@ Windows PowerShell 5.1 기준이다. 기존 recovery pilot의 lib(`RecoveryExper
 .\gradlew.bat :gatling:classes :gatling:compileGatlingScala :gatling:prepareStandaloneGatling
 # 3) 요약기·계측 단위 테스트 (DB 불필요)
 .\gradlew.bat :gatling:test
-.\gradlew.bat test --tests "*ExperimentTrace*" --tests "*ProcessorTraceTests" --tests "*RecoveryTraceTests"
+.\gradlew.bat :test --tests "*ExperimentTrace*" --tests "*ProcessorTraceTests" --tests "*RecoveryTraceTests"
 # 4) 구문 검사만 된 스크립트다. PS 5.1에서 한 번 파싱해 본다
 powershell -NoProfile -Command "foreach(`$f in 'gatling\run-recovery-live-impact.ps1','gatling\lib\RecoveryExperiment.LiveImpact.ps1','gatling\lib\RecoveryExperiment.TailPoller.ps1','gatling\lib\RecoveryExperiment.Injector.ps1'){ `$e=`$null; [void][Management.Automation.Language.Parser]::ParseFile((Resolve-Path `$f),[ref]`$null,[ref]`$e); `"`$f `$(`$e.Count) error(s)`" }"
 ```
