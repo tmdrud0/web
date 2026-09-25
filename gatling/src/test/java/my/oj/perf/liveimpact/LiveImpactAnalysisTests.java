@@ -121,6 +121,40 @@ class LiveImpactAnalysisTests {
         assertEquals("4", result.metrics().get("newApplyStallLongestSeconds"));
     }
 
+    /**
+     * The fault pause holds batch-1 for 1.5 s, so a healthy mode starts the recovery with fifteen results of
+     * backlog and drains it. That backlog is the injector's, not growth, and the run is not a C.
+     */
+    @Test
+    void theBacklogTheFaultPauseBuiltIsNotReadAsGrowth() {
+        long pausedFrom = FAULT - 1_500L;
+        load((k, judgedAt) -> judgedAt >= pausedFrom && judgedAt < FAULT ? FAULT + 50L : judgedAt + 100L);
+        tailReturnsAt(FAULT + 1_000L);
+
+        Result result = analyze();
+
+        assertEquals("A", result.verdict(), result.metrics().get("verdictReasons"));
+        assertEquals("15", result.metrics().get("backlogAtFault"));
+        assertEquals("0", result.metrics().get("newApplyStallLongestSeconds"));
+    }
+
+    /** Another contest's applies are in the trace too; counted as new, they would hide this contest's stop. */
+    @Test
+    void liveRowsOfAnotherContestAreNotCounted() {
+        long resume = FAULT + 5_000L;
+        load((k, judgedAt) -> judgedAt >= FAULT && judgedAt < resume ? resume + 10L : judgedAt + 100L);
+        for (long t = FAULT; t < resume; t += 50L) {
+            live.add(new LiveApply(t + 5L, 10_000L + t, 99_000_000L + t, t));
+        }
+        tailReturnsAt(resume);
+
+        Result result = analyze();
+
+        assertEquals("5", result.metrics().get("newApplyStallLongestSeconds"));
+        assertEquals("100", result.metrics().get("liveRowsOutsideContest"));
+        assertEquals("C", result.verdict());
+    }
+
     /** Seeded rows reach the scoreboard through the rebuild, not the stream, and are not backlog. */
     @Test
     void seededResultsAreOutsideTheBacklog() {

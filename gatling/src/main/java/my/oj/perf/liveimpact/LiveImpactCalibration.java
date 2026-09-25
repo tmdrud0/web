@@ -74,9 +74,15 @@ final class LiveImpactCalibration {
                 judged[(int) index]++;
             }
         }
+        java.util.Set<Long> contestSubmissions = new java.util.HashSet<>();
+        for (Judged row : judgedRows) {
+            contestSubmissions.add(row.submissionId());
+        }
         Map<Long, Long> first = new HashMap<>();
         for (LiveApply row : liveRows) {
-            first.merge(row.submissionId(), row.appliedAtMs(), Math::min);
+            if (contestSubmissions.isEmpty() || contestSubmissions.contains(row.submissionId())) {
+                first.merge(row.submissionId(), row.appliedAtMs(), Math::min);
+            }
         }
         long appliedBefore = 0L;
         for (long at : first.values()) {

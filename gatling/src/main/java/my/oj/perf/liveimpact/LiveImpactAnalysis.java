@@ -123,9 +123,20 @@ final class LiveImpactAnalysis {
         long h = run.preRollbackOffset();
 
         // --- the live side: first application per submission, and the re-consumed rows -------------
+        // Only the experiment contest's submissions: the trace records every contest the consumer
+        // applies, and another contest's rows counted as new applies could hide this contest's stop.
+        java.util.Set<Long> contestSubmissions = new java.util.HashSet<>();
+        for (Judged row : judgedRows) {
+            contestSubmissions.add(row.submissionId());
+        }
         Map<Long, LiveApply> first = new HashMap<>();
         List<LiveApply> reconsumed = new ArrayList<>();
+        long outsideContest = 0L;
         for (LiveApply row : liveRows) {
+            if (!contestSubmissions.isEmpty() && !contestSubmissions.contains(row.submissionId())) {
+                outsideContest++;
+                continue;
+            }
             LiveApply known = first.get(row.submissionId());
             if (known == null || row.appliedAtMs() < known.appliedAtMs()) {
                 if (known != null) {
@@ -225,6 +236,12 @@ final class LiveImpactAnalysis {
         double beforeSeconds = Math.max(1, Math.min(snapshotIndex, size));
         double judgedPerSecondBefore = sum(judged, 0, Math.min(snapshotIndex, size)) / beforeSeconds;
         double backlogTolerance = Math.max(1.0, judgedPerSecondBefore * thresholds.backlogToleranceSeconds());
+
+        // The rollback itself holds batch-1 for the fault pause, so every mode starts the recovery with the
+        // backlog that pause built. Growth is measured from there - or from the baseline, if that is higher
+        // - so a mode that only drains the injector's backlog is not reported as growing one.
+        long backlogAtFault = faultIndex - 1 >= 0 && faultIndex - 1 < size ? backlog[faultIndex - 1] : baselineBacklog;
+        long growthReference = Math.max(baselineBacklog, backlogAtFault);
 
         long peakBacklog = Long.MIN_VALUE;
         int peakIndex = -1;
@@ -354,7 +371,9 @@ final class LiveImpactAnalysis {
             entry.getValue().writeTo(entry.getKey(), metrics);
         }
 
-        verdict(thresholds, phases, longestStall, peakIndex < 0 ? null : peakBacklog, baselineBacklog,
+        metrics.put("liveRowsOutsideContest", Long.toString(outsideContest));
+        metrics.put("backlogAtFault", Long.toString(backlogAtFault));
+        verdict(thresholds, phases, longestStall, peakIndex < 0 ? null : peakBacklog, growthReference,
                 backlogTolerance, metrics);
         return new Result(metrics, seconds);
     }
@@ -369,7 +388,7 @@ final class LiveImpactAnalysis {
                                 Map<String, PhaseFigures> phases,
                                 int longestStall,
                                 Long peakBacklog,
-                                long baselineBacklog,
+                                long growthReference,
                                 double backlogTolerance,
                                 Map<String, String> metrics) {
         PhaseFigures before = phases.get("before");
@@ -383,8 +402,8 @@ final class LiveImpactAnalysis {
         if (ratio != null && ratio < 1.0 - thresholds.throughputTolerance()) {
             reasons.add("new applies were " + format(ratio) + " of judged results during recovery");
         }
-        if (peakBacklog != null && peakBacklog - baselineBacklog > backlogTolerance) {
-            reasons.add("backlog grew to " + peakBacklog + " against a baseline of " + baselineBacklog);
+        if (peakBacklog != null && peakBacklog - growthReference > backlogTolerance) {
+            reasons.add("backlog grew to " + peakBacklog + " from " + growthReference + " at the fault");
         }
         String verdict;
         if (!reasons.isEmpty()) {
