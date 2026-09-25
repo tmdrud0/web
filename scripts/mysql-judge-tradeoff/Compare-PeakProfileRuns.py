@@ -61,6 +61,10 @@ def row(s):
         "backlogFluidKeffContinuous": g(pr, "fluidAtKEffective", "continuousBacklogSeconds"),
         "backlogScaledKeff": g(pr, "scaledAtKEffective", "backlogSeconds"),
         "backlogNominalModel": g(pr, "nominal", "backlogSeconds"),
+        "backlogReplayKeff": g(pr, "replayAtKEffective", "backlogSeconds"),
+        "over10ReplayKeff": g(pr, "replayAtKEffective", "over10s"),
+        "peakP99ReplayKeff": g(pr, "replayAtKEffective", "peakP99Latency"),
+        "maxWaitReplayKeff": g(pr, "replayAtKEffective", "maxWait"),
         "over10": s["over10s"], "over10ScaledKeff": g(pr, "scaledAtKEffective", "over10s"),
         "over30": s["over30s"], "maxWait": s["maxWaitSeconds"],
         "peakP50": s["peakP50LresultSeconds"], "peakP99": s["peakP99LresultSeconds"],
@@ -107,7 +111,7 @@ def summarize_groups(rows):
                 return None
             return {"median": float(np.median(v)), "min": float(min(v)), "max": float(max(v)), "n": len(v)}
         out.append({"mode": mode, "workers": workers, "kNominal": rs[0]["kNominal"], "n": len(rs),
-                    **{k: stat(k) for k in ("backlog", "backlogFluidKeff", "backlogScaledKeff", "over10", "over30",
+                    **{k: stat(k) for k in ("backlog", "backlogFluidKeff", "backlogScaledKeff", "backlogReplayKeff", "over10", "over30",
                                             "maxWait", "peakP50", "peakP99", "kEff", "efficiency", "cpuStackLoad",
                                             "cpuStackLoadDrain", "cpuMysql", "cpuBroker", "rowLockWaitsPerS")}})
     return out
@@ -115,16 +119,16 @@ def summarize_groups(rows):
 
 def write_md(path, rows, groups):
     L = ["# Peak profile comparison", "", "## Runs", "",
-         "| run | mode | workers | k nom | valid | backlog s (meas / fluid@keff / scaled@keff / nominal model) | >10s | >30s | max wait s | peak p50/p99 s | k_eff | eff | CPU stack core-s (load / +drain) | MySQL | broker | row-lock waits/s |",
+         "| run | mode | workers | k nom | valid | backlog s (meas / replay@keff / scaled@keff / fluid@keff / nominal model) | >10s | >30s | max wait s | peak p50/p99 s | k_eff | eff | CPU stack core-s (load / +drain) | MySQL | broker | row-lock waits/s |",
          "|---|---|---|---:|---|---|---:|---:|---:|---|---:|---:|---|---:|---:|---:|"]
     for r in rows:
         L.append(f"| {r['run']} | {r['mode']} | {r['workers']} | {fmt(r['kNominal'],2)} | {fmt(r['valid'])} | "
-                 f"{fmt(r['backlog'],0)} / {fmt(r['backlogFluidKeff'],0)} / {fmt(r['backlogScaledKeff'],0)} / {fmt(r['backlogNominalModel'],0)} | "
+                 f"{fmt(r['backlog'],0)} / {fmt(r['backlogReplayKeff'],0)} / {fmt(r['backlogScaledKeff'],0)} / {fmt(r['backlogFluidKeff'],0)} / {fmt(r['backlogNominalModel'],0)} | "
                  f"{r['over10']} | {r['over30']} | {fmt(r['maxWait'],1)} | {fmt(r['peakP50'],2)}/{fmt(r['peakP99'],2)} | "
                  f"{fmt(r['kEff'],2)} | {fmt(r['efficiency'],3)} | {fmt(r['cpuStackLoad'],0)} / {fmt(r['cpuStackLoadDrain'],0)} | "
                  f"{fmt(r['cpuMysql'],0)} | {fmt(r['cpuBroker'],0)} | {fmt(r['rowLockWaitsPerS'],2)} |")
     L += ["", "## Groups (valid, no fault; median [min-max])", "",
-          "| mode | workers | k nom | n | backlog s | scaled@keff | >10s | peak p99 s | k_eff | eff |", "|---|---|---:|---:|---|---|---|---|---|---|"]
+          "| mode | workers | k nom | n | backlog s | replay@keff | scaled@keff | >10s | peak p99 s | k_eff | eff |", "|---|---|---:|---:|---|---|---|---|---|---|---|"]
 
     def st(x, nd=1):
         if not x:
@@ -132,7 +136,7 @@ def write_md(path, rows, groups):
         return f"{x['median']:.{nd}f} [{x['min']:.{nd}f}-{x['max']:.{nd}f}]"
     for gph in groups:
         L.append(f"| {gph['mode']} | {gph['workers']} | {gph['kNominal']:.2f} | {gph['n']} | {st(gph['backlog'],0)} | "
-                 f"{st(gph['backlogScaledKeff'],0)} | {st(gph['over10'],0)} | {st(gph['peakP99'],2)} | {st(gph['kEff'],2)} | {st(gph['efficiency'],3)} |")
+                 f"{st(gph['backlogReplayKeff'],0)} | {st(gph['backlogScaledKeff'],0)} | {st(gph['over10'],0)} | {st(gph['peakP99'],2)} | {st(gph['kEff'],2)} | {st(gph['efficiency'],3)} |")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(L) + "\n")
 
@@ -150,20 +154,26 @@ def draw(svg_path, rows, base_rps, seeds):
 
     plt.rcParams.update({"font.size": 10, "font.family": "sans-serif", "axes.edgecolor": "#b5b4ad",
                          "axes.labelcolor": "#0b0b0b", "xtick.color": "#52514e", "ytick.color": "#52514e"})
-    fig, ax = plt.subplots(figsize=(8.2, 4.8), dpi=100)
+    fig, ax = plt.subplots(figsize=(8.6, 5.2), dpi=100)
     fig.patch.set_facecolor("#fcfcfb")
     ax.set_facecolor("#fcfcfb")
     ax.grid(True, color="#e6e5df", linewidth=0.8)
     ax.set_axisbelow(True)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
-    ax.plot(ks, fl, color=THEORY, linewidth=2, label="model: fluid (any k)")
+    # The discrete FIFO queue at any real k: 6 servers with judge times scaled to reach k (Poisson
+    # arrivals and the 5%-slow mix kept), median of the seeds. This is the curve a measured point at its
+    # effective k is compared with; the fluid line has no randomness and under-states it near k ~ 5.
+    sk = np.round(np.arange(3.5, 11.01, 0.25), 3)
+    sc = [model.scaled(float(k), shape, seed_list, 6)["backlogSeconds"] for k in sk]
+    ax.plot(sk, sc, color=THEORY, linewidth=2, label=f"model: discrete FIFO at any k (6 servers, scaled judge time), median of {seeds} seeds")
+    ax.plot(ks, fl, color=THEORY, linewidth=1.2, linestyle=(0, (4, 3)), label="model: fluid (no randomness)")
     dk = [d["k"] for d in disc]
     ax.errorbar(dk, [d["backlogSeconds"] for d in disc],
                 yerr=[[d["backlogSeconds"] - d["backlogSecondsMin"] for d in disc],
                       [d["backlogSecondsMax"] - d["backlogSeconds"] for d in disc]],
                 fmt="s", color=THEORY, markerfacecolor="#fcfcfb", markersize=8, capsize=3, linewidth=1.2,
-                label=f"model: discrete FIFO, median and range of {seeds} seeds")
+                label=f"model: discrete FIFO at integer workers, median and range")
     for mode, label in (("rabbit", "RabbitMQ"), ("mysql", "MySQL claim")):
         rs = [r for r in rows if r["mode"] == mode and r["valid"] and not r["fault"]]
         if not rs:
@@ -181,9 +191,9 @@ def draw(svg_path, rows, base_rps, seeds):
     ax.set_title(f"Backlog duration vs capacity, peak profile at B={base_rps:g}", loc="left", color="#0b0b0b", fontsize=11)
     ax.set_xlim(3, 12)
     ax.set_ylim(bottom=0)
-    ax.legend(frameon=False, fontsize=8.5, loc="upper right")
+    ax.legend(frameon=False, fontsize=8, loc="upper right")
     fig.tight_layout()
-    fig.savefig(svg_path, format="svg", facecolor=fig.get_facecolor())
+    fig.savefig(svg_path, format=os.path.splitext(svg_path)[1].lstrip(".") or "svg", facecolor=fig.get_facecolor())
     plt.close(fig)
 
 

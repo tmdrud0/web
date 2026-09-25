@@ -311,6 +311,18 @@ def analyze(run_dir, seeds=15):
     if eff.get("sufficient"):
         predictions["fluidAtKEffective"] = strip(model.fluid(eff["kEffective"], shape))
         predictions["scaledAtKEffective"] = strip(model.scaled(eff["kEffective"], shape, seed_list, total_workers))
+        # Replay: this run's own arrival instants and its own slow/fast sequence, served FIFO by the run's
+        # workers with every judge time scaled so the mean service equals total workers / measured rate.
+        # If the measured backlog equals this, the run is fully described by one number - its service rate.
+        order = [s_ for s_ in subs]
+        arr = np.array([s_["t"] for s_ in order])
+        nominal_ms = np.array([model.SLOW_MS if s_["slow"] else model.FAST_MS for s_ in order]) / 1000.0
+        scale = (total_workers / eff["serviceRatePerSecond"]) / float(nominal_ms.mean())
+        svc = nominal_ms * scale
+        st = model.simulate_fifo(arr, svc, total_workers)
+        rep = strip(model.summarize(arr, st, st + svc, shape))
+        rep.update({"model": "replay", "serviceScale": round(scale, 4), "servers": total_workers})
+        predictions["replayAtKEffective"] = rep
 
     # ---- validity ----------------------------------------------------------------------------------
     invalid = []
@@ -546,16 +558,17 @@ def write_report(run_dir, s):
              f"- dispatch: **{s['dispatchMode']}**, workers {s['nodeWorkers']} (total {s['totalWorkers']}), B={s['baseRps']}, nominal k={s['kNominal']}",
              f"- valid: **{s['valid']}** {'' if s['valid'] else '- ' + '; '.join(s['invalidReasons'])}",
              f"- statuses: {s['statusCounts']}; counts: {s['counts']}",
-             "", "| metric | measured | nominal model | fluid @k_eff | scaled @k_eff |", "|---|---:|---:|---:|---:|"]
+             "", "| metric | measured | nominal model | fluid @k_eff | scaled @k_eff | replay @k_eff |", "|---|---:|---:|---:|---:|---:|"]
     fl = pr.get("fluidAtKEffective") or {}
+    rp = pr.get("replayAtKEffective") or {}
     sc = pr.get("scaledAtKEffective") or {}
     no = pr["nominal"]
-    lines.append(f"| backlog s | {s['backlogSeconds']:.0f} | {fmt(no.get('backlogSeconds'),0)} | {fmt(fl.get('backlogSeconds'),0)} (cont. {fmt(fl.get('continuousBacklogSeconds'))}) | {fmt(sc.get('backlogSeconds'),0)} |")
-    lines.append(f"| L_result > 10s | {s['over10s']} | {fmt(no.get('over10s'),0)} | {fmt(fl.get('over10s'),0)} | {fmt(sc.get('over10s'),0)} |")
-    lines.append(f"| L_result > 30s | {s['over30s']} | {fmt(no.get('over30s'),0)} | {fmt(fl.get('over30s'),0)} | {fmt(sc.get('over30s'),0)} |")
-    lines.append(f"| max wait s | {fmt(s['maxWaitSeconds'],2)} | {fmt(no.get('maxWait'),2)} | {fmt(fl.get('maxWait'),2)} | {fmt(sc.get('maxWait'),2)} |")
-    lines.append(f"| peak p50 s | {fmt(s['peakP50LresultSeconds'],2)} | {fmt(no.get('peakP50Latency'),2)} | {fmt(fl.get('peakP50Latency'),2)} | {fmt(sc.get('peakP50Latency'),2)} |")
-    lines.append(f"| peak p99 s | {fmt(s['peakP99LresultSeconds'],2)} | {fmt(no.get('peakP99Latency'),2)} | {fmt(fl.get('peakP99Latency'),2)} | {fmt(sc.get('peakP99Latency'),2)} |")
+    lines.append(f"| backlog s | {s['backlogSeconds']:.0f} | {fmt(no.get('backlogSeconds'),0)} | {fmt(fl.get('backlogSeconds'),0)} (cont. {fmt(fl.get('continuousBacklogSeconds'))}) | {fmt(sc.get('backlogSeconds'),0)} | {fmt(rp.get('backlogSeconds'),0)} |")
+    lines.append(f"| L_result > 10s | {s['over10s']} | {fmt(no.get('over10s'),0)} | {fmt(fl.get('over10s'),0)} | {fmt(sc.get('over10s'),0)} | {fmt(rp.get('over10s'),0)} |")
+    lines.append(f"| L_result > 30s | {s['over30s']} | {fmt(no.get('over30s'),0)} | {fmt(fl.get('over30s'),0)} | {fmt(sc.get('over30s'),0)} | {fmt(rp.get('over30s'),0)} |")
+    lines.append(f"| max wait s | {fmt(s['maxWaitSeconds'],2)} | {fmt(no.get('maxWait'),2)} | {fmt(fl.get('maxWait'),2)} | {fmt(sc.get('maxWait'),2)} | {fmt(rp.get('maxWait'),2)} |")
+    lines.append(f"| peak p50 s | {fmt(s['peakP50LresultSeconds'],2)} | {fmt(no.get('peakP50Latency'),2)} | {fmt(fl.get('peakP50Latency'),2)} | {fmt(sc.get('peakP50Latency'),2)} | {fmt(rp.get('peakP50Latency'),2)} |")
+    lines.append(f"| peak p99 s | {fmt(s['peakP99LresultSeconds'],2)} | {fmt(no.get('peakP99Latency'),2)} | {fmt(fl.get('peakP99Latency'),2)} | {fmt(sc.get('peakP99Latency'),2)} | {fmt(rp.get('peakP99Latency'),2)} |")
     lines += ["", f"- effective k: {fmt(eff.get('kEffective'),3)} (efficiency {fmt(eff.get('efficiency'),3)}), span {eff.get('spanStart')}-{eff.get('spanEnd')}s ({eff.get('spanSeconds')}s)"
               + ("" if eff.get("sufficient") else f" - INSUFFICIENT: {eff.get('reason')}"),
               f"- CPU (load window, core-seconds): stack {s['cpu'].get('stackTotal')}",
