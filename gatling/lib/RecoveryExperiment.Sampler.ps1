@@ -522,6 +522,17 @@ function Get-UnappliedResultCount {
 # quiescence decision and the row it is written into describe the same instant. `PendingEvents` is the
 # only cross-role number here and it comes from Prometheus rather than from Redis: it is the stream's
 # own lag in the scoreboard's units, which is the signal that does not change meaning between modes.
+#
+# `contest.judge.result.stream` is a RabbitMQ stream queue, and a stream's `messages_ready` is the log it
+# retains rather than a backlog a consumer drains: reading a message removes nothing, and the consumer's
+# progress is a separately stored offset - already read here as `PendingEvents` and `StreamDbPending`.
+# Requiring `messages_ready = 0` therefore made quiescence unreachable once anything had been published.
+# Observed 2026-09-25, with the consumer at the head: checkpoint 5091, `pendingEvents` 0, `dbPending` 0,
+# `unapplied` 0, digest agreeing - and the queue reporting 5092 ready, having grown 0 -> 8 -> 71 -> 990
+# -> 5092 with the published results and never fallen. The counts are still read and still columns of the
+# row; what is gone is the claim that a stream's retained log has to be empty for the pipeline to be
+# drained. Its `Consumers` stays, because a deleted stream has none and a consumer-less stream is not a
+# drained pipeline either.
 function Get-PipelineOperationalState {
     $pipelineWatch = [Diagnostics.Stopwatch]::StartNew()
     $judgeNonPublished = Get-JudgeOutboxNonPublished
@@ -545,12 +556,13 @@ function Get-PipelineOperationalState {
     $stream = Get-QueueCounts -Queues $queues -Name "contest.judge.result.stream"
 
     # A consumer that has stopped is not a drained pipeline even when every queue it feeds is empty,
-    # which is exactly the state `stream-offset` passes through while it resubscribes.
+    # which is exactly the state `stream-offset` passes through while it resubscribes. The stream queue's
+    # ready and unacked counts are deliberately not terms here - see the note above the function for what
+    # they measure on a stream and why they made this unsatisfiable.
     $quiescent = $judgeNonPublished -eq 0L -and
         $scoreboardUnapplied -eq 0L -and
         $live.Ready -eq 0L -and $live.Unacked -eq 0L -and
         $dead.Ready -eq 0L -and $dead.Unacked -eq 0L -and
-        $stream.Ready -eq 0L -and $stream.Unacked -eq 0L -and
         $stream.Consumers -ge 1L -and
         $scoreboard.StreamDbPending -eq 0L -and
         $pendingEvents -eq 0d

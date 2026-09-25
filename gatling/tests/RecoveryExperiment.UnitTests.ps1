@@ -129,9 +129,17 @@ Test-Case "an absent project queue reads as empty, and an unreadable row is refu
     #
     # The second half is why the reader's silent skip was worse than a crash. A row it could not parse
     # left the queue out of the map, and a missing queue now reads as empty and consumer-less - so a
-    # stream queue holding real backlog would have been reported as drained, and the run would have
-    # called the pipeline quiescent with messages still in it. The zeros are right for a queue that is
-    # not there and must not be reachable for a queue that is.
+    # stream queue holding real backlog would have been reported as drained. The zeros are right for a
+    # queue that is not there and must not be reachable for a queue that is.
+    #
+    # What that would have cost changed on 2026-09-25; the reason to keep the strictness did not. The
+    # quiescence gate used to require the stream queue's ready count to be zero and this reader fed that
+    # term; the gate no longer reads it (see the note above `Get-PipelineOperationalState` - on a stream
+    # queue `messages_ready` is the retained log, measured 5092 with the consumer at the head, and it was
+    # what made the gate unsatisfiable). The live and dead judge queues' ready and unacked counts are
+    # still gate terms, and every queue's counts are still recorded as `samples/polls.csv` columns, so a
+    # row dropped in silence still turns a real backlog into a recorded zero - a wrong figure now rather
+    # than a wrong verdict, which is worth less but is not nothing.
     # The expected values below are written bare (`3`, not `3L`). Not style: in command-argument position
     # the token `3L` binds as Int64 3 whose `[string]` is `"3L"`, so `Assert-Equal 3L $x` failed on a
     # value that was equal with a message reading `(expected '3L', got '3')`. `Assert-Equal` now refuses

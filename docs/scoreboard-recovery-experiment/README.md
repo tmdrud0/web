@@ -444,6 +444,10 @@ raw는 commit하지 않는다.
   "순위에는 돌아왔지만 `processed`에는 돌아오지 않았다"고 읽을 근거 자체가 없었다. 결함은 고쳤고
   같은 모양이 다시 들어오지 못하도록 source guard를 넣었다(`var/deferred-harness-fixes.md` 항목 8).
   이 조건 자체가 정당한지는 이제 **별개의 질문**이며 재측정으로 판정한다(항목 4)
+- **`quiescent`는 stream 큐의 `messages_ready`로 판정하지 않는다.** RabbitMQ stream의 ready는 소비로
+  줄어드는 backlog가 아니라 **retain된 로그**다(2026-09-25 실측: consumer가 head까지 따라잡은 상태에서
+  checkpoint 5091·`pendingEvents` 0인데도 5092 ready). stream의 실제 지연은 `pendingEvents`와
+  `streamDbPending`이 본다. 소비자 수(`Consumers ≥ 1`)는 계속 조건이다
 - 복구 메서드의 반환값이나 "rebuilt" 로그를 완료 판정으로 쓰지 않는다
 - **1회 run을 일반 성능으로 주장하지 않는다**
 - **서로 다른 데이터 크기·fault 조건의 숫자로 개선율을 계산하지 않는다**
