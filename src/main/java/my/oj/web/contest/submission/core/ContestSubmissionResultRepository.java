@@ -91,6 +91,33 @@ public interface ContestSubmissionResultRepository extends JpaRepository<Contest
                                                                Pageable pageable);
 
     /**
+     * The same rows as {@link #findReplayRowsByContestId}, newest first, keyset below {@code beforeId}.
+     *
+     * <p>For a rollback replay: what a rollback takes away is the newest results, so walking down from the
+     * top puts them back in the first page instead of the last. The scoreboard's rules are commutative
+     * over arrival order, so the order changes when the standings are right, not what they end up as.</p>
+     */
+    @Query("""
+            select csr.submission.id as submissionId,
+                   csr.contestId as contestId,
+                   s.problem.id as problemId,
+                   s.user.id as userId,
+                   s.contest.startTime as contestStart,
+                   s.submittedTime as submittedTime,
+                   coalesce(csr.finalResult, csr.provisionalResult) as result
+            from ContestSubmissionResult csr
+            join csr.submission s
+            where csr.contestId = :contestId
+              and (:beforeId is null or csr.submission.id < :beforeId)
+              and coalesce(csr.finalResult, csr.provisionalResult) <> :unjudged
+            order by csr.submission.id desc
+            """)
+    List<ContestScoreboardReplayRow> findReplayRowsByContestIdNewestFirst(@Param("contestId") Long contestId,
+                                                                          @Param("beforeId") Long beforeId,
+                                                                          @Param("unjudged") SubmissionResult unjudged,
+                                                                          Pageable pageable);
+
+    /**
      * Sequences the scoreboard handed out more than once, oldest first.
      *
      * <p>Deliberately global rather than per contest: the allocator and the mapping the scoreboard

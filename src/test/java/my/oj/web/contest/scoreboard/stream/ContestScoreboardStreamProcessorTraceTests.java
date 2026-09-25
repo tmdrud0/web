@@ -10,6 +10,7 @@ import my.oj.web.contest.scoreboard.experiment.RecordingExperimentTrace;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryMode;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy.Outcome;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardTouchedContests;
 import my.oj.web.contest.submission.messaging.ContestJudgeResultStreamMessage;
 import my.oj.web.submission.SubmissionResult;
 import org.junit.jupiter.api.Test;
@@ -128,6 +129,24 @@ class ContestScoreboardStreamProcessorTraceTests {
         ArgumentCaptor<List<Long>> completed = submissionIdsCaptor();
         verify(completion, times(2)).complete(completed.capture());
         assertThat(completed.getAllValues().get(1)).isEqualTo(completed.getAllValues().get(0));
+    }
+
+    /** What a later rollback is repaired for: each applied contest, at the offset that wrote it. */
+    @Test
+    void anAppliedBatchStampsItsContestWithTheHighestOffsetItApplied() {
+        when(applier.currentStreamOffset()).thenReturn(4L, 4L, 9L);
+        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        ContestScoreboardTouchedContests touched = new ContestScoreboardTouchedContests();
+        ContestScoreboardStreamMetrics metrics = new ContestScoreboardStreamMetrics(new SimpleMeterRegistry());
+        metrics.initializeOffset(4L);
+        ContestScoreboardStreamProcessor processor = new ContestScoreboardStreamProcessor(applier, completion,
+                new ContestScoreboardStreamPosition(), strategy, metrics, new ContestScoreboardApplyLock(),
+                ContestScoreboardExperimentTrace.NOOP, touched);
+
+        processor.process(List.of(event(4L, 104L), event(9L, 109L)));
+
+        assertThat(touched.touchedAtOrAbove(9L)).containsExactly(10L);
+        assertThat(touched.touchedAtOrAbove(10L)).isEmpty();
     }
 
     private ContestScoreboardStreamProcessor processor(ContestScoreboardExperimentTrace trace) {

@@ -66,6 +66,7 @@ class ContestScoreboardRecoveryModeWiringTests {
                 Dependencies.class,
                 ContestScoreboardFullReplayService.class,
                 ContestScoreboardReplayApplication.class,
+                ContestScoreboardTouchedContests.class,
                 ContestScoreboardStreamRecoveryService.class,
                 ContestScoreboardRecoveryCutover.class,
                 ContestScoreboardRecoveryStrategyConfig.class,
@@ -103,6 +104,7 @@ class ContestScoreboardRecoveryModeWiringTests {
                         Dependencies.class,
                         ContestScoreboardFullReplayService.class,
                         ContestScoreboardReplayApplication.class,
+                        ContestScoreboardTouchedContests.class,
                         ContestScoreboardRecoveryStrategyConfig.class
                 )
                 .run(context -> assertThat(context).doesNotHaveBean(ContestScoreboardRecoveryStrategy.class));

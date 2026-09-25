@@ -157,6 +157,7 @@ class ContestScoreboardRecoveryRoleGateTests {
             ContestScoreboardRecoveryCutover.class,
             ContestScoreboardFullReplayService.class,
             ContestScoreboardReplayApplication.class,
+            ContestScoreboardTouchedContests.class,
             ContestScoreboardFullReplayStartupRunner.class,
             ContestScoreboardRedisSequenceConfig.class,
             ContestScoreboardRedisSequenceRecoveryService.class,

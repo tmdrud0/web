@@ -110,6 +110,31 @@ class ContestScoreboardRecoveryTraceTests {
                 .satisfies(chunk -> assertThat(chunk.outcome()).isEqualTo("failed"));
     }
 
+    /**
+     * A replayed chunk carries no offset, so it is stamped with the checkpoint the scoreboard held when
+     * it was applied - the latest position a snapshot could have captured it at.
+     */
+    @Test
+    void aReplayedChunkStampsItsContestWithTheCheckpointItWasAppliedAt() {
+        when(scoreboardApplier.applyAll(anyList())).thenAnswer(invocation -> {
+            List<ContestScoreboardApplier.ApplyRequest> requests = invocation.getArgument(0);
+            return requests.stream()
+                    .map(request -> ContestScoreboardApplier.ApplyResult.success(request.correlationId(), null))
+                    .toList();
+        });
+        when(scoreboardApplier.currentStreamOffset()).thenReturn(42L);
+        ContestScoreboardTouchedContests touched = new ContestScoreboardTouchedContests();
+        ContestScoreboardReplayApplication application = new ContestScoreboardReplayApplication(
+                scoreboardApplier, appliedMarker, new ContestScoreboardApplyLock(),
+                new ContestSubmissionBatchExecutor(new NoOpTransactionManager()), new SimpleMeterRegistry(),
+                new RecordingExperimentTrace(), touched);
+
+        application.apply(requests(), "contest 77");
+
+        assertThat(touched.touchedAtOrAbove(42L)).containsExactly(77L);
+        assertThat(touched.touchedAtOrAbove(43L)).isEmpty();
+    }
+
     private ContestScoreboardReplayApplication application(RecordingExperimentTrace trace) {
         return new ContestScoreboardReplayApplication(
                 scoreboardApplier,

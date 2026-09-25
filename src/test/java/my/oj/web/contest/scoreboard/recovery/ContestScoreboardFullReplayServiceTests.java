@@ -204,6 +204,42 @@ class ContestScoreboardFullReplayServiceTests {
         assertThat(replayService.replayAllContests()).isEqualTo(3);
     }
 
+    /**
+     * The rollback replay's order: each contest from its newest result down, paged by the last id read,
+     * so what a rollback takes away - the newest results - is in the first chunk.
+     */
+    @Test
+    void replayContestsNewestFirst_walksEachContestDownFromItsNewestResult() {
+        when(resultRepository.findReplayRowsByContestIdNewestFirst(eq(CONTEST_ID), isNull(), eq(SubmissionResult.PENDING), any()))
+                .thenReturn(List.of(row(9L, SubmissionResult.ACCEPTED), row(7L, SubmissionResult.WRONG_ANSWER)));
+        when(resultRepository.findReplayRowsByContestIdNewestFirst(eq(CONTEST_ID), eq(7L), eq(SubmissionResult.PENDING), any()))
+                .thenReturn(List.of(row(5L, SubmissionResult.ACCEPTED)));
+        when(resultRepository.findReplayRowsByContestIdNewestFirst(eq(CONTEST_ID), eq(5L), eq(SubmissionResult.PENDING), any()))
+                .thenReturn(List.of());
+        when(scoreboardApplier.applyAll(anyList())).thenAnswer(invocation -> succeed(invocation.getArgument(0)));
+
+        assertThat(replayService.replayContestsNewestFirst(List.of(CONTEST_ID))).isEqualTo(3);
+
+        ArgumentCaptor<List<ContestScoreboardApplier.ApplyRequest>> requests = requestsCaptor();
+        verify(scoreboardApplier, times(2)).applyAll(requests.capture());
+        assertThat(requests.getAllValues())
+                .extracting(chunk -> chunk.stream().map(ContestScoreboardApplier.ApplyRequest::correlationId).toList())
+                .containsExactly(List.of(9L, 7L), List.of(5L));
+        verify(resultRepository, never()).findReplayRowsByContestId(anyLong(), any(), any(), any());
+    }
+
+    @Test
+    void replayContestsNewestFirst_takesTheHighestContestIdFirst() {
+        when(resultRepository.findReplayRowsByContestIdNewestFirst(anyLong(), isNull(), any(), any())).thenReturn(List.of());
+
+        replayService.replayContestsNewestFirst(List.of(3L, 8L, 5L));
+
+        InOrder order = inOrder(resultRepository);
+        order.verify(resultRepository).findReplayRowsByContestIdNewestFirst(eq(8L), isNull(), any(), any());
+        order.verify(resultRepository).findReplayRowsByContestIdNewestFirst(eq(5L), isNull(), any(), any());
+        order.verify(resultRepository).findReplayRowsByContestIdNewestFirst(eq(3L), isNull(), any(), any());
+    }
+
     private void stubPage(Long afterId, List<ContestScoreboardReplayRow> rows) {
         if (afterId == null) {
             when(resultRepository.findReplayRowsByContestId(eq(CONTEST_ID), isNull(), any(), any()))

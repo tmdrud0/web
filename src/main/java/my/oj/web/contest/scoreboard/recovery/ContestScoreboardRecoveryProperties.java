@@ -4,6 +4,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.Min;
 import my.oj.web.contest.scoreboard.PositiveDuration;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
@@ -47,12 +48,42 @@ public record ContestScoreboardRecoveryProperties(
     public record RecoveryOwner(@DefaultValue("true") boolean enabled) {
     }
 
-    /** Replaying the whole contest from MySQL. */
+    /**
+     * Replaying the whole contest from MySQL.
+     *
+     * @param rollbackReplay       how a rollback observed on a running JVM is replayed. {@code background}
+     *                             hands the pass to its own thread and lets the live consumer go on;
+     *                             {@code synchronous} runs it on whichever thread asked, as the mode did
+     *                             before, and is kept for comparison. See {@link FullReplayRecoveryStrategy}
+     * @param backgroundRetryBackoff how long the background pass waits before trying again after a
+     *                             failure, or after finding another pass holding the gate
+     */
     public record FullReplay(
             @DefaultValue("1000") @Min(1) int dbBatchSize,
             @DefaultValue("500") @Min(1) int replayBatchSize,
-            @DefaultValue("true") boolean startupReplayEnabled
+            @DefaultValue("true") boolean startupReplayEnabled,
+            @DefaultValue("background") RollbackReplay rollbackReplay,
+            @DefaultValue("1s") @PositiveDuration Duration backgroundRetryBackoff
     ) {
+
+        @ConstructorBinding
+        public FullReplay {
+        }
+
+        /** The three settings that existed before the rollback replay could run in the background. */
+        public FullReplay(int dbBatchSize, int replayBatchSize, boolean startupReplayEnabled) {
+            this(dbBatchSize, replayBatchSize, startupReplayEnabled, RollbackReplay.BACKGROUND, Duration.ofSeconds(1));
+        }
+    }
+
+    /** Where a runtime rollback's MySQL replay runs. */
+    public enum RollbackReplay {
+        BACKGROUND,
+        SYNCHRONOUS;
+
+        public String propertyValue() {
+            return name().toLowerCase(java.util.Locale.ROOT);
+        }
     }
 
     /**

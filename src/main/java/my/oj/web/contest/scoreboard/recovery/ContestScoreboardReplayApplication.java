@@ -71,6 +71,7 @@ public class ContestScoreboardReplayApplication {
     private final ContestSubmissionBatchExecutor batchExecutor;
     private final Counter markerFailures;
     private final ContestScoreboardExperimentTrace trace;
+    private final ContestScoreboardTouchedContests touchedContests;
 
     public ContestScoreboardReplayApplication(ContestScoreboardApplier scoreboardApplier,
                                               ContestScoreboardAppliedMarker appliedMarker,
@@ -87,9 +88,10 @@ public class ContestScoreboardReplayApplication {
                                               ContestScoreboardApplyLock applyLock,
                                               ContestSubmissionBatchExecutor batchExecutor,
                                               MeterRegistry meterRegistry,
-                                              ObjectProvider<ContestScoreboardExperimentTrace> trace) {
+                                              ObjectProvider<ContestScoreboardExperimentTrace> trace,
+                                              ContestScoreboardTouchedContests touchedContests) {
         this(scoreboardApplier, appliedMarker, applyLock, batchExecutor, meterRegistry,
-                trace.getIfAvailable(() -> ContestScoreboardExperimentTrace.NOOP));
+                trace.getIfAvailable(() -> ContestScoreboardExperimentTrace.NOOP), touchedContests);
     }
 
     public ContestScoreboardReplayApplication(ContestScoreboardApplier scoreboardApplier,
@@ -98,7 +100,19 @@ public class ContestScoreboardReplayApplication {
                                               ContestSubmissionBatchExecutor batchExecutor,
                                               MeterRegistry meterRegistry,
                                               ContestScoreboardExperimentTrace trace) {
+        this(scoreboardApplier, appliedMarker, applyLock, batchExecutor, meterRegistry, trace,
+                new ContestScoreboardTouchedContests());
+    }
+
+    public ContestScoreboardReplayApplication(ContestScoreboardApplier scoreboardApplier,
+                                              ContestScoreboardAppliedMarker appliedMarker,
+                                              ContestScoreboardApplyLock applyLock,
+                                              ContestSubmissionBatchExecutor batchExecutor,
+                                              MeterRegistry meterRegistry,
+                                              ContestScoreboardExperimentTrace trace,
+                                              ContestScoreboardTouchedContests touchedContests) {
         this.trace = trace;
+        this.touchedContests = touchedContests;
         this.scoreboardApplier = scoreboardApplier;
         this.appliedMarker = appliedMarker;
         this.applyLock = applyLock;
@@ -165,6 +179,14 @@ public class ContestScoreboardReplayApplication {
                         + (failure == null ? "batch stopped before every result was applied" : failure));
             }
             recordApplied(requests, description);
+            // Read under the lock, so no live event can move the checkpoint between the chunk and its
+            // stamp - see ContestScoreboardTouchedContests for why the checkpoint is the stamp.
+            long stamp = scoreboardApplier.currentStreamOffset();
+            requests.stream()
+                    .map(request -> request.update().contestId())
+                    .filter(java.util.Objects::nonNull)
+                    .distinct()
+                    .forEach(contestId -> touchedContests.touched(contestId, stamp));
         });
     }
 

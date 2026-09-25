@@ -9,6 +9,9 @@ import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
 import my.oj.web.submission.SubmissionResult;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -58,6 +61,45 @@ public class ContestScoreboardFullReplayService {
                 properties.fullReplay().dbBatchSize(),
                 (scopeId, afterId, pageable) -> resultRepository.findReplayRowsByContestId(
                         scopeId, afterId, SubmissionResult.PENDING, pageable),
+                ContestScoreboardReplayRow::getSubmissionId,
+                rows -> replayed[0] += replayBatch(contestId, rows)
+        );
+        return replayed[0];
+    }
+
+    /**
+     * Re-sends the given contests' stored judgements, each contest newest first.
+     *
+     * <p>The rollback replay's order. A rollback takes the newest results away, so reading each contest
+     * from the top down puts the lost tail back in the first chunk rather than after every older result
+     * has been offered again. Contests are taken highest id first for the same reason.</p>
+     *
+     * @return how many results were offered, the already-applied ones included
+     */
+    public int replayContestsNewestFirst(Collection<Long> contestIds) {
+        List<Long> ordered = new ArrayList<>(contestIds);
+        ordered.sort(Comparator.reverseOrder());
+        int replayed = 0;
+        for (Long contestId : ordered) {
+            replayed += replayContestNewestFirst(contestId);
+        }
+        return replayed;
+    }
+
+    /** {@link #replayContestsNewestFirst} over every contest that has a stored result. */
+    public int replayAllContestsNewestFirst() {
+        return replayContestsNewestFirst(resultRepository.findDistinctContestIds());
+    }
+
+    private int replayContestNewestFirst(Long contestId) {
+        int[] replayed = {0};
+        // The keyset the executor hands back is the last row's id, which for a newest-first page is the
+        // bound the next page has to stay below.
+        batchExecutor.processBatchesOf(
+                contestId,
+                properties.fullReplay().dbBatchSize(),
+                (scopeId, lastId, pageable) -> resultRepository.findReplayRowsByContestIdNewestFirst(
+                        scopeId, lastId, SubmissionResult.PENDING, pageable),
                 ContestScoreboardReplayRow::getSubmissionId,
                 rows -> replayed[0] += replayBatch(contestId, rows)
         );

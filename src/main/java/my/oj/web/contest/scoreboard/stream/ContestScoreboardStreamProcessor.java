@@ -6,6 +6,7 @@ import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.experiment.ContestScoreboardExperimentTrace;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy;
+import my.oj.web.contest.scoreboard.recovery.ContestScoreboardTouchedContests;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -99,6 +100,7 @@ class ContestScoreboardStreamProcessor {
     private final ContestScoreboardStreamMetrics metrics;
     private final ContestScoreboardApplyLock applyLock;
     private final ContestScoreboardExperimentTrace trace;
+    private final ContestScoreboardTouchedContests touchedContests;
 
     ContestScoreboardStreamProcessor(
             ContestScoreboardApplier applier,
@@ -108,7 +110,8 @@ class ContestScoreboardStreamProcessor {
             ContestScoreboardStreamMetrics metrics,
             ContestScoreboardApplyLock applyLock
     ) {
-        this(applier, completion, position, strategy, metrics, applyLock, ContestScoreboardExperimentTrace.NOOP);
+        this(applier, completion, position, strategy, metrics, applyLock, ContestScoreboardExperimentTrace.NOOP,
+                new ContestScoreboardTouchedContests());
     }
 
     @Autowired
@@ -119,10 +122,11 @@ class ContestScoreboardStreamProcessor {
             ContestScoreboardRecoveryStrategy strategy,
             ContestScoreboardStreamMetrics metrics,
             ContestScoreboardApplyLock applyLock,
-            ObjectProvider<ContestScoreboardExperimentTrace> trace
+            ObjectProvider<ContestScoreboardExperimentTrace> trace,
+            ContestScoreboardTouchedContests touchedContests
     ) {
         this(applier, completion, position, strategy, metrics, applyLock,
-                trace.getIfAvailable(() -> ContestScoreboardExperimentTrace.NOOP));
+                trace.getIfAvailable(() -> ContestScoreboardExperimentTrace.NOOP), touchedContests);
     }
 
     ContestScoreboardStreamProcessor(
@@ -134,6 +138,19 @@ class ContestScoreboardStreamProcessor {
             ContestScoreboardApplyLock applyLock,
             ContestScoreboardExperimentTrace trace
     ) {
+        this(applier, completion, position, strategy, metrics, applyLock, trace, new ContestScoreboardTouchedContests());
+    }
+
+    ContestScoreboardStreamProcessor(
+            ContestScoreboardApplier applier,
+            ContestScoreboardAppliedAtCompletion completion,
+            ContestScoreboardStreamPosition position,
+            ContestScoreboardRecoveryStrategy strategy,
+            ContestScoreboardStreamMetrics metrics,
+            ContestScoreboardApplyLock applyLock,
+            ContestScoreboardExperimentTrace trace,
+            ContestScoreboardTouchedContests touchedContests
+    ) {
         this.applier = applier;
         this.completion = completion;
         this.position = position;
@@ -141,6 +158,7 @@ class ContestScoreboardStreamProcessor {
         this.metrics = metrics;
         this.applyLock = applyLock;
         this.trace = trace;
+        this.touchedContests = touchedContests;
     }
 
     long process(List<ContestScoreboardStreamEvent> events) {
@@ -341,6 +359,10 @@ class ContestScoreboardStreamProcessor {
                     : offsetOf(requests, results.size());
             position.recordUnappliedRange(unappliedFrom);
             throw new IllegalStateException("Failed to apply scoreboard stream batch: " + detail);
+        }
+        for (ContestScoreboardStreamEvent event : batch) {
+            // What a later rollback is repaired for: see ContestScoreboardTouchedContests.
+            touchedContests.touched(event.message().contestId(), event.offset());
         }
         if (trace.enabled()) {
             // Recorded as soon as the applier answered for the whole batch, which is when the standings

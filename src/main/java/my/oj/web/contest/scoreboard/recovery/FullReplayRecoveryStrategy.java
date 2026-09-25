@@ -2,6 +2,8 @@ package my.oj.web.contest.scoreboard.recovery;
 
 import lombok.extern.slf4j.Slf4j;
 
+import java.util.Set;
+
 /**
  * {@code full-replay}: MySQL holds every stored judgement, so MySQL is the history.
  *
@@ -21,17 +23,54 @@ import lombok.extern.slf4j.Slf4j;
  * it reached MySQL. Which is also why the only refusal this mode can produce is the gate's: a replay
  * that threw is retried rather than remembered, because the range it did not cover is untouched by
  * the failure.</p>
+ *
+ * <h2>Where the replay runs</h2>
+ *
+ * <p>{@code synchronous} runs the replay on whichever thread asked. The paragraphs above say the consumer
+ * is never stopped, but that is exactly what this does: the first live delivery above the rolled-back
+ * checkpoint asks, and when it asks first the consumer thread runs the whole replay; when the supervisor
+ * asks first, every delivery in the meantime finds the gate held, is refused, and is only re-read by a
+ * resubscribe after the replay. Either way nothing new reaches the standings until the replay ends.</p>
+ *
+ * <p>{@code background} (the default) keeps the paragraphs above true. A rollback is handed to
+ * {@link ContestScoreboardBackgroundReplay} and answered {@link Outcome#COVERED} at once, so the live
+ * path anchors and keeps applying while the replay runs on its own thread, a chunk at a time under the
+ * apply lock. Answering before the replay has run is sound for this basis and no other: MySQL already
+ * holds every result in the range, the accepted replay starts after the rollback and is retried until it
+ * completes, and a JVM that dies first replays every contest at startup before consuming - which
+ * {@link ContestScoreboardRecoveryValidator} makes non-optional whenever this JVM consumes the stream.
+ * The live path moving the checkpoint past the range loses nothing, because the range's results are put
+ * back from MySQL, not from the stream.</p>
+ *
+ * <p>The background pass is also narrower and ordered for the tail. It replays only the contests this JVM
+ * wrote at or above the restored checkpoint ({@link ContestScoreboardTouchedContests}) when the range lies
+ * inside what this JVM applied, and every contest otherwise; and it walks each contest newest first, so
+ * the results the rollback took - the newest ones - are back after the first chunk rather than the last.
+ * The scoreboard's rules are commutative over arrival order, so neither changes what the standings end
+ * up as.</p>
  */
 @Slf4j
-class FullReplayRecoveryStrategy implements ContestScoreboardRecoveryStrategy {
+class FullReplayRecoveryStrategy implements ContestScoreboardRecoveryStrategy, AutoCloseable {
 
     private final ContestScoreboardFullReplayService replayService;
     private final ContestScoreboardRecoveryPassGate gate;
+    private final ContestScoreboardTouchedContests touchedContests;
+    /** Null for the synchronous replay. */
+    private final ContestScoreboardBackgroundReplay background;
 
     FullReplayRecoveryStrategy(ContestScoreboardFullReplayService replayService,
                                ContestScoreboardRecoveryPassGate gate) {
+        this(replayService, gate, new ContestScoreboardTouchedContests(), null);
+    }
+
+    FullReplayRecoveryStrategy(ContestScoreboardFullReplayService replayService,
+                               ContestScoreboardRecoveryPassGate gate,
+                               ContestScoreboardTouchedContests touchedContests,
+                               ContestScoreboardBackgroundReplay background) {
         this.replayService = replayService;
         this.gate = gate;
+        this.touchedContests = touchedContests;
+        this.background = background;
     }
 
     @Override
@@ -70,6 +109,9 @@ class FullReplayRecoveryStrategy implements ContestScoreboardRecoveryStrategy {
         if (range.rebuiltAlready()) {
             return Outcome.COVERED;
         }
+        if (background != null) {
+            return requestInBackground(range);
+        }
         try {
             return gate.tryRun(PassKind.MYSQL_REPLAY, () -> {
                 replayService.replayAllContests();
@@ -83,6 +125,30 @@ class FullReplayRecoveryStrategy implements ContestScoreboardRecoveryStrategy {
                     + "between offsets {} and {}; the replay is retried on the next supervisor cycle",
                     range.firstLostOffset(), range.lastLostOffset(), failure);
             return Outcome.RETRYABLE_FAILURE;
+        }
+    }
+
+    private Outcome requestInBackground(LostRange range) {
+        // Inside what this JVM applied, the contests it wrote at or above the restored checkpoint are
+        // every contest the rollback can have taken something from. Outside it - offsets this JVM never
+        // applied - any contest could be involved, so every contest is replayed.
+        Set<Long> contests = null;
+        if (range.withinAppliedHistory()) {
+            Set<Long> touched = touchedContests.touchedAtOrAbove(range.checkpointOffset());
+            contests = touched.isEmpty() ? null : touched;
+        }
+        if (!background.request(range.checkpointOffset(), range.highestAppliedOffset(), contests)) {
+            log.warn("The background scoreboard replay is closed; the rollback between offsets {} and {} is "
+                    + "asked about again", range.firstLostOffset(), range.lastLostOffset());
+            return Outcome.RETRYABLE_FAILURE;
+        }
+        return Outcome.COVERED;
+    }
+
+    @Override
+    public void close() {
+        if (background != null) {
+            background.close();
         }
     }
 }
