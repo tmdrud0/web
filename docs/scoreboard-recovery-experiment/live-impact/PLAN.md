@@ -143,7 +143,7 @@ Redis `TIME`도 재서 MySQL−Redis 차이(`clockMySqlMinusRedisMs`)를 남긴�
 | H1 | full-replay (현재) | 신규 반영이 replay 내내 멈춘다. backlog ≈ 유입률 × replay 시간. tail은 replay가 끝날 때 돌아온다 |
 | H2 | redis-seq | 같은 동기 경로라 멈추지만 기간은 tail 후보 수와 탐지 round 수에 비례한다 |
 | H3 | stream-offset | consumer 재시작과 tail 재소비 동안 멈춘다. 기간 = 재시작 고정비 + tail에 비례 |
-| H4 | full-replay 개선안 (C2) | 멈추지 않는다. 지연이 청크 단위만큼 늘어난다. tail은 첫 청크 근처에서 돌아온다 |
+| H4 | full-replay 개선안 (C2, §8) | 멈추지 않는다. 지연이 청크 단위만큼 늘어난다. tail은 첫 청크 근처에서 돌아온다 |
 
 §7의 코드 확인으로 H1에 붙는 조건: replay가 **consumer 스레드**에서 돌 수 있고, 감지 스레드에서 돌면 그동안 들어온
 배치는 거절 후 재구독으로 다시 읽힌다. 어느 쪽이든 "replay 동안 신규 반영 0"이라는 예측은 같다. 어느 스레드였는지는
@@ -275,3 +275,52 @@ Lua 스크립트는 실행 동안 **Redis 전체**를 막는다(batch-1뿐 아�
 Redis CPU 제한 0.5가 걸려 있으므로 수백 ms~수 초일 수 있다. 두 pause 길이(`snapshotPauseMs`, `faultPauseMs`)와 Lua 시간
 (`snapshotEvalMs`, `rollbackEvalMs`)을 기록하고, Gatling 시계열에서 그 구간의 ingress 흔들림은 injector 몫으로 읽는다.
 세 모드 모두 같다.
+
+---
+
+## 8. full-replay 개선안 (C2) — Run B가 재는 코드
+
+브랜치 `codex/full-replay-background-replay` (C1 `7416969`에서 분기). 설정
+`contest.scoreboard.recovery.full-replay.rollback-replay=background|synchronous`, 기본 `background`.
+`synchronous`는 C1 동작 그대로이며 같은 이미지에서 Run A를 재현할 때 쓴다.
+
+### 8.1 무엇이 바뀌었나
+
+| | C1 (synchronous) | C2 (background) |
+|---|---|---|
+| replay가 도는 곳 | 먼저 물은 스레드: consumer 또는 supervisor (§7-2) | 전용 스레드 `scoreboard-full-replay` |
+| 라이브 경로의 답 | replay가 끝나야 COVERED. 그동안 거절(§7-3) | 요청을 넘기고 즉시 COVERED, anchor 후 계속 적용 |
+| 재구독 | replay 뒤 스냅샷 checkpoint부터 다시 읽음(§7-4) | 거절이 없으므로 일어나지 않음(예상) |
+| 범위 | DB의 모든 대회 | 롤백된 checkpoint 이상에서 이 JVM이 쓴 대회(`ContestScoreboardTouchedContests`). 범위가 적용 이력 밖이면 모든 대회 |
+| 순서 | 대회 id 오름차순, 대회 안 submission id 오름차순 | 대회 id 내림차순, 대회 안 submission id **내림차순** — 잃은 tail(최신)이 첫 청크에 |
+| 청크 | 500, 청크마다 apply lock | 같음 |
+
+### 8.2 즉시 COVERED가 안전한 이유 (이 모드에서만)
+
+1. 범위의 결과는 이미 MySQL에 있다(judge는 MySQL에 먼저 쓰고 stream에 publish한다).
+2. 요청은 **요청이 받아들여진 뒤에 시작하는** pass로만 처리되고, 그 pass는 성공할 때까지 재시도된다. 진행 중인 pass가 두 번째
+   롤백 전에 읽은 행은 믿지 않는다 — 두 번째 롤백은 다음 pass로 간다.
+3. pass가 끝나기 전에 JVM이 죽으면, consumer를 켠 full-replay JVM은 startup replay가 필수이고(`ContestScoreboardRecoveryValidator`)
+   그 replay가 끝나기 전에는 소비하지 않는다.
+4. checkpoint가 범위를 지나가도 잃는 것이 없다. 범위의 결과는 stream이 아니라 MySQL에서 돌아온다.
+5. 채점 규칙은 도착 순서에 대해 교환적이다(`RedisContestScoreboardApplierRedisIntegrationTests.lateEarlierAttemptsKeepCommutativeScoreboardRule`,
+   `InMemoryContestScoreboardCommutativityTests`). 역순 replay와 라이브 적용이 섞여도 최종 순위는 같다.
+
+### 8.3 대회 범위의 근거
+
+적용마다 stamp를 남긴다: live 이벤트는 자기 offset, replay 청크와 운영자 rebuild는 적용 시점의 checkpoint. 스냅샷 checkpoint가 S인
+롤백이 무언가를 빼앗을 수 있는 대회는 스냅샷 **뒤에** 이 JVM이 쓴 대회뿐이고, 그런 쓰기의 stamp는 모두 ≥ S다. 그래서 "stamp ≥ S"는
+하나 더 넣을 수는 있어도 빠뜨리지는 않는다. 이전 JVM이 쓴 것은 모르므로 적용 이력 밖의 범위는 모든 대회로 넓힌다.
+startup replay가 모든 대회를 stamp하므로 재시작 뒤에도 빈틈이 없다.
+
+### 8.4 Run B에서 확인할 것
+
+- `replayThread` = `scoreboard-full-replay`, `newApplyStallLongestSeconds` < 2, `reconsumedAfterFault` ≈ 0(재구독 없음).
+- `tailReturnedAfterFaultMs`가 첫 청크 시간 수준인가(H4). `replayRows`가 대회 하나의 행 수(N_total이 아니라 N)인가.
+- `passesAfterRollback` = 1 (supervisor와 첫 배달의 요청이 한 pass로 합쳐졌는가).
+- 청크 락 대기(`chunkLockWait*`)와 during 반영 지연 p95 — 판정 B의 크기가 여기서 나온다.
+
+### 8.5 검증 상태
+
+단위 테스트: 백그라운드 스레드에서만 replay, 즉시 COVERED, 같은 롤백 요청 병합, 실행 중 도착한 롤백은 다음 pass, 실패·gate 점유 시
+재시도, 닫힌 뒤 거절, 범위 계산, 역순 페이지·대회 순서, live/replay stamp, 설정 바인딩. **MySQL·Redis 통합 테스트와 실제 run은 아직 돌리지 않았다.**

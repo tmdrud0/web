@@ -57,7 +57,12 @@ foreach ($mode in 'full-replay','redis-seq','stream-offset') {
     -Mode $mode -Phase run -TargetRps <calibrated> -JudgedRatePerSecond <calibrated>
 }
 
-# 3.3 Run B (C2 브랜치): 그 브랜치에서 bootJar 후 같은 명령에 -Mode full-replay -Build
+# 3.3 Run B (C2 브랜치 codex/full-replay-background-replay): bootJar 후 이미지 재빌드
+powershell -NoProfile -ExecutionPolicy Bypass -File gatling\run-recovery-live-impact.ps1 `
+  -Mode full-replay -Phase run -FullReplayRollbackReplay background -TargetRps <calibrated> -JudgedRatePerSecond <calibrated> -Build
+#   같은 C2 이미지에서 C1 동작(동기 replay)을 다시 보고 싶으면 -FullReplayRollbackReplay synchronous.
+#   C1 jar는 이 설정을 모르므로 항상 동기다. 실제로 쓰인 값은 batch-1 로그의 startup 보고
+#   "rollback-replay=" 와 run-events의 fullReplayRollbackReplay(컨테이너 환경변수)로 확인한다.
 
 # 3.4 요약만 다시 (임계값을 바꿔 보고 싶을 때). 산출물 디렉터리를 준다
 & "C:\Program Files\Java\jdk-17\bin\java.exe" -cp gatling\build\classes\java\main `
@@ -65,7 +70,7 @@ foreach ($mode in 'full-replay','redis-seq','stream-offset') {
 ```
 
 자주 쓰는 스위치: `-TailSeconds`(기본 5), `-RecoveryBudgetSeconds`(300), `-ObserveAfterRecoverySeconds`(60),
-`-OraclePollSeconds`(0 = 측정 구간 oracle 판독 끔), `-AllowUnflatBaseline`, `-SkipCleanup`, `-KeepStackRunning`, `-JavaExe`.
+`-OraclePollSeconds`(0 = 측정 구간 oracle 판독 끔), `-FullReplayRollbackReplay`(background), `-AllowUnflatBaseline`, `-SkipCleanup`, `-KeepStackRunning`, `-JavaExe`.
 
 종료 코드: 0 complete / 2 측정됐지만 불완결 / 1 실패 (PLAN §6.3).
 
