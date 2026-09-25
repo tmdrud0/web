@@ -410,7 +410,19 @@ function Get-PrometheusHistogram {
                 CumulativeCount = ConvertTo-RequiredDouble -Value @($sample.value)[1] -Description "$Description count"
             })
     }
-    return $buckets.ToArray()
+    # `,` is load-bearing, and this one was measured rather than reasoned: an array returned through the
+    # pipeline is *enumerated*, so an empty one arrives at the caller as nothing at all - `$null` - and
+    # the caller's `[Parameter(Mandatory = $true)][object[]]$Buckets` then refuses to bind it with
+    # "Cannot bind argument to parameter 'Buckets' because it is null", even though that parameter is
+    # `[AllowEmptyCollection()]` and the function behind it handles an empty list by returning `$null`.
+    # Seen on 2026-09-25: `fullreplay_0` of the 08:38 calibration suite died 2.46 min in, immediately
+    # after the K capture, when Prometheus answered this query with an empty vector and the whole run was
+    # lost to a binding error. *Why* Prometheus had no sample at that instant is not established from the
+    # artifacts and is not guessed at here; what is established is that an empty answer has to survive the
+    # return, because the empty case must reach the caller as `unavailable` (a missing
+    # `redisPipelineP95Seconds` column) and not as a throw. The neighbouring `Get-RedisSetMembers` uses
+    # the same comma for the same reason; the unit suite guards this shape.
+    return , $buckets.ToArray()
 }
 
 # The standard Prometheus histogram_quantile over cumulative buckets: linear interpolation inside the

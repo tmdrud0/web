@@ -878,6 +878,61 @@ Test-Case "a number whose text is not its value is refused, and a quoted one is 
     Assert-Equal $null $null "and an absent value still compares"
 }
 
+# A Prometheus that answers every query with an empty vector, in place of `Invoke-PrometheusQuery` for the
+# rest of this file. Defined here at the top level and deliberately *not* inside the `Test-Case` below:
+# PowerShell resolves a command inside a function through the scope that *function* was defined in, so a
+# stub created in a test body's child scope would not be visible to `Get-PrometheusHistogram` at all, and
+# the case below would pass by proving nothing - that the real client was out of reach rather than that the
+# fix works. The substitution is safe because no other case in this file goes near the network; the suites
+# that need a live Prometheus are the run and the pilot suite, not this one. It records what it was asked
+# so the case below can prove the substitution took effect.
+$script:prometheusStubQueries = New-Object 'System.Collections.Generic.List[string]'
+function Invoke-PrometheusQuery {
+    param(
+        [Parameter(Mandatory = $true)][string]$Query,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+    [void]$script:prometheusStubQueries.Add("$Description|$Query")
+    return @()
+}
+
+Test-Case "an empty histogram answer is unavailable, not a binding error" {
+    # 2026-09-25, and it cost a run: `fullreplay_0` of the 08:38 calibration suite died 2.46 min in -
+    # immediately after the K capture, the most expensive part of the run - with "Cannot bind argument to
+    # parameter 'Buckets' because it is null", and produced no numbers at all. Prometheus had answered the
+    # pipeline-histogram query with an empty vector at that instant. An empty answer is not an error here:
+    # the harness's own convention for a series that has not been sampled is to record `unavailable` and
+    # carry on, which the reader three lines below already implements for the neighbouring case of buckets
+    # that exist but sum to zero. What it could not survive was the travel: `return $buckets.ToArray()`
+    # writes the empty array to the pipeline, where it is enumerated away into nothing, so the caller's
+    # Mandatory `[object[]]` received `$null` and refused it. *Why* Prometheus had no sample at that moment
+    # is not established and is not guessed at; what is guarded here is that an empty answer survives the
+    # return and is labelled rather than fatal.
+    #
+    # The premise first: the plain shape really does hand over `$null`, and a Mandatory collection
+    # parameter really does refuse it - the two halves of how the run died.
+    function Get-ProbePlainToArray {
+        $list = New-Object 'System.Collections.Generic.List[object]'
+        return $list.ToArray()
+    }
+    $drained = Get-ProbePlainToArray
+    Assert-Equal $null $drained "a plain `return <expr>.ToArray()` hands an empty collection to its caller as null"
+    Assert-Throws { Get-PrometheusHistogramQuantile -Buckets $drained -Quantile 0.95 } `
+        "and a mandatory collection parameter refuses that null, which is the failure the run died of"
+
+    # Then the real pair, against the stub. The reader must have asked the stub, or this measures an
+    # unreachable client instead of the fix.
+    $script:prometheusStubQueries.Clear()
+    $buckets = Get-PrometheusHistogram -Query 'up' -Description "empty answer probe"
+    Assert-True ($script:prometheusStubQueries.Count -eq 1) `
+        "the histogram reader asked the stub, so the substitution is in effect and this case measures the reader"
+    Assert-Equal "empty answer probe|up" $script:prometheusStubQueries[0] "and asked it the query it was given"
+    Assert-True ($null -ne $buckets) "an empty answer arrives as a collection rather than as null"
+    Assert-Equal 0 $buckets.Count "whose size is zero"
+    Assert-Equal $null (Get-PrometheusHistogramQuantile -Buckets $buckets -Quantile 0.95) `
+        "so the quantile has no answer, the sampler leaves the column out, and the poll records unavailable instead of throwing"
+}
+
 # --- report -------------------------------------------------------------------------------------
 
 Write-TestSummary -Suite "RecoveryExperiment unit tests"
