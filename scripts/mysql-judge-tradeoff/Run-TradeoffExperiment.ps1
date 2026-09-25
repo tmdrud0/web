@@ -184,6 +184,11 @@ param(
     # -Judge2WorkerCount 0 falls back to -WorkerCount.
     [string]$JudgeCpus = "",
     [string]$Judge2Cpus = "",
+    # Web node CPU limit, both nodes together. "" (default) leaves compose.loadtest.yaml's own
+    # default (1, the base experiment's value / the 7.5-CPU-total budget compose.loadtest.yaml's
+    # header documents) untouched. A scale variant that measures web nodes CPU-throttled well past
+    # the base experiment's level passes a larger value here - the same rule for every dispatch mode.
+    [string]$WebCpus = "",
     # sleep (default, unset here) leaves compose.loadtest.yaml's own default untouched, so every
     # earlier run is unchanged. cpu switches both judge nodes to CpuLoadProfileContestJudgement.
     [ValidateSet("", "sleep", "cpu")][string]$JudgeLatencyMode = "",
@@ -3836,6 +3841,7 @@ $env:CONTEST_JUDGE_MYSQL_POLL_INTERVAL = $MySqlPollInterval
 # substitution treats an empty env var the same as an unset one.
 $env:CONTEST_JUDGE_CPUS = $JudgeCpus
 $env:CONTEST_JUDGE_2_CPUS = $judge2Cpus
+$env:CONTEST_WEB_CPUS = $WebCpus
 $env:JUDGE_LATENCY_ENABLED = "true"
 $env:JUDGE_LATENCY_MODE = $JudgeLatencyMode
 $env:JUDGE_LATENCY_SEED = "$LatencySeed"

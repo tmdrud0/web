@@ -27,6 +27,9 @@ services:
   # CONTEST_RATE_LIMIT_* passes through from the shell for the same reason JUDGE_* does: the
   # harness sets the cooldown from the same number it derives every scenario's pace from. Only
   # the web nodes accept submissions, so only they need it.
+  # CONTEST_WEB_CPUS lets a scale variant (B=70) raise the web nodes past the base 7.5-CPU budget's
+  # 1 core each; unset keeps that budget exactly (base.compose.yaml's own limit is not read here
+  # because deploy.resources.limits must be restated whole under docker compose merge, not patched).
   web-1:
     container_name: oj-loadtest-web-1
     environment:
@@ -35,6 +38,11 @@ services:
       CONTEST_SUBMISSION_WORKER_ID: 1
       CONTEST_RATE_LIMIT_STORE: ${CONTEST_RATE_LIMIT_STORE:-redis}
       CONTEST_RATE_LIMIT_COOLDOWN_MILLIS: ${CONTEST_RATE_LIMIT_COOLDOWN_MILLIS:-2000}
+    deploy:
+      resources:
+        limits:
+          cpus: "${CONTEST_WEB_CPUS:-1}"
+          memory: 1280M
     # Direct ports are setup/diagnostic-only. Gatling must use nginx:18080.
     ports: !override
       - "18081:8080"
@@ -47,6 +55,11 @@ services:
       CONTEST_SUBMISSION_WORKER_ID: 2
       CONTEST_RATE_LIMIT_STORE: ${CONTEST_RATE_LIMIT_STORE:-redis}
       CONTEST_RATE_LIMIT_COOLDOWN_MILLIS: ${CONTEST_RATE_LIMIT_COOLDOWN_MILLIS:-2000}
+    deploy:
+      resources:
+        limits:
+          cpus: "${CONTEST_WEB_CPUS:-1}"
+          memory: 1280M
     ports: !override
       - "18082:8080"
 
