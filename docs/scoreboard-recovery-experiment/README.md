@@ -283,24 +283,37 @@ suite 자체도 같은 규약으로 종료한다: 수치를 못 낸 run이 있�
 
 ### 5.1 K 캡처 (7단계)
 
-1. batch-1 `docker pause` — checkpoint와 스코어보드 내용을 **자기정합**하게 만든다 (torn state 방지)
+1. batch-1 `docker pause` — Redis 스코어보드의 **유일한 writer**를 세워 checkpoint와 스코어보드 내용을
+   **자기정합**하게 만든다 (torn state 방지). 이 pause가 멈추는 것은 **Redis 쪽**뿐이다: MySQL의
+   `scoreboard_applied_at`은 제품이 스스로 *non-authoritative*라 부르는 값이고(`ContestScoreboardAppliedAtCompletion`
+   — "Repairs the non-authoritative MySQL staleness timestamp") 비동기 batch로 채워지므로, 정지 구간을
+   걸쳐 수백 행이 움직여도 스코어보드는 한 건도 움직이지 않을 수 있다. 그래서 이 값은 **시계로 쓰지
+   않는다**(§5.2).
 2. `SCAN MATCH contest:scoreboard:*`로 키 목록 수집 → 키별 `TYPE` / `OBJECT ENCODING` / `DUMP` / `PTTL` /
    **타입별 canonical 내용**(문자열은 값, list는 순서, set은 정렬된 멤버, hash·zset은 필드별 정렬) 캡처
 3. MySQL에서 oracle digest + 적용 결과 수 스냅샷
 4. **K 시점 digest == 제품 API digest** 확인 (다르면 run 실패 — 측정 한계가 아니라 harness 결함 신호)
-5. `docker unpause`
+5. `docker unpause`. **pause 소요를 기록한다**(`recovery-summary.csv`의 `injectorCapturePauseMs`,
+   `rollback.json`의 `capturePauseMs`) — 작지 않고, 그 시간은 측정 대상 applier가 얼어 있던 시간이다(§5.3)
 
 증거: `k-snapshot.json` (type/encoding 분포 포함).
 
 ### 5.2 장애 주입 (8단계)
 
-1. K 대비 **적용 결과 수가 `-TailResults` 이상**이 되는 순간 batch-1 `docker pause`
+1. K 대비 **Redis에 적용된 결과 수가 `-TailResults` 이상**이 되는 순간 batch-1 `docker pause`.
+   판정은 `processed` 집합의 크기(K 스냅샷 대비)로 한다 — **롤백이 깎는 축이 정확히 이 집합**이므로,
+   같은 축에서 기다려야 고정 변수인 rollback depth가 지켜진다. MySQL의 `scoreboard_applied_at`으로
+   기다리면 안 된다: 그 값은 권위가 없고 비동기로 채워지므로 스코어보드가 한 건도 안 움직이는데도
+   수백 행이 한꺼번에 늘어난다(2026-09-25 실측: 같은 구간에서 MySQL 1264→2306 대 `processed` 1264→1265,
+   그래서 20건을 요구한 run이 1건만 지우고 측정 불가로 끝났다). 지켜졌는지는 run이 스스로 검사한다 —
+   유실 집합이 `-TailResults`보다 작으면 **거부한다**
 2. `contest:scoreboard:*` 전체 `DEL`
 3. 캡처한 payload를 `RESTORE key <pttl|0> payload REPLACE`
 4. **검증**: 키 집합 일치 + 타입·인코딩 일치 + canonical 내용 일치(전 키) + **payload 바이트 일치**
    (`hashtable` 인코딩 키는 제외 — §5.4) + `storedOffset == K`
 5. `T_fault` 기록
-6. `docker unpause` — **이후에도 신규 유입은 계속된다**
+6. `docker unpause` — **이후에도 신규 유입은 계속된다**. pause 소요를 기록한다
+   (`injectorFaultPauseMs` / `faultPauseMs`). 유실 집합이 `-TailResults`보다 작으면 여기서 거부된다
 
 증거: `rollback.json`. 검증에서 바이트 대신 내용으로 판정한 키 수를 함께 기록하며, run stdout에도 찍는다.
 
@@ -316,7 +329,14 @@ suite 자체도 같은 규약으로 종료한다: 수치를 못 낸 run이 있�
 세션·dedup 키를 건드리지 않아 **주입기 자체의 가용성 교란이 없다.**
 
 이 한계는 **세 모드에 동일하게 적용**되므로 모드 간 비교는 성립한다. 다만 결과를 "RDB에서 로드했을
-때의 복구 시간"으로 일반화할 수 없다. `docker pause` 구간은 주입기 footprint로 별도 기록한다.
+때의 복구 시간"으로 일반화할 수 없다.
+
+**pause footprint는 작지 않다.** 실험계획 §6은 이 구간을 "수백 ms"로 적어 두었지만, 캡처와 롤백은 키를
+하나씩 `docker exec`로 왕복한다(947키). 2026-09-25 실측에서 캡처 pause는 34초 이내, 장애 주입 pause는
+48초 안팎이었다(둘 다 poll 간격으로 잰 상한이며, 이제 run이 직접 기록한다). 즉 그 시간만큼 **측정 대상
+applier가 얼어 있었고**, `consistencyOutageMs`에는 그 시간이 들어 있다. 세 모드 모두 같으므로 **비교는
+성립하지만**, 절대 수치를 "모드가 복구하는 데 걸린 시간"으로 읽으려면 기록된 pause 값을 빼야 한다.
+계획의 "수백 ms"는 실측과 100배 어긋나며, 동결된 계획은 고치지 않고 `PILOT_REPORT.md`의 측정 한계에 적는다.
 
 ### 5.4 검증이 무엇을 증명하고, 무엇을 증명하지 않는가
 
@@ -415,7 +435,15 @@ raw는 commit하지 않는다.
 ## 8. 해석법
 
 - **설정값을 측정 결과로 쓰지 않는다.** `run-metadata.json`의 값은 조건이지 결과가 아니다
-- **단위 테스트 통과를 물리적 복구 성공으로 쓰지 않는다.** `T_consistent`는 digest 일치로만 판정한다
+- **단위 테스트 통과를 물리적 복구 성공으로 쓰지 않는다.** `T_consistent`는 digest 일치로만 판정한다.
+  다만 9단계 대기는 여기에 `lostComplete`(롤백이 지운 제출이 전부 `processed` 집합에 돌아왔는가)를
+  **추가로** 요구한다 — 계획에 없는 조건이다. 2026-09-25 run들이 이 조건에서 끝까지 false로 남아
+  측정 불가로 끝난 것을 처음에는 모드의 성질로 읽었지만, 실은 **harness 결함**이었다: 롤백 직전
+  멤버 목록을 `@(Get-RedisSetMembers ...)`로 읽으면서 수천 개 id가 공백으로 이어붙은 **한 개의
+  문자열**이 되었고, 그래서 `lostTotal`은 항상 1, `lostReapplied`는 항상 0이었다 — 즉 그 run들에서
+  "순위에는 돌아왔지만 `processed`에는 돌아오지 않았다"고 읽을 근거 자체가 없었다. 결함은 고쳤고
+  같은 모양이 다시 들어오지 못하도록 source guard를 넣었다(`var/deferred-harness-fixes.md` 항목 8).
+  이 조건 자체가 정당한지는 이제 **별개의 질문**이며 재측정으로 판정한다(항목 4)
 - 복구 메서드의 반환값이나 "rebuilt" 로그를 완료 판정으로 쓰지 않는다
 - **1회 run을 일반 성능으로 주장하지 않는다**
 - **서로 다른 데이터 크기·fault 조건의 숫자로 개선율을 계산하지 않는다**

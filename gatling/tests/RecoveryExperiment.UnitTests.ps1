@@ -726,6 +726,59 @@ Test-Case "an array wrap is not left to protect a pipeline it has already closed
     Assert-True ($checked -ge 2) "the scan found the harness's array-wrapped pipelines ($checked found)"
 }
 
+# The names of the harness's functions that end `return , @(...)`. The comma is deliberate - it keeps a
+# one-member set an array rather than a bare string - and it is also what makes a re-wrap destructive: the
+# call hands its caller one object that *is* an array, so `@(...)` around the call collects one object and
+# the members arrive joined by a space.
+#
+# Matched with `^\s*return`, so a comment that quotes the idiom is not mistaken for a use of it.
+function Get-CommaWrappedReturners {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    $found = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($match in [regex]::Matches($Text, '(?m)^function\s+([A-Za-z0-9_-]+)')) {
+        $name = $match.Groups[1].Value
+        $rest = $Text.Substring($match.Index + $match.Length)
+        $next = [regex]::Match($rest, '(?m)^function\s+[A-Za-z0-9_-]+')
+        $body = if ($next.Success) { $rest.Substring(0, $next.Index) } else { $rest }
+        if ($body -match '(?m)^\s*return\s*,\s*@\(') { $found.Add($name) }
+    }
+    return $found
+}
+
+Test-Case "a comma-wrapped reader is not wrapped again" {
+    # This was a live defect on 2026-09-25 and it cost two runs. The runner read the pre-rollback member
+    # list as `@(Get-RedisSetMembers ...)`; that function returns through `, @(...)`, so the wrap collapsed
+    # ~1600 erased submission ids into a single space-joined string. `Get-LostResultSet` then compared 1227
+    # captured members against that one blob and reported the rollback as having erased 1 result, and
+    # `Get-LostSetProgress` could never find the blob among the real members - so the step-9 wait for
+    # `lostComplete` was unsatisfiable and both runs died on its drain timeout with the digest already
+    # matching. The premise is asserted first, because a guard over an idiom nobody uses passes by finding
+    # nothing.
+    function Get-ProbeCommaWrapped {
+        $members = @("a", "b", "c")
+        return , @($members)
+    }
+    $plain = Get-ProbeCommaWrapped
+    Assert-Equal 3 $plain.Count "a comma-wrapped return is an array at the call site"
+    $rewrapped = @(Get-ProbeCommaWrapped)
+    Assert-Equal 1 $rewrapped.Count "and `@(...)` around that call collects it as one object"
+    Assert-Equal "a b c" $rewrapped[0] "whose text is the members joined by a space"
+
+    $checked = 0
+    foreach ($source in @(Get-HarnessSourceFiles)) {
+        $text = Get-Content -LiteralPath $source.FullName -Raw
+        foreach ($name in @(Get-CommaWrappedReturners -Text $text)) {
+            $checked++
+            foreach ($hit in [regex]::Matches($text, '@\(\s*' + [regex]::Escape($name) + '\b')) {
+                $line = ($text.Substring(0, $hit.Index) -split "`n").Count
+                Assert-True $false "$($source.Name):$line wraps `@(...)` around $name(), which returns through `, @(...)` - every member collapses into one string. Assign it plainly, or write `@((...))`."
+            }
+        }
+    }
+    Assert-True ($checked -ge 1) "the scan found the harness's comma-wrapped readers ($checked found)"
+}
+
 Test-Case "every SQL reader normalizes the cell it hands a caller" {
     # The two readers are the only place MySQL's untyped text becomes a value for this harness, so they are
     # where a NULL is turned into an absence. A reader that casts its split line straight into string[] puts

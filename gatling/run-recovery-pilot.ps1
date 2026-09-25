@@ -611,6 +611,13 @@ try {
     # --- 7. capture -------------------------------------------------------------------------------
 
     $kRow = Invoke-PilotPoll -Phase "k-capture"
+    # Both pauses are timed, because the plan requires the `docker pause` window to be recorded as the
+    # injector's own footprint. It is not small: the capture walks the namespace key by key through
+    # `docker exec`, so the applier this experiment is measuring is frozen for tens of seconds while the
+    # load keeps offering work. That time is inside `consistencyOutageMs` unless it is subtracted, and it
+    # is identical in all three modes, so the comparison holds while the absolute figures would otherwise
+    # read as recovery time.
+    $kPauseWatch = [Diagnostics.Stopwatch]::StartNew()
     Pause-Batch
     $kObservedAtMysql = Get-MySqlNow
     $kSnapshot = Export-ScoreboardSnapshot -Label "k" -ObservedAtMysql $kObservedAtMysql
@@ -621,21 +628,35 @@ try {
     $kOracle = Get-OracleDigest
     $kCompare = Compare-ScoreboardWithOracle -AllResolvedResults:$false
     Resume-Batch
+    $kCapturePauseMs = $kPauseWatch.ElapsedMilliseconds
     if (-not $kCompare.Matches) {
         throw ("At the capture instant the scoreboard and the oracle disagree " +
             "(api=$($kCompare.ApiDigest) oracle=$($kCompare.OracleDigest)). The snapshot is not a state " +
             "the scoreboard ever reached, so a rollback to it would measure nothing.")
     }
     Write-Output "  captured K: $($kSnapshot.KeyCount) key(s), $($kSnapshot.ProcessedCount) processed results, checkpoint $($kSnapshot.Checkpoint), $($kCounts.AppliedResults) applied"
+    Write-Output "    the capture froze batch-1 for ${kCapturePauseMs}ms (injector footprint, not recovery time)"
 
     # --- 8. tail, then the fault ------------------------------------------------------------------
 
+    # The tail is read on the Redis axis, which is the axis the rollback cuts: `Get-LostResultSet` is the
+    # capture's `processed` subtracted from the pre-rollback one, so waiting on that same set is what
+    # holds the plan's fixed variable - the rollback depth - at `-TailResults`.
+    #
+    # It cannot be read from MySQL's `scoreboard_applied_at`, which is what this wait used to use. The
+    # product calls that timestamp non-authoritative and repairs it asynchronously in batches
+    # (`ContestScoreboardAppliedAtCompletion`: "Repairs the non-authoritative MySQL staleness timestamp",
+    # with a `repairPending` that marks ids without applying them), so it moves by hundreds of rows while
+    # the scoreboard does not move at all. Observed 2026-09-25: across one capture pause it went
+    # 1264 -> 2306 while `processed` went 1264 -> 1265, this wait fired on the +1042, and the rollback
+    # erased 1 result instead of the 20 it was asked for - so the run measured a fault depth it had not
+    # fixed and could not be compared with anything.
     [void](Wait-PilotCondition -Phase "tail" -TimeoutSeconds $SettleTimeoutSeconds `
-            -Description "$TailResults applied results past the capture instant" `
+            -Description "$TailResults results applied to the scoreboard past the capture instant" `
             -Predicate {
                 param($row)
-                $n = Get-RowNumber -Row $row -Name "oracleAppliedResults"
-                $null -ne $n -and ($n - $kCounts.AppliedResults) -ge $TailResults
+                $n = Get-RowNumber -Row $row -Name "processedCardinality"
+                $null -ne $n -and ($n - $kSnapshot.ProcessedCount) -ge $TailResults
             })
 
     if ($script:gatlingProcess.HasExited) {
@@ -646,12 +667,28 @@ try {
     # Paused first and read second, so the pre-rollback reading and the rollback are one step from the
     # batch role's point of view: nothing can be applied between the reading that defines the lost set
     # and the rollback that creates it.
+    #
+    # Assigned without `@(...)`, and that is not style. `Get-RedisSetMembers` ends in `return , @(...)` -
+    # the comma keeps a one-member set an array rather than a bare string - and a comma-wrapped return
+    # reaches `@(...)` as a *single* object, so the wrap collapses every member into one space-joined
+    # string. Measured: `@(f)` over `return , @('a','b','c')` has `Count` 1 and `[0]` = "a b c".
+    #
+    # That one string was the entire `lost` set, which is why this run refused to measure it: the polls
+    # show the `processed` set at 1227 members when K was captured and 2852 at the last poll before the
+    # pause, so the rollback took back well over a thousand results while `Get-LostResultSet` compared
+    # 1227 members against one blob and reported 1. It also fed `Get-LostSetProgress`, which could never
+    # find that blob among the real members - so `lostComplete` was false for every poll of the
+    # 2026-09-25 runs while `digestMatches` was true, and step 9 waited out its drain timeout over a
+    # bookkeeping defect. Plain assignment unrolls the comma correctly for a one-member set and for an
+    # empty one (Count 0, which `[AllowEmptyCollection()]` accepts on the parameter).
+    $faultPauseWatch = [Diagnostics.Stopwatch]::StartNew()
     Pause-Batch
-    $preRollbackMembers = @(Get-RedisSetMembers -Key $config.ProcessedKey)
+    $preRollbackMembers = Get-RedisSetMembers -Key $config.ProcessedKey
     $faultAtUtc = [DateTimeOffset]::UtcNow
     $rollback = Invoke-ScoreboardRollback -SnapshotLabel "k"
     $faultAtMysql = Get-MySqlNow
     Resume-Batch
+    $faultPauseMs = $faultPauseWatch.ElapsedMilliseconds
 
     $lost = Get-LostResultSet -SnapshotMembers $kSnapshot.Processed -PreRollbackMembers $preRollbackMembers
     if ($lost.LostCount -lt 1) {
@@ -662,7 +699,22 @@ try {
     if ($rollback.CanonicalOnlyKeys -gt 0) {
         Write-Output "    of those, $($rollback.CanonicalOnlyKeys) hash-table-encoded key(s) were verified by content, not payload bytes (Redis does not serialize that encoding reproducibly)"
     }
-    Write-Output "  lost set: $($lost.LostCount) result(s) the rollback erased"
+    Write-Output "  lost set: $($lost.LostCount) result(s) the rollback erased (at least $TailResults were asked for)"
+    Write-Output "    read $($lost.SnapshotCount) member(s) from the capture and $($lost.PreRollbackCount) from the set the rollback emptied"
+    Write-Output "    the injection froze batch-1 for ${faultPauseMs}ms (injector footprint, not recovery time)"
+    if ($lost.LostCount -lt $TailResults) {
+        # Refused rather than reported, because the rollback depth is one of the plan's fixed variables:
+        # a run whose fault removed less than the calibration asked for is not comparable with the runs of
+        # the other two modes, and a figure from it would be attributed to the mode. Reaching this means
+        # the wait above and the rollback disagree about what "applied past the capture instant" counts,
+        # which is a harness defect and not a property of any mode. It has now caught one: on 2026-09-25
+        # the pre-rollback read was wrapped in `@(...)`, which collapsed the whole member list into a
+        # single string, and the two counts printed above are what names that shape rather than leaving
+        # the reader with only the difference.
+        throw ("The rollback erased $($lost.LostCount) result(s) but this run asked for at least " +
+            "$TailResults (capture $($lost.SnapshotCount) member(s), pre-rollback $($lost.PreRollbackCount)). " +
+            "The fault depth is a fixed variable, so the run is not comparable.")
+    }
 
     # --- 9. observe -------------------------------------------------------------------------------
 
@@ -817,6 +869,10 @@ try {
         faultRestoredKeys = $rollback.RestoredKeys
         faultVerifiedKeys = $rollback.VerifiedKeys
         faultCheckpointAfter = $rollback.Checkpoint
+        # The injector's own footprint, which the plan requires be recorded separately from recovery
+        # time: both pauses freeze the applier this experiment measures, for tens of seconds.
+        injectorCapturePauseMs = $kCapturePauseMs
+        injectorFaultPauseMs = $faultPauseMs
         lostSnapshotCount = $lost.SnapshotCount
         lostPreRollbackCount = $lost.PreRollbackCount
         lostCount = $lost.LostCount
@@ -1045,7 +1101,13 @@ try {
             observedAtUtc   = $rollback.ObservedAtUtc
             faultAtUtc      = $faultAtUtc.UtcDateTime.ToString("o")
             faultAtMysql    = $faultAtMysql
+            # How long the injector itself held the applier frozen. Subtracting it is what turns
+            # `consistencyOutageMs` from "how long the outage lasted" into "how long the mode took", and
+            # it is recorded here so a reader can do that subtraction rather than infer it from polls.
+            capturePauseMs  = $kCapturePauseMs
+            faultPauseMs    = $faultPauseMs
             lostCount       = $lost.LostCount
+            tailResults     = $TailResults
             lost            = $lost.Lost
         })
     Write-JsonFile -Path (Join-Path $artifacts "recovery-log-events.json") -Object $script:recoveryEvents
