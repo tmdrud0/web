@@ -70,6 +70,7 @@ services:
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 200
       JUDGE_LATENCY_ENABLED: ${JUDGE_LATENCY_ENABLED:-false}
+      JUDGE_LATENCY_MODE: ${JUDGE_LATENCY_MODE:-sleep}
       JUDGE_LATENCY_SEED: ${JUDGE_LATENCY_SEED:-}
       JUDGE_LATENCY_KEY_SOURCE: ${JUDGE_LATENCY_KEY_SOURCE:-submission-id}
       JUDGE_SLOW_RATIO: ${JUDGE_SLOW_RATIO:-0.01}
@@ -83,6 +84,13 @@ services:
       CONTEST_JUDGE_MYSQL_MAX_IN_FLIGHT: ${CONTEST_JUDGE_MYSQL_MAX_IN_FLIGHT:-16}
       CONTEST_JUDGE_MYSQL_CLAIM_TIMEOUT: ${CONTEST_JUDGE_MYSQL_CLAIM_TIMEOUT:-30s}
       CONTEST_JUDGE_MYSQL_POLL_INTERVAL: ${CONTEST_JUDGE_MYSQL_POLL_INTERVAL:-100ms}
+    # CONTEST_JUDGE_CPUS lets the CPU-load judge variant give judge-1 one core per worker (the
+    # "one judgement per core" premise); unset it keeps the base experiment's 0.75 limit exactly.
+    deploy:
+      resources:
+        limits:
+          cpus: "${CONTEST_JUDGE_CPUS:-0.75}"
+          memory: 768M
     ports:
       - "19001:9000"
 
@@ -95,6 +103,7 @@ services:
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 201
       JUDGE_LATENCY_ENABLED: ${JUDGE_LATENCY_ENABLED:-false}
+      JUDGE_LATENCY_MODE: ${JUDGE_LATENCY_MODE:-sleep}
       JUDGE_LATENCY_SEED: ${JUDGE_LATENCY_SEED:-}
       JUDGE_LATENCY_KEY_SOURCE: ${JUDGE_LATENCY_KEY_SOURCE:-submission-id}
       JUDGE_SLOW_RATIO: ${JUDGE_SLOW_RATIO:-0.01}
@@ -108,6 +117,13 @@ services:
       CONTEST_JUDGE_MYSQL_MAX_IN_FLIGHT: ${CONTEST_JUDGE_2_MYSQL_MAX_IN_FLIGHT:-${CONTEST_JUDGE_MYSQL_MAX_IN_FLIGHT:-16}}
       CONTEST_JUDGE_MYSQL_CLAIM_TIMEOUT: ${CONTEST_JUDGE_MYSQL_CLAIM_TIMEOUT:-30s}
       CONTEST_JUDGE_MYSQL_POLL_INTERVAL: ${CONTEST_JUDGE_MYSQL_POLL_INTERVAL:-100ms}
+    # CONTEST_JUDGE_2_CPUS overrides judge-1's CONTEST_JUDGE_CPUS the same way the existing
+    # CONTEST_JUDGE_2_* worker-sizing variables override judge-1's, for asymmetric plans like 3+2.
+    deploy:
+      resources:
+        limits:
+          cpus: "${CONTEST_JUDGE_2_CPUS:-${CONTEST_JUDGE_CPUS:-0.75}}"
+          memory: 768M
     ports:
       - "19002:9000"
 

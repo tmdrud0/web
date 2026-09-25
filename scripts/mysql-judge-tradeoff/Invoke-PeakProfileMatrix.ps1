@@ -12,7 +12,12 @@ param(
     [double]$BaseRps = 5,
     [long]$LatencySeed = 20260920,
     [string[]]$Only = @(),
-    [string]$Custom = ""
+    [string]$Custom = "",
+    # sleep (default) reproduces the base experiment exactly. cpu switches both judge nodes to
+    # CpuLoadProfileContestJudgement AND caps each judge node's container at cpus = its own worker
+    # count (the "one judgement per core" premise for the CPU-load variant experiment) - overridable
+    # per-condition below, but there is currently no reason to run cpu mode with a different limit.
+    [ValidateSet("sleep", "cpu")][string]$JudgeMode = "sleep"
 )
 $ErrorActionPreference = "Stop"
 $runner = Join-Path $PSScriptRoot "Run-TradeoffExperiment.ps1"
@@ -47,7 +52,8 @@ $results = New-Object System.Collections.Generic.List[object]
 foreach ($c in $conditions) {
     $name, $mode, $w1, $w2, $fault = $c
     if ($Only.Count -gt 0 -and $Only -notcontains $name) { continue }
-    $runId = "peak-b$([int]$BaseRps)-$name-$Suffix"
+    $runIdInfix = if ($JudgeMode -eq "cpu") { "b$([int]$BaseRps)cpu" } else { "b$([int]$BaseRps)" }
+    $runId = "peak-$runIdInfix-$name-$Suffix"
     $log = Join-Path $logDir "$runId.log"
     $runArgs = @{
         DispatchMode = $mode; PeakProfile = $true; PeakBaseRps = $BaseRps
@@ -58,7 +64,9 @@ foreach ($c in $conditions) {
         UserCount = $userCount; BurstAuthRps = $authRps; BurstAuthSeconds = $authSeconds
         SteadyGuardSeconds = 0; DrainTimeoutSeconds = 900
         ResetMySqlVolume = $true; ResetBrokerAndCacheVolumes = $true; RunId = $runId
+        JudgeLatencyMode = $JudgeMode
     }
+    if ($JudgeMode -eq "cpu") { $runArgs.JudgeCpus = "$w1"; $runArgs.Judge2Cpus = "$w2" }
     if ($fault) { $runArgs.PeakFaultKillAtSeconds = 120; $runArgs.PeakFaultRestartAtSeconds = 180; $runArgs.KilledNode = "judge-1" }
     $started = Get-Date
     Write-Host "[$($started.ToString('HH:mm:ss'))] $runId ..."

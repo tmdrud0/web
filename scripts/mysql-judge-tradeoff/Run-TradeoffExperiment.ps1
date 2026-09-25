@@ -172,6 +172,16 @@ param(
     # earlier run is unchanged. judge-2 reads CONTEST_JUDGE_2_* overrides in compose.loadtest.yaml.
     [int]$Judge2WorkerCount = 0,
     [int]$Judge2MaxInFlight = 0,
+    # Judge container CPU limit (docker compose deploy.resources.limits.cpus), per node. "" (default)
+    # leaves compose.loadtest.yaml's own default (0.75, the base sleep-judge experiment's value)
+    # untouched. Set both for the CPU-load judge variant's "one judgement per core" sizing (e.g.
+    # -JudgeCpus 3 -Judge2Cpus 3 for worker 3+3); -Judge2Cpus "" falls back to -JudgeCpus the same way
+    # -Judge2WorkerCount 0 falls back to -WorkerCount.
+    [string]$JudgeCpus = "",
+    [string]$Judge2Cpus = "",
+    # sleep (default, unset here) leaves compose.loadtest.yaml's own default untouched, so every
+    # earlier run is unchanged. cpu switches both judge nodes to CpuLoadProfileContestJudgement.
+    [ValidateSet("", "sleep", "cpu")][string]$JudgeLatencyMode = "",
     # Also remove the broker and Redis volumes before the stack is built, so no queue, stream offset,
     # session, rate-limit or dedup key survives from an earlier run. Requires -ResetMySqlVolume.
     [switch]$ResetBrokerAndCacheVolumes,
@@ -345,6 +355,9 @@ if ($ResetBrokerAndCacheVolumes -and -not $ResetMySqlVolume) { throw "-ResetBrok
 if ($Judge2WorkerCount -lt 0 -or $Judge2MaxInFlight -lt 0) { throw "-Judge2WorkerCount/-Judge2MaxInFlight must not be negative (0 = same as judge-1)." }
 $judge2Workers = if ($Judge2WorkerCount -gt 0) { $Judge2WorkerCount } else { $WorkerCount }
 $judge2MaxInFlight = if ($Judge2MaxInFlight -gt 0) { $Judge2MaxInFlight } else { $MySqlMaxInFlight }
+# judge-2's CPU limit falls back to judge-1's the same way its worker sizing does; both fall back to
+# compose.loadtest.yaml's own default (0.75) when left "".
+$judge2Cpus = if ($Judge2Cpus -ne "") { $Judge2Cpus } else { $JudgeCpus }
 # Everything that traces a hold: the closed staged runs place their window from a trace file, and the
 # burst writes its own schedule to one. The preflight and fault machinery below stay on the narrower
 # $stagedLoad - those are the closed model's devices and neither applies to a burst. The warm-up does
@@ -741,7 +754,8 @@ $parameters = [ordered]@{
     mysqlClaimTimeoutProperty = $claimTimeoutProperty
     mysqlPollInterval = $MySqlPollInterval; rabbitPrefetch = $RabbitPrefetch
     rabbitReservedPerNode = $WorkerCount * $RabbitPrefetch
-    deterministicLatencySeed = $LatencySeed; latency = @{ baseMillis = 50; slowMillis = 2000; slowRatio = 0.05; keySource = "code" }
+    deterministicLatencySeed = $LatencySeed
+    latency = @{ baseMillis = 50; slowMillis = 2000; slowRatio = 0.05; keySource = "code"; mode = if ($JudgeLatencyMode -ne "") { $JudgeLatencyMode } else { "sleep" } }
     # Three different things can put a run's fault fields in play, and they are not interchangeable:
     # the legacy fixed-time fault kills at a scheduled second, the recovery mode kills when the target
     # node is observed to hold work, and a run with neither has no fault at all. Downstream readers key
@@ -757,8 +771,8 @@ $parameters = [ordered]@{
     idleBaselineSeconds = $IdleBaselineSeconds
     # Per-node sizing. judge-1 takes -WorkerCount/-MySqlMaxInFlight, judge-2 its own override (or the same).
     judgeNodes = [ordered]@{
-        "judge-1" = [ordered]@{ workers = $WorkerCount; mysqlMaxInFlight = $MySqlMaxInFlight; rabbitConcurrency = $WorkerCount }
-        "judge-2" = [ordered]@{ workers = $judge2Workers; mysqlMaxInFlight = $judge2MaxInFlight; rabbitConcurrency = $judge2Workers }
+        "judge-1" = [ordered]@{ workers = $WorkerCount; mysqlMaxInFlight = $MySqlMaxInFlight; rabbitConcurrency = $WorkerCount; cpus = if ($JudgeCpus -ne "") { $JudgeCpus } else { "0.75" } }
+        "judge-2" = [ordered]@{ workers = $judge2Workers; mysqlMaxInFlight = $judge2MaxInFlight; rabbitConcurrency = $judge2Workers; cpus = if ($judge2Cpus -ne "") { $judge2Cpus } else { "0.75" } }
     }
     totalWorkers = $WorkerCount + $judge2Workers
     hostCpuSampler = (-not $SkipHostCpu) -and $peakMode
@@ -3806,7 +3820,12 @@ $env:CONTEST_JUDGE_2_MYSQL_WORKERS = "$judge2Workers"
 $env:CONTEST_JUDGE_2_MYSQL_MAX_IN_FLIGHT = "$judge2MaxInFlight"
 $env:CONTEST_JUDGE_MYSQL_CLAIM_TIMEOUT = $claimTimeoutProperty
 $env:CONTEST_JUDGE_MYSQL_POLL_INTERVAL = $MySqlPollInterval
+# "" leaves compose.loadtest.yaml's own default (0.75) in place: docker compose's ${VAR:-default}
+# substitution treats an empty env var the same as an unset one.
+$env:CONTEST_JUDGE_CPUS = $JudgeCpus
+$env:CONTEST_JUDGE_2_CPUS = $judge2Cpus
 $env:JUDGE_LATENCY_ENABLED = "true"
+$env:JUDGE_LATENCY_MODE = $JudgeLatencyMode
 $env:JUDGE_LATENCY_SEED = "$LatencySeed"
 $env:JUDGE_LATENCY_KEY_SOURCE = "code"
 $env:JUDGE_BASE_MILLIS = "50"
