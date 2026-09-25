@@ -36,6 +36,8 @@ class ContestSubmissionSimulation extends Simulation {
   private val holdSeconds    = propInt("perf.holdSeconds", 30)
   private val targetRps      = propDouble("perf.targetRps", 139d)
   private val intervalMs     = propLong("perf.submitIntervalMillis", 25_000L)
+  // Off by default so every earlier run keeps the queued feeder it was measured with.
+  private val circularFeeder = java.lang.Boolean.getBoolean("perf.feeder.circular")
 
   private val availableUsers = userIndexEnd - userIndexStart + 1
   private val concurrentUsers = ApiLoad.concurrentUsers(targetRps, intervalMs)
@@ -51,7 +53,10 @@ class ContestSubmissionSimulation extends Simulation {
   private val httpProtocol = ApiLoad.jsonProtocol(baseUrl)
 
   private val submitScenario = scenario("Contest submissions (API)")
-    .feed(ApiLoad.loginFeeder(userPrefix, userIndexStart, userIndexEnd))
+    .feed(
+      if (circularFeeder) ApiLoad.circularLoginFeeder(userPrefix, userIndexStart, userIndexEnd)
+      else ApiLoad.loginFeeder(userPrefix, userIndexStart, userIndexEnd)
+    )
     .exec(ApiLoad.login)
     .exitHereIfFailed
     .exec(ApiLoad.initialJitter(intervalMs))

@@ -31,17 +31,29 @@ object ApiLoad {
   def concurrentUsers(rps: Double, intervalMillis: Long): Int =
     math.max(1, math.ceil(rps * intervalMillis / 1000d).toInt)
 
-  /**
-   * Queued rather than random: two sessions sharing an account would share its dedup and
-   * rate-limit state, so the load would not be the load it claims to be.
-   */
-  def loginFeeder(userPrefix: String, userIndexStart: Int, userIndexEnd: Int) =
+  private def loginRecords(userPrefix: String, userIndexStart: Int, userIndexEnd: Int) =
     (userIndexStart to userIndexEnd).map { userIndex =>
       Map(
         "userName" -> s"${userPrefix}_user_$userIndex",
         "password" -> "pass"
       )
-    }.queue
+    }
+
+  /**
+   * Queued rather than random: two sessions sharing an account would share its dedup and
+   * rate-limit state, so the load would not be the load it claims to be.
+   */
+  def loginFeeder(userPrefix: String, userIndexStart: Int, userIndexEnd: Int) =
+    loginRecords(userPrefix, userIndexStart, userIndexEnd).queue
+
+  /**
+   * Circular, for a closed model that uses every seeded account. A session that dies is replaced by
+   * the injector, and a queued feeder with no account left to hand the replacement ends the whole
+   * run - which is how a high-rate run once lost its engine right after the ramp. Circular trades that
+   * for an occasional shared account, whose rate-limit refusals show up as KO in the log.
+   */
+  def circularLoginFeeder(userPrefix: String, userIndexStart: Int, userIndexEnd: Int) =
+    loginRecords(userPrefix, userIndexStart, userIndexEnd).circular
 
   val login: HttpRequestBuilder = http("api-login-once")
     .post("/api/login")

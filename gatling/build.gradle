@@ -72,3 +72,15 @@ registerSimulationTask(
     'Runs only OjGoalLoadSimulation.'
 )
 
+
+// The live-impact summarizer (src/main/java/my/oj/perf/liveimpact) is plain Java so its verdict logic
+// can be unit-tested; the PowerShell runner only collects files and calls it.
+dependencies {
+  testImplementation platform('org.junit:junit-bom:5.11.4')
+  testImplementation 'org.junit.jupiter:junit-jupiter'
+  testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+  useJUnitPlatform()
+}
