@@ -34,16 +34,27 @@ public class ContestJudgeExecutionMetrics implements MeterBinder {
         meters.duration().record(elapsedNanos, TimeUnit.NANOSECONDS);
     }
 
+    /**
+     * The whole of one processor call on a worker thread: the stored-result lookup, the judgement and
+     * the wait for the result to be persisted and published. Its excess over contest.judge.duration is
+     * the post-judge work a worker is held for (the MySQL dispatcher's outbox completion comes after).
+     */
+    public void recordProcessing(long elapsedNanos) {
+        meters.processing().record(elapsedNanos, TimeUnit.NANOSECONDS);
+    }
+
     public void recordStoredResultRepublish() {
         meters.storedResultRepublish().increment();
     }
 
-    private record Meters(Counter invocations, Timer duration, Counter storedResultRepublish) {
+    private record Meters(Counter invocations, Timer duration, Timer processing, Counter storedResultRepublish) {
         private static Meters of(MeterRegistry registry, String mode, String strategy) {
             return new Meters(
                     Counter.builder("contest.judge.invocations")
                             .tags("mode", mode, "strategy", strategy).register(registry),
                     Timer.builder("contest.judge.duration")
+                            .tags("mode", mode, "strategy", strategy).register(registry),
+                    Timer.builder("contest.judge.processing")
                             .tags("mode", mode, "strategy", strategy).register(registry),
                     Counter.builder("contest.judge.stored_result.republish")
                             .tags("mode", mode, "strategy", strategy).register(registry)

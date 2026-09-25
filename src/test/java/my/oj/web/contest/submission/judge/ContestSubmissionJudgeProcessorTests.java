@@ -46,8 +46,31 @@ class ContestSubmissionJudgeProcessorTests {
         verify(resultWriter).persist(
                 org.mockito.ArgumentMatchers.same(projection),
                 org.mockito.ArgumentMatchers.eq(SubmissionResult.PARTIAL_ACCEPTED),
+                any(LocalDateTime.class),
                 any(LocalDateTime.class)
         );
+    }
+
+    @Test
+    void recordsTheWorkerStartBeforeTheJudgementEnds() {
+        given(submissionService.getJudgeProjectionById(91L)).willReturn(projection);
+        given(judgement.judgeSubmission(projection)).willReturn(SubmissionResult.PARTIAL_ACCEPTED);
+        ContestSubmissionJudgeProcessor processor =
+                new ContestSubmissionJudgeProcessor(submissionService, judgement, resultWriter);
+        LocalDateTime before = LocalDateTime.now();
+
+        processor.judge(91L);
+
+        org.mockito.ArgumentCaptor<LocalDateTime> started = org.mockito.ArgumentCaptor.forClass(LocalDateTime.class);
+        org.mockito.ArgumentCaptor<LocalDateTime> judged = org.mockito.ArgumentCaptor.forClass(LocalDateTime.class);
+        verify(resultWriter).persist(
+                org.mockito.ArgumentMatchers.same(projection),
+                org.mockito.ArgumentMatchers.eq(SubmissionResult.PARTIAL_ACCEPTED),
+                started.capture(),
+                judged.capture()
+        );
+        org.assertj.core.api.Assertions.assertThat(started.getValue()).isAfterOrEqualTo(before);
+        org.assertj.core.api.Assertions.assertThat(judged.getValue()).isAfterOrEqualTo(started.getValue());
     }
 
     @Test

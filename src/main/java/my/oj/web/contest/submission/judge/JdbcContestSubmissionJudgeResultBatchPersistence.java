@@ -20,11 +20,12 @@ public class JdbcContestSubmissionJudgeResultBatchPersistence {
                 contest_id,
                 provisional_result,
                 provisional_judged_at,
+                judge_started_at,
                 final_result,
                 final_judged_at,
                 result_saved_at
             )
-            VALUES (?, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP(6))
+            VALUES (?, ?, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP(6))
             """;
 
     private final JdbcTemplate jdbcTemplate;
@@ -47,6 +48,7 @@ public class JdbcContestSubmissionJudgeResultBatchPersistence {
                 statement.setLong(2, command.contestId());
                 statement.setString(3, command.result().name());
                 statement.setTimestamp(4, timestamp(command.judgedAt()));
+                statement.setTimestamp(5, timestamp(command.judgeStartedAt()));
             }
 
             @Override

@@ -14,11 +14,31 @@ public record ContestSubmissionJudgeResultCommand(
         LocalDateTime contestStart,
         LocalDateTime submittedTime,
         SubmissionResult result,
-        LocalDateTime judgedAt
+        LocalDateTime judgedAt,
+        LocalDateTime judgeStartedAt
 ) {
+
+    /** A command with no recorded judge start: a republished stored result, or a caller that did not time it. */
+    public ContestSubmissionJudgeResultCommand(Long submissionId,
+                                               Long contestId,
+                                               Long problemId,
+                                               Long userId,
+                                               LocalDateTime contestStart,
+                                               LocalDateTime submittedTime,
+                                               SubmissionResult result,
+                                               LocalDateTime judgedAt) {
+        this(submissionId, contestId, problemId, userId, contestStart, submittedTime, result, judgedAt, null);
+    }
 
     public static ContestSubmissionJudgeResultCommand from(ContestSubmissionJudgeProjection submission,
                                                             SubmissionResult result,
+                                                            LocalDateTime judgedAt) {
+        return from(submission, result, null, judgedAt);
+    }
+
+    public static ContestSubmissionJudgeResultCommand from(ContestSubmissionJudgeProjection submission,
+                                                            SubmissionResult result,
+                                                            LocalDateTime judgeStartedAt,
                                                             LocalDateTime judgedAt) {
         return new ContestSubmissionJudgeResultCommand(
                 submission.getSubmissionId(),
@@ -28,7 +48,8 @@ public record ContestSubmissionJudgeResultCommand(
                 submission.getContestStart(),
                 submission.getSubmittedTime(),
                 result,
-                judgedAt
+                judgedAt,
+                judgeStartedAt
         );
     }
 

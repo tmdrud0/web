@@ -40,6 +40,18 @@ public class ContestSubmissionJudgeProcessor {
         if (contestSubmissionId == null) {
             return;
         }
+        // The instant this worker picked the submission up: the end of its queue wait, whichever
+        // transport delivered it. Taken before the stored-result lookup so the whole occupancy counts.
+        LocalDateTime judgeStartedAt = LocalDateTime.now();
+        long processingStarted = System.nanoTime();
+        try {
+            judgeOnce(contestSubmissionId, judgeStartedAt);
+        } finally {
+            metrics.recordProcessing(System.nanoTime() - processingStarted);
+        }
+    }
+
+    private void judgeOnce(Long contestSubmissionId, LocalDateTime judgeStartedAt) {
 
         var storedResult = contestSubmissionService.findStoredJudgeResultById(contestSubmissionId);
         if (storedResult.isPresent()) {
@@ -64,6 +76,7 @@ public class ContestSubmissionJudgeProcessor {
         resultWriter.persist(
                 submission,
                 result,
+                judgeStartedAt,
                 LocalDateTime.now()
         );
     }

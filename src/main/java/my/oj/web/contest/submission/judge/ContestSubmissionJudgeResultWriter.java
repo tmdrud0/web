@@ -11,5 +11,16 @@ public interface ContestSubmissionJudgeResultWriter {
                  SubmissionResult result,
                  LocalDateTime judgedAt);
 
+    /**
+     * Persists a result together with the instant the worker picked the submission up. A writer that
+     * does not record the start falls back to the three-argument form.
+     */
+    default void persist(ContestSubmissionJudgeProjection submission,
+                         SubmissionResult result,
+                         LocalDateTime judgeStartedAt,
+                         LocalDateTime judgedAt) {
+        persist(submission, result, judgedAt);
+    }
+
     void republish(ContestSubmissionJudgeResultCommand storedResult);
 }

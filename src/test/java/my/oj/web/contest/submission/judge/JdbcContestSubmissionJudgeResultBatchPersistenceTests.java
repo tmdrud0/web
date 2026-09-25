@@ -37,6 +37,7 @@ class JdbcContestSubmissionJudgeResultBatchPersistenceTests {
         assertThat(sqlCaptor.getValue())
                 .contains("contest_submission_result")
                 .contains("result_saved_at")
+                .contains("judge_started_at")
                 .contains("CURRENT_TIMESTAMP(6)")
                 .doesNotContain("contest_submission_outbox");
         assertThat(setterCaptor.getValue().getBatchSize()).isEqualTo(2);
@@ -45,6 +46,29 @@ class JdbcContestSubmissionJudgeResultBatchPersistenceTests {
         setterCaptor.getValue().setValues(resultStatement, 0);
         verify(resultStatement).setLong(1, 1L);
         verify(resultStatement).setString(3, SubmissionResult.PARTIAL_ACCEPTED.name());
+        verify(resultStatement).setTimestamp(5, null);
+    }
+
+    @Test
+    void writesTheJudgeStartInstantWhenTheCommandCarriesOne() throws Exception {
+        JdbcTemplate jdbcTemplate = mock(JdbcTemplate.class);
+        JdbcContestSubmissionJudgeResultBatchPersistence persistence =
+                new JdbcContestSubmissionJudgeResultBatchPersistence(jdbcTemplate);
+        LocalDateTime judgedAt = LocalDateTime.of(2026, 9, 25, 12, 0, 0, 500_000_000);
+        LocalDateTime startedAt = judgedAt.minusNanos(50_000_000);
+        ContestSubmissionJudgeResultCommand command = new ContestSubmissionJudgeResultCommand(
+                7L, 10L, 20L, 30L, judgedAt.minusHours(1), judgedAt.minusSeconds(1),
+                SubmissionResult.PARTIAL_ACCEPTED, judgedAt, startedAt);
+
+        persistence.persistAll(List.of(command));
+
+        ArgumentCaptor<BatchPreparedStatementSetter> setterCaptor =
+                ArgumentCaptor.forClass(BatchPreparedStatementSetter.class);
+        verify(jdbcTemplate).batchUpdate(org.mockito.ArgumentMatchers.anyString(), setterCaptor.capture());
+        PreparedStatement statement = mock(PreparedStatement.class);
+        setterCaptor.getValue().setValues(statement, 0);
+        verify(statement).setTimestamp(4, java.sql.Timestamp.valueOf(judgedAt));
+        verify(statement).setTimestamp(5, java.sql.Timestamp.valueOf(startedAt));
     }
 
     private static ContestSubmissionJudgeResultCommand command(Long submissionId, LocalDateTime judgedAt) {

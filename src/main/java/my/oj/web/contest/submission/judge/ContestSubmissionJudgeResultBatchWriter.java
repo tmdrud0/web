@@ -65,9 +65,17 @@ public class ContestSubmissionJudgeResultBatchWriter implements ContestSubmissio
     public void persist(ContestSubmissionJudgeProjection submission,
                         SubmissionResult result,
                         LocalDateTime judgedAt) {
+        persist(submission, result, null, judgedAt);
+    }
+
+    @Override
+    public void persist(ContestSubmissionJudgeProjection submission,
+                        SubmissionResult result,
+                        LocalDateTime judgeStartedAt,
+                        LocalDateTime judgedAt) {
         CompletableFuture<Void> completion = new CompletableFuture<>();
         PendingResult pending = new PendingResult(
-                ContestSubmissionJudgeResultCommand.from(submission, result, judgedAt),
+                ContestSubmissionJudgeResultCommand.from(submission, result, judgeStartedAt, judgedAt),
                 true,
                 completion
         );
