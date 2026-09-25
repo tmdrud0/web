@@ -835,12 +835,85 @@ function Invoke-Compose {
     }
 }
 
+# One mysql client session for the whole run instead of one `docker compose exec` per query. The
+# per-second sampler, the drain gate and the boundary snapshots used to open a new exec every time -
+# several Docker API round trips each, about one a second for the whole load and drain. On
+# 2026-09-25 Docker Desktop's backend panicked ("concurrent map iteration and map write") during a
+# run of this harness, and repeated exec calls against the engine are the likely load it could not
+# carry. The session is one exec, opened on first use and fed statements over stdin; each statement
+# is followed by a marker SELECT so its rows end at a known line. stderr is folded into stdout inside
+# the container so an error arrives in order with the rows it belongs to, and --force keeps the
+# client alive after one so the marker still arrives.
+$script:mysqlSession = $null
+$script:mysqlSessionStarts = 0
+$script:mysqlSessionSequence = 0
+
+function Start-MysqlSession {
+    $argumentList = @("compose") + $composeArgs + @("exec", "-T", "mysql", "sh", "-c",
+        "MYSQL_PWD=1234 exec mysql -uroot -D $dbName -N -B -n --force 2>&1")
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = (Get-Command docker.exe).Source
+    $startInfo.Arguments = (($argumentList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+    $startInfo.WorkingDirectory = $repoRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    # compose's own stderr is drained asynchronously so a chatty client can never block on a full pipe.
+    $process.BeginErrorReadLine()
+    $script:mysqlSession = $process
+    $script:mysqlSessionStarts++
+}
+
+function Stop-MysqlSession {
+    $process = $script:mysqlSession
+    $script:mysqlSession = $null
+    if ($null -eq $process) { return }
+    try {
+        if (-not $process.HasExited) {
+            $process.StandardInput.Close()
+            if (-not $process.WaitForExit(5000)) { $process.Kill() }
+        }
+    } catch { Write-Warning "mysql session stop: $_" }
+}
+
 function Invoke-SqlRows {
-    param([Parameter(Mandatory = $true)][string]$Sql)
-    $oneLine = ($Sql -replace "\r?\n", " ").Trim()
-    $output = @(Invoke-Compose -Arguments @("exec", "-T", "mysql", "env", "MYSQL_PWD=1234", "mysql", "-uroot", "-D", $dbName, "-N", "-B", "-e", $oneLine))
-    return @($output | ForEach-Object { [string]$_ } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notmatch '^(Container|Network|mysql:) ' })
+    param([Parameter(Mandatory = $true)][string]$Sql, [int]$TimeoutSeconds = 120)
+    $oneLine = ($Sql -replace "\r?\n", " ").Trim().TrimEnd(";").Trim()
+    if ($null -eq $script:mysqlSession -or $script:mysqlSession.HasExited) {
+        if ($null -ne $script:mysqlSession) { Write-Warning "mysql session exited (code $($script:mysqlSession.ExitCode)); reopening" }
+        Start-MysqlSession
+    }
+    $script:mysqlSessionSequence++
+    $marker = "__oj_end_$($script:mysqlSessionSequence)__"
+    $session = $script:mysqlSession
+    $session.StandardInput.WriteLine("$oneLine;")
+    $session.StandardInput.WriteLine("SELECT '$marker';")
+    $session.StandardInput.Flush()
+    $rows = New-Object System.Collections.Generic.List[string]
+    $errors = New-Object System.Collections.Generic.List[string]
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $read = $session.StandardOutput.ReadLineAsync()
+        $remaining = [int][math]::Max(1, ($deadline - (Get-Date)).TotalMilliseconds)
+        if (-not $read.Wait($remaining)) {
+            # A session that stops answering is not reused: its next line would be this query's.
+            Stop-MysqlSession
+            throw "mysql session did not answer within ${TimeoutSeconds}s: $oneLine"
+        }
+        $line = $read.Result
+        if ($null -eq $line) {
+            Stop-MysqlSession
+            throw "mysql session closed while answering: $oneLine"
+        }
+        if ($line -eq $marker) { break }
+        if ($line -match '^ERROR \d+') { $errors.Add($line); continue }
+        if (-not [string]::IsNullOrWhiteSpace($line)) { $rows.Add($line) }
+    }
+    if ($errors.Count -gt 0) { throw "mysql error: $($errors -join ' | ') for: $oneLine" }
+    return @($rows.ToArray() | Where-Object { $_ -notmatch '^(Container|Network|mysql:) ' })
 }
 
 function Get-SqlScalar {
@@ -4604,7 +4677,7 @@ try {
     }
     $unavailable.Add("duplicate judge time is bounded by the deterministic 50ms/2000ms profile; exact per-claim attribution is unavailable")
     if ($DispatchMode -eq "rabbit") { $unavailable.Add("Rabbit per-node running/local-waiting/reserved gauges are unavailable; worker-count x prefetch is recorded only as the configured normalized ceiling") }
-    $unavailable.Add("MySQL CPU is not exposed by the stock mysql:8.0 container; connection and InnoDB lock counters are captured instead")
+    if ($SkipContainerCpu) { $unavailable.Add("MySQL CPU is not exposed by the stock mysql:8.0 container and this run skipped the cgroup CPU sampler; connection and InnoDB lock counters are captured instead") }
     if ($DispatchMode -eq "rabbit") {
         # The three readings the mysql path reports and the rabbit path cannot. Each is stated as a
         # reason rather than omitted, so a reader of this run's document can tell "not applicable to
@@ -4906,7 +4979,7 @@ try {
         }
         workCost = @{ duplicateClaimEstimate=$duplicateEstimate; duplicateJudgementEstimate=$duplicateJudgements; judgeInvocations=$judgeInvocations; judgeInvocationsLowerBound=[bool]$faultWasInjected; totalJudgeMillis=if ($null -eq $judgeDurationSeconds) {$null} else {[math]::Round($judgeDurationSeconds*1000,3)}; duplicateJudgeMillisLowerBound=$duplicateJudgeMillisLowerBound; duplicateJudgeMillisUpperBound=$duplicateJudgeMillisUpperBound; claimCalls=$claimCalls; claimedRows=$claimRows; staleReclaims=$staleReclaims; completionSuccess=$completionSuccess; completionFailure=$completionFailure; staleTokenCompletions=$staleCompletions; storedResultRepublishes=$storedRepublishes; claimAttemptsFile="claim-attempts.tsv"; killedNodeClaimCount=if ($claimSnapshot.exact) {@($claimSnapshot.ids).Count} else {$null}; clusterWideClaimedUnfinishedUpperBound=$claimSnapshot.observedActiveClaimCount; claimedUnfinishedExact=[bool]$claimSnapshot.exact }
         cohortAvailability = @{ killedNodeClaimed=[bool]$claimSnapshot.exact }
-        mysql = @{ statusSnapshots="metrics/*-mysql-status.tsv"; cpu=$null; lockAndConnectionCounters="captured" }
+        mysql = @{ statusSnapshots="metrics/*-mysql-status.tsv"; cpu=$(if ($SkipContainerCpu) { $null } else { "container-cpu-1s.csv (cgroup cpu.stat, 1s)" }); lockAndConnectionCounters="captured" }
         warmup = $warmupVerification
         # Set only in open-burst mode: whether this run was actually offered the arrival schedule it
         # names. It is deliberately not folded into `integrity`, because the two are different
@@ -4917,6 +4990,13 @@ try {
         unavailable = @($unavailable)
     }
     $verification | ConvertTo-Json -Depth 7 | Set-Content (Join-Path $runDirectory "db-verification.json") -Encoding utf8
+    # The CPU series is closed before the analyzer reads the run, so the run's own summary carries it.
+    # The finally block still stops it on every other path.
+    if ($null -ne $script:containerCpuSampler) {
+        $cpuCsv = Stop-ContainerCpuSampler -Sampler $script:containerCpuSampler
+        $script:containerCpuSampler = $null
+        Write-Host "Container CPU series: $cpuCsv"
+    }
     & (Join-Path $PSScriptRoot "Analyze-TradeoffRun.ps1") -RunDirectory $runDirectory
 } catch {
     $events.runEndedAt = [datetimeoffset]::UtcNow.ToString("o")
@@ -4980,6 +5060,8 @@ try {
     # be torn down, and its error log would fill with connection failures that describe the teardown
     # rather than the run.
     Stop-RabbitSampler
+    if ($script:mysqlSessionStarts -gt 0) { Write-Host "mysql session: opened $($script:mysqlSessionStarts) time(s) for $($script:mysqlSessionSequence) statements" }
+    Stop-MysqlSession
     if ($null -ne $script:containerCpuSampler) {
         try {
             $cpuCsv = Stop-ContainerCpuSampler -Sampler $script:containerCpuSampler
