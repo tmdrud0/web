@@ -27,6 +27,8 @@ $parametersPath = Join-Path $runPath "parameters.json"
 # two scripts is a rule that drifts. It is dot-sourced here for the rabbit fault export below; every
 # other reader in this file is unaffected by it, because nothing else calls into it.
 . (Join-Path $PSScriptRoot "RabbitFaultRecoveryVerdict.ps1")
+# Get-ContainerCpuWindow: the per-container CPU series the runner records beside timeseries.csv.
+. (Join-Path $PSScriptRoot "ContainerCpuSampler.ps1")
 
 function Get-Percentile {
     param([double[]]$Values, [double]$Percentile)
@@ -1805,6 +1807,10 @@ function Resolve-StageLabelAt {
 
 $parameters = Get-Content $parametersPath -Raw | ConvertFrom-Json
 $events = Get-Content $eventsPath -Raw | ConvertFrom-Json
+# Container CPU from the runner's cgroup sampler. Absent for runs that predate it; every reader below
+# reports it as unavailable rather than as zero in that case.
+$containerCpuPath = Join-Path $runPath "container-cpu-1s.csv"
+$containerCpuRows = if (Test-Path $containerCpuPath) { @(Import-Csv $containerCpuPath) } else { @() }
 $verification = Get-Content $verificationPath -Raw | ConvertFrom-Json
 $rows = if (Test-Path $latencyPath) { @(Import-Csv $latencyPath) } else { @() }
 $cohortNames = @("all", "pre-fault-normal", "fault-window", "killed-node-claimed", "post-fault-arrivals")
@@ -2301,6 +2307,9 @@ if (Test-Path $stagesPath) {
                 questions = Get-ColumnStats $windowRows "questions"
                 rowLockWaitsPerSecond = if ($mSeconds -gt 0 -and $null -ne (Get-ColumnStats $windowRows "innodbRowLockWaits").delta) { [math]::Round((Get-ColumnStats $windowRows "innodbRowLockWaits").delta / $mSeconds, 4) } else { $null }
                 questionsPerSecond = if ($mSeconds -gt 0 -and $null -ne (Get-ColumnStats $windowRows "questions").delta) { [math]::Round((Get-ColumnStats $windowRows "questions").delta / $mSeconds, 4) } else { $null }
+                # Time-weighted mean of the 1s cgroup readings whose interval ends inside the measurement
+                # window, per container. $null when the run has no CPU series.
+                containerCpu = if ($containerCpuRows.Count -gt 0) { Get-ContainerCpuWindow -Rows $containerCpuRows -StartMillis $mStart -EndMillis $mEnd } else { $null }
             }
             claim = [ordered]@{
                 windowBasis = "staleReclaimRowsInWindow counts rows whose outbox updated_at falls in the measurement window; updated_at is the row's last write, so it is when the reclaim finished, not when it happened, which is why the prometheus claim-stale counter is reported beside it. The prometheus deltas run between the hold's own start and end scrapes, which are $($windowSeconds)s apart rather than $($mSeconds)s, because snapshots are only taken at segment boundaries"
@@ -3046,6 +3055,7 @@ if (Test-Path $stagesPath) {
         mysqlMaxInFlightPerNode = $parameters.mysqlMaxInFlightPerNode
         mysqlClaimBatchSize = $parameters.mysqlClaimBatchSize
         mysqlClaimTimeout = $parameters.mysqlClaimTimeout
+        mysqlPollInterval = $parameters.mysqlPollInterval
         workerCountPerNode = $parameters.workerCountPerNode
         stageRps = $stagesDoc.stageRps
         warmupStageCount = $stagesDoc.warmupStageCount
@@ -3134,6 +3144,60 @@ if ($null -ne $staircase -and @("normal-timeout", "fault-recovery", "open-burst"
     }
 }
 
+# The idle cost of the dispatcher: the stack is up, the judge nodes poll, nothing is submitted. The
+# runner brackets the window with two snapshots. Prometheus is scraped first in each snapshot and
+# MySQL's status last, so the claim rate is taken between the snapshots' start instants and the MySQL
+# rates between their finish instants; the CPU window is the interior between the two snapshots.
+$idleBaseline = $null
+if ($null -ne $events.idleBaselineStartedAt -and $null -ne $events.idleBaselineEndedAt -and
+    $null -ne $events.idleBaselineStartSnapshotDoneAt -and $null -ne $events.idleBaselineEndSnapshotDoneAt) {
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $idleS0 = [datetimeoffset]::Parse([string]$events.idleBaselineStartedAt, $invariant)
+    $idleS1 = [datetimeoffset]::Parse([string]$events.idleBaselineStartSnapshotDoneAt, $invariant)
+    $idleE0 = [datetimeoffset]::Parse([string]$events.idleBaselineEndedAt, $invariant)
+    $idleE1 = [datetimeoffset]::Parse([string]$events.idleBaselineEndSnapshotDoneAt, $invariant)
+    $promSeconds = ($idleE0 - $idleS0).TotalSeconds
+    $mysqlSeconds = ($idleE1 - $idleS1).TotalSeconds
+    $readStatus = {
+        param([string]$Label)
+        $map = @{}
+        $path = Join-Path $runPath "metrics\$Label-mysql-status.tsv"
+        if (Test-Path $path) {
+            foreach ($line in @(Get-Content $path | Select-Object -Skip 1)) {
+                $parts = ([string]$line).Split([char]9)
+                if ($parts.Count -ge 2) { $map[$parts[0]] = [double]$parts[1] }
+            }
+        }
+        return $map
+    }
+    $idleStartStatus = & $readStatus "idle-start"
+    $idleEndStatus = & $readStatus "idle-end"
+    $idleMysql = [ordered]@{}
+    foreach ($name in @("Questions", "Com_select", "Com_update", "Innodb_row_lock_waits")) {
+        $idleMysql["$($name)PerSecond"] = if ($idleStartStatus.ContainsKey($name) -and $idleEndStatus.ContainsKey($name) -and $mysqlSeconds -gt 0) {
+            [math]::Round(($idleEndStatus[$name] - $idleStartStatus[$name]) / $mysqlSeconds, 4)
+        } else { $null }
+    }
+    $idleClaims = Get-PromDelta "idle-start" "idle-end" "contest_judge_claim_calls_total"
+    $idleClaimRows = Get-PromDelta "idle-start" "idle-end" "contest_judge_claim_rows_total"
+    $idleByNode = [ordered]@{}
+    foreach ($node in @("judge-1", "judge-2")) {
+        $nodeClaims = Get-PromNodeDelta "idle-start" "idle-end" "contest_judge_claim_calls_total" $node
+        $idleByNode[$node] = if ($null -ne $nodeClaims -and $promSeconds -gt 0) { [math]::Round($nodeClaims / $promSeconds, 3) } else { $null }
+    }
+    $idleBaseline = [ordered]@{
+        configuredPollInterval = $parameters.mysqlPollInterval
+        promWindowSeconds = [math]::Round($promSeconds, 3)
+        mysqlWindowSeconds = [math]::Round($mysqlSeconds, 3)
+        claimCallsPerSecond = if ($null -ne $idleClaims -and $promSeconds -gt 0) { [math]::Round($idleClaims / $promSeconds, 3) } else { $null }
+        claimCallsPerSecondByNode = $idleByNode
+        claimedRows = $idleClaimRows
+        mysql = $idleMysql
+        containerCpu = if ($containerCpuRows.Count -gt 0) { Get-ContainerCpuWindow -Rows $containerCpuRows -StartMillis $idleS1.ToUnixTimeMilliseconds() -EndMillis $idleE0.ToUnixTimeMilliseconds() } else { $null }
+        basis = "no load is offered between the two snapshots; every claim call is an empty poll and every MySQL statement comes from the stack's own background work (judge claim polls, the batch node's relays and health checks). The per-second timeseries sampler is not running in this window, so its own queries are not in these rates."
+    }
+}
+
 $summary = [ordered]@{
     runId = $parameters.runId
     gitCommit = $parameters.gitCommit
@@ -3162,6 +3226,7 @@ $summary = [ordered]@{
     mysql = $verification.mysql
     unavailable = @($verification.unavailable)
 }
+if ($null -ne $idleBaseline) { $summary.idleBaseline = $idleBaseline }
 if ($null -ne $staircase) {
     $summary.staircase = $staircase
     $summary.unavailable = @($verification.unavailable) + @($staircase.unavailable)
@@ -3626,6 +3691,27 @@ if ($null -ne $staircase) {
             "$(if ($null -eq $mech.rowsPerClaim) { 'unavailable' } else { $mech.rowsPerClaim }) |"
     }
     $lines += @("", "Implied occupancy: $($staircase.stages[0].mechanism.impliedOccupancyBasis)")
+    $lines += @("", "### Database cost per stage", "",
+        "| Stage | result/s | claims/s | rows per claim | Questions/s | row-lock waits/s | Threads_running avg | MySQL CPU cores | MySQL throttled ms/s | judge-1 CPU | judge-2 CPU |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    foreach ($stage in $staircase.stages) {
+        $mech = $stage.mechanism
+        $db = $stage.mysql
+        $cpu = $db.containerCpu
+        $cpuCell = {
+            param($Name, $Field)
+            if ($null -eq $cpu -or -not $cpu.Contains($Name) -or $null -eq $cpu[$Name][$Field]) { return 'unavailable' }
+            return $cpu[$Name][$Field]
+        }
+        $lines += "| $($stage.label) | $(if ($null -eq $stage.resultsCompleted.perSecond) { 'unavailable' } else { $stage.resultsCompleted.perSecond }) | " +
+            "$(if ($null -eq $mech.claimsPerSecond) { 'unavailable' } else { $mech.claimsPerSecond }) | " +
+            "$(if ($null -eq $mech.rowsPerClaim) { 'unavailable' } else { $mech.rowsPerClaim }) | " +
+            "$(if ($null -eq $db.questionsPerSecond) { 'unavailable' } else { $db.questionsPerSecond }) | " +
+            "$(if ($null -eq $db.rowLockWaitsPerSecond) { 'unavailable' } else { $db.rowLockWaitsPerSecond }) | " +
+            "$(if ($null -eq $db.threadsRunning.average) { 'unavailable' } else { $db.threadsRunning.average }) | " +
+            "$(& $cpuCell 'oj-loadtest-mysql' 'meanCores') | $(& $cpuCell 'oj-loadtest-mysql' 'throttledMsPerSecond') | " +
+            "$(& $cpuCell 'oj-loadtest-judge-1' 'meanCores') | $(& $cpuCell 'oj-loadtest-judge-2' 'meanCores') |"
+    }
     $lines += @("", "### Would a small change have flipped the steady verdict?", "",
         "| Stage | endpoint rows/s | least squares rows/s | tick stdev rows | largest single tick swing | net rows that would exceed the threshold | verdict at half / double threshold | without first / last sample | stable |",
         "|---|---:|---:|---:|---:|---:|---|---|---|")

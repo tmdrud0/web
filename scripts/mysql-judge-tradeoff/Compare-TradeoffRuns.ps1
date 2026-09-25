@@ -40,6 +40,23 @@ function Get-Median {
     return [math]::Round((($present[$present.Count / 2 - 1] + $present[$present.Count / 2]) / 2), 3)
 }
 
+# "100ms", "20ms", "1s", "PT0.1S" -> milliseconds, for ordering runs by poll interval. $null when the
+# text is not one of those forms, which leaves the run unordered rather than misplaced.
+function ConvertTo-DurationMillis {
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    $t = $Text.Trim().ToLowerInvariant()
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($t -match '^([0-9.]+)ms$') { return [double]::Parse($Matches[1], $culture) }
+    if ($t -match '^([0-9.]+)s$') { return 1000.0 * [double]::Parse($Matches[1], $culture) }
+    if ($t -match '^pt([0-9.]+)s$') { return 1000.0 * [double]::Parse($Matches[1], $culture) }
+    if ($t -match '^[0-9]+$') { return [double]$t }
+    return $null
+}
+
+# The 32-worker reference every capacity document quotes: 2 nodes x 16 workers / 147.5ms mean judge time.
+$TheoryResultRps = 2 * 16 / 0.1475
+
 function Get-MifRatio {
     param($ByMif, [int]$NumeratorMif, [int]$DenominatorMif, [string]$Field, [string]$BlockedReason = "")
     $result = [ordered]@{
@@ -153,11 +170,20 @@ foreach ($directory in $RunDirectory) {
     }
     # max-in-flight is validated above, so it is present for every analyzed run.
     $maxInFlight = [int]$staircase.mysqlMaxInFlightPerNode
+    # Older summaries do not carry the poll interval; the run's own parameters.json always has it.
+    $pollInterval = $staircase.mysqlPollInterval
+    if ($null -eq $pollInterval) {
+        $parametersPath = Join-Path $runPath "parameters.json"
+        if (Test-Path $parametersPath) { $pollInterval = (Get-Content $parametersPath -Raw | ConvertFrom-Json).mysqlPollInterval }
+    }
 
     $analyzed.Add([pscustomobject]@{
         runId = $summary.runId
         runDirectory = $runPath
         maxInFlight = $maxInFlight
+        pollInterval = $pollInterval
+        pollIntervalMillis = ConvertTo-DurationMillis ([string]$pollInterval)
+        idleBaseline = $summary.idleBaseline
         claimBatchSize = $staircase.mysqlClaimBatchSize
         claimTimeout = $staircase.mysqlClaimTimeout
         workerCountPerNode = $staircase.workerCountPerNode
@@ -221,7 +247,11 @@ $comparabilityBlockedReason = if ($parameterMismatches.Count -gt 0) {
 # Two runs at the same max-in-flight mean the mapping is ambiguous. Keeping the last one silently
 # would drop a repeatability run from the ratios while still printing it in the tables.
 $byMif = @{}
+# The max-in-flight ratios hold the poll interval fixed: they are built from the runs that share the
+# first run's poll interval. Runs at another poll interval are compared in the poll section instead.
+$ratioPollInterval = if ($analyzed.Count -gt 0) { [string]$analyzed[0].pollInterval } else { "" }
 foreach ($run in $analyzed) {
+    if ([string]$run.pollInterval -ne $ratioPollInterval) { continue }
     if ($byMif.ContainsKey($run.maxInFlight)) {
         $previous = $byMif[$run.maxInFlight]
         $excluded.Add([ordered]@{
@@ -363,8 +393,69 @@ $hypotheses.Add([ordered]@{
     values = [ordered]@{ maxInFlight16 = Get-DuplicateObservation $mif16; maxInFlight64 = Get-DuplicateObservation $mif64 }
 })
 
+# Poll interval comparison: every analyzed run at its own (max-in-flight, poll) condition, and for each
+# max-in-flight every pair of poll intervals, ratioed on the saturated plateau. Within one condition
+# the first run in execution order is the one ratioed; the others are listed as repeats.
+$pollConditions = [ordered]@{}
+foreach ($run in $analyzed) {
+    $key = "$($run.maxInFlight)|$($run.pollInterval)"
+    if (-not $pollConditions.Contains($key)) { $pollConditions[$key] = New-Object System.Collections.Generic.List[object] }
+    $pollConditions[$key].Add($run)
+}
+$pollRuns = [object[]]@($analyzed | Sort-Object @{ Expression = { $_.maxInFlight } }, @{ Expression = { - [double]$(if ($null -eq $_.pollIntervalMillis) { 0 } else { $_.pollIntervalMillis }) } } | ForEach-Object {
+
+    [ordered]@{
+        runId = $_.runId
+        pollInterval = $_.pollInterval
+        maxInFlight = $_.maxInFlight
+        excludedFromComparison = $_.excludedFromComparison
+        saturatedResultRpsMedian = $_.throughput.saturatedResultRpsMedian
+        saturatedStageCount = $_.throughput.saturatedStageCount
+        percentOfTheory = if ($null -ne $_.throughput.saturatedResultRpsMedian) { [math]::Round(100.0 * $_.throughput.saturatedResultRpsMedian / $TheoryResultRps, 1) } else { $null }
+        knee = $_.kneeShort
+        drainSeconds = $_.drainSeconds
+        idleClaimCallsPerSecond = if ($null -ne $_.idleBaseline) { $_.idleBaseline.claimCallsPerSecond } else { $null }
+        idleQuestionsPerSecond = if ($null -ne $_.idleBaseline) { $_.idleBaseline.mysql.QuestionsPerSecond } else { $null }
+        idleMysqlCpuCores = if ($null -ne $_.idleBaseline -and $null -ne $_.idleBaseline.containerCpu -and $null -ne $_.idleBaseline.containerCpu.'oj-loadtest-mysql') { $_.idleBaseline.containerCpu.'oj-loadtest-mysql'.meanCores } else { $null }
+    }
+})
+$pollRatios = New-Object System.Collections.Generic.List[object]
+foreach ($mif in @($analyzed | ForEach-Object { $_.maxInFlight } | Sort-Object -Unique)) {
+    $atMif = @($pollConditions.Keys | Where-Object { $_ -like "$mif|*" })
+    foreach ($numeratorKey in $atMif) {
+        foreach ($denominatorKey in $atMif) {
+            if ($numeratorKey -eq $denominatorKey) { continue }
+            $numerator = $pollConditions[$numeratorKey][0]
+            $denominator = $pollConditions[$denominatorKey][0]
+            # Faster poll over slower poll only, so each pair appears once and reads as "what shortening bought".
+            if ($null -eq $numerator.pollIntervalMillis -or $null -eq $denominator.pollIntervalMillis -or $numerator.pollIntervalMillis -ge $denominator.pollIntervalMillis) { continue }
+            $blocked = if ($numerator.excludedFromComparison) { "$($numerator.runId): $($numerator.exclusionReason)" } elseif ($denominator.excludedFromComparison) { "$($denominator.runId): $($denominator.exclusionReason)" } else { $null }
+            $nValue = $numerator.throughput.saturatedResultRpsMedian
+            $dValue = $denominator.throughput.saturatedResultRpsMedian
+            $pollRatios.Add([ordered]@{
+                maxInFlight = $mif
+                numeratorRunId = $numerator.runId
+                numeratorPollInterval = $numerator.pollInterval
+                denominatorRunId = $denominator.runId
+                denominatorPollInterval = $denominator.pollInterval
+                numeratorSaturatedResultRps = $nValue
+                denominatorSaturatedResultRps = $dValue
+                ratio = if ($null -eq $blocked -and $null -ne $nValue -and $null -ne $dValue -and $dValue -ne 0) { [math]::Round($nValue / $dValue, 3) } else { $null }
+                blockedReason = $blocked
+            })
+        }
+    }
+}
+
 $comparison = [ordered]@{
     generatedAt = [datetimeoffset]::UtcNow.ToString("o")
+    pollComparison = [ordered]@{
+        theoryResultRps = [math]::Round($TheoryResultRps, 3)
+        theoryBasis = "2 nodes x 16 workers / 147.5ms mean synthetic judge time; a reference, not a fitting target"
+        runs = $pollRuns
+        ratios = [object[]]$pollRatios
+        maxInFlightRatiosUsePollInterval = $ratioPollInterval
+    }
     runOrder = [object[]]@($analyzed | ForEach-Object { $_.runId })
     runs = [object[]]$analyzed
     ratios = $ratios
@@ -406,6 +497,48 @@ foreach ($run in $analyzed) {
         "$(if ($run.apiRateLimitSuspected) { 'yes' } else { 'no' }) |"
 }
 $lines += @("", "A 'no' in either robustness column means that end of the knee is steady or overloaded only under the exact threshold used here: halving or doubling the threshold, or dropping one end sample, changes the verdict. Read such a run's interval as the neighbourhood of a transition rather than as two proven operating points.")
+
+$lines += @("", "## Poll interval comparison", "",
+    "Theory reference: $([math]::Round($TheoryResultRps, 1)) result/s (2 nodes x 16 workers / 147.5ms). The max-in-flight ratios below use only the runs at poll interval $ratioPollInterval.", "",
+    "| Run | poll | max-in-flight | saturated result RPS (median of overloaded stages) | % of theory | knee | drain s | idle claims/s | idle Questions/s | idle MySQL CPU cores |",
+    "|---|---|---:|---:|---:|---|---:|---:|---:|---:|")
+foreach ($entry in $pollRuns) {
+    $lines += "| $($entry.runId) | $($entry.pollInterval) | $($entry.maxInFlight) | " +
+        "$(if ($null -eq $entry.saturatedResultRpsMedian) { 'unavailable' } else { "$($entry.saturatedResultRpsMedian) ($($entry.saturatedStageCount) stages)" }) | " +
+        "$(if ($null -eq $entry.percentOfTheory) { 'unavailable' } else { $entry.percentOfTheory }) | $($entry.knee) | " +
+        "$(if ($null -eq $entry.drainSeconds) { 'unavailable' } else { $entry.drainSeconds }) | " +
+        "$(if ($null -eq $entry.idleClaimCallsPerSecond) { 'unavailable' } else { $entry.idleClaimCallsPerSecond }) | " +
+        "$(if ($null -eq $entry.idleQuestionsPerSecond) { 'unavailable' } else { $entry.idleQuestionsPerSecond }) | " +
+        "$(if ($null -eq $entry.idleMysqlCpuCores) { 'unavailable' } else { $entry.idleMysqlCpuCores }) |"
+}
+$lines += @("", "| max-in-flight | faster poll run | slower poll run | saturated RPS faster / slower | ratio | note |", "|---:|---|---|---|---:|---|")
+foreach ($ratio in $pollRatios) {
+    $lines += "| $($ratio.maxInFlight) | $($ratio.numeratorRunId) ($($ratio.numeratorPollInterval)) | $($ratio.denominatorRunId) ($($ratio.denominatorPollInterval)) | " +
+        "$($ratio.numeratorSaturatedResultRps) / $($ratio.denominatorSaturatedResultRps) | $(if ($null -eq $ratio.ratio) { 'unavailable' } else { $ratio.ratio }) | $(if ($ratio.blockedReason) { $ratio.blockedReason } else { '' }) |"
+}
+
+$lines += @("", "## Database cost per stage, all runs", "",
+    "| Run | poll | max-in-flight | Stage | target RPS | result RPS | running avg /$(2 * 16) | queued avg | claims/s | rows/claim | Questions/s | row-lock waits/s | MySQL CPU cores |",
+    "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+foreach ($run in $analyzed) {
+    if ($null -ne $run.idleBaseline) {
+        $idleCpu = if ($null -ne $run.idleBaseline.containerCpu -and $null -ne $run.idleBaseline.containerCpu.'oj-loadtest-mysql') { $run.idleBaseline.containerCpu.'oj-loadtest-mysql'.meanCores } else { 'unavailable' }
+        $lines += "| $($run.runId) | $($run.pollInterval) | $($run.maxInFlight) | idle (no load) | 0 | 0 | 0 | 0 | " +
+            "$(if ($null -eq $run.idleBaseline.claimCallsPerSecond) { 'unavailable' } else { $run.idleBaseline.claimCallsPerSecond }) | 0 | " +
+            "$(if ($null -eq $run.idleBaseline.mysql.QuestionsPerSecond) { 'unavailable' } else { $run.idleBaseline.mysql.QuestionsPerSecond }) | " +
+            "$(if ($null -eq $run.idleBaseline.mysql.Innodb_row_lock_waitsPerSecond) { 'unavailable' } else { $run.idleBaseline.mysql.Innodb_row_lock_waitsPerSecond }) | $idleCpu |"
+    }
+    foreach ($stage in $run.stages) {
+        $mysqlCpu = if ($null -ne $stage.mysql.containerCpu -and $null -ne $stage.mysql.containerCpu.'oj-loadtest-mysql') { $stage.mysql.containerCpu.'oj-loadtest-mysql'.meanCores } else { 'unavailable' }
+        $lines += "| $($run.runId) | $($run.pollInterval) | $($run.maxInFlight) | $($stage.label) | $($stage.targetRps) | " +
+            "$(if ($null -eq $stage.resultsCompleted.perSecond) { 'unavailable' } else { $stage.resultsCompleted.perSecond }) | " +
+            "$($stage.executor.bothNodes.running.average) | $($stage.executor.bothNodes.queued.average) | " +
+            "$(if ($null -eq $stage.mechanism.claimsPerSecond) { 'unavailable' } else { $stage.mechanism.claimsPerSecond }) | " +
+            "$(if ($null -eq $stage.mechanism.rowsPerClaim) { 'unavailable' } else { $stage.mechanism.rowsPerClaim }) | " +
+            "$(if ($null -eq $stage.mysql.questionsPerSecond) { 'unavailable' } else { $stage.mysql.questionsPerSecond }) | " +
+            "$(if ($null -eq $stage.mysql.rowLockWaitsPerSecond) { 'unavailable' } else { $stage.mysql.rowLockWaitsPerSecond }) | $mysqlCpu |"
+    }
+}
 
 $lines += @("", "## Throughput ratios", "",
     "- $($ratios.note)",
