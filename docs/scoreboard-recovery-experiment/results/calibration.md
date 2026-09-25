@@ -210,15 +210,65 @@ DEL/RESTORE → `Resume-Batch` 순서이므로 `faultPauseMs`에는 `T_fault` �
 5. **자원 비용의 모드 간 비교.** `maxAppProcessCpu`(1.000 / 0.992 / 0.983), `repairDurationMs`
    (13099.2 / 7811.9 / 11812.5)는 회복 구간 길이가 달라 그대로 비교할 수 없다. pilot 요약표의
    `*PerSecond` 비율 열을 쓴다.
+   **단, 그 열의 분모에는 freeze가 들어 있다.** 분모는 `recoveryWindowSeconds = T_consistent − T_fault`
+   이고 그 안의 대부분은 injector가 batch-1을 얼린 시간이다(실측 freeze 44–47초). 따라서 이 비율은
+   "회복 1초당 비용"이 아니라 "freeze + 회복 1초당 비용"이고, 모드 자신의 회복 비용을 5–6배 과소평가한다.
+   모드 간 **비교**에는 여전히 쓸 수 있지만(세 모드가 같은 freeze를 겪는다), 절대값을 읽을 때는 분모를
+   `consistencyOutageMs − injectorFaultPauseMs`로 놓아야 한다. `PILOT_REPORT.md`의 자원 비용 표는
+   두 분모를 모두 낸다. (`run-recovery-pilot.ps1:803-807,953-957`; 근거는 `deferred-harness-fixes.md`.)
 6. **롤백 깊이가 고정됐다는 것.** §5 참조. 요청값 20에 대해 달성값이 1661 / 1809 / 1719이고,
    이는 pilot에서도 같다.
 
 ---
 
-## 9. 이 문서를 쓴 revision
+## 9. 이 문서를 쓴 revision — 그리고 측정된 artifact는 그 revision이 아니었다
 
 이 문서와 calibration 수치는 revision `352ff43`에서 실행된 suite의 산출물이다.
 `detectionLatencyMs` 부호 수정(§7)은 그 뒤에 반영됐고, **pilot의 9 run은 모두 수정 후 revision으로
 돌린다.** 수정은 한 열의 부호만 바꾸는 표시 변경이며, `-TargetRps`·`-HoldSeconds`·깊이·timeout 등
 **측정 조건과 측정량은 하나도 바뀌지 않는다.** 따라서 이 문서의 calibration 값과 pilot 값을 같은
 조건 위에서 비교할 수 있다.
+
+### 9-1. 정정 — 그 `gitHead`는 저장소의 revision이지, 측정된 jar의 revision이 아니다
+
+**이 절은 위 §9의 결론을 뒤집는다. calibration의 모드 비교는 성립하지 않는다.**
+
+`suite-metadata.json`의 `gitHead`는 run 시점의 **저장소** HEAD다. 측정된 **제품 artifact**의 revision은
+다른 값이었고, 어느 산출물에도 기록되지 않는다. `Dockerfile`에 build 단계가 없어
+(`COPY build/libs/web-0.0.1-SNAPSHOT.jar app.jar`) jar는 호스트 Gradle이 만들고, `up -d --build`는
+그 파일을 다시 복사할 뿐이다. jar 바이트가 그대로면 `COPY` 레이어가 캐시에 적중해 이미지가 그대로
+재사용되고 `CreatedAt`도 바뀌지 않는다.
+
+실측된 이미지는 `oj-loadtest-batch-1` = `169720d1dcda`, `CreatedAt` **2026-09-20 11:39:30**이었고,
+그 `/app/app.jar`에는 `my/oj/web/contest/scoreboard/recovery/` 패키지가 **하나도 없다**
+(HEAD의 jar는 38개). 모드별 전략(`FullReplayRecoveryStrategy`·`StreamOffsetRecoveryStrategy`·
+`RedisSequenceRecoveryStrategy`·`ContestScoreboardRecoveryMode` 등)은 `274b389`
+(2026-09-20 17:15:13)에서 추가됐으므로 **이미지가 그보다 6시간 앞선다.** 이미지에는 모드 이전의 단일
+`stream/ContestScoreboardStreamRecoveryService`(rewind 경로)만 있다.
+
+따라서 `CONTEST_SCOREBOARD_RECOVERY_MODE`는 **효력이 없었다.** 이 suite의 3 run과 아래 pilot 1차
+9 run은 모두 **같은 하나의 회복 구현**을 돌린 것이며, 세 arm은 서로 다른 모드가 아니다. run별
+지표로도 독립적으로 확인된다: 되돌림 없이 재구성하는 모드들의 카운터
+(`scoreboard.stream.rollback.observed`·`.unrecoverable`·`.retry`, `scoreboard.redis.sequence.*`)는
+12개 poll 전부에서 **없었고**, 2026-08-09에 추가된 `stream.rollback.restarts`(rewind 경로)만 0/1로
+읽혔다. `Assert-BatchRecoveryMode`가 이를 막지 못한 이유는 그 검사가 컨테이너의 **환경변수**를
+의도한 모드와 비교할 뿐이라, 코드가 그 변수를 읽지 않아도 통과하기 때문이다 — 설정을 검사하고
+동작을 검사하지 않는다.
+
+**그래서 이 문서에서 무엇이 유효한가:**
+
+- §1(확정값), §3(`-HoldSeconds` 근거), §5(`-TailResults`는 하한), §6(injector footprint),
+  §7(부호 반전)은 **유효하다.** 조건·harness·injector에 대한 기록이고 모드 비교가 아니다.
+- **§2의 세 행(3912.7 / 4123.2 / 10021.5 ms)은 모드 측정이 아니다.** 같은 구현의 3회 반복이며,
+  모드 이름은 그 행이 실행된 설정 이름일 뿐이다. §8-1이 "모드 간 우열이 아니다"라고 이미 못박았지만,
+  이제는 이유가 더 강하다: **비교 대상 자체가 없었다.**
+- §8-1의 괄호 중 "같은 run에서 소비자가 0까지 떨어지고 ready 이벤트가 48.63초 머문 것"은 모드 고유
+  현상이 아니었다. 2차 pilot 9 run에서 세 모드 모두에게 나타났고(6/9 run, `pollsWithoutConsumer`가
+  모드별로 모두 1), 길이가 injector freeze와 일치한다. 이는 **injector의 `docker pause`가 회복 구간
+  안에서 관측된 것**이다.
+
+pilot은 jar를 `gradlew bootJar`로 다시 만들고 이미지 5개를 재빌드한 뒤 재실행했다
+(web-1 `dd28e0b7e269`, web-2 `7286eb3a272c`, judge-1 `543c1f0bf24b`, judge-2 `ae74d7c1c85b`,
+batch-1 `73f6cf8773cd`; 1차 suite가 측정한 이미지는 `*-1:stale-20260920` 태그로 보존). 모드가 실제로
+존재하는 artifact에 대한 수치는 `PILOT_REPORT.md`에 있다. 재현 절차와 이 결함의 재발 방지는
+`var/deferred-harness-fixes.md` item 16.
