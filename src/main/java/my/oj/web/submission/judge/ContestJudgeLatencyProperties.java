@@ -12,6 +12,10 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *                   pipeline history 9.3 asks for
  * @param slowMillis how long a slow judgement blocks its consumer
  * @param baseMillis how long every other judgement takes
+ * @param mode       {@code sleep} (default) blocks the consumer without using CPU;
+ *                   {@code cpu} spends the same duration in on-thread computation instead, so the
+ *                   dispatcher and the judge compete for the same core. Same seed, same slow/fast
+ *                   classification either way &mdash; only how the time is spent changes.
  */
 @ConfigurationProperties(prefix = "contest.submission.judge.latency")
 public record ContestJudgeLatencyProperties(boolean enabled,
@@ -19,11 +23,14 @@ public record ContestJudgeLatencyProperties(boolean enabled,
                                             Long slowMillis,
                                             Long baseMillis,
                                             Long seed,
-                                            String keySource) {
+                                            String keySource,
+                                            String mode) {
 
     private static final double DEFAULT_SLOW_RATIO = 0.01d;
     private static final long DEFAULT_SLOW_MILLIS = 2000L;
     private static final long DEFAULT_BASE_MILLIS = 10L;
+    public static final String MODE_SLEEP = "sleep";
+    public static final String MODE_CPU = "cpu";
 
     public double effectiveSlowRatio() {
         return slowRatio == null ? DEFAULT_SLOW_RATIO : slowRatio;
@@ -35,6 +42,19 @@ public record ContestJudgeLatencyProperties(boolean enabled,
 
     public long effectiveBaseMillis() {
         return baseMillis == null ? DEFAULT_BASE_MILLIS : baseMillis;
+    }
+
+    /**
+     * Defaults to {@link #MODE_SLEEP} so existing deployments and the base experiment keep
+     * blocking without CPU cost unless {@code contest.submission.judge.latency.mode=cpu} is set
+     * explicitly (e.g. via the {@code CONTEST_JUDGE_LATENCY_MODE} environment variable).
+     */
+    public String effectiveMode() {
+        return mode == null ? MODE_SLEEP : mode;
+    }
+
+    public boolean isCpuMode() {
+        return MODE_CPU.equalsIgnoreCase(effectiveMode());
     }
 
     /**

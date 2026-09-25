@@ -3,10 +3,12 @@ package my.oj.web.submission.judge;
 import my.oj.web.contest.submission.core.ContestSubmissionJudgeProjection;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgement;
 import my.oj.web.submission.SubmissionResult;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.stereotype.Component;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -23,17 +25,21 @@ import java.util.concurrent.ThreadLocalRandom;
  * while it runs, and {@code prefetch=1} with {@code concurrency=64} means the pool is what
  * absorbs it, so sleeping here reproduces the contention a non-blocking stub cannot.
  *
- * <p>Off unless {@code contest.submission.judge.latency.enabled} is true, and
- * {@link ContestProvisionalJudgement} backs off when it is, so exactly one implementation exists
- * in any context.
+ * <p>Off unless {@code contest.submission.judge.latency.enabled} is true. When it is, exactly one
+ * of this class and {@link CpuLoadProfileContestJudgement} is active, selected by
+ * {@code contest.submission.judge.latency.mode} ({@code sleep}, the default, here; {@code cpu}
+ * there); {@link ContestProvisionalJudgement} backs off whenever latency simulation is enabled at
+ * all. So exactly one {@link ContestSubmissionJudgement} implementation exists in any context.
  */
 @Component
-@ConditionalOnProperty(prefix = "contest.submission.judge.latency", name = "enabled", havingValue = "true")
+@ConditionalOnExpression("${contest.submission.judge.latency.enabled:false} "
+        + "and '${contest.submission.judge.latency.mode:sleep}'.equalsIgnoreCase('sleep')")
 @EnableConfigurationProperties(ContestJudgeLatencyProperties.class)
 public class LatencyProfileContestJudgement implements ContestSubmissionJudgement {
 
     private final ContestJudgeLatencyProperties properties;
     private final ContestJudgeLatencyClassMetrics latencyClassMetrics;
+    private final ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
 
     public LatencyProfileContestJudgement(ContestJudgeLatencyProperties properties,
                                           ContestJudgeLatencyClassMetrics latencyClassMetrics) {
@@ -51,10 +57,16 @@ public class LatencyProfileContestJudgement implements ContestSubmissionJudgemen
                 ? ContestJudgeLatencyClassMetrics.SLOW
                 : ContestJudgeLatencyClassMetrics.FAST;
         long started = System.nanoTime();
+        long cpuStarted = threadMXBean.isCurrentThreadCpuTimeSupported()
+                ? threadMXBean.getCurrentThreadCpuTime() : -1L;
         try {
             sleep(slow ? properties.effectiveSlowMillis() : properties.effectiveBaseMillis());
         } finally {
             latencyClassMetrics.record(latencyClass, System.nanoTime() - started);
+            if (cpuStarted >= 0L) {
+                latencyClassMetrics.recordCpu(latencyClass,
+                        threadMXBean.getCurrentThreadCpuTime() - cpuStarted);
+            }
         }
         return SubmissionResult.PARTIAL_ACCEPTED;
     }

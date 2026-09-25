@@ -41,12 +41,26 @@ public class ContestJudgeLatencyClassMetrics implements MeterBinder {
     }
 
     public void record(String latencyClass, long elapsedNanos) {
+        selected(latencyClass).invocations().increment();
+        selected(latencyClass).duration().record(elapsedNanos, TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * Records how much of a judgement's wall-clock time was actually spent on-CPU (thread CPU
+     * time from {@code ThreadMXBean}). For the {@code sleep} judge this stays near zero; for the
+     * {@code cpu} judge it should track {@link #record} closely. Comparing the two series is how
+     * the CPU-load variant experiment reads the wall/CPU ratio per latency class.
+     */
+    public void recordCpu(String latencyClass, long elapsedCpuNanos) {
+        selected(latencyClass).cpuDuration().record(elapsedCpuNanos, TimeUnit.NANOSECONDS);
+    }
+
+    private Meters selected(String latencyClass) {
         Meters selected = meters.get(latencyClass);
         if (selected == null) {
             throw new IllegalArgumentException("Unknown judge latency class: " + latencyClass);
         }
-        selected.invocations().increment();
-        selected.duration().record(elapsedNanos, TimeUnit.NANOSECONDS);
+        return selected;
     }
 
     private Map<String, Meters> createMeters(MeterRegistry registry) {
@@ -56,7 +70,7 @@ public class ContestJudgeLatencyClassMetrics implements MeterBinder {
         );
     }
 
-    private record Meters(Counter invocations, Timer duration) {
+    private record Meters(Counter invocations, Timer duration, Timer cpuDuration) {
         private static Meters of(MeterRegistry registry, String mode, String strategy,
                                  String latencyClass) {
             return new Meters(
@@ -64,6 +78,9 @@ public class ContestJudgeLatencyClassMetrics implements MeterBinder {
                             .tags("mode", mode, "strategy", strategy, "latency_class", latencyClass)
                             .register(registry),
                     Timer.builder("contest.judge.latency.class.duration")
+                            .tags("mode", mode, "strategy", strategy, "latency_class", latencyClass)
+                            .register(registry),
+                    Timer.builder("contest.judge.latency.class.cpu.duration")
                             .tags("mode", mode, "strategy", strategy, "latency_class", latencyClass)
                             .register(registry)
             );

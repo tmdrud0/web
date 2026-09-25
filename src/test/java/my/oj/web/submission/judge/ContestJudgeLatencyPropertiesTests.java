@@ -10,7 +10,7 @@ class ContestJudgeLatencyPropertiesTests {
     @Test
     void seedAndSubmissionIdProduceStableButIdSpecificDraws() {
         ContestJudgeLatencyProperties properties =
-                new ContestJudgeLatencyProperties(true, 0.1, 2_000L, 10L, 42L, "submission-id");
+                new ContestJudgeLatencyProperties(true, 0.1, 2_000L, 10L, 42L, "submission-id", null);
 
         double first = properties.deterministicDraw(101L);
 
@@ -22,7 +22,7 @@ class ContestJudgeLatencyPropertiesTests {
     @Test
     void missingSeedKeepsDeterministicPathDisabled() {
         ContestJudgeLatencyProperties properties =
-                new ContestJudgeLatencyProperties(true, null, null, null, null, null);
+                new ContestJudgeLatencyProperties(true, null, null, null, null, null, null);
 
         assertThatThrownBy(() -> properties.deterministicDraw(1L))
                 .isInstanceOf(IllegalStateException.class);
@@ -31,9 +31,9 @@ class ContestJudgeLatencyPropertiesTests {
     @Test
     void deterministicAssignmentsFollowConfiguredRatioAndChangeWithSeed() {
         ContestJudgeLatencyProperties first =
-                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 123L, "submission-id");
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 123L, "submission-id", null);
         ContestJudgeLatencyProperties second =
-                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 456L, "submission-id");
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 456L, "submission-id", null);
         int sampleSize = 20_000;
         int firstSlow = 0;
         int changedAssignments = 0;
@@ -55,7 +55,7 @@ class ContestJudgeLatencyPropertiesTests {
     @Test
     void codeKeyKeepsTheSameWorkloadItemStableAcrossGeneratedSubmissionIds() {
         ContestJudgeLatencyProperties properties =
-                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 123L, "code");
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 123L, "code", null);
 
         assertThat(properties.deterministicDraw(1L, "stable-work-item"))
                 .isEqualTo(properties.deterministicDraw(999L, "stable-work-item"));
@@ -64,9 +64,27 @@ class ContestJudgeLatencyPropertiesTests {
     }
 
     @Test
+    void modeDefaultsToSleepAndOnlyCpuIsRecognizedAsCpuMode() {
+        ContestJudgeLatencyProperties defaultMode =
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 1L, "code", null);
+        ContestJudgeLatencyProperties sleepMode =
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 1L, "code", "sleep");
+        ContestJudgeLatencyProperties cpuMode =
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 1L, "code", "cpu");
+        ContestJudgeLatencyProperties cpuModeUpperCase =
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 1L, "code", "CPU");
+
+        assertThat(defaultMode.effectiveMode()).isEqualTo("sleep");
+        assertThat(defaultMode.isCpuMode()).isFalse();
+        assertThat(sleepMode.isCpuMode()).isFalse();
+        assertThat(cpuMode.isCpuMode()).isTrue();
+        assertThat(cpuModeUpperCase.isCpuMode()).isTrue();
+    }
+
+    @Test
     void codeKeyMatchesThePowerShellAnalyzerFixture() {
         ContestJudgeLatencyProperties properties =
-                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 20260920L, "code");
+                new ContestJudgeLatencyProperties(true, 0.05, 2_000L, 50L, 20260920L, "code", null);
 
         assertThat(properties.isSlow(properties.deterministicDraw(1L, "stable-work-item")))
                 .isFalse();
