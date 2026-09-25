@@ -933,6 +933,59 @@ Test-Case "an empty histogram answer is unavailable, not a binding error" {
         "so the quantile has no answer, the sampler leaves the column out, and the poll records unavailable instead of throwing"
 }
 
+Test-Case "a statement is not put inside a grouping parenthesis" {
+    # Found by running, not by reading, and it cost the whole of the 2026-09-25 08:38 calibration suite:
+    # `fullRecoveryMs` in `run-recovery-pilot.ps1` chose between `T_consistent` and `T_backlog_drained`
+    # with a bare grouping parenthesis. In PowerShell `( )` is a *grouping expression* and holds an
+    # expression, never a statement - so `if` inside one is read as the name of a command to run, and the
+    # script fails at that point with "The term 'if' is not recognized as the name of a cmdlet, function,
+    # script file, or operable program." It is a parse-time-legal, run-time-fatal shape, which is why it
+    # survived every read of the file: nothing about the line looks wrong, and PowerShell has no syntax
+    # error to report at load time.
+    #
+    # What made it expensive is *where* it sat. The line is evaluated while the summary object is built,
+    # after the recovery has been measured in full, so the first run that ever reached it - the one with
+    # the corrected fault depth and the completed `lostComplete` wait - threw away its numbers and was
+    # recorded as `failed to measure`. Every earlier run had died before reaching it. The premise is
+    # asserted below as two live parses rather than as a remembered rule, so this guard is testing the
+    # language rather than this file's opinion of it.
+    $grouping = [scriptblock]::Create('(if ($true) { 1 } else { 2 })')
+    Assert-Throws { $null = & $grouping } `
+        "a grouping parenthesis cannot hold an if statement, which is the failure the run died of"
+    $subexpression = [scriptblock]::Create('$(if ($true) { 1 } else { 2 })')
+    Assert-Equal 1 (& $subexpression) "a subexpression can, and is what the fix uses"
+    $arraySubexpression = [scriptblock]::Create('@(if ($false) { 1 } else { 2 })')
+    Assert-Equal 2 (& $arraySubexpression)[0] `
+        "and an array subexpression can too, so `@(...)` is not the shape being forbidden here"
+
+    # `(?<![\$@])` is the whole subtlety: `$(if ...)` and `@(if ...)` are the two legal spellings and both
+    # put a character before the parenthesis that this pattern refuses to look behind. Without it the scan
+    # would fail on the harness's own correct lines, and a guard that cries wolf on working code is one
+    # somebody deletes. The keyword must also be followed by its own parenthesis, which is what keeps
+    # `(ForEach-Object ...)` and prose out of the match.
+    $pattern = '(?<![\$@])\(\s*(if|foreach|while|for|switch)\s*\('
+    Assert-True ([regex]::Matches('Format-PilotElapsed $a (if ($b -gt $c) { $b } else { $c })', $pattern).Count -eq 1) `
+        "the scan recognises the shape it forbids"
+    Assert-True ([regex]::Matches('$(if ($b) { 1 } else { 2 })', $pattern).Count -eq 0) `
+        "and does not mistake the legal subexpression spelling for it"
+    Assert-True ([regex]::Matches('@(if ($b) { 1 } else { 2 })', $pattern).Count -eq 0) `
+        "nor the legal array spelling"
+    Assert-True ([regex]::Matches('@($rows | ForEach-Object { $_.Count })', $pattern).Count -eq 0) `
+        "nor a cmdlet whose name merely begins with one of the keywords"
+
+    $checked = 0
+    foreach ($source in @(Get-HarnessSourceFiles)) {
+        $text = Get-Content -LiteralPath $source.FullName -Raw
+        $checked++
+        foreach ($hit in [regex]::Matches($text, $pattern)) {
+            $line = ($text.Substring(0, $hit.Index) -split "`n").Count
+            $found = $hit.Value -replace '\s+', ' '
+            Assert-True $false "$($source.Name):$line opens a grouping parenthesis on a statement - $found - which PowerShell runs as a command named after the keyword. Use `$(...)`."
+        }
+    }
+    Assert-True ($checked -ge 4) "the scan read the harness's sources ($checked read)"
+}
+
 # --- report -------------------------------------------------------------------------------------
 
 Write-TestSummary -Suite "RecoveryExperiment unit tests"

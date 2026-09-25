@@ -847,7 +847,15 @@ try {
         repairDurationMs = Format-PilotElapsed $consistentAtUtc $drainedAtUtc
         consistencyOutageMs = Format-PilotElapsed $faultAtUtc $consistentAtUtc
         backlogDrainMs = Format-PilotElapsed $faultAtUtc $drainedAtUtc
-        fullRecoveryMs = Format-PilotElapsed $faultAtUtc (if ($consistentAtUtc -gt $drainedAtUtc) { $consistentAtUtc } else { $drainedAtUtc })
+        # The `$` on the next line is load-bearing and this is the one place in the harness where it was
+        # missing. A bare grouping parenthesis holds an *expression*, not a statement, so `if` inside one is
+        # read as the name of a command to run - and the run dies with "The term 'if' is not recognized as
+        # the name of a cmdlet" after the whole recovery has already been measured, which is how it was
+        # found: `fullreplay_0` of the 2026-09-25 08:48 calibration suite reached its final reading
+        # (`digestMatches=True quiescent=True processed=4151 applied=4151`) and then lost the summary to
+        # this line, and every earlier run had died before reaching it. `$( )` is a subexpression and takes
+        # the statement. The unit suite scans every harness source for the shape.
+        fullRecoveryMs = Format-PilotElapsed $faultAtUtc $(if ($consistentAtUtc -gt $drainedAtUtc) { $consistentAtUtc } else { $drainedAtUtc })
         drainedBeforeConsistent = ($drainedAtUtc -lt $consistentAtUtc)
         recoveryCompletedInsideLoad = ($consistentAtUtc -lt $loadStartedAtUtc.AddSeconds($RampSeconds + $HoldSeconds))
         pollsTotal = $script:polls.Count
