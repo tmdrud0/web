@@ -281,7 +281,15 @@ function Assert-OraclePreconditions {
     $contestIds = @(Invoke-SqlRows -Sql @"
 SELECT DISTINCT contest_id FROM contest_submission_result ORDER BY contest_id;
 "@ -Description "contests with stored results")
-    $foreign = @($contestIds | Where-Object { (ConvertTo-RequiredInt64 -Value $_[0] -Description "result contest id") -ne $config.ContestId })
+    # Projected to the id rather than left as rows, because the refusal below has to name the contests it
+    # is talking about and `-join` over rows renders each `object[]` as the text "System.Object[]". Seen
+    # on 2026-09-25, when this guard refused the MySql integration suite's setup with "Contest(s)
+    # System.Object[] also have stored results" - a correct refusal that named nothing, so the operator
+    # could not tell which contest to look at without writing the query again by hand. Counted the same
+    # way either way: one string per foreign contest.
+    $foreign = @($contestIds |
+        Where-Object { (ConvertTo-RequiredInt64 -Value $_[0] -Description "result contest id") -ne $config.ContestId } |
+        ForEach-Object { [string]$_[0] })
     $observed["contestsWithResults"] = ($contestIds.Count)
     if ($foreign.Count -gt 0) {
         throw "Contest(s) $($foreign -join ', ') also have stored results. full-replay would replay them and the " +
