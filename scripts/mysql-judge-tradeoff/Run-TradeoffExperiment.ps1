@@ -17,6 +17,11 @@ param(
     [int]$DownDurationSeconds = 15,
     [int]$DrainTimeoutSeconds = 180,
     [int]$UserCount = 2000,
+    # The seed endpoint batch-inserts UserCount rows (1000/batch) inside one HTTP request/transaction,
+    # then does a LIKE-prefix SELECT to read back the id range. At the B=5 UserCount (~6400) 60s was
+    # never close; at B=70 (~80,100, seeded twice - warm-up and measurement) it has not been measured
+    # against 60s. Scale this explicitly for large-UserCount runs instead of guessing a hidden margin.
+    [int]$SeedTimeoutSeconds = 60,
     [string]$RunId = "",
     [switch]$KeepStack,
     [switch]$DryRun,
@@ -4078,7 +4083,7 @@ try {
         # seeding is database work, and putting it between the warm-up and the burst would move the
         # load it is meant to precede.
         $warmupSeed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" `
-            -Body (@{ prefix=$warmupPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec 60
+            -Body (@{ prefix=$warmupPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec $SeedTimeoutSeconds
         $seed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" `
             -Body (@{ prefix=$workloadPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec 300
         if ([long]$warmupSeed.contestId -eq [long]$seed.contestId) {
@@ -4094,9 +4099,9 @@ try {
         # phases would put database work inside the run and move the load it is meant to precede.
         $seedBody = @{ userCount=$UserCount; problemCount=5; durationMinutes=60; reset=$true }
         $warmupSeed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" `
-            -Body (@{ prefix=$warmupPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec 60
+            -Body (@{ prefix=$warmupPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec $SeedTimeoutSeconds
         $seed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" `
-            -Body (@{ prefix=$measurementPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec 60
+            -Body (@{ prefix=$measurementPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec $SeedTimeoutSeconds
         if ([long]$warmupSeed.contestId -eq [long]$seed.contestId) {
             throw "The warm-up and measurement contests resolved to the same contest id, so the phases would not be isolated."
         }
@@ -4107,7 +4112,7 @@ try {
             # window reads. Seeded here with the other two because seeding later would put database
             # work inside the run it is meant to precede.
             $preflightSeed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" `
-                -Body (@{ prefix=$preflightPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec 60
+                -Body (@{ prefix=$preflightPrefix } + $seedBody | ConvertTo-Json -Compress) -TimeoutSec $SeedTimeoutSeconds
             if ([long]$preflightSeed.contestId -eq [long]$seed.contestId -or [long]$preflightSeed.contestId -eq [long]$warmupSeed.contestId) {
                 throw "The preflight contest resolved to the same contest id as a phase contest, so its work would not be isolated from the measurement."
             }
@@ -4116,7 +4121,7 @@ try {
     } else {
         $workloadPrefix = "tradeoff_seed_$LatencySeed"
         $seedRequest = @{ prefix=$workloadPrefix; userCount=$UserCount; problemCount=5; durationMinutes=60; reset=$true } | ConvertTo-Json -Compress
-        $seed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" -Body $seedRequest -TimeoutSec 60
+        $seed = Invoke-RestMethod -Method Post -Uri "$baseUrl/perf/contest/seed" -ContentType "application/json" -Body $seedRequest -TimeoutSec $SeedTimeoutSeconds
     }
     $events.contestId = [long]$seed.contestId
     $contestId = [long]$seed.contestId

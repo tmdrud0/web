@@ -47,6 +47,11 @@ $contexts = [math]::Ceiling($expected + 6 * [math]::Sqrt($expected) + 20)
 $authRps = [math]::Max(100, [math]::Ceiling($contexts / 300))
 $authSeconds = [int][math]::Ceiling($contexts / $authRps) + 2
 $userCount = [int]([math]::Ceiling($authRps * $authSeconds) + 100)
+# The seed endpoint batch-inserts UserCount rows (1000/batch, single transaction) then reads the id
+# range back with a LIKE-prefix SELECT, and the phased-load path seeds two contests (warm-up and
+# measurement) at this same UserCount. The base experiment's fixed 60s default was measured only up
+# to ~6,400 users; scale it so the margin is checked rather than assumed at 14x the user count.
+$seedTimeoutSeconds = [Math]::Max(60, [int][math]::Ceiling($userCount / 200.0) + 60)
 
 $results = New-Object System.Collections.Generic.List[object]
 foreach ($c in $conditions) {
@@ -55,13 +60,19 @@ foreach ($c in $conditions) {
     $runIdInfix = if ($JudgeMode -eq "cpu") { "b$([int]$BaseRps)cpu" } else { "b$([int]$BaseRps)" }
     $runId = "peak-$runIdInfix-$name-$Suffix"
     $log = Join-Path $logDir "$runId.log"
+    # Claim batch must stay >= MIF (worker x 4) or a poll can only ever fill part of max-in-flight,
+    # capping the node's claim rate at batch/poll-interval regardless of worker count. The base
+    # experiment's fixed 16 always satisfied this (MIF was 8-12), so this keeps every B=5 run byte-
+    # identical while scaling automatically for larger worker counts (B=70: MIF 112-168).
+    $claimBatch = [Math]::Max(16, 4 * [Math]::Max($w1, $w2))
     $runArgs = @{
         DispatchMode = $mode; PeakProfile = $true; PeakBaseRps = $BaseRps
         WorkerCount = $w1; Judge2WorkerCount = $w2
-        MySqlMaxInFlight = 4 * $w1; Judge2MaxInFlight = 4 * $w2; MySqlClaimBatchSize = 16
+        MySqlMaxInFlight = 4 * $w1; Judge2MaxInFlight = 4 * $w2; MySqlClaimBatchSize = $claimBatch
         MySqlClaimTimeout = "4s"; MySqlPollInterval = "100ms"; RabbitPrefetch = 1
         LatencySeed = $LatencySeed; WarmupTargetRps = 10; WarmupSeconds = 30
         UserCount = $userCount; BurstAuthRps = $authRps; BurstAuthSeconds = $authSeconds
+        SeedTimeoutSeconds = $seedTimeoutSeconds
         SteadyGuardSeconds = 0; DrainTimeoutSeconds = 900
         ResetMySqlVolume = $true; ResetBrokerAndCacheVolumes = $true; RunId = $runId
         JudgeLatencyMode = $JudgeMode
