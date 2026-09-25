@@ -187,6 +187,13 @@ param(
     # sleep (default, unset here) leaves compose.loadtest.yaml's own default untouched, so every
     # earlier run is unchanged. cpu switches both judge nodes to CpuLoadProfileContestJudgement.
     [ValidateSet("", "sleep", "cpu")][string]$JudgeLatencyMode = "",
+    # Grading latency shape. Defaults reproduce every earlier peak-profile run exactly (50ms base,
+    # 5% at 2000ms). A pre-check that wants to isolate ingress/dispatch capacity from grading time
+    # sets -JudgeBaseMillis 0 -JudgeSlowRatio 0 (equivalent to "latency disabled" for capacity
+    # purposes, without touching the JUDGE_LATENCY_ENABLED plumbing every other run relies on).
+    [int]$JudgeBaseMillis = 50,
+    [int]$JudgeSlowMillis = 2000,
+    [double]$JudgeSlowRatio = 0.05,
     # Also remove the broker and Redis volumes before the stack is built, so no queue, stream offset,
     # session, rate-limit or dedup key survives from an earlier run. Requires -ResetMySqlVolume.
     [switch]$ResetBrokerAndCacheVolumes,
@@ -3833,9 +3840,9 @@ $env:JUDGE_LATENCY_ENABLED = "true"
 $env:JUDGE_LATENCY_MODE = $JudgeLatencyMode
 $env:JUDGE_LATENCY_SEED = "$LatencySeed"
 $env:JUDGE_LATENCY_KEY_SOURCE = "code"
-$env:JUDGE_BASE_MILLIS = "50"
-$env:JUDGE_SLOW_MILLIS = "2000"
-$env:JUDGE_SLOW_RATIO = "0.05"
+$env:JUDGE_BASE_MILLIS = "$JudgeBaseMillis"
+$env:JUDGE_SLOW_MILLIS = "$JudgeSlowMillis"
+$env:JUDGE_SLOW_RATIO = "$JudgeSlowRatio"
 $env:CONTEST_RATE_LIMIT_STORE = "redis"
 $env:CONTEST_RATE_LIMIT_COOLDOWN_MILLIS = "2000"
 
