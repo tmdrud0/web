@@ -69,6 +69,9 @@ param(
     # The baseline has to show the pipeline keeping up before a fault is injected; this lets a run proceed
     # when it does not, and records that it did.
     [switch]$AllowUnflatBaseline,
+    # full-replay only. 'synchronous' reproduces the C1 behaviour on a C2 jar; a C1 jar ignores the
+    # setting and is always synchronous (its startup report line carries no "rollback-replay=").
+    [ValidateSet("background", "synchronous")][string]$FullReplayRollbackReplay = "background",
 
     [string]$ArtifactRoot = "var\scoreboard-recovery-live-impact",
     [string]$DbName = "",
@@ -249,6 +252,8 @@ try {
     # --- 3. start ----------------------------------------------------------------------------------
     $env:CONTEST_SCOREBOARD_RECOVERY_MODE = $Mode
     $env:CONTEST_SCOREBOARD_EXPERIMENT_TRACE_ENABLED = "true"
+    # Set every run, so a value exported by an earlier run in the same shell does not leak in.
+    $env:CONTEST_SCOREBOARD_RECOVERY_FULL_REPLAY_ROLLBACK_REPLAY = $FullReplayRollbackReplay
     $env:CONTEST_SCOREBOARD_EXPERIMENT_TRACE_DIRECTORY = $traceDirectory
     $upArguments = @("up", "-d")
     if ($Build) { $upArguments += "--build" }
@@ -266,6 +271,10 @@ try {
         throw "The batch role's jar is not this repository's build or lacks mode '$Mode' (match=$($artifact.jarsMatch), mode class=$($artifact.modeClassPresent)). Rebuild: gradlew.bat bootJar, then -Build."
     }
     $events["containerJarSha256"] = $artifact.containerJarSha256
+    # What the batch role was started with, read back from the container. Whether the jar acts on it is
+    # what its startup report line says ("rollback-replay="); a C1 jar has no such field and is synchronous.
+    $rollbackReplayEnv = @(Invoke-Docker -Arguments @("exec", $config.BatchContainer, "sh", "-c", "printenv CONTEST_SCOREBOARD_RECOVERY_FULL_REPLAY_ROLLBACK_REPLAY || true")) -join ""
+    $events["fullReplayRollbackReplay"] = if ([string]::IsNullOrWhiteSpace($rollbackReplayEnv)) { "unset" } else { $rollbackReplayEnv.Trim() }
     # A jar from before the trace existed starts without complaint and writes nothing, which would read as
     # a pipeline that applied nothing. The file is created when the trace starts, so its absence is a
     # refusal here rather than an empty series later.

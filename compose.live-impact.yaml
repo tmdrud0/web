@@ -4,8 +4,8 @@
 #     -f compose.yaml -f compose.loadtest.yaml -f compose.observability.yaml \
 #     -f compose.recovery-pilot.yaml -f compose.live-impact.yaml up -d ...
 #
-# The only difference from the recovery-pilot stack is the batch role's experiment trace, which is off
-# unless the runner turns it on (gatling/run-recovery-live-impact.ps1 sets
+# The differences from the recovery-pilot stack are the batch role's experiment trace, which is off
+# unless the runner turns it on, and full-replay's rollback-replay setting (gatling/run-recovery-live-impact.ps1 sets
 # CONTEST_SCOREBOARD_EXPERIMENT_TRACE_ENABLED=true). The trace writes inside the container; the runner
 # copies it out with `docker cp`, so nothing here mounts a host directory.
 
@@ -14,3 +14,6 @@ services:
     environment:
       CONTEST_SCOREBOARD_EXPERIMENT_TRACE_ENABLED: ${CONTEST_SCOREBOARD_EXPERIMENT_TRACE_ENABLED:-false}
       CONTEST_SCOREBOARD_EXPERIMENT_TRACE_DIRECTORY: ${CONTEST_SCOREBOARD_EXPERIMENT_TRACE_DIRECTORY:-/tmp/scoreboard-experiment-trace}
+      # full-replay only: where a runtime rollback's replay runs (background | synchronous). A jar from
+      # before the setting existed (C1) ignores it and always replays synchronously.
+      CONTEST_SCOREBOARD_RECOVERY_FULL_REPLAY_ROLLBACK_REPLAY: ${CONTEST_SCOREBOARD_RECOVERY_FULL_REPLAY_ROLLBACK_REPLAY:-background}
