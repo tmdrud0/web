@@ -64,3 +64,5 @@ var/
 
 ### Local helper launchers ###
 /codex_bootrun_*.cmd
+
+__pycache__/
