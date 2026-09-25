@@ -151,7 +151,33 @@ param(
     [int]$BurstAuthSeconds = 60,
     # Spring Session's cookie name. Read rather than assumed by the preparation phase, which captures
     # whatever the login response set and then checks the name against this.
-    [string]$BurstAuthCookieName = "SESSION"
+    [string]$BurstAuthCookieName = "SESSION",
+    # Contest peak profile (open arrivals, Poisson by default). Rides the open-burst machinery - the
+    # closed warm-up in its own contest drained to quiescence, one prepared session per arrival - but
+    # the offered schedule is a list of segments "seconds:multiplier" at a baseline rate -PeakBaseRps
+    # (default: 90s 1B, 60s 5B, 30s 10B, 60s 5B, 120s 1B). The analysis is Analyze-PeakProfileRun.py.
+    [switch]$PeakProfile,
+    [double]$PeakBaseRps = 5,
+    [string]$PeakSegments = "90:1,60:5,30:10,60:5,120:1",
+    # Constant-interval arrivals instead of Poisson. The queue model assumes Poisson; this exists only
+    # to separate arrival variability from everything else if a run ever needs it.
+    [switch]$PeakDeterministic,
+    [int]$PeakCompletionTimeoutSeconds = 120,
+    # Peak-profile fault: SIGKILL -KilledNode this many seconds after the schedule anchor and start it
+    # again (same container, same settings) at -PeakFaultRestartAtSeconds. 0 = no fault. The only docker
+    # CLI calls during the load are this kill and this start; readiness is read over HTTP.
+    [int]$PeakFaultKillAtSeconds = 0,
+    [int]$PeakFaultRestartAtSeconds = 0,
+    # Per-node judge sizing. 0 means "the same as judge-1" (-WorkerCount / -MySqlMaxInFlight), so every
+    # earlier run is unchanged. judge-2 reads CONTEST_JUDGE_2_* overrides in compose.loadtest.yaml.
+    [int]$Judge2WorkerCount = 0,
+    [int]$Judge2MaxInFlight = 0,
+    # Also remove the broker and Redis volumes before the stack is built, so no queue, stream offset,
+    # session, rate-limit or dedup key survives from an earlier run. Requires -ResetMySqlVolume.
+    [switch]$ResetBrokerAndCacheVolumes,
+    # Host-wide CPU (Windows, all cores) from Win32_PerfFormattedData_PerfOS_Processor once a second in a
+    # background job; no Docker call. On by default in peak-profile runs.
+    [switch]$SkipHostCpu
 )
 
 $ErrorActionPreference = "Stop"
@@ -278,6 +304,47 @@ if ($NormalTimeout -and $FaultRecovery) { throw "-NormalTimeout and -FaultRecove
 if ($FaultEnabled -and $FaultRecovery) { throw "-FaultEnabled kills at a fixed second and -FaultRecovery triggers on active work; pass one of them." }
 if ($openBurst -and $stagedLoad) { throw "-OpenBurst is the open-arrival model and -Staircase/-NormalTimeout/-FaultRecovery are the closed one; pass one of them." }
 if ($openBurst -and $FaultEnabled) { throw "-OpenBurst measures what a sustained arrival rate does to the stack and does not inject faults." }
+# The peak profile is an open-arrival run: it takes the burst's warm-up, preparation and recorder path,
+# and differs in the schedule it offers and in how the offer is judged (segment counts against a
+# Poisson band, not a per-second tolerance).
+$peakMode = [bool]$PeakProfile
+$peakSegmentList = @()
+$peakExpectedArrivals = 0.0
+$peakRequiredContexts = 0L
+if ($peakMode) {
+    if ($OpenBurst) { throw "-PeakProfile and -OpenBurst are different open-arrival schedules; pass one of them." }
+    if ($stagedLoad -or $FaultEnabled) { throw "-PeakProfile is an open-arrival run and is not combined with -Staircase/-NormalTimeout/-FaultRecovery/-FaultEnabled." }
+    if ($PeakBaseRps -le 0) { throw "-PeakBaseRps must be greater than 0." }
+    if ($PeakCompletionTimeoutSeconds -lt 1) { throw "-PeakCompletionTimeoutSeconds must be at least 1." }
+    $offset = 0
+    foreach ($part in @($PeakSegments -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $fields = $part -split ':'
+        if ($fields.Count -ne 2) { throw "-PeakSegments entry '$part' is not seconds:multiplier." }
+        $seconds = [int]$fields[0]; $multiplier = [double]$fields[1]
+        if ($seconds -lt 1 -or $multiplier -le 0) { throw "-PeakSegments entry '$part' needs seconds >= 1 and a positive multiplier." }
+        $peakSegmentList += [pscustomobject]@{ index = $peakSegmentList.Count; seconds = $seconds; multiplier = $multiplier
+            rps = $PeakBaseRps * $multiplier; startSeconds = $offset; endSeconds = $offset + $seconds }
+        $offset += $seconds
+        $peakExpectedArrivals += $PeakBaseRps * $multiplier * $seconds
+    }
+    if ($peakSegmentList.Count -eq 0) { throw "-PeakSegments is empty." }
+    # One prepared session per arrival. A Poisson count has standard deviation sqrt(E), so the pool is
+    # sized six deviations above the expectation: a reused session would resubmit that account's code
+    # (the payload is derived from the account), which the dedup registry would answer with the old id.
+    $peakRequiredContexts = [long][math]::Ceiling($peakExpectedArrivals + 6 * [math]::Sqrt($peakExpectedArrivals) + 20)
+    if ($PeakFaultKillAtSeconds -lt 0 -or $PeakFaultRestartAtSeconds -lt 0) { throw "-PeakFault*AtSeconds must not be negative." }
+    if ($PeakFaultKillAtSeconds -gt 0 -and $PeakFaultRestartAtSeconds -le $PeakFaultKillAtSeconds) {
+        throw "-PeakFaultRestartAtSeconds must come after -PeakFaultKillAtSeconds."
+    }
+    if ($PeakFaultKillAtSeconds -eq 0 -and $PeakFaultRestartAtSeconds -gt 0) { throw "-PeakFaultRestartAtSeconds needs -PeakFaultKillAtSeconds." }
+    # The burst's rate parameter is the arrival rate everywhere below; in a peak run that is the baseline.
+    $TargetRps = $PeakBaseRps
+    $openBurst = $true
+}
+if ($ResetBrokerAndCacheVolumes -and -not $ResetMySqlVolume) { throw "-ResetBrokerAndCacheVolumes resets the rest of the stack's state and is only meaningful with -ResetMySqlVolume." }
+if ($Judge2WorkerCount -lt 0 -or $Judge2MaxInFlight -lt 0) { throw "-Judge2WorkerCount/-Judge2MaxInFlight must not be negative (0 = same as judge-1)." }
+$judge2Workers = if ($Judge2WorkerCount -gt 0) { $Judge2WorkerCount } else { $WorkerCount }
+$judge2MaxInFlight = if ($Judge2MaxInFlight -gt 0) { $Judge2MaxInFlight } else { $MySqlMaxInFlight }
 # Everything that traces a hold: the closed staged runs place their window from a trace file, and the
 # burst writes its own schedule to one. The preflight and fault machinery below stay on the narrower
 # $stagedLoad - those are the closed model's devices and neither applies to a burst. The warm-up does
@@ -401,8 +468,8 @@ if ($FaultRecovery) {
         throw "-MeasurementSeconds must be at least $($faultWorstCaseSeconds + 45) for this trigger: the window opens at ${FaultMinSteadySeconds}s, waits up to ${FaultTriggerWaitSeconds}s, the outage lasts ${DownDurationSeconds}s, and at least 45s must remain for readiness plus the post-recovery steady window."
     }
 }
-$effectiveHoldSeconds = if ($openBurst) { $BurstSteadySeconds } elseif ($phasedLoad) { $measurementHoldSeconds } else { $StageHoldSeconds }
-$workloadPrefix = if ($openBurst) { "burst_open_meas_$LatencySeed" } elseif ($phasedLoad) { $measurementPrefix } else { "tradeoff_seed_$LatencySeed" }
+$effectiveHoldSeconds = if ($peakMode) { [int](($peakSegmentList | Measure-Object -Property seconds -Sum).Sum) } elseif ($openBurst) { $BurstSteadySeconds } elseif ($phasedLoad) { $measurementHoldSeconds } else { $StageHoldSeconds }
+$workloadPrefix = if ($peakMode) { "peak_meas_$LatencySeed" } elseif ($openBurst) { "burst_open_meas_$LatencySeed" } elseif ($phasedLoad) { $measurementPrefix } else { "tradeoff_seed_$LatencySeed" }
 
 # The burst's own plan arithmetic, which is the simulation's `Plan` restated so a dry run can be
 # checked against it before a stack is started. The steady count is exact - a constant rate for a whole
@@ -419,8 +486,15 @@ $workloadPrefix = if ($openBurst) { "burst_open_meas_$LatencySeed" } elseif ($ph
 $burstPlannedRampArrivals = [long][math]::Floor((($BurstRampFromRps + $TargetRps) / 2) * $BurstRampSeconds + 0.5)
 $burstPlannedSteadyArrivals = [long][math]::Floor($TargetRps * $BurstSteadySeconds + 0.5)
 $burstPlannedStarts = $burstPlannedRampArrivals + $burstPlannedSteadyArrivals
+if ($peakMode) {
+    # No ramp and no single hold: the "planned starts" every pool check below reads is the number of
+    # prepared sessions the Poisson schedule needs (expectation + six deviations).
+    $burstPlannedRampArrivals = 0L
+    $burstPlannedSteadyArrivals = [long][math]::Round($peakExpectedArrivals)
+    $burstPlannedStarts = $peakRequiredContexts
+}
 if ($openBurst) {
-    if (-not $PSBoundParameters.ContainsKey("TargetRps")) { throw "-OpenBurst requires an explicit -TargetRps: the arrival rate is the input the whole comparison is offered at, not a default." }
+    if (-not $peakMode -and -not $PSBoundParameters.ContainsKey("TargetRps")) { throw "-OpenBurst requires an explicit -TargetRps: the arrival rate is the input the whole comparison is offered at, not a default." }
     if ($TargetRps -le 0) { throw "-TargetRps must be greater than 0: it is the arrival rate the burst is offered at." }
     if ($BurstRampFromRps -le 0) { throw "-BurstRampFromRps must be greater than 0: a ramp has to start somewhere." }
     if ($BurstRampFromRps -gt $TargetRps) { throw "-BurstRampFromRps must not exceed -TargetRps." }
@@ -477,7 +551,7 @@ if ($openBurst) {
     # query scoped to the measurement. Fresh rather than shared with the closed runs, for the same
     # reason the burst's own prefix is: the seed's reset is scoped to its prefix, and reusing one an
     # earlier run used would delete that run's rows.
-    $warmupPrefix = "burst_warm_$LatencySeed"
+    $warmupPrefix = if ($peakMode) { "peak_warm_$LatencySeed" } else { "burst_warm_$LatencySeed" }
 }
 
 # Whether a fault was actually injected, as opposed to merely requested. This is not the same as the
@@ -620,6 +694,23 @@ if ($openBurst) {
     }
 }
 
+if ($peakMode) {
+    $expectedPlan = [ordered]@{
+        model = "peak-profile-open-arrival"
+        baseRps = $PeakBaseRps
+        randomized = (-not $PeakDeterministic)
+        segments = @($peakSegmentList | ForEach-Object { [ordered]@{ index = $_.index; seconds = $_.seconds; multiplier = $_.multiplier; rps = $_.rps; startSeconds = $_.startSeconds; endSeconds = $_.endSeconds; expectedArrivals = $_.rps * $_.seconds } })
+        expectedArrivals = $peakExpectedArrivals
+        preparedSessionsRequired = $peakRequiredContexts
+        completionTimeoutSeconds = $PeakCompletionTimeoutSeconds
+        injectionSeconds = $effectiveHoldSeconds
+        fault = if ($PeakFaultKillAtSeconds -gt 0) { [ordered]@{ node = $KilledNode; signal = "SIGKILL"; killAtSeconds = $PeakFaultKillAtSeconds; restartAtSeconds = $PeakFaultRestartAtSeconds; clock = "seconds after the schedule anchor written by the marker user" } } else { $null }
+        preparationPhase = [ordered]@{ contestPrefix = $workloadPrefix; logins = [long][math]::Round($BurstAuthRps * $BurstAuthSeconds); rps = $BurstAuthRps; seconds = $BurstAuthSeconds }
+        warmupPhase = [ordered]@{ contestPrefix = $warmupPrefix; targetRps = $warmupPhaseRps; population = $warmupPopulation; rampSeconds = $RampSeconds; holdSeconds = $WarmupSeconds; simulationClass = "my.oj.perf.ContestSubmissionStepLoadSimulation" }
+        simulationClass = "my.oj.perf.ContestSubmissionPeakProfileSimulation"
+    }
+}
+
 $resultsRoot = Join-Path $repoRoot "results\mysql-judge-tradeoff"
 $runDirectory = Join-Path $resultsRoot $RunId
 if (Test-Path $runDirectory) { throw "Run directory already exists: $runDirectory" }
@@ -662,9 +753,44 @@ $parameters = [ordered]@{
     judgeNodeCount = 2; generatedAt = [datetimeoffset]::UtcNow.ToString("o")
     containerCpuSampler = (-not $SkipContainerCpu)
     resetMySqlVolume = [bool]$ResetMySqlVolume
+    resetBrokerAndCacheVolumes = [bool]$ResetBrokerAndCacheVolumes
     idleBaselineSeconds = $IdleBaselineSeconds
+    # Per-node sizing. judge-1 takes -WorkerCount/-MySqlMaxInFlight, judge-2 its own override (or the same).
+    judgeNodes = [ordered]@{
+        "judge-1" = [ordered]@{ workers = $WorkerCount; mysqlMaxInFlight = $MySqlMaxInFlight; rabbitConcurrency = $WorkerCount }
+        "judge-2" = [ordered]@{ workers = $judge2Workers; mysqlMaxInFlight = $judge2MaxInFlight; rabbitConcurrency = $judge2Workers }
+    }
+    totalWorkers = $WorkerCount + $judge2Workers
+    hostCpuSampler = (-not $SkipHostCpu) -and $peakMode
 }
-if ($openBurst) {
+if ($peakMode) {
+    $parameters.peakProfile = [ordered]@{
+        enabled = $true
+        baseRps = $PeakBaseRps
+        segments = $PeakSegments
+        randomized = (-not $PeakDeterministic)
+        expectedArrivals = $peakExpectedArrivals
+        preparedSessionsRequired = $peakRequiredContexts
+        completionTimeoutSeconds = $PeakCompletionTimeoutSeconds
+        nominalK = ($WorkerCount + $judge2Workers) / 0.1475 / $PeakBaseRps
+        faultKillAtSeconds = $PeakFaultKillAtSeconds
+        faultRestartAtSeconds = $PeakFaultRestartAtSeconds
+        killedNode = if ($PeakFaultKillAtSeconds -gt 0) { $KilledNode } else { $null }
+        contestPrefix = $workloadPrefix
+        warmupPrefix = $warmupPrefix
+        warmupTargetRps = $warmupPhaseRps
+        warmupSeconds = $WarmupSeconds
+        authPrepRps = $BurstAuthRps
+        authPrepSeconds = $BurstAuthSeconds
+        simulationClass = "my.oj.perf.ContestSubmissionPeakProfileSimulation"
+        stageTraceFile = "stage-trace.csv"
+        recorderFile = "peak-recorder.json"
+        attemptsFile = "submission-attempts.csv"
+        analyzer = "Analyze-PeakProfileRun.py"
+        expectedPlan = $expectedPlan
+    }
+}
+if ($openBurst -and -not $peakMode) {
     $parameters.openBurst = [ordered]@{
         enabled = $true
         model = "open-arrival"
@@ -1572,7 +1698,8 @@ SELECT cs.id, cs.submitted_time, csr.result_saved_at, csr.scoreboard_applied_at,
        TIMESTAMPDIFF(MICROSECOND, cs.submitted_time, csr.result_saved_at) / 1000.0,
        TIMESTAMPDIFF(MICROSECOND, csr.result_saved_at, csr.scoreboard_applied_at) / 1000.0,
        TIMESTAMPDIFF(MICROSECOND, cs.submitted_time, csr.scoreboard_applied_at) / 1000.0,
-       o.attempts, o.updated_at, HEX(cs.code)
+       o.attempts, o.updated_at, HEX(cs.code),
+       csr.judge_started_at, csr.provisional_judged_at, o.published_at, o.created_at
 FROM contest_submission cs
 LEFT JOIN contest_submission_result csr ON csr.submission_id = cs.id
 LEFT JOIN contest_judge_outbox o ON o.submission_id = cs.id
@@ -1607,6 +1734,10 @@ ORDER BY cs.id;
             submissionId=$p[0]; submittedAt=$p[1]; resultSavedAt=$p[2]; scoreboardAppliedAt=$p[3]
             L_result_ms=$p[4]; L_scoreboard_ms=$p[5]; L_total_ms=$p[6]; attempts=$p[7]
             outboxUpdatedAt=$p[8]; latencyClass=$latencyClass; cohorts=($cohorts -join ";")
+            # Worker pickup, judgement end (judge JVM clock) and the outbox row's creation and
+            # PUBLISHED instant (DB clock): relay publish under rabbit, judge completion under mysql.
+            judgeStartedAt=$(if ($p.Count -gt 10) { $p[10] } else { "" }); judgedAt=$(if ($p.Count -gt 11) { $p[11] } else { "" })
+            outboxPublishedAt=$(if ($p.Count -gt 12) { $p[12] } else { "" }); outboxCreatedAt=$(if ($p.Count -gt 13) { $p[13] } else { "" })
         }
     }
     $objects | Export-Csv (Join-Path $runDirectory "latency.csv") -NoTypeInformation -Encoding utf8
@@ -3660,6 +3791,8 @@ function Invoke-FaultRecoveryPhase {
 . (Join-Path $PSScriptRoot "OpenBurstSupply.ps1")
 . (Join-Path $PSScriptRoot "ContainerCpuSampler.ps1")
 $script:containerCpuSampler = $null
+. (Join-Path $PSScriptRoot "HostCpuSampler.ps1")
+$script:hostCpuSampler = $null
 
 $env:CONTEST_JUDGE_DISPATCH_MODE = $DispatchMode
 $env:CONTEST_JUDGE_CONCURRENCY = "$WorkerCount"
@@ -3667,6 +3800,10 @@ $env:CONTEST_JUDGE_PREFETCH = "$RabbitPrefetch"
 $env:CONTEST_JUDGE_MYSQL_WORKERS = "$WorkerCount"
 $env:CONTEST_JUDGE_MYSQL_CLAIM_BATCH_SIZE = "$MySqlClaimBatchSize"
 $env:CONTEST_JUDGE_MYSQL_MAX_IN_FLIGHT = "$MySqlMaxInFlight"
+# judge-2's own sizing (compose.loadtest.yaml falls back to the judge-1 values when these are unset).
+$env:CONTEST_JUDGE_2_CONCURRENCY = "$judge2Workers"
+$env:CONTEST_JUDGE_2_MYSQL_WORKERS = "$judge2Workers"
+$env:CONTEST_JUDGE_2_MYSQL_MAX_IN_FLIGHT = "$judge2MaxInFlight"
 $env:CONTEST_JUDGE_MYSQL_CLAIM_TIMEOUT = $claimTimeoutProperty
 $env:CONTEST_JUDGE_MYSQL_POLL_INTERVAL = $MySqlPollInterval
 $env:JUDGE_LATENCY_ENABLED = "true"
@@ -3690,7 +3827,14 @@ if ($DryRun) {
         # The boundaries themselves come from the JVM trace at run time; this only states the
         # shape the parameters imply, so a wrong ladder is caught before the stack is built.
         $expectedPlan | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDirectory "expected-plan.json") -Encoding utf8
-        if ($openBurst) {
+        if ($peakMode) {
+            Write-Host ("Peak profile: warm-up at $warmupPhaseRps RPS for ${WarmupSeconds}s in '$warmupPrefix', drained; " +
+                "$BurstAuthRps logins/s for ${BurstAuthSeconds}s in '$workloadPrefix'; then segments $PeakSegments at B=$PeakBaseRps " +
+                "($(if ($PeakDeterministic) { 'constant' } else { 'Poisson' }) arrivals, expected $peakExpectedArrivals, sessions needed $peakRequiredContexts), " +
+                "judge-1 $WorkerCount workers / MIF $MySqlMaxInFlight, judge-2 $judge2Workers workers / MIF $judge2MaxInFlight, nominal k " +
+                "$([math]::Round(($WorkerCount + $judge2Workers) / 0.1475 / $PeakBaseRps, 2))" +
+                $(if ($PeakFaultKillAtSeconds -gt 0) { ", SIGKILL $KilledNode at +${PeakFaultKillAtSeconds}s, start at +${PeakFaultRestartAtSeconds}s" } else { "" }) + ".")
+        } elseif ($openBurst) {
             Write-Host ("Open-arrival burst: warm-up at $warmupPhaseRps RPS for ${WarmupSeconds}s in '$warmupPrefix' " +
                 "(population $warmupPopulation) in its own contest, drained to quiescence; then ${BurstAuthRps} logins/s for ${BurstAuthSeconds}s in '$workloadPrefix' " +
                 "(~$([long][math]::Round($BurstAuthRps * $BurstAuthSeconds)) prepared sessions, $BurstAuthCookieName), " +
@@ -3815,6 +3959,18 @@ try {
         if ($existing.Count -gt 0) { Invoke-DockerCli -Arguments @("volume", "rm", $volumeName) | Out-Null }
         $events.mysqlVolumeReset = $true
         $events.mysqlVolumeExistedBeforeReset = ($existing.Count -gt 0)
+        if ($ResetBrokerAndCacheVolumes) {
+            # The broker keeps queues and the result stream (and their consumer offsets) in its volume,
+            # Redis keeps sessions, rate-limit and dedup keys. A reset MySQL restarts contest and user ids
+            # at 1, so a dedup key left from an earlier run could match this run's (contest, user, problem,
+            # code); both are removed so each run starts from nothing.
+            $events.brokerAndCacheVolumesReset = [ordered]@{}
+            foreach ($stateVolume in @("oj-loadtest-rabbitmq-data", "oj-loadtest-redis-data")) {
+                $present = @(Invoke-DockerCli -Arguments @("volume", "ls", "-q", "--filter", "name=^$stateVolume$") | Where-Object { $_ })
+                if ($present.Count -gt 0) { Invoke-DockerCli -Arguments @("volume", "rm", $stateVolume) | Out-Null }
+                $events.brokerAndCacheVolumesReset[$stateVolume] = ($present.Count -gt 0)
+            }
+        }
     }
     Invoke-Compose -Arguments @("up", "-d", "--build")
     Wait-Healthy
@@ -3826,6 +3982,10 @@ try {
             -SamplerName "oj-loadtest-cpu-sampler"
         $events.containerCpuSamplerStartedAt = $script:containerCpuSampler.startedAt
         Write-Host "Container CPU sampler started for: $($cpuContainers -join ', ')"
+    }
+    if ($peakMode -and -not $SkipHostCpu) {
+        $script:hostCpuSampler = Start-HostCpuSampler -OutputDirectory $runDirectory
+        $events.hostCpuSamplerStartedAt = $script:hostCpuSampler.startedAt
     }
     if ($FaultRecovery -and $DispatchMode -eq "rabbit") {
         # Three things happen here, in this order, and the order is the point.
@@ -4159,7 +4319,16 @@ try {
         "-Dperf.userIndex.start=1", "-Dperf.userIndex.end=$UserCount",
         "-Dperf.contestId=$($seed.contestId)", "-Dperf.problemId.start=$($seed.firstProblemId)", "-Dperf.problemId.end=$($seed.lastProblemId)"
     )
-    if ($openBurst) {
+    if ($peakMode) {
+        $javaArgs += @(
+            "-Dperf.peakBaseRps=$PeakBaseRps", "-Dperf.peakSegments=$PeakSegments",
+            "-Dperf.peakRandomized=$(if ($PeakDeterministic) { 'false' } else { 'true' })",
+            "-Dperf.peakCompletionTimeoutSeconds=$PeakCompletionTimeoutSeconds",
+            "-Dperf.authContextFile=$burstContextPath", "-Dperf.artifactDir=$burstArtifactDir",
+            "-Dperf.stageTraceFile=$tracePath",
+            "-cp", $classpath, "io.gatling.app.Gatling", "-s", "my.oj.perf.ContestSubmissionPeakProfileSimulation"
+        )
+    } elseif ($openBurst) {
         # The arrival schedule, and the artifacts the verdict is computed from. Every property the
         # simulation reads is passed rather than left to its default, including the ones whose defaults
         # happen to agree: a burst that silently took a default would be a burst whose shape was decided
@@ -4288,9 +4457,47 @@ try {
                 -ContestId $contestId -CapturedBoundaries $capturedBoundaries
         } else {
         $nextTick = [datetimeoffset]::UtcNow
+        $peakFault = $null
+        if ($peakMode -and $PeakFaultKillAtSeconds -gt 0) {
+            $peakFault = [ordered]@{
+                node = $KilledNode
+                killDueMillis = $staircaseTrace.anchorMillis + 1000L * $PeakFaultKillAtSeconds
+                restartDueMillis = $staircaseTrace.anchorMillis + 1000L * $PeakFaultRestartAtSeconds
+                killed = $false; restarted = $false; metricsUp = $false; judging = $false
+                port = if ($KilledNode -eq "judge-1") { 19001 } else { 19002 }
+            }
+        }
         while (-not $gatling.HasExited) {
             $nextTick = $nextTick.AddSeconds(1)
             $nowMillis = [datetimeoffset]::UtcNow.ToUnixTimeMilliseconds()
+            if ($null -ne $peakFault) {
+                # Deadlines first, so a slow sample can delay the next check but never the kill itself.
+                # These two compose calls are the only docker CLI calls the load makes.
+                if (-not $peakFault.killed -and $nowMillis -ge $peakFault.killDueMillis) {
+                    Save-MetricsSnapshot "pre-fault"
+                    Invoke-Compose -Arguments @("kill", "-s", "SIGKILL", $peakFault.node)
+                    $events.faultInjectedAt = [datetimeoffset]::UtcNow.ToString("o")
+                    $events.faultTimingErrorSeconds = [math]::Round(([datetimeoffset]::UtcNow.ToUnixTimeMilliseconds() - $peakFault.killDueMillis) / 1000.0, 3)
+                    $faultWasInjected = $true
+                    $peakFault.killed = $true
+                    Write-Host "[peak-fault] SIGKILL $($peakFault.node) at $($events.faultInjectedAt) (lag $($events.faultTimingErrorSeconds)s)"
+                } elseif ($peakFault.killed -and -not $peakFault.restarted -and $nowMillis -ge $peakFault.restartDueMillis) {
+                    $events.restartRequestedAt = [datetimeoffset]::UtcNow.ToString("o")
+                    Invoke-Compose -Arguments @("start", $peakFault.node)
+                    $events.nodeRestartedAt = [datetimeoffset]::UtcNow.ToString("o")
+                    $events.restartTimingErrorSeconds = [math]::Round(([datetimeoffset]::Parse($events.restartRequestedAt).ToUnixTimeMilliseconds() - $peakFault.restartDueMillis) / 1000.0, 3)
+                    $peakFault.restarted = $true
+                    Write-Host "[peak-fault] started $($peakFault.node) at $($events.nodeRestartedAt)"
+                } elseif ($peakFault.restarted -and -not $peakFault.judging) {
+                    # Readiness over HTTP only: the node's metrics endpoint answering is "up", and its own
+                    # invocation counter (reset by the restart) moving off zero is "judging again".
+                    $live = Get-JudgeLiveState -Port $peakFault.port
+                    if ($null -ne $live.invocations) {
+                        if (-not $peakFault.metricsUp) { $peakFault.metricsUp = $true; $events.nodeReadyAt = [datetimeoffset]::UtcNow.ToString("o") }
+                        if ($live.invocations -gt 0) { $peakFault.judging = $true; $events.nodeFirstJudgementAfterRestartAt = [datetimeoffset]::UtcNow.ToString("o") }
+                    }
+                }
+            }
             Save-StaircaseBoundarySnapshots -Trace $staircaseTrace -NowMillis $nowMillis -Captured $capturedBoundaries
             Save-StaircaseSample -Phase "load" -Trace $staircaseTrace -ContestId $contestId | Out-Null
             $remaining = ($nextTick - [datetimeoffset]::UtcNow).TotalMilliseconds
@@ -4379,6 +4586,16 @@ try {
     Stop-RabbitSampler
     Set-RabbitSamplerPhase "stopped"
     Save-MetricsSnapshot "end"
+    if ($peakMode -and $faultWasInjected) {
+        # One docker call after the load: the judge logs, from which the RabbitMQ listener's
+        # "Redelivered contest judge message for submission N" lines form the redelivered cohort.
+        try {
+            $judgeLog = @(Invoke-Compose -Arguments @("logs", "--no-color", "--no-log-prefix", "judge-1", "judge-2"))
+            $judgeLog | Set-Content (Join-Path $runDirectory "judge-logs.txt") -Encoding utf8
+            @("submissionId") + @($judgeLog | ForEach-Object { if ([string]$_ -match 'Redelivered contest judge message for submission (\d+)') { $Matches[1] } }) |
+                Set-Content (Join-Path $runDirectory "redelivered-submissions.csv") -Encoding utf8
+        } catch { Write-Warning "judge log capture failed: $_" }
+    }
     $events.measurementEndSnapshotAt = [datetimeoffset]::UtcNow.ToString("o")
     if ($phasedLoad) {
         # The measured window's judge-invocation delta is end minus start, so warm-up work that ran
@@ -4495,7 +4712,54 @@ try {
         # own question - what the application refused, and what never reached a socket - and they are
         # passed to the verdict as separate facts rather than merged into the start count.
         $openBurstDocument = $null
-        if ($openBurst) {
+        if ($peakMode) {
+            $peakRecorder = Read-OpenBurstJson -Path (Join-Path $runDirectory "peak-recorder.json")
+            if ($null -eq $peakRecorder) { throw "The peak profile wrote no peak-recorder.json, so what it offered is unknown." }
+            # The offer: each segment's recorded starts against its Poisson expectation. A segment more than
+            # four deviations off is a generator that did not deliver the schedule, not an unlucky draw.
+            $segmentChecks = @(foreach ($segment in @($peakRecorder.segments)) {
+                $expected = [double]$segment.expected
+                $z = if ($expected -gt 0) { ([double]$segment.started - $expected) / [math]::Sqrt($expected) } else { 0.0 }
+                [ordered]@{ index = $segment.index; rps = $segment.rps; seconds = $segment.seconds; expected = $expected
+                    started = $segment.started; z = [math]::Round($z, 2); withinFourSigma = ([math]::Abs($z) -le 4) }
+            })
+            $statusCounts = [ordered]@{}
+            foreach ($row in $measurementSubmits) {
+                if (-not $statusCounts.Contains($row.status)) { $statusCounts[$row.status] = 0 }
+                $statusCounts[$row.status]++
+            }
+            $count = { param($name) if ($statusCounts.Contains($name)) { [long]$statusCounts[$name] } else { 0L } }
+            $failed = New-Object System.Collections.Generic.List[string]
+            if ((& $count "ko503") -gt 0) { $failed.Add("http-503: $((& $count 'ko503')) submissions refused with 503; refused work is missing from the latency statistics, so the run is invalid") }
+            if ((& $count "ko429") -gt 0) { $failed.Add("http-429: $((& $count 'ko429')) submissions rate-limited") }
+            if ((& $count "ko500") -gt 0) { $failed.Add("http-500: $((& $count 'ko500'))") }
+            $otherKo = @($measurementSubmits | Where-Object { $_.status -ne "ok" -and $_.status -notin @("ko503", "ko429", "ko500") }).Count
+            if ($otherKo -gt 0) { $failed.Add("other-failures: $otherKo submissions failed without a 503/429/500 (connect refusals, 401/403, timeouts)") }
+            if ([long]$peakRecorder.incompleteAttempts -gt 0) { $failed.Add("incomplete: $($peakRecorder.incompleteAttempts) submissions never answered before maxDuration") }
+            if ([long]$peakRecorder.authContextReuse -gt 0) { $failed.Add("session-reuse: $($peakRecorder.authContextReuse) arrivals reused a prepared session") }
+            if ([long]$peakRecorder.droppedRecords -gt 0) { $failed.Add("recorder-dropped: $($peakRecorder.droppedRecords)") }
+            foreach ($check in $segmentChecks) { if (-not $check.withinFourSigma) { $failed.Add("segment-$($check.index)-offer: started $($check.started) against $($check.expected) expected (z=$($check.z))") } }
+            $peakSupply = [ordered]@{
+                model = "peak-profile-open-arrival"
+                supplySucceeded = ($failed.Count -eq 0)
+                failed = @($failed)
+                segments = $segmentChecks
+                statusCounts = $statusCounts
+                recordedArrivals = $peakRecorder.recordedArrivals
+                okAttempts = $peakRecorder.okAttempts
+                incompleteAttempts = $peakRecorder.incompleteAttempts
+                authContextReuse = $peakRecorder.authContextReuse
+                basis = "starts are counted by the load generator at dispatch (peak-recorder.json); statuses are read from the client log. A 503, 429 or 500, a failure of any other kind, an unanswered or a session-sharing arrival makes the run invalid for the comparison."
+            }
+            $peakSupply | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDirectory "supply.json") -Encoding utf8
+            $events.supplyVerdict = if ($peakSupply.supplySucceeded) { "delivered" } else { "invalid" }
+            $events.supplySucceeded = $peakSupply.supplySucceeded
+            $events.supplyStarts = $peakRecorder.recordedArrivals
+            $events.supplyFindingsFailed = @($failed)
+            $events.burstRefusalComposition = $statusCounts
+            $openBurstDocument = [ordered]@{ model = "peak-profile-open-arrival"; recorder = $peakRecorder; supply = $peakSupply; supplyVerdictFile = "supply.json"; windowSource = "the whole schedule (every segment)"; authPrep = $authPrep; authPrepFile = "auth-prep.json" }
+            Write-Host "Peak supply: $($events.supplyVerdict) - $($peakRecorder.recordedArrivals) arrivals (expected $peakExpectedArrivals), statuses $(($statusCounts.Keys | ForEach-Object { "$_=$($statusCounts[$_])" }) -join ', ')$(if ($failed.Count -gt 0) { '; FAILED: ' + ($failed -join ' | ') })"
+        } elseif ($openBurst) {
             $burstRecorder = Read-OpenBurstJson -Path (Join-Path $runDirectory "open-burst-recorder.json")
             if ($null -eq $burstRecorder) {
                 throw "The burst wrote no open-burst-recorder.json, so the number of starts it delivered is unavailable and its offer cannot be judged."
@@ -4615,7 +4879,7 @@ try {
             }
         }
         [ordered]@{
-            mode = if ($openBurst) { "open-burst" } elseif ($FaultRecovery) { "fault-recovery" } elseif ($NormalTimeout) { "normal-timeout" } else { "staircase" }
+            mode = if ($peakMode) { "peak-profile" } elseif ($openBurst) { "open-burst" } elseif ($FaultRecovery) { "fault-recovery" } elseif ($NormalTimeout) { "normal-timeout" } else { "staircase" }
             stageRps = $stageRpsList
             warmupStageCount = $WarmupStageCount
             transitionRampSeconds = $RampSeconds
@@ -4702,7 +4966,9 @@ try {
     # A burst whose offer was short is not a capacity measurement, and the reason is named rather than
     # left for a reader to infer from the verdict: the comparison this run exists for is only valid on
     # a run that was offered its schedule.
-    if ($openBurst -and -not $events.supplySucceeded) {
+    if ($peakMode -and -not $events.supplySucceeded) {
+        $unavailable.Add("this peak-profile run is INVALID for the comparison: $(@($events.supplyFindingsFailed) -join ' | ')")
+    } elseif ($openBurst -and -not $events.supplySucceeded) {
         $unavailable.Add("the arrival schedule this run names was NOT delivered ($($events.supplyVerdict)): the offer is short or its evidence is incomplete, so this run cannot support a statement about what the stack does when 1000 submissions a second are offered. The failed checks are in supply.json and db-verification.json under openBurst.supplyFindingsFailed.")
     }
     # A re-claim is not a duplicate execution: the process that owned the claim is gone. In a SIGKILL
@@ -4997,7 +5263,19 @@ try {
         $script:containerCpuSampler = $null
         Write-Host "Container CPU series: $cpuCsv"
     }
-    & (Join-Path $PSScriptRoot "Analyze-TradeoffRun.ps1") -RunDirectory $runDirectory
+    if ($null -ne $script:hostCpuSampler) {
+        $hostCsv = Stop-HostCpuSampler -Sampler $script:hostCpuSampler
+        $script:hostCpuSampler = $null
+        Write-Host "Host CPU series: $hostCsv"
+    }
+    if ($peakMode) {
+        # The peak profile has its own analysis (segment-labelled backlog, queue wait, model comparison).
+        $peakAnalyzer = Join-Path $PSScriptRoot "Analyze-PeakProfileRun.py"
+        & python $peakAnalyzer $runDirectory
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Analyze-PeakProfileRun.py exited with $LASTEXITCODE; the run's raw files are intact." }
+    } else {
+        & (Join-Path $PSScriptRoot "Analyze-TradeoffRun.ps1") -RunDirectory $runDirectory
+    }
 } catch {
     $events.runEndedAt = [datetimeoffset]::UtcNow.ToString("o")
     $events | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDirectory "events.json") -Encoding utf8
@@ -5062,6 +5340,10 @@ try {
     Stop-RabbitSampler
     if ($script:mysqlSessionStarts -gt 0) { Write-Host "mysql session: opened $($script:mysqlSessionStarts) time(s) for $($script:mysqlSessionSequence) statements" }
     Stop-MysqlSession
+    if ($null -ne $script:hostCpuSampler) {
+        try { Stop-HostCpuSampler -Sampler $script:hostCpuSampler | Out-Null } catch { Write-Warning "host CPU sampler stop failed: $_" }
+        $script:hostCpuSampler = $null
+    }
     if ($null -ne $script:containerCpuSampler) {
         try {
             $cpuCsv = Stop-ContainerCpuSampler -Sampler $script:containerCpuSampler
