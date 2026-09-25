@@ -44,6 +44,26 @@ class ContestScoreboardRecoveryPropertiesTests {
     }
 
     @Test
+    void theRollbackReplayRunsInTheBackgroundUnlessSynchronousIsAskedFor() {
+        contextRunner.run(context -> {
+            ContestScoreboardRecoveryProperties.FullReplay fullReplay =
+                    context.getBean(ContestScoreboardRecoveryProperties.class).fullReplay();
+            assertThat(fullReplay.rollbackReplay()).isEqualTo(ContestScoreboardRecoveryProperties.RollbackReplay.BACKGROUND);
+            assertThat(fullReplay.backgroundRetryBackoff()).isEqualTo(Duration.ofSeconds(1));
+        });
+        contextRunner
+                .withPropertyValues("contest.scoreboard.recovery.full-replay.rollback-replay=synchronous",
+                        "contest.scoreboard.recovery.full-replay.background-retry-backoff=250ms")
+                .run(context -> {
+                    ContestScoreboardRecoveryProperties.FullReplay fullReplay =
+                            context.getBean(ContestScoreboardRecoveryProperties.class).fullReplay();
+                    assertThat(fullReplay.rollbackReplay())
+                            .isEqualTo(ContestScoreboardRecoveryProperties.RollbackReplay.SYNCHRONOUS);
+                    assertThat(fullReplay.backgroundRetryBackoff()).isEqualTo(Duration.ofMillis(250));
+                });
+    }
+
+    @Test
     void bindsEachModeFromItsPropertyValue() {
         for (ContestScoreboardRecoveryMode mode : ContestScoreboardRecoveryMode.values()) {
             contextRunner

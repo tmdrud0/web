@@ -48,11 +48,12 @@ public class ContestScoreboardRecoveryStrategyConfig {
     ) {
         return switch (properties.mode()) {
             case STREAM_OFFSET -> new StreamOffsetRecoveryStrategy(streamRecovery.getObject(), gate);
-            case FULL_REPLAY -> properties.fullReplay().rollbackReplay() == ContestScoreboardRecoveryProperties.RollbackReplay.BACKGROUND
-                    ? new FullReplayRecoveryStrategy(fullReplay, gate, touchedContests,
+            // Only an explicit `synchronous` keeps the old behaviour; a value that bound to nothing is the default.
+            case FULL_REPLAY -> properties.fullReplay().rollbackReplay() == ContestScoreboardRecoveryProperties.RollbackReplay.SYNCHRONOUS
+                    ? new FullReplayRecoveryStrategy(fullReplay, gate)
+                    : new FullReplayRecoveryStrategy(fullReplay, gate, touchedContests,
                             new ContestScoreboardBackgroundReplay(fullReplay, gate,
-                                    properties.fullReplay().backgroundRetryBackoff()))
-                    : new FullReplayRecoveryStrategy(fullReplay, gate);
+                                    properties.fullReplay().backgroundRetryBackoff()));
             case REDIS_SEQ -> new RedisSequenceRecoveryStrategy(sequenceRecovery.getObject(), gate);
         };
     }

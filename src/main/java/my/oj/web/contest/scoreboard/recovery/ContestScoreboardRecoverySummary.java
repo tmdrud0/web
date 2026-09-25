@@ -36,7 +36,8 @@ public final class ContestScoreboardRecoverySummary {
                 summary.append(" db-batch-size=").append(fullReplay.dbBatchSize())
                         .append(" replay-batch-size=").append(fullReplay.replayBatchSize())
                         .append(" startup-replay-enabled=").append(fullReplay.startupReplayEnabled())
-                        .append(" rollback-replay=").append(fullReplay.rollbackReplay().propertyValue());
+                        .append(" rollback-replay=").append(fullReplay.rollbackReplay() == null
+                                ? "background" : fullReplay.rollbackReplay().propertyValue());
             }
             case REDIS_SEQ -> {
                 ContestScoreboardRecoveryProperties.RedisSequence redisSeq = properties.redisSeq();
