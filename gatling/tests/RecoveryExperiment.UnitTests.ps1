@@ -1036,6 +1036,29 @@ Test-Case "an elapsed interval runs from its first argument to its second" {
         "and not to it, which is the spelling that published the sign reversed"
 }
 
+Test-Case "every mode's artifact probe names a class the tree actually has" {
+    # `Assert-BatchArtifactCarriesMode` refuses to measure a jar that lacks the class this map names for
+    # the run's mode, so a map that has drifted from the source does not fail quietly: it fails every run
+    # of that mode, before the load starts. The entry is a compiled path and the source is its `.java`
+    # neighbour under `src/main/java`, which is what this checks - the class the probe looks for exists,
+    # rather than the probe merely being spelled consistently.
+    $repoRoot = (Get-Item (Join-Path $PSScriptRoot "..\..")).FullName
+    foreach ($mode in @("full-replay", "redis-seq", "stream-offset")) {
+        $entry = Get-RecoveryModeClassEntry -Mode $mode
+        Assert-True ($entry.StartsWith("BOOT-INF/classes/") -and $entry.EndsWith(".class")) `
+            "the $mode entry is a compiled class path ('$entry')"
+        $source = Join-Path $repoRoot ("src\main\java\" + `
+                ($entry.Substring("BOOT-INF/classes/".Length).Replace("/", "\").Replace(".class", ".java")))
+        Assert-True (Test-Path -LiteralPath $source) `
+            "mode '$mode' maps to a class the source tree has: src\main\java\$($entry.Substring("BOOT-INF/classes/".Length).Replace('.class', '.java'))"
+    }
+    # A mode the map does not know is refused rather than probed with a wrong class, which is how a new
+    # mode added to the suite would announce itself.
+    $refused = $false
+    try { [void](Get-RecoveryModeClassEntry -Mode "not-a-mode") } catch { $refused = $true }
+    Assert-True $refused "a mode with no entry in the map is refused rather than probed"
+}
+
 # --- report -------------------------------------------------------------------------------------
 
 Write-TestSummary -Suite "RecoveryExperiment unit tests"

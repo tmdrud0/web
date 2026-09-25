@@ -679,6 +679,121 @@ function Assert-BatchRecoveryMode {
     return $runtime
 }
 
+# The strategy class each mode is compiled into. Per mode rather than "the recovery package": a probe that
+# only looked for the package would pass on a jar built before one of the three modes existed, which is
+# exactly the jar this check was added after measuring.
+function Get-RecoveryModeClassEntry {
+    param([Parameter(Mandatory = $true)][string]$Mode)
+
+    switch ($Mode) {
+        "full-replay" { return "BOOT-INF/classes/my/oj/web/contest/scoreboard/recovery/FullReplayRecoveryStrategy.class" }
+        "redis-seq" { return "BOOT-INF/classes/my/oj/web/contest/scoreboard/recovery/RedisSequenceRecoveryStrategy.class" }
+        "stream-offset" { return "BOOT-INF/classes/my/oj/web/contest/scoreboard/recovery/StreamOffsetRecoveryStrategy.class" }
+    }
+    throw "Mode '$Mode' has no strategy class in this harness's map, so no jar can be checked against it."
+}
+
+# `Assert-BatchRecoveryMode` checks the *setting*: it reads CONTEST_SCOREBOARD_RECOVERY_MODE out of the
+# container's environment, and compose writes that variable whether or not any code reads it - so an image
+# built before the recovery modes existed passes it, and one did: a pilot suite measured an image six weeks
+# older than the revision it recorded and ran all three mode names against one implementation
+# (var/deferred-harness-fixes.md item 16). This checks the *artifact* instead: the jar the batch role is
+# executing, compared by content with the jar this repository built, and then that jar's own entry table.
+#
+# A jar that cannot be read comes back as `unavailable` rather than as a throw - the caller decides, and
+# nothing about a failed copy says the artifact is wrong. A jar that is read and does not match is the
+# defect this exists to catch, and the caller refuses to measure on it.
+function Assert-BatchArtifactCarriesMode {
+    param([Parameter(Mandatory = $true)][string]$JarPath)
+
+    $config = Get-RecoveryConfig
+    $identity = [ordered]@{
+        hostJarPath        = $JarPath
+        hostJarSha256      = "unavailable"
+        containerJarSha256 = "unavailable"
+        jarsMatch          = "unavailable"
+        modeClassEntry     = Get-RecoveryModeClassEntry -Mode $config.Mode
+        modeClassPresent   = "unavailable"
+    }
+
+    if (-not (Test-Path -LiteralPath $JarPath)) {
+        return [pscustomobject]$identity
+    }
+    $identity["hostJarSha256"] = (Get-FileHash -LiteralPath $JarPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    # The container's copy is taken out with `docker cp` instead of being hashed inside it: the image is a
+    # bare JRE, and this way the check needs no tool that the image may not carry.
+    $copied = Join-Path ([IO.Path]::GetTempPath()) ("oj-pilot-artifact-" + [Guid]::NewGuid().ToString("N") + ".jar")
+    try {
+        Invoke-Docker -Arguments @("cp", "$($config.BatchContainer):/app/app.jar", $copied) | Out-Null
+        if (Test-Path -LiteralPath $copied) {
+            $identity["containerJarSha256"] = (Get-FileHash -LiteralPath $copied -Algorithm SHA256).Hash.ToLowerInvariant()
+            $identity["jarsMatch"] = if ($identity["containerJarSha256"] -eq $identity["hostJarSha256"]) { "true" } else { "false" }
+        }
+    }
+    catch {
+        # Deliberately swallowed, and only here. The comparison is a guard, not the measurement: a copy
+        # that failed leaves both hashes `unavailable`, which the run reports as an unverified artifact
+        # rather than as a bad one.
+    }
+    finally {
+        Remove-Item -LiteralPath $copied -Force -ErrorAction SilentlyContinue
+    }
+
+    # Read from the host jar, which - when the two hashes above agree - is the same file the batch role is
+    # running, and which is the file the images were built from in any case.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($JarPath)
+    try {
+        $present = $false
+        foreach ($entry in $archive.Entries) {
+            if ($entry.FullName -eq [string]$identity["modeClassEntry"]) { $present = $true; break }
+        }
+        $identity["modeClassPresent"] = if ($present) { "true" } else { "false" }
+    }
+    finally {
+        $archive.Dispose()
+    }
+    return [pscustomobject]$identity
+}
+
+# Draining what a failed run left in the judge queues.
+#
+# The reset refuses to start a run while `contest.judge.live` or `.dead` hold work, because draining is the
+# previous run's result - which is right for a run that finished and wrong for one that failed to measure.
+# That run has no result to protect, and its in-flight submissions do not stay put: they fail every later
+# run of the suite at its reset. Observed 2026-09-25, one run failed at the capture precondition and the
+# five runs after it each died in 0.1 minutes on this check, ending a suite with seven runs left to run.
+# What was drained is recorded, because an unreported drain is indistinguishable from an empty queue.
+function Clear-FailedRunJudgeWork {
+    param([Parameter(Mandatory = $true)][string]$EvidencePath)
+
+    $config = Get-RecoveryConfig
+    $before = Get-RabbitQueueState
+    $queues = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($name in @("contest.judge.live", "contest.judge.dead")) {
+        $counts = Get-QueueCounts -Queues $before -Name $name
+        $held = [long]$counts.Ready + [long]$counts.Unacked
+        $purged = 0L
+        if ($held -gt 0) {
+            Invoke-Docker -Arguments @("exec", $config.RabbitContainer, "rabbitmqctl", "purge_queue", $name, "-p", "/") | Out-Null
+            $purged = $held
+        }
+        $queues.Add([pscustomobject][ordered]@{
+                queue         = $name
+                readyBefore   = [long]$counts.Ready
+                unackedBefore = [long]$counts.Unacked
+                purged        = $purged
+            })
+    }
+    $record = [pscustomobject][ordered]@{
+        drainedAtUtc = [DateTimeOffset]::UtcNow.UtcDateTime.ToString("o")
+        queues       = $queues.ToArray()
+    }
+    Write-JsonFile -Path $EvidencePath -Object $record
+    return $record
+}
+
 # --- the batch role's own account of what happened -------------------------------------------------
 
 # Docker's timestamps are RFC3339 with nanosecond precision and .NET parses at most seven fractional

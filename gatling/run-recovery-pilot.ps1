@@ -322,6 +322,9 @@ $script:gatlingProcess = $null
 $script:stackStarted = $false
 $script:cleanupDone = $false
 $script:seed = $null
+# Set in the catch below and read in the finally, which runs before the process exits. It is what makes the
+# cleanup able to tell "this run failed, so nothing here is a result" from "this run finished".
+$script:runFailed = $false
 
 function Invoke-PilotPoll {
     param(
@@ -470,6 +473,28 @@ try {
             "was writing to a database this harness never reads.")
     }
     Write-Output "  stack healthy; batch-1 environment: mode=$($runtime.Mode) deterministic=$($runtime.DeterministicJudging) acceptPermille=$($runtime.AcceptPermille) db=$($runtime.DbHost):$($runtime.DbPort)/$($runtime.DbName)"
+
+    # The setting read above says which mode was asked for; this says whether the artifact that came up can
+    # run it at all. A jar older than the recovery modes carries the variable and ignores it, and this run
+    # would then measure the wrong implementation under the right name - which is what happened once, with
+    # every guard passing (var/deferred-harness-fixes.md item 16).
+    $artifact = Assert-BatchArtifactCarriesMode -JarPath (Join-Path $repoRoot "build\libs\web-0.0.1-SNAPSHOT.jar")
+    Write-Output "  artifact: jar $($artifact.hostJarSha256) host / $($artifact.containerJarSha256) in batch-1, match=$($artifact.jarsMatch), $($artifact.modeClassEntry) present=$($artifact.modeClassPresent)"
+    if ($artifact.jarsMatch -eq "false") {
+        throw ("The batch role is running a jar this repository did not build (host $($artifact.hostJarSha256), " +
+            "batch-1 $($artifact.containerJarSha256)). The image was built from a different artifact, so no " +
+            "figure from this run describes the revision this suite records.")
+    }
+    if ($artifact.modeClassPresent -eq "false") {
+        throw ("The jar this run would measure carries no $($artifact.modeClassEntry), so mode '$Mode' has no " +
+            "implementation behind it and the setting would be inert. Rebuild the jar (gradlew bootJar) and the " +
+            "images (up -d --build) before measuring.")
+    }
+    if ($artifact.jarsMatch -eq "unavailable" -or $artifact.modeClassPresent -eq "unavailable") {
+        # Reported, not thrown: the artifact could not be identified, which is a weaker claim than a wrong
+        # one. It is recorded in the summary so the run's figures are not read as coming from a known jar.
+        Write-Output "  note: the artifact could not be fully identified, so this run's summary reports it as unavailable"
+    }
 
     # The app tier this run measures is new; the edge in front of it may not be. Recreated here, after
     # the tier is up, so that it resolves web-1 and web-2 to this run's containers rather than to the
@@ -630,8 +655,19 @@ try {
     Resume-Batch
     $kCapturePauseMs = $kPauseWatch.ElapsedMilliseconds
     if (-not $kCompare.Matches) {
+        # The counts, and the first few users that differ, are in the message and not only in the sample
+        # file: a repeat of this failure is the one piece of evidence that separates "the oracle holds
+        # results the scoreboard was never given" (the non-authoritative marker written ahead of the apply)
+        # from "the two boards disagree on standings", and the run that failed here is the only place the
+        # question can be asked.
+        $difference = $kCompare.Difference
         throw ("At the capture instant the scoreboard and the oracle disagree " +
-            "(api=$($kCompare.ApiDigest) oracle=$($kCompare.OracleDigest)). The snapshot is not a state " +
+            "(api=$($kCompare.ApiDigest) oracle=$($kCompare.OracleDigest); " +
+            "api participants=$($kCompare.ApiParticipants) entries=$($kCompare.ApiEntries), " +
+            "oracle participants=$($kCompare.OracleParticipants) entries=$($kCompare.OracleEntries); " +
+            "missingFromScoreboard=$($difference.MissingFromScoreboard) notInOracle=$($difference.NotInOracle) " +
+            "wrongScoreOrPenalty=$($difference.WrongScoreOrPenalty) wrongRank=$($difference.WrongRank); " +
+            "missingSample=$(@($difference.MissingSample) -join ',')). The snapshot is not a state " +
             "the scoreboard ever reached, so a rollback to it would measure nothing.")
     }
     Write-Output "  captured K: $($kSnapshot.KeyCount) key(s), $($kSnapshot.ProcessedCount) processed results, checkpoint $($kSnapshot.Checkpoint), $($kCounts.AppliedResults) applied"
@@ -829,6 +865,15 @@ try {
         pollIntervalSeconds = $PollIntervalSeconds
         baselineWindowSeconds = $BaselineWindowSeconds
         tailResults = $TailResults
+
+        # The artifact these figures came from. The mode is a setting in the container's environment and an
+        # implementation in its jar, and these four fields are the only thing in the run that ties the two
+        # together - so a summary whose jar is not the built one, or whose jar lacks the mode's class, can be
+        # read for what it is instead of being taken as a measurement of this revision.
+        artifactJarSha256 = $artifact.hostJarSha256
+        artifactContainerJarSha256 = $artifact.containerJarSha256
+        artifactJarsMatch = $artifact.jarsMatch
+        artifactModeClassPresent = $artifact.modeClassPresent
 
         # --- the four instants the experiment is defined by, plus what they derive ------------------
         loadStartedAtUtc = $loadStartedAtUtc.UtcDateTime.ToString("o")
@@ -1172,6 +1217,7 @@ try {
 }
 catch {
     $failure = $_
+    $script:runFailed = $true
     Write-Output ""
     Write-Output "  FAILED: $($failure.Exception.Message)"
     Write-JsonFile -Path (Join-Path $artifacts "failure.json") -Object ([pscustomobject][ordered]@{
@@ -1202,6 +1248,22 @@ finally {
             [void](Invoke-Compose -Arguments (@("stop") + @("web-1", "web-2", "batch-1", "judge-1", "judge-2")))
         }
         catch { Write-Output "  could not stop the application tier: $($_.Exception.Message)" }
+    }
+    # A failed run leaves whatever the judges had in flight in their queues, and the next run's reset refuses
+    # to start while they hold it - so one failure takes the rest of the suite with it. Observed 2026-09-25:
+    # a run died at the capture precondition and the five runs after it each failed in 0.1 minutes on this
+    # check. A run that failed to measure has no result for those messages to be part of, and the drain is
+    # recorded, so what was emptied is evidence rather than a silence. After the stop above, so nothing can
+    # republish into what is being drained.
+    if ($script:runFailed -and $script:stackStarted -and -not $KeepStackRunning -and $null -ne $artifacts) {
+        try {
+            $drained = Clear-FailedRunJudgeWork -EvidencePath (Join-Path $artifacts "queue-drain-after-failure.json")
+            $emptied = @($drained.queues | Where-Object { $_.purged -gt 0 })
+            if ($emptied.Count -gt 0) {
+                Write-Output "  drained a failed run's leftover judge work: $(@($emptied | ForEach-Object { "$($_.queue) purged=$($_.purged) of ready=$($_.readyBefore)" }) -join '; ')"
+            }
+        }
+        catch { Write-Output "  could not drain the failed run's leftover judge work: $($_.Exception.Message)" }
     }
     if (-not $script:cleanupDone -and $null -ne $script:seed -and (Get-RecoveryConfig).ContestScopeFromSeed) {
         try {
