@@ -843,7 +843,15 @@ try {
         consistentAtUtc = $consistentAtUtc.UtcDateTime.ToString("o")
         consistentAtMysql = $recoveryRow.timestampMysql
         drainedAtUtc = $drainedAtUtc.UtcDateTime.ToString("o")
-        detectionLatencyMs = Format-PilotElapsed $(if ($null -eq $detection) { $null } else { $detection.Instant }) $faultAtUtc
+        # The fault is the first argument, because a latency runs from its cause to its effect and
+        # `Format-PilotElapsed` returns `$ToUtc - $FromUtc`. This call had the two the other way round, so
+        # every run reported the fault-to-detection interval negated: `fullreplay_0` of the 2026-09-25 09:44
+        # calibration suite detected at `00:47:17.9262305Z` after a fault at `00:46:34.3777818Z`, 43.548 s
+        # apart in the positive direction, and the column read `-43548.4`. The `detectionPrecedesFault`
+        # guard above is not what catches that - it tests the instants directly and fires on the one case a
+        # correct formula makes negative - so nothing but this order decides the sign. The unit suite pins
+        # the order of these two arguments for this figure, the way it pins the grouping-parenthesis shape.
+        detectionLatencyMs = Format-PilotElapsed $faultAtUtc $(if ($null -eq $detection) { $null } else { $detection.Instant })
         repairDurationMs = Format-PilotElapsed $consistentAtUtc $drainedAtUtc
         consistencyOutageMs = Format-PilotElapsed $faultAtUtc $consistentAtUtc
         backlogDrainMs = Format-PilotElapsed $faultAtUtc $drainedAtUtc

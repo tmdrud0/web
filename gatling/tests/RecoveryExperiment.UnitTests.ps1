@@ -986,6 +986,56 @@ Test-Case "a statement is not put inside a grouping parenthesis" {
     Assert-True ($checked -ge 4) "the scan read the harness's sources ($checked read)"
 }
 
+Test-Case "an elapsed interval runs from its first argument to its second" {
+    # `Format-PilotElapsed` returns `$ToUtc - $FromUtc`, and the runner's other call sites read that way:
+    # `consistencyOutageMs = Format-PilotElapsed $faultAtUtc $consistentAtUtc` and
+    # `repairDurationMs = Format-PilotElapsed $consistentAtUtc $drainedAtUtc` are both positive because in
+    # each the second instant is the later one. The detection latency had them the other way round, so the
+    # 09:44 calibration suite's first run reported a fault-to-detection interval of 43.548 s as
+    # `-43548.4` - and no behavioural test of the *helper* can see that, because the helper is right.
+    #
+    # The function lives in the runner rather than in `lib`, so this reads the function's own text out of
+    # the runner by AST and runs it, instead of restating the subtraction in a copy that could quietly
+    # disagree with the source. The parse is asserted first, so a runner that does not compile fails here
+    # rather than in a run that has already been measured.
+    $runnerPath = Join-Path (Get-Item (Join-Path $PSScriptRoot "..")).FullName "run-recovery-pilot.ps1"
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) "the runner parses ($($parseErrors.Count) syntax error(s) reported)"
+
+    $definition = $ast.Find(
+        {
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq "Format-PilotElapsed"
+        }, $true)
+    Assert-True ($null -ne $definition) "the runner still defines Format-PilotElapsed, which this case runs"
+    . ([scriptblock]::Create($definition.Extent.Text))
+
+    $early = [DateTimeOffset]::Parse("2026-09-25T00:00:00.0000000Z")
+    $late = [DateTimeOffset]::Parse("2026-09-25T00:00:05.0000000Z")
+    Assert-Equal 5000 (Format-PilotElapsed $early $late) `
+        "an interval from the earlier instant to the later one is positive"
+    Assert-Equal -5000 (Format-PilotElapsed $late $early) `
+        "the same two instants the other way round are its negation, which is the whole of the defect"
+    Assert-Equal "unavailable" (Format-PilotElapsed $null $late) "a missing instant is unavailable, not zero"
+    Assert-Equal "unavailable" (Format-PilotElapsed $early $null) "and so is the other one"
+
+    # The call site's order is what went wrong, and the helper's behaviour cannot speak to it. This pins
+    # the one figure whose two instants are named well enough for a shape rule: a latency runs from its
+    # cause to its effect, so the fault is the first argument of the detection latency. It is deliberately
+    # a rule about *this* figure rather than about every call - which of two instants is the earlier one
+    # is not decidable from the text of a call - and it says so instead of pretending to a general guard.
+    $text = Get-Content -LiteralPath $runnerPath -Raw
+    $fromTheFault = 'detectionLatencyMs\s*=\s*Format-PilotElapsed\s+\$faultAtUtc\s+\$\(if'
+    $toTheFault = 'detectionLatencyMs\s*=\s*Format-PilotElapsed\s+\$\(if'
+    Assert-True ([regex]::Matches($text, $fromTheFault).Count -eq 1) `
+        "the detection latency is measured from the fault, which is its first argument"
+    Assert-True ([regex]::Matches($text, $toTheFault).Count -eq 0) `
+        "and not to it, which is the spelling that published the sign reversed"
+}
+
 # --- report -------------------------------------------------------------------------------------
 
 Write-TestSummary -Suite "RecoveryExperiment unit tests"
