@@ -8,6 +8,7 @@
 | `PILOT_REPORT.md` | 실측 결과 (측정 후 작성) |
 | `results/` | 요약 산출물 (`summary.csv`, `runs.csv`, `run-metadata.json`, `calibration.md`) |
 | [`../SCOREBOARD_RECOVERY_FINAL_REPORT.md`](../SCOREBOARD_RECOVERY_FINAL_REPORT.md) | 세 모드의 구현 내역. 이 실험은 그 보고서가 **측정하지 않았다고 밝힌 항목**(§10)만 다룬다 |
+| [live-impact/](live-impact/README.md) | 후속 실험: 복구 중 신규 처리(접수·채점·반영)가 줄거나 멈추는가, tail이 언제 돌아오는가. 별도 runner(`gatling/run-recovery-live-impact.ps1`) |
 
 이 실험은 기존 `gatling/run-scoreboard-rdb-recovery.ps1`과 **다른 질문**에 답한다. 그 스크립트는 outbox vs
 stream **전송 방식** 비교용이고 rollback 전에 부하를 멈춘다. 여기서는 rollback **중에도 신규 유입이
