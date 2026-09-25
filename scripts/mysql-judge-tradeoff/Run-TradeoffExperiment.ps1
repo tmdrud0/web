@@ -3833,7 +3833,7 @@ try {
             throw "The warm-up and measurement contests resolved to the same contest id, so the warm-up's work would land in the measured window."
         }
         $events.warmupContestId = [long]$warmupSeed.contestId
-    } elseif ($stagedLoad) {
+    } elseif ($phasedLoad) {
         # Two contests inside one stack lifetime. The warm-up writes to one and the measurement to
         # the other, so no warm-up row can be counted inside a measured window. The duplicate
         # registry is keyed by (contestId, problemId, userId, codeHash), so the identical
@@ -3870,7 +3870,7 @@ try {
     $contestId = [long]$seed.contestId
     # In a phased-load run this first snapshot is the warm-up phase's starting point; the baseline
     # the measured window is read against is taken again once the warm-up has drained.
-    Save-MetricsSnapshot $(if ($traceLoad) { "warmup-start" } else { "start" })
+    Save-MetricsSnapshot $(if ($phasedLoad -or $openBurst) { "warmup-start" } else { "start" })
 
     # The outbox the claim query scans, as it stands before the load. A PUBLISHED row left by an
     # earlier run is not claimable but still sits in the tables the claim and the sampler read, so the
@@ -4018,7 +4018,7 @@ try {
         $warmupAcceptedAtBaseline = $warmupQuiescence.accepted
     }
 
-    if ($stagedLoad -and $IngressPreflight) {
+    if ($phasedLoad -and $IngressPreflight) {
         # Before the warm-up rather than between the phases: the question is whether the fresh stack
         # can carry this experiment's arrival pattern at all, and asking it after the warm-up would
         # have spent the warm-up on an ingress that was already known to refuse connections. The
@@ -4035,7 +4035,7 @@ try {
         Write-Host "Ingress preflight passed: $($preflight.population) sessions prepared over $($preflight.preparationSeconds)s, $($preflight.http.loginOffered) logins and $($preflight.http.submitOffered) submissions offered with $($preflight.refusalTotal) refusals."
     }
 
-    if ($stagedLoad) {
+    if ($phasedLoad) {
         # Warm-up phase. It is offered the same rate and the same workload as the measurement and
         # differs only in which contest it writes to, so the measurement starts against a stack that
         # has already been through the same code paths (JIT, connection pool, buffer pool). Its
@@ -4307,7 +4307,7 @@ try {
     Set-RabbitSamplerPhase "stopped"
     Save-MetricsSnapshot "end"
     $events.measurementEndSnapshotAt = [datetimeoffset]::UtcNow.ToString("o")
-    if ($stagedLoad) {
+    if ($phasedLoad) {
         # The measured window's judge-invocation delta is end minus start, so warm-up work that ran
         # after the baseline would be charged to the measurement. The baseline was taken at
         # quiescence and the warm-up contest's own submissions are the observable part of that work:
@@ -4511,7 +4511,7 @@ try {
             Write-Host "Open-arrival supply: $($burstSupplyVerdict.verdict) (supplySucceeded=$($burstSupplyVerdict.supplySucceeded)) - starts $($burstSupplyVerdict.starts) of $burstPlannedStarts planned, $($burstSupplyVerdict.startsInWindow) inside the ${BurstSteadySeconds}s window at $($burstSupplyVerdict.observedRatePerSecond)/s against $TargetRps/s, worst second off by $($burstSupplyVerdict.worstBucketDeviationPercent)%; client saw $($events.burstSubmitsInWindow) submits in the window ($burstConnectRefusals connect refusals, $burstUnauthenticated unauthenticated, $burstAppRefusals application refusals)."
         }
         $warmupDocument = $null
-        if ($stagedLoad -or $openBurst) {
+        if ($phasedLoad -or $openBurst) {
             $warmupDocument = [ordered]@{
                 contestId = $events.warmupContestId
                 contestPrefix = $warmupPrefix
@@ -4639,7 +4639,7 @@ try {
     $duplicateJudgeMillisLowerBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 50 }
     $duplicateJudgeMillisUpperBound = if ($null -eq $duplicateJudgements) { $null } else { $duplicateJudgements * 2000 }
     $warmupVerification = $null
-    if ($stagedLoad -or $openBurst) {
+    if ($phasedLoad -or $openBurst) {
         $warmupAcceptedAtEndRead = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission WHERE contest_id=$($events.warmupContestId)"
         $warmupResults = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id=$($events.warmupContestId)"
         $warmupDuplicateClaims = Get-SqlScalar "SELECT COALESCE(SUM(GREATEST(attempts - 1, 0)),0) FROM contest_judge_outbox o JOIN contest_submission s ON s.id=o.submission_id WHERE s.contest_id=$($events.warmupContestId)"
