@@ -84,24 +84,109 @@ class ContestScoreboardBackgroundReplayTests {
         verify(replayService).replayAllContestsNewestFirst();
     }
 
-    /** The supervisor and the first live delivery ask about one rollback; one pass answers both. */
+    /**
+     * Questions that wait for the same pass are answered by it once. The worker is kept busy with an
+     * earlier pass, so both questions arrive before the next pass starts.
+     */
     @Test
-    void oneRollbackAskedTwiceIsReplayedOnce() throws Exception {
+    void questionsThatWaitForTheSamePassAreAnsweredByItOnce() throws Exception {
+        CountDownLatch firstStarted = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         AtomicInteger passes = new AtomicInteger();
         when(replayService.replayContestsNewestFirst(any())).thenAnswer(invocation -> {
             passes.incrementAndGet();
+            firstStarted.countDown();
             release.await(10, TimeUnit.SECONDS);
             return 0;
         });
         ContestScoreboardBackgroundReplay background = background();
 
+        background.request(10L, 20L, Set.of(1L));
+        assertThat(firstStarted.await(10, TimeUnit.SECONDS)).isTrue();
         assertThat(background.request(20L, 40L, Set.of(7L))).isTrue();
         assertThat(background.request(20L, 40L, Set.of(7L))).isTrue();
         release.countDown();
 
         assertThat(background.awaitIdle(WAIT)).isTrue();
-        assertThat(passes).hasValue(1);
+        assertThat(passes).hasValue(2);
+    }
+
+    /**
+     * The hole this pins: a rollback, its pass under way newest first, and Redis rolled back again with
+     * nothing applied in between. The second rollback is named exactly like the first, and the running
+     * pass may already have walked past what it took away - so it gets a pass of its own.
+     */
+    @Test
+    void aRepeatedRollbackDuringThePassItRepeatsGetsAnotherPass() throws Exception {
+        CountDownLatch firstStarted = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger passes = new AtomicInteger();
+        when(replayService.replayContestsNewestFirst(any())).thenAnswer(invocation -> {
+            passes.incrementAndGet();
+            firstStarted.countDown();
+            release.await(10, TimeUnit.SECONDS);
+            return 0;
+        });
+        ContestScoreboardBackgroundReplay background = background();
+
+        background.request(20L, 40L, Set.of(7L));
+        assertThat(firstStarted.await(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(background.request(20L, 40L, Set.of(7L))).isTrue();
+        release.countDown();
+
+        assertThat(background.awaitIdle(WAIT)).isTrue();
+        assertThat(passes).hasValue(2);
+        assertThat(background.completedPasses()).isEqualTo(2L);
+    }
+
+    /**
+     * The same scenario through the strategy, the way the lifecycle asks: after the first COVERED the
+     * supervisor marks the range rebuilt through H, so the second rollback's range - same H, the same or
+     * an older checkpoint - reads as rebuilt already. In the background that mark means "queued", and the
+     * question still has to reach the replay.
+     */
+    @Test
+    void aRangeMarkedRebuiltByAQueuedPassIsStillReplayedAgain() throws Exception {
+        CountDownLatch firstStarted = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger passes = new AtomicInteger();
+        when(replayService.replayContestsNewestFirst(any())).thenAnswer(invocation -> {
+            passes.incrementAndGet();
+            firstStarted.countDown();
+            release.await(10, TimeUnit.SECONDS);
+            return 0;
+        });
+        ContestScoreboardTouchedContests touched = new ContestScoreboardTouchedContests();
+        touched.touched(7L, 40L);
+        ContestScoreboardBackgroundReplay background = background();
+        FullReplayRecoveryStrategy strategy = new FullReplayRecoveryStrategy(replayService, gate, touched, background);
+
+        assertThat(strategy.rebuildHistory(new LostRange(20L, 40L, 40L, -1L))).isEqualTo(Outcome.COVERED);
+        assertThat(firstStarted.await(10, TimeUnit.SECONDS)).isTrue();
+        LostRange sameCheckpoint = new LostRange(20L, 40L, 40L, 40L);
+        LostRange olderCheckpoint = new LostRange(15L, 40L, 40L, 40L);
+        assertThat(sameCheckpoint.rebuiltAlready()).isTrue();
+        assertThat(strategy.rebuildHistory(sameCheckpoint)).isEqualTo(Outcome.COVERED);
+        assertThat(strategy.rebuildHistory(olderCheckpoint)).isEqualTo(Outcome.COVERED);
+        release.countDown();
+
+        assertThat(background.awaitIdle(WAIT)).isTrue();
+        // The two repeated questions waited for the same next pass.
+        assertThat(passes).hasValue(2);
+    }
+
+    /** A pass that finished is not an answer to a rollback that came after it, even one named the same. */
+    @Test
+    void theSameRollbackAfterItsPassFinishedIsReplayedAgain() throws Exception {
+        ContestScoreboardBackgroundReplay background = background();
+
+        background.request(20L, 40L, Set.of(7L));
+        assertThat(background.awaitIdle(WAIT)).isTrue();
+        background.request(20L, 40L, Set.of(7L));
+        assertThat(background.awaitIdle(WAIT)).isTrue();
+
+        verify(replayService, org.mockito.Mockito.times(2)).replayContestsNewestFirst(Set.of(7L));
+        assertThat(background.completedPasses()).isEqualTo(2L);
     }
 
     /**

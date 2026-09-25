@@ -5,7 +5,6 @@ import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy.P
 
 import java.time.Duration;
 import java.util.Collection;
-import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.TreeSet;
@@ -22,20 +21,21 @@ import java.util.TreeSet;
  * pass is retried - after a failure, or while another pass holds the gate - until one completes, so an
  * accepted request is not dropped on a transient error.</p>
  *
- * <p>Requests are coalesced. One rollback is asked about twice, by the supervisor and by the first live
- * delivery above the rolled-back checkpoint, and both name it by the same pair of offsets - the
- * checkpoint Redis now holds and the highest offset this JVM applied - so the second is recognised and
- * adds nothing. Requests for different rollbacks that arrive before the next pass starts are merged into
- * it: their contests are unioned, and a request for every contest makes the pass cover every contest.</p>
+ * <p>Requests are coalesced only while they wait. Every request that arrives before the next pass
+ * starts is merged into that pass: contests are unioned, and a request for every contest makes the pass
+ * cover every contest. A request that arrives after a pass has started is never answered by that pass,
+ * whatever it is named: the pair of offsets a rollback is named by - the checkpoint Redis now holds and
+ * the highest offset this JVM applied - stays the same when Redis is rolled back again with nothing
+ * applied in between, so a second rollback cannot be told apart from a second question about the
+ * first. The running pass may already have walked past what the second one took away, so the request
+ * waits for the next pass. The cost is at most one extra pass when the same rollback is asked about again
+ * after its pass started; the alternative was a rollback nobody repaired.</p>
  *
  * <p>What the gate keeps apart is unchanged: a background pass takes {@link PassKind#MYSQL_REPLAY} like
  * every other replay, so it never overlaps the startup replay or an operator's pass.</p>
  */
 @Slf4j
 public class ContestScoreboardBackgroundReplay implements AutoCloseable {
-
-    /** How many recent rollbacks are remembered for coalescing. A rollback is a rare event. */
-    private static final int REMEMBERED_ROLLBACKS = 1024;
 
     private record RollbackKey(long checkpointOffset, long highestAppliedOffset) {
     }
@@ -44,7 +44,8 @@ public class ContestScoreboardBackgroundReplay implements AutoCloseable {
     private final ContestScoreboardRecoveryPassGate gate;
     private final long retryBackoffMillis;
     private final Object monitor = new Object();
-    private final Set<RollbackKey> accepted = new LinkedHashSet<>();
+    /** The rollbacks merged into the pass that has not started yet. Cleared when it starts. */
+    private final Set<RollbackKey> pendingKeys = new LinkedHashSet<>();
     private final Thread worker;
 
     /** Contests the next pass must cover. Empty with {@link #pendingAll} false means no pass is due. */
@@ -78,13 +79,9 @@ public class ContestScoreboardBackgroundReplay implements AutoCloseable {
                 return false;
             }
             RollbackKey key = new RollbackKey(checkpointOffset, highestAppliedOffset);
-            if (!accepted.add(key)) {
+            if (!pendingKeys.add(key) && (pendingAll || contests == null || pendingContests.containsAll(contests))) {
+                // Already waiting for the next pass with a scope that covers this one.
                 return true;
-            }
-            if (accepted.size() > REMEMBERED_ROLLBACKS) {
-                Iterator<RollbackKey> oldest = accepted.iterator();
-                oldest.next();
-                oldest.remove();
             }
             if (contests == null) {
                 pendingAll = true;
@@ -156,6 +153,7 @@ public class ContestScoreboardBackgroundReplay implements AutoCloseable {
                 contests = new TreeSet<>(pendingContests);
                 all = pendingAll;
                 pendingContests.clear();
+                pendingKeys.clear();
                 pendingAll = false;
                 pending = false;
                 running = true;

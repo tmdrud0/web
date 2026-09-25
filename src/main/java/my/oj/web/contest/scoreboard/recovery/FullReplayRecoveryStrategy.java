@@ -106,11 +106,17 @@ class FullReplayRecoveryStrategy implements ContestScoreboardRecoveryStrategy, A
 
     @Override
     public Outcome rebuildHistory(LostRange range) {
+        if (background != null) {
+            // Not asked of rebuiltAlready(). The lifecycle marks a range rebuilt when the answer is
+            // COVERED, and in the background that answer means "a pass is queued", not "a pass has
+            // finished". A second rollback with nothing applied in between states the same top as the
+            // first, so the mark would skip it while the first pass may already have walked past what it
+            // took away. Every question goes to the background replay, which answers it with a pass that
+            // starts after it.
+            return requestInBackground(range);
+        }
         if (range.rebuiltAlready()) {
             return Outcome.COVERED;
-        }
-        if (background != null) {
-            return requestInBackground(range);
         }
         try {
             return gate.tryRun(PassKind.MYSQL_REPLAY, () -> {

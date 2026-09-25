@@ -306,6 +306,19 @@ Redis CPU 제한 0.5가 걸려 있으므로 수백 ms~수 초일 수 있다. 두
 5. 채점 규칙은 도착 순서에 대해 교환적이다(`RedisContestScoreboardApplierRedisIntegrationTests.lateEarlierAttemptsKeepCommutativeScoreboardRule`,
    `InMemoryContestScoreboardCommutativityTests`). 역순 replay와 라이브 적용이 섞여도 최종 순위는 같다.
 
+**2번이 성립하도록 고친 것 (C2-fix, 방법 B).** 처음 구현에서는 2번이 요청이 background에 도달할 때만 참이었다. 즉시 COVERED를
+받은 supervisor가 `markRebuiltThrough(H)`를 기록하므로, 새 적용 없이 다시 롤백되면 두 번째 범위의 top도 H라 `rebuiltAlready()`에서
+걸러졌고, 같은 checkpoint면 `(checkpoint, H)` 중복 제거에도 걸렸다. 이제 background 모드는 `rebuiltAlready()`를 보지 않고 모든 질문을
+background에 넘기며, background는 **아직 시작하지 않은 pass를 기다리는 요청끼리만** 합친다. pass가 시작된 뒤(또는 끝난 뒤)에 온
+요청은 이름이 같아도 다음 pass를 예약한다. 방법 A(Outcome에 "예약됨"을 추가해 pass 완료 때 rebuiltThrough를 올림) 대신 B를 고른
+이유: 두 번째 롤백과 첫 롤백에 대한 두 번째 질문은 offset 쌍으로 구분되지 않으므로 A도 결국 "시작 이후의 질문은 새 pass"라는 같은
+규칙이 필요하고, A는 거기에 더해 세 모드가 공유하는 lifecycle·processor 경로와 Outcome 계약을 바꾼다. B는 background 모드 안에서
+끝나고 synchronous·redis-seq·stream-offset 경로를 건드리지 않는다. 대가는 같은 롤백을 pass 시작 뒤에 다시 물으면 pass가 한 번 더
+도는 것뿐이다(안전한 방향). **남는 한계**: supervisor는 이미 답한 `(checkpoint, H)` 쌍을 다시 묻지 않으므로, 새 적용 없이 **같은
+스냅샷**으로 다시 롤백되면 누구도 묻지 않는다. offset만으로는 관측할 수 없는 경우이고 synchronous 모드에도 같은 한계가 있다
+(synchronous는 pass가 끝난 뒤 rebuiltThrough를 기록하므로, pass 도중 다른 checkpoint로 다시 롤백된 경우도 걸러진다 — 이번 범위에서
+바꾸지 않았다).
+
 ### 8.3 대회 범위의 근거
 
 적용마다 stamp를 남긴다: live 이벤트는 자기 offset, replay 청크와 운영자 rebuild는 적용 시점의 checkpoint. 스냅샷 checkpoint가 S인
@@ -317,7 +330,9 @@ startup replay가 모든 대회를 stamp하므로 재시작 뒤에도 빈틈이 
 
 - `replayThread` = `scoreboard-full-replay`, `newApplyStallLongestSeconds` < 2, `reconsumedAfterFault` ≈ 0(재구독 없음).
 - `tailReturnedAfterFaultMs`가 첫 청크 시간 수준인가(H4). `replayRows`가 대회 하나의 행 수(N_total이 아니라 N)인가.
-- `passesAfterRollback` = 1 (supervisor와 첫 배달의 요청이 한 pass로 합쳐졌는가).
+- `passesAfterRollback`: 부하 중에는 첫 배달이 먼저 묻고 anchor해 checkpoint가 H를 넘으므로 supervisor는 롤백을 보지 못해 1이 예상된다.
+  supervisor가 먼저 묻고 pass가 시작된 뒤 첫 배달이 다시 물으면 2가 된다(C2-fix, §8.2). 2는 정상이며 3 이상이면 반복 롤백이나
+  반복 질문을 의심한다.
 - 청크 락 대기(`chunkLockWait*`)와 during 반영 지연 p95 — 판정 B의 크기가 여기서 나온다.
 
 ### 8.5 검증 상태
