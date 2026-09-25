@@ -21,6 +21,15 @@ class ContestJudgeRabbitListenerTests {
     }
 
     @Test
+    void judgesARedeliveredMessageLikeAnyOther() {
+        listener.judge(new ContestJudgeMessage(5L, 91L, 1), Boolean.TRUE);
+        listener.judge(new ContestJudgeMessage(6L, 92L, 1), null);
+
+        verify(processor).judge(91L);
+        verify(processor).judge(92L);
+    }
+
+    @Test
     void propagatesProcessorFailureForContainerRetry() {
         RuntimeException failure = new RuntimeException("judge failed");
         doThrow(failure).when(processor).judge(91L);
