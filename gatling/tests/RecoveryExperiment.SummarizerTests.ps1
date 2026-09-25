@@ -356,8 +356,39 @@ Test-Case "a suite whose metadata cannot say what its runs ran under is refused"
     Assert-True ($result.Output -match "has no suite-metadata.json") "and the reason names the missing file"
 }
 
-# --- report -----------------------------------------------------------------------------------------
+Test-Case "a run directory from an earlier suite is not summarized as this suite's" {
+    # The suite records the directory it resolved for each run. For a run that produced no summary of its
+    # own that resolution used to land on an earlier suite's directory for the same run id - the run ids are
+    # reused by design - so a run that failed to measure was summarized with another run's figures and the
+    # other run's verdict, and could be counted as a measured repeat. What tells the two apart is the stamp
+    # the harness writes at the front of every directory name, which is the same clock written the same way
+    # for the suite and for its runs. See `var/deferred-harness-fixes.md` item 17.
+    $ownRun = Join-Path $script:scratchRoot "20260925-110000-fullreplay_1"
+    Write-RunArtifact -Directory $ownRun -Row (New-SummarizerRow -RunId "fullreplay_1" -Mode "full-replay" `
+            -Figures @{ detectionLatencyMs = 900 })
+    # The same run id from a suite that ran an hour earlier, with a verdict of its own and a large figure.
+    $earlierRun = Join-Path $script:scratchRoot "20260925-100000-fullreplay_2"
+    Write-RunArtifact -Directory $earlierRun -Row (New-SummarizerRow -RunId "fullreplay_2" -Mode "full-replay" `
+            -Figures @{ detectionLatencyMs = 41000 })
+    $suiteDirectory = New-SummarizerSuite -Name "20260925-110000-suite-pilot" -Modes @("full-replay") -Runs @(
+        (New-SuiteRunEntry -RunId "fullreplay_1" -Mode "full-replay" -RunIndex 1 -ArtifactDirectory $ownRun),
+        (New-SuiteRunEntry -RunId "fullreplay_2" -Mode "full-replay" -RunIndex 2 -ArtifactDirectory $earlierRun `
+            -ExitMeaning "failed to measure" -ExitCode 1))
+    $outDirectory = Join-Path $script:scratchRoot "foreign-out"
 
+    $result = Invoke-Summarizer -SuiteDirectory $suiteDirectory -OutputDirectory $outDirectory
+    Assert-Equal 0 $result.ExitCode "the suite is summarized from the run it did measure"
+    Assert-True ($result.Output -match "earlier suite") "the earlier suite's directory is refused by name"
+    $rows = @(Import-Csv -LiteralPath (Join-Path $outDirectory "runs.csv"))
+    Assert-Equal 1 $rows.Count "the earlier suite's row is not counted among this suite's runs"
+    Assert-Equal "fullreplay_1" ([string]$rows[0].runId) "and the row kept is this suite's own run"
+    $table = @(Import-Csv -LiteralPath (Join-Path $outDirectory "summary.csv"))
+    $detection = @($table | Where-Object { [string]$_.figure -eq "detectionLatencyMs" })
+    Assert-Equal "900" ([string]$detection[0]."full-replay median") `
+        "the earlier run's figure does not enter the median"
+}
+
+# --- report -----------------------------------------------------------------------------------------
 try {
     Remove-Item -LiteralPath $script:scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

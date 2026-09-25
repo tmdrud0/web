@@ -140,12 +140,20 @@ function Clear-SuiteLeftovers {
 # back from disk rather than passed from the child, so a run that died before it could report still
 # leaves whatever it produced for the summary to find.
 function Find-RunArtifacts {
-    param([Parameter(Mandatory = $true)][string]$RunId)
+    param(
+        [Parameter(Mandatory = $true)][string]$RunId,
+        # The instant this suite started this run. A directory older than it was written by an earlier suite
+        # that used the same run id, and the run ids are reused on purpose - the pilot's nine are the same
+        # nine every time it is run. Reading one of those is how a run that produced no summary of its own
+        # inherited a previous suite's figures: the search below prefers a directory that *has* a summary,
+        # which on a failed run is exactly the older one. See `deferred-harness-fixes.md` item 17.
+        [Parameter(Mandatory = $true)][DateTimeOffset]$NotBefore
+    )
 
     $root = Join-Path $repoRoot $ArtifactRoot
     if (-not (Test-Path -LiteralPath $root)) { return $null }
     $candidates = @(Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like "*-$RunId" } |
+        Where-Object { $_.Name -like "*-$RunId" -and $_.LastWriteTime.ToUniversalTime() -ge $NotBefore.UtcDateTime } |
         Sort-Object LastWriteTime -Descending)
     foreach ($candidate in $candidates) {
         if (Test-Path -LiteralPath (Join-Path $candidate.FullName "recovery-summary.csv")) {
@@ -272,7 +280,7 @@ foreach ($entry in $schedule) {
         Write-Output "  $line"
     }
 
-    $artifactDirectory = Find-RunArtifacts -RunId $entry.RunId
+    $artifactDirectory = Find-RunArtifacts -RunId $entry.RunId -NotBefore $runStartedAt
     $summaryRow = $null
     if ($null -ne $artifactDirectory) { $summaryRow = Read-RunSummary -ArtifactDirectory $artifactDirectory }
 

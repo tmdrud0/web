@@ -147,10 +147,37 @@ $conditionHoldSeconds = if ($PSBoundParameters.ContainsKey("HoldSeconds")) { $Ho
 
 # The runs are read from their own artifact directories rather than from the suite's own table, so a
 # column added to a run's summary appears here without this script being changed to carry it.
+#
+# The suite's own stamp is read from its directory name. Every directory this harness writes - the suite's
+# and each run's - begins with `yyyyMMdd-HHmmss` in this machine's local time, so two stamps compare as
+# text in the order they were written, and that is the only thing available here that tells this suite's
+# runs from an earlier suite's runs of the same ids.
+$suiteStamp = ""
+$suiteStampMatch = [regex]::Match([IO.Path]::GetFileName($SuiteDirectory), '^(\d{8}-\d{6})-')
+if ($suiteStampMatch.Success) { $suiteStamp = $suiteStampMatch.Groups[1].Value }
+
 $runs = New-Object 'System.Collections.Generic.List[object]'
 $unmeasured = New-Object 'System.Collections.Generic.List[object]'
 foreach ($run in @($suite.runs)) {
     $artifactDirectory = [string]$run.artifactDirectory
+    # A row is this suite's only if its directory was written after this suite started. The suite records
+    # the directory it resolved for each run, and for a run that produced no summary of its own that
+    # resolution can land on an earlier suite's directory for the same run id - whose row then reads as a
+    # measured run of this one, carrying another run's figures and another run's verdict. Checked at the
+    # lookup as well, but checked here too, because this is the step whose output is read and because a
+    # suite-metadata.json written before that fix is still on disk.
+    $artifactStamp = ""
+    $artifactStampMatch = [regex]::Match([IO.Path]::GetFileName($artifactDirectory), '^(\d{8}-\d{6})-')
+    if ($artifactStampMatch.Success) { $artifactStamp = $artifactStampMatch.Groups[1].Value }
+    if ($suiteStamp -ne "" -and ($artifactStamp -eq "" -or $artifactStamp -lt $suiteStamp)) {
+        $unmeasured.Add([pscustomobject][ordered]@{
+                runId = [string]$run.runId
+                mode = [string]$run.mode
+                exitMeaning = [string]$run.exitMeaning
+                reason = "the directory it resolved to ('$artifactDirectory') was written before this suite started, so its summary belongs to an earlier suite that used the same run id"
+            })
+        continue
+    }
     $summaryPath = if ([string]::IsNullOrWhiteSpace($artifactDirectory)) { "" } else { Join-Path $artifactDirectory "recovery-summary.csv" }
     if ([string]::IsNullOrWhiteSpace($summaryPath) -or -not (Test-Path -LiteralPath $summaryPath)) {
         $unmeasured.Add([pscustomobject][ordered]@{
@@ -166,6 +193,15 @@ foreach ($run in @($suite.runs)) {
         throw "A run's recovery-summary.csv must have exactly one data row; '$summaryPath' has $($rows.Count)."
     }
     $row = $rows[0]
+    if ([string]$row.runId -ne [string]$run.runId) {
+        $unmeasured.Add([pscustomobject][ordered]@{
+                runId = [string]$run.runId
+                mode = [string]$run.mode
+                exitMeaning = [string]$run.exitMeaning
+                reason = "the summary it read is for run '$($row.runId)', not '$($run.runId)'"
+            })
+        continue
+    }
     # A run that could not be measured at all carries no figures; one measured but incomplete does, and
     # it is kept, because the way a mode breaks is a result. Which of the two it is is in `complete`.
     if ([string]$row.complete -ne "True" -and [string]$row.complete -ne "False") {
