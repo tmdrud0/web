@@ -147,7 +147,7 @@ final class LiveImpactReader {
             if (header == null) {
                 return rows;
             }
-            if (!header.replace("﻿", "").trim().equals(expectedHeader)) {
+            if (!header.replace(String.valueOf((char) 0xFEFF), "").trim().equals(expectedHeader)) {
                 throw new IllegalArgumentException("Expected header '" + expectedHeader + "' but read '" + header + "'");
             }
             String line;
