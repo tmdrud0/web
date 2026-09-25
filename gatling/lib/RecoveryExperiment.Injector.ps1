@@ -633,3 +633,365 @@ function Get-LostSetProgress {
         CurrentCount = $CurrentMembers.Count
     }
 }
+
+# --- short-pause injector (live-impact experiment) --------------------------------------------------
+#
+# An option next to the injector above, not a replacement for it: nothing above calls anything below,
+# and the recovery pilot keeps its key-by-key capture. This variant exists because that capture walks
+# the namespace through one `docker exec` per key, which held batch-1 frozen for 32-47 s per pause in the
+# pilot - for a live-impact measurement the injector would be most of what was measured.
+#
+# What changes is where the work happens and how much of it is inside the pause:
+#
+#   * Scope: one contest's keys (`contest:scoreboard:<contestId>:*`) plus the global keys a rollback of
+#     that contest has to move with it - the stream checkpoint, its db-pending mark and the two sequence
+#     allocators. Other contests' keys are not touched. The global keys are shared by every contest, so a
+#     live-impact run assumes the experiment contest is the only one being written, which the runner checks.
+#   * Snapshot: one Lua script copies every key in scope into a run-scoped shadow namespace
+#     (`sbrec:snap:<runId>:<label>:`) with `COPY`, server-side. Nothing binary leaves Redis.
+#   * Rollback: one Lua script deletes the keys in scope and copies the shadow back, then compares each
+#     restored key with its shadow by type and cardinality. `COPY` duplicates the value, so this is the
+#     content check; the byte-level payload check of the pilot injector is not repeated (see its §5.4 for
+#     why bytes are not reproducible for `hashtable` encodings anyway).
+#   * Inside the pause: the Lua script and one `SMEMBERS` of the contest's processed set to a file in the
+#     container. MySQL is never read inside the pause; the caller reads it before or after.
+#
+# A Lua script blocks every Redis client while it runs, not only batch-1. That is the cost of making
+# the snapshot one instant, and it is measured: the scripts report Redis's own TIME and the caller
+# records both the pause and the script's wall time.
+
+function Get-ShortPauseSnapshotPrefix {
+    param([Parameter(Mandatory = $true)][string]$Label)
+
+    $config = Get-RecoveryConfig
+    if ($Label -notmatch '^[A-Za-z0-9_-]+$') {
+        throw "Snapshot label '$Label' must be alphanumeric, underscore or hyphen: it becomes a Redis key prefix."
+    }
+    return "sbrec:snap:$($config.RunId):${Label}:"
+}
+
+# The global keys a contest rollback carries with it. Read from the product's key definitions
+# (ContestScoreboardRedisKeys), not guessed: STREAM_OFFSET, STREAM_DB_PENDING, SEQUENCE, SUBMISSION_SEQUENCE.
+function Get-ShortPauseGlobalKeys {
+    $prefix = (Get-RecoveryConfig).ScoreboardKeyPrefix
+    return @(
+        "${prefix}stream:offset",
+        "${prefix}stream:db-pending",
+        "${prefix}seq",
+        "${prefix}submission-seq"
+    )
+}
+
+function Get-ShortPauseContestPattern {
+    $config = Get-RecoveryConfig
+    if (-not $config.ContestScopeFromSeed) {
+        throw "Refusing a contest-scoped Redis operation before a seed has set the contest scope."
+    }
+    return "$($config.ScoreboardKeyPrefix)$($config.ContestId):*"
+}
+
+# ARGV: pattern, shadow prefix, checkpoint key, then the global keys.
+$script:shortPauseSnapshotLua = @'
+local t = redis.call("TIME")
+local pattern, shadow, checkpointKey = ARGV[1], ARGV[2], ARGV[3]
+if #redis.call("KEYS", shadow .. "*") > 0 then
+    return redis.error_reply("SBRE shadow namespace " .. shadow .. " is not empty")
+end
+local copied = 0
+for _, key in ipairs(redis.call("KEYS", pattern)) do
+    redis.call("COPY", key, shadow .. key)
+    copied = copied + 1
+end
+local globals = 0
+for i = 4, #ARGV do
+    if redis.call("EXISTS", ARGV[i]) == 1 then
+        redis.call("COPY", ARGV[i], shadow .. ARGV[i])
+        globals = globals + 1
+    end
+end
+local checkpoint = redis.call("GET", checkpointKey)
+return {t[1], t[2], copied, globals, checkpoint or "absent"}
+'@
+
+# ARGV: pattern, shadow prefix, checkpoint key, then the global keys.
+$script:shortPauseRollbackLua = @'
+local t = redis.call("TIME")
+local pattern, shadow, checkpointKey = ARGV[1], ARGV[2], ARGV[3]
+local saved = redis.call("KEYS", shadow .. "*")
+if #saved == 0 then
+    return redis.error_reply("SBRE shadow namespace " .. shadow .. " is empty")
+end
+local before = redis.call("GET", checkpointKey)
+local deleted = 0
+for _, key in ipairs(redis.call("KEYS", pattern)) do
+    deleted = deleted + redis.call("DEL", key)
+end
+for i = 4, #ARGV do
+    deleted = deleted + redis.call("DEL", ARGV[i])
+end
+local function size(key, kind)
+    if kind == "string" then return redis.call("STRLEN", key)
+    elseif kind == "set" then return redis.call("SCARD", key)
+    elseif kind == "hash" then return redis.call("HLEN", key)
+    elseif kind == "zset" then return redis.call("ZCARD", key)
+    elseif kind == "list" then return redis.call("LLEN", key)
+    end
+    return -1
+end
+local restored, mismatched = 0, 0
+local offset = #shadow + 1
+for _, shadowKey in ipairs(saved) do
+    local key = string.sub(shadowKey, offset)
+    redis.call("COPY", shadowKey, key)
+    restored = restored + 1
+    local kind = redis.call("TYPE", shadowKey)["ok"]
+    if redis.call("TYPE", key)["ok"] ~= kind or size(key, kind) ~= size(shadowKey, kind) then
+        mismatched = mismatched + 1
+    end
+end
+local after = redis.call("GET", checkpointKey)
+return {t[1], t[2], before or "absent", after or "absent", deleted, restored, mismatched}
+'@
+
+# ARGV: pattern, batch size. Deletes in bounded batches so one call cannot hold Redis for the whole
+# namespace. One line and no double quotes, because it is passed as a `docker exec` argument and Windows
+# PowerShell 5.1 does not escape embedded double quotes for native commands.
+$script:shortPauseDeleteLua = "local keys = redis.call('KEYS', ARGV[1]); local limit = tonumber(ARGV[2]); local deleted = 0; for i = 1, math.min(#keys, limit) do deleted = deleted + redis.call('UNLINK', keys[i]) end; return {deleted, #keys - deleted}"
+
+# Runs one Lua script and one processed-set read inside the container, in one `docker exec`, so the
+# pause the caller holds is one round trip rather than several. Output markers are parsed below.
+$script:shortPauseRunScript = @'
+set -e
+dir="$1"; lua="$2"; processedKey="$3"; processedFile="$4"
+shift 4
+mkdir -p "$dir"
+# Read first: for a rollback this is the processed set just before it, which defines the lost set, and
+# for a snapshot the order does not matter because batch-1 is paused.
+redis-cli --raw SMEMBERS "$processedKey" | grep -v '^$' > "$dir/$processedFile" || true
+before=$(redis-cli --raw TIME | tr '\n' ' ')
+status=0
+redis-cli --raw EVAL "$(cat "$lua")" 0 "$@" > "$dir/eval.out" 2>&1 || status=$?
+after=$(redis-cli --raw TIME | tr '\n' ' ')
+if [ "$status" -ne 0 ] || grep -q -E '^(ERR|SBRE |WRONGTYPE|OOM|NOSCRIPT|BUSY)' "$dir/eval.out"; then
+    echo "SBRE_EVAL_FAILED $(tr '\n' ' ' < "$dir/eval.out")" >&2
+    exit 1
+fi
+echo "SBRE_TIME_BEFORE=$before"
+echo "SBRE_TIME_AFTER=$after"
+echo "SBRE_EVAL=$(tr '\n' '|' < "$dir/eval.out")"
+echo "SBRE_PROCESSED=$(wc -l < "$dir/$processedFile")"
+'@
+
+function ConvertFrom-RedisTimePair {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    $parts = @(([string]$Text).Trim() -split '\s+' | Where-Object { $_ -ne "" })
+    if ($parts.Count -lt 2) {
+        throw "Unreadable Redis TIME '$Text'."
+    }
+    return ([long]$parts[0]) * 1000L + [long][math]::Floor([long]$parts[1] / 1000.0)
+}
+
+function Invoke-ShortPauseScript {
+    param(
+        [Parameter(Mandatory = $true)][string]$Lua,
+        [Parameter(Mandatory = $true)][string]$ProcessedFile,
+        [Parameter(Mandatory = $true)][string[]]$LuaArguments,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $config = Get-RecoveryConfig
+    $dir = "/tmp/sbrec-live-$($config.RunId)"
+    $luaLocal = Join-Path ([IO.Path]::GetTempPath()) ("sbrec-" + [Guid]::NewGuid().ToString("N") + ".lua")
+    try {
+        [IO.File]::WriteAllText($luaLocal, ($Lua -replace "`r`n", "`n"), (New-Object Text.UTF8Encoding($false)))
+        [void](Invoke-Docker -Arguments @("exec", $config.RedisContainer, "mkdir", "-p", $dir))
+        [void](Invoke-Docker -Arguments @("cp", $luaLocal, "$($config.RedisContainer):$dir/script.lua"))
+    }
+    finally {
+        Remove-Item -LiteralPath $luaLocal -Force -ErrorAction SilentlyContinue
+    }
+    $output = Invoke-ContainerScript -Container $config.RedisContainer -ScriptText $script:shortPauseRunScript `
+        -Description $Description -ScriptArguments (@($dir, "$dir/script.lua", $config.ProcessedKey, $ProcessedFile) + $LuaArguments)
+    $values = @{}
+    foreach ($line in $output) {
+        if ([string]$line -match '^(SBRE_[A-Z_]+)=(.*)$') { $values[$Matches[1]] = $Matches[2] }
+    }
+    foreach ($required in @("SBRE_TIME_BEFORE", "SBRE_TIME_AFTER", "SBRE_EVAL", "SBRE_PROCESSED")) {
+        if (-not $values.ContainsKey($required)) {
+            throw "$Description did not report $required`: $($output -join ' | ')"
+        }
+    }
+    return [pscustomobject][ordered]@{
+        ContainerDirectory = $dir
+        EvalStartMs = ConvertFrom-RedisTimePair -Text $values["SBRE_TIME_BEFORE"]
+        EvalEndMs = ConvertFrom-RedisTimePair -Text $values["SBRE_TIME_AFTER"]
+        Eval = @(([string]$values["SBRE_EVAL"]).TrimEnd('|') -split '\|', -1)
+        ProcessedCount = [long]$values["SBRE_PROCESSED"]
+        ProcessedPath = "$dir/$ProcessedFile"
+    }
+}
+
+# Redis refuses writes at maxmemory under `noeviction`, which is how the stack runs it - a shadow copy
+# that crossed the limit would fail the application's own writes, not the snapshot. Checked first.
+function Assert-ShortPauseMemoryHeadroom {
+    $info = @(Invoke-RedisText -RedisArguments @("INFO", "memory"))
+    $used = $null
+    $max = $null
+    foreach ($line in $info) {
+        if ([string]$line -match '^used_memory:(\d+)') { $used = [long]$Matches[1] }
+        if ([string]$line -match '^maxmemory:(\d+)') { $max = [long]$Matches[1] }
+    }
+    if ($null -eq $used -or $null -eq $max) {
+        throw "Could not read used_memory/maxmemory from INFO memory."
+    }
+    $pattern = Get-ShortPauseContestPattern
+    $sample = [pscustomobject][ordered]@{ usedMemory = $used; maxMemory = $max; pattern = $pattern }
+    # The shadow copy is at most the size of the keys in scope, which is at most everything in use.
+    if ($max -gt 0 -and ($used * 2L + 64MB) -gt $max) {
+        throw ("Redis uses $used of $max bytes; a shadow copy of the contest could reach maxmemory, where " +
+            "noeviction refuses the application's own writes. Raise maxmemory or shrink the seed.")
+    }
+    return $sample
+}
+
+# Caller holds the batch-1 pause. Copies the contest's keys and the global keys into the shadow namespace
+# and reads the processed set into a file, and nothing else.
+function Export-ContestScoreboardShortPauseSnapshot {
+    param([Parameter(Mandatory = $true)][string]$Label)
+
+    $config = Get-RecoveryConfig
+    $shadow = Get-ShortPauseSnapshotPrefix -Label $Label
+    $run = Invoke-ShortPauseScript -Lua $script:shortPauseSnapshotLua -ProcessedFile "processed-$Label.txt" `
+        -LuaArguments (@((Get-ShortPauseContestPattern), $shadow, $config.CheckpointKey) + (Get-ShortPauseGlobalKeys)) `
+        -Description "short-pause snapshot '$Label'"
+    if ($run.Eval.Count -lt 5) {
+        throw "Snapshot '$Label' returned $($run.Eval.Count) value(s): $($run.Eval -join ' ')"
+    }
+    return [pscustomobject][ordered]@{
+        Label = $Label
+        ShadowPrefix = $shadow
+        RedisTimeMs = ([long]$run.Eval[0]) * 1000L + [long][math]::Floor([long]$run.Eval[1] / 1000.0)
+        EvalStartMs = $run.EvalStartMs
+        EvalEndMs = $run.EvalEndMs
+        ContestKeys = [long]$run.Eval[2]
+        GlobalKeys = [long]$run.Eval[3]
+        Checkpoint = [string]$run.Eval[4]
+        ProcessedCount = $run.ProcessedCount
+        ProcessedPath = $run.ProcessedPath
+    }
+}
+
+# Caller holds the batch-1 pause. Reads the processed set as it is just before the rollback, then puts
+# the shadow back. `PreRollbackCheckpoint` is H: the highest stream offset the scoreboard held when it
+# was rolled back, which is what the summarizer calls a delivery "new" against.
+function Invoke-ContestScoreboardShortPauseRollback {
+    param([Parameter(Mandatory = $true)][string]$Label)
+
+    $config = Get-RecoveryConfig
+    $shadow = Get-ShortPauseSnapshotPrefix -Label $Label
+    $run = Invoke-ShortPauseScript -Lua $script:shortPauseRollbackLua -ProcessedFile "processed-prerollback.txt" `
+        -LuaArguments (@((Get-ShortPauseContestPattern), $shadow, $config.CheckpointKey) + (Get-ShortPauseGlobalKeys)) `
+        -Description "short-pause rollback to '$Label'"
+    if ($run.Eval.Count -lt 7) {
+        throw "Rollback to '$Label' returned $($run.Eval.Count) value(s): $($run.Eval -join ' ')"
+    }
+    $mismatched = [long]$run.Eval[6]
+    if ($mismatched -ne 0) {
+        throw "Rollback to '$Label' restored $mismatched key(s) whose type or size differs from the snapshot."
+    }
+    return [pscustomobject][ordered]@{
+        Label = $Label
+        RedisTimeMs = ([long]$run.Eval[0]) * 1000L + [long][math]::Floor([long]$run.Eval[1] / 1000.0)
+        EvalStartMs = $run.EvalStartMs
+        EvalEndMs = $run.EvalEndMs
+        PreRollbackCheckpoint = [string]$run.Eval[2]
+        RestoredCheckpoint = [string]$run.Eval[3]
+        DeletedKeys = [long]$run.Eval[4]
+        RestoredKeys = [long]$run.Eval[5]
+        MismatchedKeys = $mismatched
+        PreRollbackProcessedCount = $run.ProcessedCount
+        PreRollbackProcessedPath = $run.ProcessedPath
+    }
+}
+
+# After the pause: the lost set L = pre-rollback processed - snapshot processed, computed in the
+# container (the same direction as Get-LostResultSet, over files rather than PowerShell arrays), and
+# loaded into a run-scoped set the tail poller intersects with the processed set.
+$script:shortPauseLostSetScript = @'
+set -e
+dir="$1"; snapshotFile="$2"; preFile="$3"; lostKey="$4"
+awk 'NR==FNR { seen[$0] = 1; next } !($0 in seen)' "$dir/$snapshotFile" "$dir/$preFile" > "$dir/lost.txt"
+redis-cli --raw DEL "$lostKey" > /dev/null
+if [ -s "$dir/lost.txt" ]; then
+    sed "s/^/SADD $lostKey /" "$dir/lost.txt" | redis-cli > /dev/null
+fi
+echo "SBRE_LOST=$(wc -l < "$dir/lost.txt")"
+echo "SBRE_LOST_KEY_CARD=$(redis-cli --raw SCARD "$lostKey")"
+'@
+
+function Get-ShortPauseLostKey {
+    return "sbrec:lost:$((Get-RecoveryConfig).RunId)"
+}
+
+function New-ShortPauseLostSet {
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [Parameter(Mandatory = $true)]$Rollback
+    )
+
+    $config = Get-RecoveryConfig
+    $dir = "/tmp/sbrec-live-$($config.RunId)"
+    $lostKey = Get-ShortPauseLostKey
+    $output = Invoke-ContainerScript -Container $config.RedisContainer -ScriptText $script:shortPauseLostSetScript `
+        -Description "lost set" -ScriptArguments @($dir, (Split-Path -Leaf $Snapshot.ProcessedPath),
+        (Split-Path -Leaf $Rollback.PreRollbackProcessedPath), $lostKey)
+    $lost = $null
+    $card = $null
+    foreach ($line in $output) {
+        if ([string]$line -match '^SBRE_LOST=(\d+)') { $lost = [long]$Matches[1] }
+        if ([string]$line -match '^SBRE_LOST_KEY_CARD=(\d+)') { $card = [long]$Matches[1] }
+    }
+    if ($null -eq $lost -or $null -eq $card -or $lost -ne $card) {
+        throw "The lost set did not load: $($output -join ' | ')"
+    }
+    return [pscustomobject][ordered]@{
+        LostCount = $lost
+        LostKey = $lostKey
+        LostPath = "$dir/lost.txt"
+    }
+}
+
+# Deletes keys matching one run-owned pattern, in bounded batches. Refuses any pattern outside the two
+# namespaces a live-impact run owns: its own contest's scoreboard and its own `sbrec:*:<runId>` keys.
+function Remove-ShortPauseKeys {
+    param(
+        [Parameter(Mandatory = $true)][string]$Pattern,
+        [int]$BatchSize = 5000
+    )
+
+    $config = Get-RecoveryConfig
+    $allowed = @(
+        "sbrec:snap:$($config.RunId):*",
+        "sbrec:lost:$($config.RunId)"
+    )
+    if ($config.ContestScopeFromSeed) {
+        $allowed += "$($config.ScoreboardKeyPrefix)$($config.ContestId):*"
+    }
+    if ($allowed -notcontains $Pattern) {
+        throw "Refusing to delete Redis keys matching '$Pattern': not a namespace this run owns ($($allowed -join ', '))."
+    }
+    $total = 0L
+    for ($round = 0; $round -lt 10000; $round++) {
+        $result = @(Invoke-RedisText -RedisArguments @("EVAL", $script:shortPauseDeleteLua, "0", $Pattern, [string]$BatchSize))
+        $values = @($result | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($values.Count -lt 2) {
+            throw "Deleting '$Pattern' returned '$($result -join ' ')'."
+        }
+        $total += [long]$values[0]
+        if ([long]$values[1] -le 0L) {
+            return $total
+        }
+    }
+    throw "Deleting '$Pattern' did not finish."
+}
