@@ -20,6 +20,19 @@ param(
     [string]$RunId = "",
     [switch]$KeepStack,
     [switch]$DryRun,
+    # Per-container CPU series (container-cpu-1s.csv) from each container's cgroup cpu.stat, read once
+    # a second by one helper container for the whole stack lifetime. On by default; the helper's own
+    # cost is recorded in the same series. See ContainerCpuSampler.ps1.
+    [switch]$SkipContainerCpu,
+    # Remove the stack's MySQL volume before the stack is built, so the run starts from a freshly
+    # migrated schema: earlier runs' PUBLISHED outbox rows and submissions are not in the tables the
+    # claim query and the sampler read. The row counts actually present before the load are recorded
+    # in events.json either way.
+    [switch]$ResetMySqlVolume,
+    # Seconds of deliberate idleness after seeding and before the load: the stack is up and the judge
+    # nodes are polling, nothing is submitted. Bracketed by idle-start/idle-end snapshots so the idle
+    # cost of polling (claim calls/s, Questions/s, container CPU) is measured on its own. 0 skips it.
+    [int]$IdleBaselineSeconds = 0,
     # Staircase (steady-state capacity sweep). With -Staircase the run does a warm-up hold followed
     # by one hold per -StageRps entry, all inside one stack/JVM lifetime, and -TargetRps,
     # -DurationSeconds, and -FaultEnabled no longer apply.
@@ -647,6 +660,9 @@ $parameters = [ordered]@{
     killedNode = $KilledNode; downDurationSeconds = $DownDurationSeconds
     userCount = $UserCount; drainTimeoutSeconds = $DrainTimeoutSeconds
     judgeNodeCount = 2; generatedAt = [datetimeoffset]::UtcNow.ToString("o")
+    containerCpuSampler = (-not $SkipContainerCpu)
+    resetMySqlVolume = [bool]$ResetMySqlVolume
+    idleBaselineSeconds = $IdleBaselineSeconds
 }
 if ($openBurst) {
     $parameters.openBurst = [ordered]@{
@@ -3569,6 +3585,8 @@ function Invoke-FaultRecoveryPhase {
 # itself or the stack. Dot-sourced here, before the run, so a library that cannot be loaded stops the
 # harness rather than failing after a ten-minute load.
 . (Join-Path $PSScriptRoot "OpenBurstSupply.ps1")
+. (Join-Path $PSScriptRoot "ContainerCpuSampler.ps1")
+$script:containerCpuSampler = $null
 
 $env:CONTEST_JUDGE_DISPATCH_MODE = $DispatchMode
 $env:CONTEST_JUDGE_CONCURRENCY = "$WorkerCount"
@@ -3713,10 +3731,29 @@ try {
     } finally { Pop-Location }
     $events.runStartedAt = [datetimeoffset]::UtcNow.ToString("o")
     $started = $true
+    $events.mysqlVolumeReset = $false
+    if ($ResetMySqlVolume) {
+        # The volume cannot be removed while a container still holds it, so the stack goes down first.
+        # Only the MySQL volume is removed: the broker and Redis volumes are left as every earlier run
+        # found them.
+        Invoke-Compose -Arguments @("down")
+        $volumeName = "oj-loadtest-mysql-data"
+        $existing = @(Invoke-DockerCli -Arguments @("volume", "ls", "-q", "--filter", "name=^$volumeName$") | Where-Object { $_ })
+        if ($existing.Count -gt 0) { Invoke-DockerCli -Arguments @("volume", "rm", $volumeName) | Out-Null }
+        $events.mysqlVolumeReset = $true
+        $events.mysqlVolumeExistedBeforeReset = ($existing.Count -gt 0)
+    }
     Invoke-Compose -Arguments @("up", "-d", "--build")
     Wait-Healthy
     Invoke-Compose -Arguments @("restart", "nginx")
     Wait-Healthy
+    if (-not $SkipContainerCpu) {
+        $cpuContainers = @(Invoke-Compose -Arguments @("ps", "--format", "{{.Name}}") | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() })
+        $script:containerCpuSampler = Start-ContainerCpuSampler -OutputDirectory $runDirectory -Containers $cpuContainers `
+            -SamplerName "oj-loadtest-cpu-sampler"
+        $events.containerCpuSamplerStartedAt = $script:containerCpuSampler.startedAt
+        Write-Host "Container CPU sampler started for: $($cpuContainers -join ', ')"
+    }
     if ($FaultRecovery -and $DispatchMode -eq "rabbit") {
         # Three things happen here, in this order, and the order is the point.
         #
@@ -3834,6 +3871,38 @@ try {
     # In a phased-load run this first snapshot is the warm-up phase's starting point; the baseline
     # the measured window is read against is taken again once the warm-up has drained.
     Save-MetricsSnapshot $(if ($traceLoad) { "warmup-start" } else { "start" })
+
+    # The outbox the claim query scans, as it stands before the load. A PUBLISHED row left by an
+    # earlier run is not claimable but still sits in the tables the claim and the sampler read, so the
+    # count is part of the run's conditions.
+    $events.outboxRowsBeforeLoad = [ordered]@{}
+    foreach ($row in @(Invoke-SqlRows "SELECT status, COUNT(*) FROM contest_judge_outbox GROUP BY status ORDER BY status")) {
+        $parts = ([string]$row).Split([char]9)
+        if ($parts.Count -ge 2) { $events.outboxRowsBeforeLoad[$parts[0]] = [long]$parts[1] }
+    }
+    $events.contestSubmissionRowsBeforeLoad = Get-SqlScalar "SELECT COUNT(*) FROM contest_submission"
+
+    # What the judge containers were actually started with. The dispatcher has no log line for its
+    # poll interval, so the container environment is the configuration evidence and the idle claim
+    # rate (idle-start -> idle-end) is the behavioural evidence.
+    $judgeEvidence = [ordered]@{}
+    foreach ($node in @("judge-1", "judge-2")) {
+        $envLines = @(Invoke-DockerCli -Arguments @("inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", "oj-loadtest-$node") |
+            Where-Object { ([string]$_) -like "CONTEST_JUDGE_*" } | ForEach-Object { ([string]$_).Trim() } | Sort-Object)
+        $judgeEvidence[$node] = $envLines
+    }
+    $judgeEvidence | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDirectory "judge-config-evidence.json") -Encoding utf8
+
+    if ($IdleBaselineSeconds -gt 0) {
+        $events.idleBaselineStartedAt = [datetimeoffset]::UtcNow.ToString("o")
+        Save-MetricsSnapshot "idle-start"
+        $events.idleBaselineStartSnapshotDoneAt = [datetimeoffset]::UtcNow.ToString("o")
+        Start-Sleep -Seconds $IdleBaselineSeconds
+        $events.idleBaselineEndedAt = [datetimeoffset]::UtcNow.ToString("o")
+        Save-MetricsSnapshot "idle-end"
+        $events.idleBaselineEndSnapshotDoneAt = [datetimeoffset]::UtcNow.ToString("o")
+        Write-Host "Idle baseline: ${IdleBaselineSeconds}s with the stack up and no load."
+    }
 
     if ($traceLoad) {
         # The per-second sampler reads these in the same statement as the backlog counts; prove
@@ -4911,6 +4980,13 @@ try {
     # be torn down, and its error log would fill with connection failures that describe the teardown
     # rather than the run.
     Stop-RabbitSampler
+    if ($null -ne $script:containerCpuSampler) {
+        try {
+            $cpuCsv = Stop-ContainerCpuSampler -Sampler $script:containerCpuSampler
+            Write-Host "Container CPU series: $cpuCsv"
+        } catch { Write-Warning "container CPU sampler stop failed: $_" }
+        $script:containerCpuSampler = $null
+    }
     if ($started -and -not $KeepStack) {
         try { Invoke-Compose -Arguments @("down") } catch { Write-Warning $_ }
     }
