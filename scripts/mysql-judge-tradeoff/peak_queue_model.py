@@ -89,6 +89,17 @@ class Shape:
                 return rate
         return 0.0
 
+    @property
+    def head_seconds(self) -> float:
+        """The first (baseline) segment, excluded from the backlog search."""
+        return float(self.segments[0][0])
+
+    def top_window(self) -> tuple:
+        """The highest-rate segment through the end of the segment after it (10B and the following 5B)."""
+        b = self.boundaries()
+        top = max(range(len(b)), key=lambda i: b[i][2])
+        return (b[top][0], b[min(top + 1, len(b) - 1)][1])
+
     def peak_window(self) -> tuple:
         """First segment whose multiplier is above 1 to the last such segment's end (the 5B..5B span)."""
         b = self.boundaries()
@@ -311,7 +322,8 @@ def summarize(arrival_s: np.ndarray, start_s: np.ndarray, end_s: np.ndarray, sha
     wait = start_s - arrival_s
     latency = end_s - arrival_s
     series = bin_series(arrival_s, wait, latency, shape.total_seconds)
-    backlog = longest_backlog_run([r["binStart"] for r in series], [r["meanWait"] for r in series])
+    backlog = longest_backlog_run([r["binStart"] for r in series], [r["meanWait"] for r in series],
+                                  head_seconds=shape.head_seconds)
     lo, hi = shape.peak_window()
     peak = (arrival_s >= lo) & (arrival_s < hi)
     out = {
@@ -415,12 +427,12 @@ def fluid(k: float, shape: Shape, dt: float = 0.01, mean_service: float = MEAN_S
         w = weights[m]
         starts.append(b * BIN_SECONDS)
         means.append(float((wait[m] * w).sum() / w.sum()) if w.sum() > 0 else None)
-    backlog = longest_backlog_run(starts, means)
+    backlog = longest_backlog_run(starts, means, head_seconds=shape.head_seconds)
     above = wait > BACKLOG_WAIT_THRESHOLD_S
     # Continuous duration after the first baseline: the longest stretch with instantaneous wait > 1s.
     cont, best = 0.0, 0.0
     for i in range(steps):
-        if t[i] >= BASELINE_HEAD_SECONDS and above[i]:
+        if t[i] >= shape.head_seconds and above[i]:
             cont += dt
             best = max(best, cont)
         else:
