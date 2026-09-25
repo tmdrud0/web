@@ -6,7 +6,10 @@ import lombok.extern.slf4j.Slf4j;
 import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
+import my.oj.web.contest.scoreboard.experiment.ContestScoreboardExperimentTrace;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -67,12 +70,35 @@ public class ContestScoreboardReplayApplication {
     private final ContestScoreboardApplyLock applyLock;
     private final ContestSubmissionBatchExecutor batchExecutor;
     private final Counter markerFailures;
+    private final ContestScoreboardExperimentTrace trace;
 
     public ContestScoreboardReplayApplication(ContestScoreboardApplier scoreboardApplier,
                                               ContestScoreboardAppliedMarker appliedMarker,
                                               ContestScoreboardApplyLock applyLock,
                                               ContestSubmissionBatchExecutor batchExecutor,
                                               MeterRegistry meterRegistry) {
+        this(scoreboardApplier, appliedMarker, applyLock, batchExecutor, meterRegistry,
+                ContestScoreboardExperimentTrace.NOOP);
+    }
+
+    @Autowired
+    public ContestScoreboardReplayApplication(ContestScoreboardApplier scoreboardApplier,
+                                              ContestScoreboardAppliedMarker appliedMarker,
+                                              ContestScoreboardApplyLock applyLock,
+                                              ContestSubmissionBatchExecutor batchExecutor,
+                                              MeterRegistry meterRegistry,
+                                              ObjectProvider<ContestScoreboardExperimentTrace> trace) {
+        this(scoreboardApplier, appliedMarker, applyLock, batchExecutor, meterRegistry,
+                trace.getIfAvailable(() -> ContestScoreboardExperimentTrace.NOOP));
+    }
+
+    public ContestScoreboardReplayApplication(ContestScoreboardApplier scoreboardApplier,
+                                              ContestScoreboardAppliedMarker appliedMarker,
+                                              ContestScoreboardApplyLock applyLock,
+                                              ContestSubmissionBatchExecutor batchExecutor,
+                                              MeterRegistry meterRegistry,
+                                              ContestScoreboardExperimentTrace trace) {
+        this.trace = trace;
         this.scoreboardApplier = scoreboardApplier;
         this.appliedMarker = appliedMarker;
         this.applyLock = applyLock;
@@ -93,7 +119,40 @@ public class ContestScoreboardReplayApplication {
      *                               every result was applied
      */
     public void apply(List<ContestScoreboardApplier.ApplyRequest> requests, String description) {
+        if (!trace.enabled()) {
+            applyUnderLock(requests, description, null);
+            return;
+        }
+        long requestedAt = System.currentTimeMillis();
+        long[] lockedAt = {-1L};
+        String outcome = "failed";
+        try {
+            applyUnderLock(requests, description, lockedAt);
+            outcome = "applied";
+        } finally {
+            trace.recovery(new ContestScoreboardExperimentTrace.RecoveryRecord(
+                    ContestScoreboardExperimentTrace.RecoveryEvent.CHUNK,
+                    Thread.currentThread().getName(),
+                    requestedAt,
+                    lockedAt[0],
+                    System.currentTimeMillis(),
+                    requests.size(),
+                    description,
+                    outcome
+            ));
+        }
+    }
+
+    /**
+     * @param lockedAt where the instant the lock was acquired is written, or {@code null} when nobody
+     *                 is recording it
+     */
+    private void applyUnderLock(List<ContestScoreboardApplier.ApplyRequest> requests, String description,
+                                long[] lockedAt) {
         applyLock.withLock(() -> {
+            if (lockedAt != null) {
+                lockedAt[0] = System.currentTimeMillis();
+            }
             List<ContestScoreboardApplier.ApplyResult> results = scoreboardApplier.applyAll(requests);
             String failure = results.stream()
                     .filter(result -> !result.succeeded())

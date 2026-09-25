@@ -3,7 +3,12 @@ package my.oj.web.contest.scoreboard.recovery;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
+import my.oj.web.contest.scoreboard.experiment.ContestScoreboardExperimentTrace;
+import my.oj.web.contest.scoreboard.experiment.ContestScoreboardExperimentTrace.RecoveryEvent;
+import my.oj.web.contest.scoreboard.experiment.ContestScoreboardExperimentTrace.RecoveryRecord;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy.PassKind;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.EnumMap;
@@ -40,8 +45,20 @@ public class ContestScoreboardRecoveryPassGate {
 
     private final AtomicBoolean held = new AtomicBoolean();
     private final Map<PassKind, Counter> skipped = new EnumMap<>(PassKind.class);
+    private final ContestScoreboardExperimentTrace trace;
 
     public ContestScoreboardRecoveryPassGate(MeterRegistry meterRegistry) {
+        this(meterRegistry, ContestScoreboardExperimentTrace.NOOP);
+    }
+
+    @Autowired
+    public ContestScoreboardRecoveryPassGate(MeterRegistry meterRegistry,
+                                             ObjectProvider<ContestScoreboardExperimentTrace> trace) {
+        this(meterRegistry, trace.getIfAvailable(() -> ContestScoreboardExperimentTrace.NOOP));
+    }
+
+    public ContestScoreboardRecoveryPassGate(MeterRegistry meterRegistry, ContestScoreboardExperimentTrace trace) {
+        this.trace = trace;
         for (PassKind kind : PassKind.values()) {
             skipped.put(kind, Counter.builder("contest.scoreboard.recovery.pass.skipped")
                     .tag("pass", kind.label())
@@ -74,8 +91,17 @@ public class ContestScoreboardRecoveryPassGate {
         if (!held.compareAndSet(false, true)) {
             skipped.get(kind).increment();
             log.warn("A recovery pass already holds the gate; this {} pass is skipped", kind.label());
+            if (trace.enabled()) {
+                long now = System.currentTimeMillis();
+                trace.recovery(record(RecoveryEvent.PASS_SKIPPED, kind, now, now, "skipped"));
+            }
             return Optional.empty();
         }
+        long startedAt = trace.enabled() ? System.currentTimeMillis() : 0L;
+        if (trace.enabled()) {
+            trace.recovery(record(RecoveryEvent.PASS_START, kind, startedAt, -1L, "started"));
+        }
+        String outcome = "failed";
         try {
             T value = pass.get();
             if (value == null) {
@@ -83,10 +109,22 @@ public class ContestScoreboardRecoveryPassGate {
                         + " value; an empty result means another pass held the gate, so this pass could"
                         + " not be told apart from one that never ran");
             }
+            outcome = abbreviate(String.valueOf(value));
             return Optional.of(value);
         } finally {
             held.set(false);
+            if (trace.enabled()) {
+                trace.recovery(record(RecoveryEvent.PASS_END, kind, startedAt, System.currentTimeMillis(), outcome));
+            }
         }
+    }
+
+    private static RecoveryRecord record(RecoveryEvent event, PassKind kind, long start, long end, String outcome) {
+        return new RecoveryRecord(event, Thread.currentThread().getName(), start, -1L, end, -1, kind.label(), outcome);
+    }
+
+    private static String abbreviate(String text) {
+        return text.length() <= 200 ? text : text.substring(0, 200) + "...";
     }
 
     /** Whether a pass is running right now. */

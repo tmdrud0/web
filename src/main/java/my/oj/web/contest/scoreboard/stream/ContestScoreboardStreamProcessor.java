@@ -4,12 +4,16 @@ import lombok.extern.slf4j.Slf4j;
 import my.oj.web.contest.scoreboard.CheckpointAdvance;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
+import my.oj.web.contest.scoreboard.experiment.ContestScoreboardExperimentTrace;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Turns one batch of stream deliveries into scoreboard writes, deciding what the checkpoint may claim.
@@ -94,6 +98,7 @@ class ContestScoreboardStreamProcessor {
     private final ContestScoreboardRecoveryStrategy strategy;
     private final ContestScoreboardStreamMetrics metrics;
     private final ContestScoreboardApplyLock applyLock;
+    private final ContestScoreboardExperimentTrace trace;
 
     ContestScoreboardStreamProcessor(
             ContestScoreboardApplier applier,
@@ -103,12 +108,39 @@ class ContestScoreboardStreamProcessor {
             ContestScoreboardStreamMetrics metrics,
             ContestScoreboardApplyLock applyLock
     ) {
+        this(applier, completion, position, strategy, metrics, applyLock, ContestScoreboardExperimentTrace.NOOP);
+    }
+
+    @Autowired
+    ContestScoreboardStreamProcessor(
+            ContestScoreboardApplier applier,
+            ContestScoreboardAppliedAtCompletion completion,
+            ContestScoreboardStreamPosition position,
+            ContestScoreboardRecoveryStrategy strategy,
+            ContestScoreboardStreamMetrics metrics,
+            ContestScoreboardApplyLock applyLock,
+            ObjectProvider<ContestScoreboardExperimentTrace> trace
+    ) {
+        this(applier, completion, position, strategy, metrics, applyLock,
+                trace.getIfAvailable(() -> ContestScoreboardExperimentTrace.NOOP));
+    }
+
+    ContestScoreboardStreamProcessor(
+            ContestScoreboardApplier applier,
+            ContestScoreboardAppliedAtCompletion completion,
+            ContestScoreboardStreamPosition position,
+            ContestScoreboardRecoveryStrategy strategy,
+            ContestScoreboardStreamMetrics metrics,
+            ContestScoreboardApplyLock applyLock,
+            ContestScoreboardExperimentTrace trace
+    ) {
         this.applier = applier;
         this.completion = completion;
         this.position = position;
         this.strategy = strategy;
         this.metrics = metrics;
         this.applyLock = applyLock;
+        this.trace = trace;
     }
 
     long process(List<ContestScoreboardStreamEvent> events) {
@@ -229,7 +261,21 @@ class ContestScoreboardStreamProcessor {
                 position.highestAppliedOffset(),
                 position.rebuiltThrough()
         );
+        long askedAt = trace.enabled() ? System.currentTimeMillis() : 0L;
         ContestScoreboardRecoveryStrategy.Outcome outcome = strategy.rebuildHistory(range);
+        if (trace.enabled()) {
+            trace.recovery(new ContestScoreboardExperimentTrace.RecoveryRecord(
+                    ContestScoreboardExperimentTrace.RecoveryEvent.GAP,
+                    Thread.currentThread().getName(),
+                    askedAt,
+                    -1L,
+                    System.currentTimeMillis(),
+                    -1,
+                    reason.name().toLowerCase(Locale.ROOT) + " checkpoint=" + checkpoint
+                            + " delivery=" + firstDelivery,
+                    outcome.label()
+            ));
+        }
         if (!outcome.covers()) {
             throw new IllegalStateException(
                     "Scoreboard stream checkpoint " + checkpoint + " is "
@@ -275,6 +321,7 @@ class ContestScoreboardStreamProcessor {
         }
 
         List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(requests);
+        long answeredAt = trace.enabled() ? System.currentTimeMillis() : 0L;
         ContestScoreboardApplier.ApplyResult failed = results.stream()
                 .filter(result -> !result.succeeded())
                 .findFirst()
@@ -294,6 +341,15 @@ class ContestScoreboardStreamProcessor {
                     : offsetOf(requests, results.size());
             position.recordUnappliedRange(unappliedFrom);
             throw new IllegalStateException("Failed to apply scoreboard stream batch: " + detail);
+        }
+        if (trace.enabled()) {
+            // Recorded as soon as the applier answered for the whole batch, which is when the standings
+            // reflect it - before the MySQL completion below, which is bookkeeping about a write that
+            // has already happened.
+            trace.liveBatchApplied(answeredAt, batch.stream()
+                    .map(event -> new ContestScoreboardExperimentTrace.LiveEvent(
+                            event.offset(), event.message().submissionId(), event.message().judgedAt()))
+                    .toList());
         }
 
         completion.complete(batch.stream().map(event -> event.message().submissionId()).toList());
