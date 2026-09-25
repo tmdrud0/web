@@ -23,5 +23,6 @@ $script:recoveryHarnessRoot = $PSScriptRoot
 . "$PSScriptRoot\RecoveryExperiment.Common.ps1"
 . "$PSScriptRoot\RecoveryExperiment.Oracle.ps1"
 . "$PSScriptRoot\RecoveryExperiment.Injector.ps1"
+. "$PSScriptRoot\RecoveryExperiment.TailPoller.ps1"
 . "$PSScriptRoot\RecoveryExperiment.Sampler.ps1"
 . "$PSScriptRoot\RecoveryExperiment.Seeder.ps1"
