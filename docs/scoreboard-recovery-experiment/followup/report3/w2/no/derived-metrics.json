@@ -1,0 +1,8 @@
+{
+  "applyLatencyMs": {"n": 137466, "p50": 148, "p95": 749, "p99": 1492, "max": 2189, "windowMs": [1790447754582, 1790448054582]},
+  "scoreboardQueryLatencyMs": {"n": 8013, "achievedRps": 26.7, "targetRps": 50, "p50": 29.05, "p99": 185.01, "max": 921.11, "http200Ratio": "8013/8013"},
+  "redisCpuCoresAvg": 0.27,
+  "redisContainerCpuLimit": 0.5,
+  "redisErrorsOrTimeoutsInBatchLog": 0,
+  "note": "redisCpuCoresAvg from Prometheus redis_cpu_sys_seconds_total+redis_cpu_user_seconds_total rate over the measured window (redis-exporter's own INFO-derived counters); cAdvisor's container_cpu_usage_seconds_total has no per-container label in this environment (only the root cgroup series), so it could not be used."
+}
