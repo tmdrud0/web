@@ -242,6 +242,18 @@ if ([MysqlJudgeTradeoff.LatencyClassifier]::IsSlow(20260920, "stable-work-item",
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $composeArgs = @("-p", "oj-loadtest", "-f", "compose.yaml", "-f", "compose.loadtest.yaml")
+# The observability overlay (compose.observability.yaml: grafana, prometheus, alertmanager,
+# cadvisor, the three exporters) is started separately but under the SAME "-p oj-loadtest" project
+# name, so it persists across load-test runs instead of being rebuilt every time. `docker compose
+# ps` (unlike `down`, which only ever touches the services named in $composeArgs's own -f files)
+# lists every container in the project by default on this Compose version, orphans included. An
+# unscoped "ps -q" therefore returns those 7 containers too whenever the observability stack is up,
+# on top of these 9. Wait-Healthy's "-eq 9" gate, the container-CPU sampler's target list, and
+# Get-ContainerStates all assumed "every container in the project" meant "the load-test stack" -
+# discovered 2026-09-26 when three consecutive runs failed "did not become healthy in five minutes"
+# with all nine services already healthy, because the count was 16, never 9. Every "ps" call that
+# means "the load-test stack" must name these nine explicitly.
+$loadTestServiceNames = @("mysql", "redis", "rabbitmq", "nginx", "web-1", "web-2", "batch-1", "judge-1", "judge-2")
 $baseUrl = "http://127.0.0.1:18080"
 $dbName = "oj_loadtest"
 # The date pattern is a separate -f operand on purpose: inside a single format string the "t" of
@@ -1130,7 +1142,7 @@ function Wait-Healthy {
     $deadline = (Get-Date).AddMinutes(5)
     while ((Get-Date) -lt $deadline) {
         if ($ObserveRecovery) { Observe-FaultRecovery "health-wait" }
-        $ids = @(Invoke-Compose -Arguments @("ps", "-q") | Where-Object { $_ })
+        $ids = @(Invoke-Compose -Arguments (@("ps", "-q") + $loadTestServiceNames) | Where-Object { $_ })
         if ($ids.Count -eq 9) {
             $bad = @(& docker inspect --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $ids | Where-Object { $_ -notmatch '^true (healthy|none)$' })
             if ($LASTEXITCODE -eq 0 -and $bad.Count -eq 0) { return }
@@ -1944,7 +1956,7 @@ function Save-ContainerLog {
 # answers the three questions section 3 asks of them - running, OOM-killed, restarted - in the form
 # the failure note for the 2026-09-20 runs already recorded them in.
 function Get-ContainerStates {
-    $ids = @(Invoke-Compose -Arguments @("ps", "-q") | Where-Object { $_ })
+    $ids = @(Invoke-Compose -Arguments (@("ps", "-q") + $loadTestServiceNames) | Where-Object { $_ })
     if ($ids.Count -eq 0) { return @() }
     return @(& docker inspect --format '{{.Name}}|{{.State.Status}}|exit={{.State.ExitCode}}|oom={{.State.OOMKilled}}|restarts={{.RestartCount}}|started={{.State.StartedAt}}' $ids)
 }
@@ -4014,7 +4026,7 @@ try {
     Invoke-Compose -Arguments @("restart", "nginx")
     Wait-Healthy
     if (-not $SkipContainerCpu) {
-        $cpuContainers = @(Invoke-Compose -Arguments @("ps", "--format", "{{.Name}}") | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() })
+        $cpuContainers = @(Invoke-Compose -Arguments (@("ps", "--format", "{{.Name}}") + $loadTestServiceNames) | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() })
         $script:containerCpuSampler = Start-ContainerCpuSampler -OutputDirectory $runDirectory -Containers $cpuContainers `
             -SamplerName "oj-loadtest-cpu-sampler"
         $events.containerCpuSamplerStartedAt = $script:containerCpuSampler.startedAt
