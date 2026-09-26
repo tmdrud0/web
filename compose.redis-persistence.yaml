@@ -1,0 +1,29 @@
+# Report 3 (AOF cost / loss surface) override. Applied LAST, on top of the -StackMySql compose
+# file list, so it only touches oj-loadtest-redis's command. It never changes `save` (RDB stays
+# identical across the three conditions so W3's "restart restores from AOF, not RDB" check is
+# meaningful), and it always disables background AOF rewrite and enables the latency monitor so
+# the measurement window excludes rewrite cost and captures aof-fsync-always / aof-write events.
+#
+# Condition is selected purely by two env vars read at `docker compose ... up`/`create` time:
+#   REDIS_APPENDONLY   no | yes            (default: no)
+#   REDIS_APPENDFSYNC  no | everysec | always (default: everysec; irrelevant when appendonly=no)
+#
+# no:        REDIS_APPENDONLY=no                                    (current baseline)
+# everysec:  REDIS_APPENDONLY=yes REDIS_APPENDFSYNC=everysec
+# always:    REDIS_APPENDONLY=yes REDIS_APPENDFSYNC=always
+services:
+  redis:
+    command:
+      - redis-server
+      - --maxmemory
+      - 384mb
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - ${REDIS_APPENDONLY:-no}
+      - --appendfsync
+      - ${REDIS_APPENDFSYNC:-everysec}
+      - --auto-aof-rewrite-percentage
+      - "0"
+      - --latency-monitor-threshold
+      - "100"

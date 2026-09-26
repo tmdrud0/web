@@ -90,7 +90,12 @@ param(
     [switch]$ResetMySqlVolume,
     # The one application container this runner starts on its own, before the rest of the stack, so
     # Spring Boot's own Flyway integration migrates a fresh or behind schema. Only used with -StackMySql.
-    [string]$MigrationAppService = "web-1"
+    [string]$MigrationAppService = "web-1",
+    # Extra compose files layered on top of the runner's own list, in order, after the -StackMySql
+    # overlay. Used by the Redis-persistence report (compose.redis-persistence.yaml) instead of
+    # `redis-cli CONFIG SET`, so a Redis restart during the run reloads from the compose-declared
+    # command rather than losing the condition.
+    [string[]]$ExtraComposeFiles = @()
 )
 
 Set-StrictMode -Version Latest
@@ -174,6 +179,9 @@ if (-not $StackMySql) {
 $config = Get-RecoveryConfig
 # The live-impact overlay goes last, so the batch role's trace settings are the only thing it changes.
 $config.ComposeArgs = @($config.ComposeArgs) + @("-f", "compose.live-impact.yaml")
+foreach ($extraComposeFile in $ExtraComposeFiles) {
+    $config.ComposeArgs = @($config.ComposeArgs) + @("-f", $extraComposeFile)
+}
 
 $concurrentUsers = [long][math]::Ceiling($TargetRps * $SubmitIntervalMillis / 1000.0)
 if ($concurrentUsers -gt $UserCount) {
