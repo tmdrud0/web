@@ -336,7 +336,10 @@ try {
         # an account already handed out; a queued feeder would end the whole run instead.
         "-Dperf.feeder.circular=true",
         # The run is not judged by Gatling's assertions - they are recorded, and the summarizer reads the log.
-        "-Dperf.assert.minSuccessPercent=0",
+        # LoadTestAssertions requires this in (0, 100]; 0 itself throws at Gatling startup
+        # ("perf.assert.minSuccessPercent must be in (0, 100]"), so this is the smallest value that is
+        # still effectively no floor.
+        "-Dperf.assert.minSuccessPercent=0.0001",
         "-Dperf.assert.p95Millis=600000",
         "-Dperf.assert.minRequests=0",
         "-cp", $classpath,
