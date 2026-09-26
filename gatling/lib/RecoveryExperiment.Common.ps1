@@ -936,8 +936,14 @@ function Ensure-StackMySqlReady {
             if ($after.Present -and $after.AllSucceeded -and $after.MaxVersion -ge $targetVersion) {
                 break
             }
-            if ($after.Present -and -not $after.AllSucceeded) {
-                # A recorded failure will not fix itself by waiting out the rest of the timeout.
+            if ($after.Present -and $after.RowCount -gt 0 -and -not $after.AllSucceeded) {
+                # A recorded failure will not fix itself by waiting out the rest of the timeout. RowCount
+                # is checked separately from AllSucceeded because the two are indistinguishable at zero
+                # rows: Get-StackMySqlSchemaState's `IFNULL(MIN(success),0)` reads as false the instant
+                # Flyway has created flyway_schema_history but not yet inserted its first migration row -
+                # a state that lasts on the order of a second, real, and reproducible every -ResetMySqlVolume
+                # run, not a one-off. Treating it as "a recorded failure" broke the poll loop before the
+                # migration that was already running underneath it had a chance to finish.
                 $lastError = "flyway_schema_history records a failed migration (max version $($after.MaxVersion))."
                 break
             }
