@@ -125,9 +125,9 @@ submitOk/s가 낮다(반면 during 구간 자체 길이도 10s로 다른 두 모
 | redis(명령 수) | unavailable | unavailable | unavailable |
 
 Redis `INFO commandstats` 증분은 세 run 모두 `unavailable`로 남았다(harness가 이번 실행에서 수집하지 못했다).
-MySQL 쪽은 full-replay가 `Innodb_rows_read`에서 redis-seq의 약 1.6배, stream-offset의 약 41배를 읽었다 —
-full-replay의 replay가 대회 전체를 페이지 단위(1,000행)로 다시 읽기 때문이라는 PLAN §2 설명과 방향이 맞다.
-정확한 배수는 계산하지 않는다(이 문서는 "약 몇 배"를 주장이 아니라 원자료로만 남긴다).
+MySQL 쪽 `Innodb_rows_read`는 full-replay 72,923,141, redis-seq 45,050,542, stream-offset 1,784,952로
+full-replay가 가장 많았다. full-replay의 replay가 대회 전체를 페이지 단위(1,000행)로 다시 읽는다는 PLAN §2 설명과
+방향이 맞다. 단일 run이므로 모드 사이의 배수는 계산하지 않는다.
 
 ## 7. PLAN 가설과의 대조
 
