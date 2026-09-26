@@ -49,7 +49,7 @@
 | oracle polling | 측정 구간에서 끔 | `-OraclePollSeconds 0` | 최종 정합성은 drain 뒤 digest 1회 |
 | 청크 크기 | 500 (replay-batch-size 기본값), DB 페이지 1,000 | 설정 변경 없음 | `run.replayChunkSize` |
 | 계측 | batch-1만 `contest.scoreboard.experiment.trace.enabled=true` | `compose.live-impact.yaml` | production 기본값은 off |
-| DB | 스택 MySQL(`oj-loadtest-mysql`), pilot의 `oj_test`와 다른 인스턴스 | `-StackMySql` | `oj_loadtest`, `compose.loadtest.yaml`이 커밋한 테스트 root 비밀번호로 자체 초기화. 컨테이너 CPU 2 / 메모리 2560M(`compose.yaml`의 `mysql` 서비스 `deploy.resources.limits`, `compose.loadtest.yaml`은 이름·환경변수만 바꾸고 한도는 바꾸지 않는다). 외부 DB 모드(`oj-test-mysql`, `oj_test`)는 대안으로 남아 있다 |
+| DB | 스택 MySQL(`oj-loadtest-mysql`), pilot의 `oj_test`와 다른 인스턴스 | `-StackMySql` | `oj_loadtest`, 이 실험 전용 볼륨 `oj-loadtest-mysql-live-impact-data`(공유 볼륨 `oj-loadtest-mysql-data`에는 다른 브랜치의 V18이 적용돼 있어 분리), `compose.loadtest.yaml`이 커밋한 테스트 root 비밀번호로 자체 초기화. 컨테이너 CPU 2 / 메모리 2560M(`compose.yaml`의 `mysql` 서비스 `deploy.resources.limits`, `compose.loadtest.yaml`은 이름·환경변수만 바꾸고 한도는 바꾸지 않는다). 외부 DB 모드(`oj-test-mysql`, `oj_test`)는 대안으로 남아 있다 |
 
 ## 3. 지표 정의
 

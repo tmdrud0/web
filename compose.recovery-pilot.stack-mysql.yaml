@@ -86,3 +86,13 @@ services:
 
   nginx-exporter:
     container_name: oj-loadtest-nginx-exporter
+
+# The stack's MySQL gets a volume of its own for this experiment. oj-loadtest-mysql-data is shared with
+# other branches' experiments, and codex/mysql-judge-tradeoff has already applied a different V18
+# (contest_result_judge_started_at) there, so this branch's V18 (contest_result_scoreboard_applied_seq)
+# fails Flyway validation and the app tier never starts. Renaming the volume here leaves that data and
+# its schema history as they are. The first run on an empty volume migrates V1-V18 through the runner's
+# migration step.
+volumes:
+  mysql-data:
+    name: oj-loadtest-mysql-live-impact-data

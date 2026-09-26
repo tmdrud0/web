@@ -85,7 +85,7 @@ param(
     # one: Invoke-SqlScript authenticates inside the container using its own environment variable. The
     # external-DB mode (the default) is unchanged by this switch.
     [switch]$StackMySql,
-    # Drops only the loadtest stack's own MySQL volume (oj-loadtest-mysql-data) before starting it, so a
+    # Drops only the loadtest stack's own MySQL volume (oj-loadtest-mysql-live-impact-data) before starting it, so a
     # run can begin from an empty database. No other volume is touched. Meaningless without -StackMySql.
     [switch]$ResetMySqlVolume,
     # The one application container this runner starts on its own, before the rest of the stack, so

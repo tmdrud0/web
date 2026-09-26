@@ -959,16 +959,16 @@ function Ensure-StackMySqlReady {
 # empty database when asked. `docker compose down` is not used here: it would also stop and remove
 # every other service this run needs untouched. The container is removed by name (forced, so a stopped
 # one from an earlier run does not block re-creation) and the volume by the exact name
-# compose.loadtest.yaml gives it, not a wildcard.
+# compose.recovery-pilot.stack-mysql.yaml gives it, not a wildcard.
 function Reset-StackMySqlVolume {
     $config = Get-RecoveryConfig
     if (-not $config.StackMySqlAuth) {
         throw "Reset-StackMySqlVolume is only meaningful in stack-MySQL mode."
     }
-    Write-Output "  -ResetMySqlVolume: removing container '$($config.DbContainer)' and volume 'oj-loadtest-mysql-data'"
+    Write-Output "  -ResetMySqlVolume: removing container '$($config.DbContainer)' and volume 'oj-loadtest-mysql-live-impact-data'"
     try { [void](Invoke-Compose -Arguments @("rm", "-f", "-s", "-v", "mysql")) }
     catch { Write-Output "  Reset-StackMySqlVolume: removing the mysql container: $($_.Exception.Message)" }
-    try { [void](Invoke-NativeCommand -Executable "docker" -Arguments @("volume", "rm", "oj-loadtest-mysql-data")) }
+    try { [void](Invoke-NativeCommand -Executable "docker" -Arguments @("volume", "rm", "oj-loadtest-mysql-live-impact-data")) }
     catch { Write-Output "  Reset-StackMySqlVolume: removing the volume: $($_.Exception.Message)" }
 }
 

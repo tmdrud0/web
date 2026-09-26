@@ -55,7 +55,7 @@ powershell -NoProfile -Command "foreach(`$f in 'gatling\run-recovery-live-impact
 
 ```powershell
 # 3.0 처음 한 번, 또는 스키마를 비우고 다시 시작하고 싶을 때만: -ResetMySqlVolume가 오직
-#     `oj-loadtest-mysql-data` 볼륨만 지우고 다시 만든다. 그 밖에는 필요 없다 - runner가 mysql을
+#     `oj-loadtest-mysql-live-impact-data` 볼륨만 지우고 다시 만든다. 그 밖에는 필요 없다 - runner가 mysql을
 #     띄우고 healthy를 기다린 뒤 flyway_schema_history를 읽어 스키마가 최신이 아니면 web-1 하나만
 #     띄워 migration을 끝내고 다시 내린다.
 
@@ -97,7 +97,7 @@ foreach ($mode in 'full-replay','redis-seq','stream-offset') {
 `-OraclePollSeconds`(0 = 측정 구간 oracle 판독 끔), `-AllowUnflatBaseline`, `-SkipCleanup`, `-KeepStackRunning`, `-JavaExe`.
 
 스택 MySQL 모드 전용: `-StackMySql`(DB를 `oj-loadtest-mysql`/`oj_loadtest`로 전환), `-ResetMySqlVolume`
-(`oj-loadtest-mysql-data` 볼륨만 지우고 다시 만든다; 다른 볼륨은 건드리지 않는다), `-MigrationAppService`
+(`oj-loadtest-mysql-live-impact-data` 볼륨만 지우고 다시 만든다; 다른 볼륨은 건드리지 않는다), `-MigrationAppService`
 (스키마가 없거나 오래됐을 때 먼저 띄워 migration을 끝낼 앱 컨테이너, 기본 `web-1`).
 
 종료 코드: 0 complete / 2 측정됐지만 불완결 / 1 실패 (PLAN §6.3).
