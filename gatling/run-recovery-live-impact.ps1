@@ -269,9 +269,21 @@ try {
     # A jar from before the trace existed starts without complaint and writes nothing, which would read as
     # a pipeline that applied nothing. The file is created when the trace starts, so its absence is a
     # refusal here rather than an empty series later.
-    $traceProbe = @(Invoke-Docker -Arguments @("exec", $config.BatchContainer, "sh", "-c", "test -f $traceDirectory/live-apply.csv && echo SBRE_TRACE_ON || echo SBRE_TRACE_OFF"))
-    if (-not ($traceProbe -contains "SBRE_TRACE_ON")) {
-        throw "The batch role did not start the experiment trace in $traceDirectory. The jar predates it or the overlay was not applied."
+    #
+    # The container's own healthcheck (worker-healthcheck: "grep -aq java /proc/1/cmdline") only proves the
+    # JVM process exists, not that Spring context refresh has reached the trace bean - on this machine that
+    # takes ~40s (JPA/Hibernate init dominates), so Wait-PilotStackHealthy above returns healthy long before
+    # the file exists. A single probe here reads as a stale jar every run. Retry it like the other
+    # readiness waits in this codebase (Wait-PilotStackHealthy, Wait-PrometheusTargetsHealthy) instead.
+    $traceDeadline = [DateTimeOffset]::UtcNow.AddSeconds($config.ReadyTimeoutSeconds)
+    $traceOn = $false
+    do {
+        $traceProbe = @(Invoke-Docker -Arguments @("exec", $config.BatchContainer, "sh", "-c", "test -f $traceDirectory/live-apply.csv && echo SBRE_TRACE_ON || echo SBRE_TRACE_OFF"))
+        $traceOn = $traceProbe -contains "SBRE_TRACE_ON"
+        if (-not $traceOn) { Start-Sleep -Seconds 1 }
+    } while (-not $traceOn -and [DateTimeOffset]::UtcNow -lt $traceDeadline)
+    if (-not $traceOn) {
+        throw "The batch role did not start the experiment trace in $traceDirectory within $($config.ReadyTimeoutSeconds) seconds. The jar predates it or the overlay was not applied."
     }
     Reset-EdgeRouting
     Wait-PrometheusTargetsHealthy
