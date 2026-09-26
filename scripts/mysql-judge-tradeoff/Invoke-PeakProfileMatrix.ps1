@@ -17,7 +17,12 @@ param(
     # CpuLoadProfileContestJudgement AND caps each judge node's container at cpus = its own worker
     # count (the "one judgement per core" premise for the CPU-load variant experiment) - overridable
     # per-condition below, but there is currently no reason to run cpu mode with a different limit.
-    [ValidateSet("sleep", "cpu")][string]$JudgeMode = "sleep"
+    [ValidateSet("sleep", "cpu")][string]$JudgeMode = "sleep",
+    # "" (default) leaves compose.loadtest.yaml's own web CPU default (1) untouched, reproducing
+    # every B=5 run exactly. The B=70 scale variant's pre-check measured both dispatch modes
+    # throttled at 1 CPU/web-node badly enough that rabbit failed with http-503s at that limit
+    # (mysql did not, at the same load) - pass the same larger value for both dispatch modes.
+    [string]$WebCpus = ""
 )
 $ErrorActionPreference = "Stop"
 $runner = Join-Path $PSScriptRoot "Run-TradeoffExperiment.ps1"
@@ -77,6 +82,7 @@ foreach ($c in $conditions) {
         ResetMySqlVolume = $true; ResetBrokerAndCacheVolumes = $true; RunId = $runId
         JudgeLatencyMode = $JudgeMode
     }
+    if ($WebCpus -ne "") { $runArgs.WebCpus = $WebCpus }
     if ($JudgeMode -eq "cpu") { $runArgs.JudgeCpus = "$w1"; $runArgs.Judge2Cpus = "$w2" }
     if ($fault) { $runArgs.PeakFaultKillAtSeconds = 120; $runArgs.PeakFaultRestartAtSeconds = 180; $runArgs.KilledNode = "judge-1" }
     $started = Get-Date
