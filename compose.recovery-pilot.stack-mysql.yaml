@@ -1,0 +1,88 @@
+# Recovery-pilot overlay, stack-MySQL variant. Stacked the same way as compose.recovery-pilot.yaml,
+# but replacing it rather than joining it:
+#
+#   docker compose -p oj-loadtest \
+#     -f compose.yaml -f compose.loadtest.yaml -f compose.observability.yaml \
+#     -f compose.recovery-pilot.stack-mysql.yaml up -d nginx mysql web-1 web-2 batch-1 judge-1 judge-2 \
+#       redis rabbitmq prometheus grafana cadvisor mysqld-exporter redis-exporter nginx-exporter
+#
+# compose.recovery-pilot.yaml sends every application at the MySQL instance already running on the
+# host (`host.docker.internal`) and requires `DB_PASSWORD` to be set in the shell before Compose will
+# even parse the file - `${DB_PASSWORD:?...}` fails interpolation with no default. That is the
+# password-handling step this variant removes: it deletes every DB-pointing override
+# (`x-pilot-database`, the `host.docker.internal` extra_hosts, the `depends_on: !override` blocks that
+# exist only to drop `mysql` as a dependency, and the exporter's host-gateway redirect) and lets every
+# service fall through to compose.yaml + compose.loadtest.yaml's own `mysql` service
+# (`oj-loadtest-mysql`, database `oj_loadtest`) with its own committed test root password. The harness's
+# SQL client authenticates inside that container, using the container's own environment variable, and
+# never carries the password itself (see RecoveryExperiment.Common.ps1's Invoke-SqlScript).
+#
+# What this keeps, unchanged from compose.recovery-pilot.yaml: the recovery-mode switch
+# (CONTEST_SCOREBOARD_RECOVERY_MODE), the deterministic judge switches (JUDGE_DETERMINISTIC_ENABLED,
+# JUDGE_ACCEPT_PERMILLE), and the load-test container names for every observability container
+# (oj-loadtest-*), so the twelve Prometheus targets this experiment's readiness gate counts are named
+# exactly as they are in the external-DB mode.
+#
+# Use this file INSTEAD of compose.recovery-pilot.yaml, not alongside it: both set the same services'
+# `environment:` and `depends_on:` keys, and compose.recovery-pilot.yaml would additionally fail to
+# parse without DB_PASSWORD set.
+
+services:
+  web-1:
+    environment:
+      JUDGE_DETERMINISTIC_ENABLED: ${JUDGE_DETERMINISTIC_ENABLED:-true}
+      JUDGE_ACCEPT_PERMILLE: ${JUDGE_ACCEPT_PERMILLE:-400}
+
+  web-2:
+    environment:
+      JUDGE_DETERMINISTIC_ENABLED: ${JUDGE_DETERMINISTIC_ENABLED:-true}
+      JUDGE_ACCEPT_PERMILLE: ${JUDGE_ACCEPT_PERMILLE:-400}
+
+  # batch-1 is the scoreboard stream's consumer and the declared recovery owner, so the recovery mode
+  # is the one setting this overlay exists to vary. It is passed to every application service rather
+  # than to batch-1 alone so that the value in the startup report is the same on all five and a wrong
+  # mode cannot be a per-role accident.
+  batch-1:
+    environment:
+      CONTEST_SCOREBOARD_RECOVERY_MODE: ${CONTEST_SCOREBOARD_RECOVERY_MODE:-stream-offset}
+      JUDGE_DETERMINISTIC_ENABLED: ${JUDGE_DETERMINISTIC_ENABLED:-true}
+      JUDGE_ACCEPT_PERMILLE: ${JUDGE_ACCEPT_PERMILLE:-400}
+
+  judge-1:
+    environment:
+      CONTEST_SCOREBOARD_RECOVERY_MODE: ${CONTEST_SCOREBOARD_RECOVERY_MODE:-stream-offset}
+      JUDGE_DETERMINISTIC_ENABLED: ${JUDGE_DETERMINISTIC_ENABLED:-true}
+      JUDGE_ACCEPT_PERMILLE: ${JUDGE_ACCEPT_PERMILLE:-400}
+
+  judge-2:
+    environment:
+      CONTEST_SCOREBOARD_RECOVERY_MODE: ${CONTEST_SCOREBOARD_RECOVERY_MODE:-stream-offset}
+      JUDGE_DETERMINISTIC_ENABLED: ${JUDGE_DETERMINISTIC_ENABLED:-true}
+      JUDGE_ACCEPT_PERMILLE: ${JUDGE_ACCEPT_PERMILLE:-400}
+
+  # Renamed only, same as compose.recovery-pilot.yaml: compose.observability.yaml's names are not
+  # load-test-scoped, so a normal stack started from another checkout would collide with them. Every
+  # Prometheus target stays a service name, so all twelve stay exactly as the environment documents
+  # them. mysqld-exporter needs no other change here - compose.observability.yaml already points it at
+  # `mysql:3306` with the base stack's root password, and in stack-MySQL mode that service exists and
+  # is healthy, unlike in the external-DB overlay this file replaces.
+  prometheus:
+    container_name: oj-loadtest-prometheus
+
+  grafana:
+    container_name: oj-loadtest-grafana
+
+  alertmanager:
+    container_name: oj-loadtest-alertmanager
+
+  cadvisor:
+    container_name: oj-loadtest-cadvisor
+
+  mysqld-exporter:
+    container_name: oj-loadtest-mysqld-exporter
+
+  redis-exporter:
+    container_name: oj-loadtest-redis-exporter
+
+  nginx-exporter:
+    container_name: oj-loadtest-nginx-exporter

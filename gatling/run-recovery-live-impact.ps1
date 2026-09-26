@@ -78,7 +78,19 @@ param(
     [switch]$KeepStackRunning,
     # Leaves this run's rows and Redis keys in place for inspection. They are removed by hand afterwards
     # with the statements logged in cleanup-scope.json.
-    [switch]$SkipCleanup
+    [switch]$SkipCleanup,
+    # Runs against the loadtest stack's own `mysql` service (container oj-loadtest-mysql, database
+    # oj_loadtest) instead of the external oj-test-mysql instance. That container starts with its own
+    # committed test root password (compose.loadtest.yaml), so nothing here ever reads, holds, or prints
+    # one: Invoke-SqlScript authenticates inside the container using its own environment variable. The
+    # external-DB mode (the default) is unchanged by this switch.
+    [switch]$StackMySql,
+    # Drops only the loadtest stack's own MySQL volume (oj-loadtest-mysql-data) before starting it, so a
+    # run can begin from an empty database. No other volume is touched. Meaningless without -StackMySql.
+    [switch]$ResetMySqlVolume,
+    # The one application container this runner starts on its own, before the rest of the stack, so
+    # Spring Boot's own Flyway integration migrates a fresh or behind schema. Only used with -StackMySql.
+    [string]$MigrationAppService = "web-1"
 )
 
 Set-StrictMode -Version Latest
@@ -126,19 +138,39 @@ $stamp = Get-Date -Format "yyyyMMddHHmmss"
 $runId = "li{0}_{1}{2}_{3}" -f ($Mode -replace '-', ''), $Phase.Substring(0, 1), $RunIndex, $stamp
 $artifacts = Join-Path $repoRoot (Join-Path $ArtifactRoot $runId)
 
-if ([string]::IsNullOrWhiteSpace($env:DB_PASSWORD)) {
-    throw "DB_PASSWORD is not set. Export it before running; it is never read from a file or written to an artifact."
+if (-not $StackMySql) {
+    # Only the external-DB mode carries a password at all, and only through this one environment
+    # variable, read once, here - never in stack-MySQL mode, where authentication happens inside the
+    # database container with its own environment.
+    if ([string]::IsNullOrWhiteSpace($env:DB_PASSWORD)) {
+        throw "DB_PASSWORD is not set. Export it before running; it is never read from a file or written to an artifact."
+    }
 }
 $resolvedDbName = if (-not [string]::IsNullOrWhiteSpace($DbName)) { $DbName }
+elseif ($StackMySql) { "oj_loadtest" }
 elseif (-not [string]::IsNullOrWhiteSpace($env:RECOVERY_PILOT_DB_NAME)) { $env:RECOVERY_PILOT_DB_NAME }
 elseif (-not [string]::IsNullOrWhiteSpace($env:DB_NAME)) { $env:DB_NAME }
 else { "oj_test" }
 $resolvedDbPort = if (-not [string]::IsNullOrWhiteSpace($DbPort)) { $DbPort }
 elseif (-not [string]::IsNullOrWhiteSpace($env:DB_PORT)) { $env:DB_PORT }
 else { "3306" }
+$resolvedDbContainer = if ($StackMySql) { "oj-loadtest-mysql" } else { "oj-test-mysql" }
 
-[void](Initialize-RecoveryExperiment -WorktreeRoot $repoRoot -ArtifactDirectory $artifacts -RunId $runId `
-        -Mode $Mode -DbPassword $env:DB_PASSWORD -DbName $resolvedDbName -DbPort $resolvedDbPort -JavaExe $JavaExe)
+$initializeArguments = @{
+    WorktreeRoot = $repoRoot
+    ArtifactDirectory = $artifacts
+    RunId = $runId
+    Mode = $Mode
+    DbName = $resolvedDbName
+    DbPort = $resolvedDbPort
+    DbContainer = $resolvedDbContainer
+    JavaExe = $JavaExe
+    StackMySqlAuth = [bool]$StackMySql
+}
+if (-not $StackMySql) {
+    $initializeArguments["DbPassword"] = $env:DB_PASSWORD
+}
+[void](Initialize-RecoveryExperiment @initializeArguments)
 $config = Get-RecoveryConfig
 # The live-impact overlay goes last, so the batch role's trace settings are the only thing it changes.
 $config.ComposeArgs = @($config.ComposeArgs) + @("-f", "compose.live-impact.yaml")
@@ -212,13 +244,28 @@ try {
             throw "Missing '$required'. Build first: gradlew.bat :gatling:classes :gatling:prepareStandaloneGatling (and set -JavaExe)."
         }
     }
+    # redis comes up before any stack-MySQL migration: the one application container that migration
+    # starts (compose.yaml's web-depends-on) will not become healthy without it. rabbitmq is not on
+    # web-1's dependency list, but starting both together here rather than splitting the pair changes
+    # nothing this run measures - no load has started and no fault has been injected.
+    [void](Invoke-Compose -Arguments @("up", "-d", "redis", "rabbitmq"))
+    Wait-ResetTargetsReady
+
+    if ($StackMySql) {
+        if ($ResetMySqlVolume) {
+            Reset-StackMySqlVolume
+        }
+        $schema = Ensure-StackMySqlReady -WorktreeRoot $repoRoot -MigrationAppService $MigrationAppService
+        $events["stackMySqlSchemaMigratedThisRun"] = $schema.Migrated
+        $events["stackMySqlSchemaVersion"] = $schema.After.MaxVersion
+        $events["stackMySqlSchemaTargetVersion"] = $schema.TargetVersion
+        Write-Output "  stack MySQL: schema version $($schema.After.MaxVersion) (target $($schema.TargetVersion)), migrated this run=$($schema.Migrated)"
+    }
     $script:sentinelBefore = Get-NonInterferenceSentinel
     $script:residualBefore = Get-ResidualRowCounts
     Write-Output "  residual rows before: $(($script:residualBefore.Keys | ForEach-Object { "$_=$($script:residualBefore[$_])" }) -join ' ')"
     [void](Assert-ExperimentDataAbsent -Phase "before this run seeds")
 
-    [void](Invoke-Compose -Arguments @("up", "-d", "redis", "rabbitmq"))
-    Wait-ResetTargetsReady
     $redisIdentity = Assert-RedisIsDedicated
     $queues = Get-RabbitQueueState
     Assert-OnlyProjectQueues -Queues $queues

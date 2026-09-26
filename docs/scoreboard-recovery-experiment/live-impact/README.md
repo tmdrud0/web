@@ -9,20 +9,31 @@
 
 | 파일 | 역할 |
 |---|---|
-| `gatling/run-recovery-live-impact.ps1` | runner. `-Mode full-replay\|redis-seq\|stream-offset`, `-Phase calibration\|run` |
+| `gatling/run-recovery-live-impact.ps1` | runner. `-Mode full-replay\|redis-seq\|stream-offset`, `-Phase calibration\|run`, `-StackMySql`(기본 실행 방법) |
 | `gatling/lib/RecoveryExperiment.LiveImpact.ps1` | 결과 seed, rebuild 호출, 시계 차이, judged 내보내기, 순위 없는 digest, 카운터 |
 | `gatling/lib/RecoveryExperiment.Injector.ps1` (끝부분) | 짧은 pause 롤백 injector (`*ShortPause*`). 기존 pilot injector는 그대로 |
 | `gatling/lib/RecoveryExperiment.TailPoller.ps1` | Redis 컨테이너 안에서 100 ms마다 잃은 집합의 복귀를 세는 poller |
 | `gatling/src/main/java/my/oj/perf/liveimpact/` | 요약기(1초 시계열, 지표, A/B/C 판정, calibration 판정). JUnit 테스트 있음 |
 | `compose.live-impact.yaml` | batch-1의 trace 설정만 켜는 overlay |
+| `compose.recovery-pilot.stack-mysql.yaml` | `-StackMySql`용 overlay. `compose.recovery-pilot.yaml`을 **대신**한다(같이 쓰지 않음) — DB 관련 부분(host.docker.internal, `DB_PASSWORD` 필수 보간, mysql을 depends_on에서 빼는 부분)을 빼고, 나머지(judge 설정, 복구 모드, observability 컨테이너 이름)는 그대로 둔다 |
 | `src/main/java/.../scoreboard/experiment/` | 제품 쪽 계측. `contest.scoreboard.experiment.trace.enabled=false`가 기본값이며, 꺼져 있으면 빈(bean)이 없다 |
 
-Windows PowerShell 5.1 기준이다. 기존 recovery pilot의 lib(`RecoveryExperiment.*.ps1`)를 그대로 쓰고, 그 runner는 바꾸지 않았다.
+Windows PowerShell 5.1 기준이다. 기존 recovery pilot의 lib(`RecoveryExperiment.*.ps1`)를 그대로 쓰고, 그 runner는 바꾸지 않았다. `Invoke-SqlScript`(공용 lib)만 두 인증 모드를 갖도록 넓혔다 — 기존 외부 DB 모드는 그대로 동작한다.
 
 ## 2. 사전 조건과 첫 실행 전 점검
 
-기존 pilot의 사전 조건([../README.md](../README.md) §1)과 같다: Docker, `oj-test-mysql`(oj_test, Flyway 18),
-`DB_PASSWORD`·`DB_PORT` 환경변수, JDK 17. 추가로:
+**기본 실행 방법은 스택 MySQL 모드다(`-StackMySql`).** DB는 loadtest 스택 자신의 `mysql` 서비스
+(컨테이너 `oj-loadtest-mysql`, 데이터베이스 `oj_loadtest`)를 쓴다. 이 컨테이너는 `compose.loadtest.yaml`에
+커밋된 테스트 root 비밀번호(`1234`)로 스스로 초기화하고, harness는 그 안에서 컨테이너 자신의 환경변수로
+인증한다(`docker exec -i oj-loadtest-mysql sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -uroot -D oj_loadtest -N -B'`).
+그래서 `DB_PASSWORD`를 셸에 두거나 찾을 필요가 없다. 필요한 것: Docker, JDK 17. `DB_PASSWORD`·`DB_PORT`
+환경변수는 필요 없다.
+
+외부 DB 모드(`-StackMySql` 없이 실행)는 대안으로 남아 있다: 기존 pilot의 사전 조건
+([../README.md](../README.md) §1)과 같다 — Docker, `oj-test-mysql`(oj_test, Flyway 18),
+`DB_PASSWORD`·`DB_PORT` 환경변수, JDK 17.
+
+공통으로 추가할 것:
 
 ```powershell
 # 1) 제품 jar와 이미지: 계측이 들어간 jar여야 한다 (runner가 trace 파일 존재로 확인하고, 없으면 거부)
@@ -40,13 +51,17 @@ powershell -NoProfile -Command "foreach(`$f in 'gatling\run-recovery-live-impact
 
 ## 3. 실행
 
+스택 MySQL 모드(기본 실행 방법). 비밀번호를 셸에 두지 않는다:
+
 ```powershell
-$env:DB_PASSWORD = '<password>'     # 파일이나 문서에 적지 않는다
-$env:DB_PORT = '3307'
+# 3.0 처음 한 번, 또는 스키마를 비우고 다시 시작하고 싶을 때만: -ResetMySqlVolume가 오직
+#     `oj-loadtest-mysql-data` 볼륨만 지우고 다시 만든다. 그 밖에는 필요 없다 - runner가 mysql을
+#     띄우고 healthy를 기다린 뒤 flyway_schema_history를 읽어 스키마가 최신이 아니면 web-1 하나만
+#     띄워 migration을 끝내고 다시 내린다.
 
 # 3.1 calibration: 복구 없이 steady 60초. 1,000/s부터 최대 3단계
 powershell -NoProfile -ExecutionPolicy Bypass -File gatling\run-recovery-live-impact.ps1 `
-  -Mode full-replay -Phase calibration -TargetRps 1000 -Build
+  -Mode full-replay -Phase calibration -StackMySql -TargetRps 1000 -Build
 #   -> summarizer: calibration=stable|ko|backlog-growing|under-target
 #   stable이 아니면 -TargetRps 850, 700 순으로. stable인 가장 높은 값과 그 run의
 #   live-impact-calibration.csv의 calibration.judgedPerSecond를 기록한다.
@@ -54,18 +69,36 @@ powershell -NoProfile -ExecutionPolicy Bypass -File gatling\run-recovery-live-im
 # 3.2 본 run: 모드마다 1회, 같은 값으로
 foreach ($mode in 'full-replay','redis-seq','stream-offset') {
   powershell -NoProfile -ExecutionPolicy Bypass -File gatling\run-recovery-live-impact.ps1 `
-    -Mode $mode -Phase run -TargetRps <calibrated> -JudgedRatePerSecond <calibrated>
+    -Mode $mode -Phase run -StackMySql -TargetRps <calibrated> -JudgedRatePerSecond <calibrated>
 }
 
-# 3.3 Run B (C2 브랜치): 그 브랜치에서 bootJar 후 같은 명령에 -Mode full-replay -Build
+# 3.3 Run B (C2 브랜치): 그 브랜치에서 bootJar 후 같은 명령에 -Mode full-replay -StackMySql -Build
 
 # 3.4 요약만 다시 (임계값을 바꿔 보고 싶을 때). 산출물 디렉터리를 준다
 & "C:\Program Files\Java\jdk-17\bin\java.exe" -cp gatling\build\classes\java\main `
   my.oj.perf.liveimpact.LiveImpactSummarizer var\scoreboard-recovery-live-impact\<runId> --stall-seconds 2
 ```
 
+외부 DB 모드(대안). `-StackMySql`을 빼고, `DB_PASSWORD`·`DB_PORT`를 셸에 둔다:
+
+```powershell
+$env:DB_PASSWORD = '<password>'     # 파일이나 문서에 적지 않는다
+$env:DB_PORT = '3307'
+
+powershell -NoProfile -ExecutionPolicy Bypass -File gatling\run-recovery-live-impact.ps1 `
+  -Mode full-replay -Phase calibration -TargetRps 1000 -Build
+foreach ($mode in 'full-replay','redis-seq','stream-offset') {
+  powershell -NoProfile -ExecutionPolicy Bypass -File gatling\run-recovery-live-impact.ps1 `
+    -Mode $mode -Phase run -TargetRps <calibrated> -JudgedRatePerSecond <calibrated>
+}
+```
+
 자주 쓰는 스위치: `-TailSeconds`(기본 5), `-RecoveryBudgetSeconds`(300), `-ObserveAfterRecoverySeconds`(60),
 `-OraclePollSeconds`(0 = 측정 구간 oracle 판독 끔), `-AllowUnflatBaseline`, `-SkipCleanup`, `-KeepStackRunning`, `-JavaExe`.
+
+스택 MySQL 모드 전용: `-StackMySql`(DB를 `oj-loadtest-mysql`/`oj_loadtest`로 전환), `-ResetMySqlVolume`
+(`oj-loadtest-mysql-data` 볼륨만 지우고 다시 만든다; 다른 볼륨은 건드리지 않는다), `-MigrationAppService`
+(스키마가 없거나 오래됐을 때 먼저 띄워 migration을 끝낼 앱 컨테이너, 기본 `web-1`).
 
 종료 코드: 0 complete / 2 측정됐지만 불완결 / 1 실패 (PLAN §6.3).
 
@@ -73,7 +106,8 @@ foreach ($mode in 'full-replay','redis-seq','stream-offset') {
 
 | 대상 | 규칙 | 구현 |
 |---|---|---|
-| MySQL | 기존 `oj_test @ 127.0.0.1:3307`(컨테이너 `oj-test-mysql`). 자격 증명은 `DB_PASSWORD` 환경변수로만 | 파일에서 읽지 않고, artifact에 쓰지 않는다 |
+| MySQL | 기본(`-StackMySql`): loadtest 스택 자신의 `mysql`(컨테이너 `oj-loadtest-mysql`, DB `oj_loadtest`). 자격 증명은 컨테이너 자신의 `MYSQL_ROOT_PASSWORD`로, 컨테이너 안에서만 | harness 프로세스는 비밀번호를 절대 읽거나 담거나 출력하지 않는다. `docker exec -i oj-loadtest-mysql sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -uroot -D oj_loadtest -N -B'`(`Invoke-SqlScript`). DB 이름은 `^[A-Za-z0-9_]+$`로 검증(`sh -c` 문자열에 들어가므로) |
+| MySQL | 대안(외부 DB): `oj_test @ 127.0.0.1:3307`(컨테이너 `oj-test-mysql`). 자격 증명은 `DB_PASSWORD` 환경변수로만 | 파일에서 읽지 않고, artifact에 쓰지 않는다 |
 | MySQL | schema·인스턴스 DROP, 무관한 테이블 truncate 금지 | `DELETE`만, 이 run의 contest id·`sbrec_<runId>_` prefix로 한정(`Get-ExperimentTableScope`) |
 | MySQL | run마다 고유 prefix/contest | runId = `li<mode>_<phase><index>_<yyyyMMddHHmmss>`. 같은 prefix를 재사용하면 이전 run의 contest까지 지워지므로 호출마다 새로 만든다 |
 | MySQL | 정리 전 대상 로그 | 삭제 전에 contest id, 테이블별 건수, `DELETE` 문장을 출력하고 `cleanup-scope.json`에 남긴다. 삭제 후 `removed-rows.json` |

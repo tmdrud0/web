@@ -41,8 +41,13 @@ $script:recoveryScoreboardKeyPrefix = "contest:scoreboard:"
 # Services the pilot stack must have, by Compose service name, mapped to the exact container name the
 # merged overlay produces. Counted and asserted as a set rather than by `docker ps | grep`, so a
 # service that quietly failed to start is a stopped run instead of a thinner measurement.
+# In stack-MySQL mode `mysql` (container oj-loadtest-mysql) is part of this project's containers, so it
+# belongs in the set Assert-PilotStackHealthy counts; in the external-DB mode it is not started at all
+# (see Get-PilotStartServices) and must not be expected. Read from the initialized config rather than
+# taking a parameter, so every existing caller - which calls this with no arguments - keeps working
+# unchanged in the mode it already runs in.
 function Get-ExpectedPilotContainers {
-    return [ordered]@{
+    $expected = [ordered]@{
         nginx = "oj-loadtest-nginx"
         redis = "oj-loadtest-redis"
         rabbitmq = "oj-loadtest-rabbitmq"
@@ -59,18 +64,27 @@ function Get-ExpectedPilotContainers {
         "redis-exporter" = "oj-loadtest-redis-exporter"
         "nginx-exporter" = "oj-loadtest-nginx-exporter"
     }
+    if ($null -ne $script:recoveryConfig -and $script:recoveryConfig.StackMySqlAuth) {
+        $expected["mysql"] = $script:recoveryConfig.DbContainer
+    }
+    return $expected
 }
 
-# The services a run starts. `mysql` is absent on purpose - the overlay points every application at
-# the instance already running on the host, and starting a container of our own would be a second,
-# differently provisioned server wearing the same name in the reports.
+# The services a run starts. `mysql` is absent in the external-DB mode on purpose - the overlay points
+# every application at the instance already running on the host, and starting a container of our own
+# would be a second, differently provisioned server wearing the same name in the reports. In stack-MySQL
+# mode it is this project's own database and belongs in the set that is started and health-gated.
 function Get-PilotStartServices {
-    return @(
+    $services = @(
         "nginx", "redis", "rabbitmq",
         "web-1", "web-2", "batch-1", "judge-1", "judge-2",
         "prometheus", "grafana", "alertmanager", "cadvisor",
         "mysqld-exporter", "redis-exporter", "nginx-exporter"
     )
+    if ($null -ne $script:recoveryConfig -and $script:recoveryConfig.StackMySqlAuth) {
+        $services = @("mysql") + $services
+    }
+    return $services
 }
 
 function Initialize-RecoveryExperiment {
@@ -79,10 +93,21 @@ function Initialize-RecoveryExperiment {
         [Parameter(Mandatory = $true)][string]$ArtifactDirectory,
         [Parameter(Mandatory = $true)][string]$RunId,
         [Parameter(Mandatory = $true)][ValidateSet("full-replay", "redis-seq", "stream-offset")][string]$Mode,
-        [Parameter(Mandatory = $true)][string]$DbPassword,
+        # Required in the external-DB mode (the only mode that carries a password at all): the harness
+        # process holds it only long enough to hand it to `docker exec -e`, and never writes it to a
+        # file or an artifact. Not required when -StackMySqlAuth is set - that mode authenticates with
+        # the database container's own environment variable instead, so the harness process never sees
+        # a password value in either mode.
+        [string]$DbPassword = "",
         [string]$ProjectName = "oj-loadtest",
         [string]$DbContainer = "oj-test-mysql",
         [string]$DbName = "oj_test",
+        # When set, Invoke-SqlScript authenticates inside $DbContainer using that container's own
+        # $DbRootPasswordEnvVar (its environment, resolved by its own shell) instead of the
+        # `-e MYSQL_PWD=...` the external-DB mode passes from the harness process. -DbPassword is not
+        # read in this mode.
+        [switch]$StackMySqlAuth,
+        [string]$DbRootPasswordEnvVar = "MYSQL_ROOT_PASSWORD",
         # The host port the application tier dials. The harness's own SQL client never uses it - it runs
         # `docker exec` inside the database container, with no TCP hop - so this value exists only to be
         # compared against the port the batch role actually carries. It is worth comparing because the
@@ -109,8 +134,14 @@ function Initialize-RecoveryExperiment {
     if ($RunId -notmatch '^[A-Za-z0-9_]+$') {
         throw "RunId '$RunId' must be alphanumeric or underscore: it becomes a SQL LIKE pattern and a Redis key suffix."
     }
-    if ([string]::IsNullOrWhiteSpace($DbPassword)) {
+    if (-not $StackMySqlAuth -and [string]::IsNullOrWhiteSpace($DbPassword)) {
         throw "DbPassword is empty. Pass it from the DB_PASSWORD environment variable; it is never written to an artifact."
+    }
+    # DbName is interpolated into a `sh -c` string in stack-MySQL mode (Invoke-SqlScript), so it is
+    # validated in both modes rather than only where it is currently dangerous - a value that would be
+    # unsafe there is not a value this harness wants to carry quietly into the other mode either.
+    if ($DbName -notmatch '^[A-Za-z0-9_]+$') {
+        throw "DbName '$DbName' must be alphanumeric or underscore."
     }
 
     $resolvedRoot = (Resolve-Path -LiteralPath $WorktreeRoot).Path
@@ -131,13 +162,17 @@ function Initialize-RecoveryExperiment {
             "-f", "compose.yaml",
             "-f", "compose.loadtest.yaml",
             "-f", "compose.observability.yaml",
-            "-f", "compose.recovery-pilot.yaml"
+            # compose.recovery-pilot.yaml requires $env:DB_PASSWORD to even parse
+            # (`${DB_PASSWORD:?...}`), so the stack-MySQL overlay replaces it rather than joining it.
+            "-f", $(if ($StackMySqlAuth) { "compose.recovery-pilot.stack-mysql.yaml" } else { "compose.recovery-pilot.yaml" })
         )
         DbContainer = $DbContainer
         DbName = $DbName
         DbPort = $DbPort
         DbUser = $DbUser
         DbPassword = $DbPassword
+        StackMySqlAuth = [bool]$StackMySqlAuth
+        DbRootPasswordEnvVar = $DbRootPasswordEnvVar
         ContestId = $ContestId
         ProblemIdStart = $ProblemIdStart
         ProblemIdEnd = $ProblemIdEnd
@@ -305,12 +340,26 @@ function Invoke-SqlScript {
     )
 
     $config = Get-RecoveryConfig
-    $output = Invoke-NativeCommand -Executable "docker" -StandardInput $Sql -Arguments @(
-        "exec", "-i",
-        "-e", "MYSQL_PWD=$($config.DbPassword)",
-        $config.DbContainer,
-        "mysql", "-u$($config.DbUser)", "-D", $config.DbName, "-N", "-B"
-    )
+    if ($config.StackMySqlAuth) {
+        # The password never becomes a value this process holds: the container resolves its own
+        # $($config.DbRootPasswordEnvVar) inside `sh -c`, so nothing on the harness side of `docker exec`
+        # ever carries it. DbName was validated alphanumeric-or-underscore in
+        # Initialize-RecoveryExperiment specifically because it is interpolated into this shell string.
+        $shellCommand = "MYSQL_PWD=`"`$$($config.DbRootPasswordEnvVar)`" exec mysql -u$($config.DbUser) -D $($config.DbName) -N -B"
+        $output = Invoke-NativeCommand -Executable "docker" -StandardInput $Sql -Arguments @(
+            "exec", "-i",
+            $config.DbContainer,
+            "sh", "-c", $shellCommand
+        )
+    }
+    else {
+        $output = Invoke-NativeCommand -Executable "docker" -StandardInput $Sql -Arguments @(
+            "exec", "-i",
+            "-e", "MYSQL_PWD=$($config.DbPassword)",
+            $config.DbContainer,
+            "mysql", "-u$($config.DbUser)", "-D", $config.DbName, "-N", "-B"
+        )
+    }
     if (@($output | Where-Object { $_ -match '^ERROR \d+' }).Count -gt 0) {
         throw "MySQL rejected $Description`: $(@($output | Where-Object { $_ -match '^ERROR \d+' }) -join ' ')"
     }
@@ -757,6 +806,170 @@ function Assert-ContainerIdentitiesStable {
             throw "Container '$name' was replaced or restarted during the run. The measurement is not comparable."
         }
     }
+}
+
+# --- stack MySQL (-StackMySqlAuth) ------------------------------------------------------------------
+#
+# Only used in stack-MySQL mode. The external-DB mode reuses an instance that is already migrated and
+# already running, so none of this runs there.
+
+# Docker's own health status for a container that declares a HEALTHCHECK (the base compose.yaml's
+# `mysql` service does: `mysqladmin ping`). Polled rather than read once, because `docker compose up -d`
+# returns as soon as the container exists, not when the server inside it answers.
+function Wait-ContainerHealthy {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [int]$TimeoutSeconds = 120
+    )
+
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastStatus = "unknown"
+    while ([DateTimeOffset]::UtcNow -lt $deadline) {
+        try {
+            $json = (Invoke-Docker -Arguments @("inspect", $Name)) -join "`n"
+            $containers = @($json | ConvertFrom-Json)
+            if ($containers.Count -eq 1) {
+                $healthProperty = $containers[0].State.PSObject.Properties["Health"]
+                if ($null -ne $healthProperty -and $null -ne $healthProperty.Value) {
+                    $lastStatus = [string]$healthProperty.Value.Status
+                    if ($lastStatus -eq "healthy") {
+                        return
+                    }
+                }
+            }
+        }
+        catch {
+            $lastStatus = $_.Exception.Message
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw "Container '$Name' did not report healthy within $TimeoutSeconds seconds (last status: $lastStatus)."
+}
+
+# The highest Flyway version this checkout ships, read from the migration files rather than hard-coded,
+# so a later migration added to the repository is picked up without this harness needing to change.
+# `V<n>__description.sql` is the only naming convention in src/main/resources/db/migration; a filename
+# that does not match it is not a versioned migration Flyway would apply as one (e.g. a repeatable
+# `R__...` migration, of which there are none today) and is excluded rather than guessed at.
+function Get-FlywayTargetVersion {
+    param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
+
+    $migrationDirectory = Join-Path $WorktreeRoot "src\main\resources\db\migration"
+    if (-not (Test-Path -LiteralPath $migrationDirectory -PathType Container)) {
+        throw "Migration directory not found: $migrationDirectory"
+    }
+    $versions = New-Object 'System.Collections.Generic.List[long]'
+    foreach ($file in @(Get-ChildItem -LiteralPath $migrationDirectory -Filter "V*.sql")) {
+        if ($file.Name -match '^V(\d+)__') {
+            $versions.Add([long]$Matches[1])
+        }
+    }
+    if ($versions.Count -eq 0) {
+        throw "No versioned Flyway migration files (V<n>__...) found under $migrationDirectory."
+    }
+    return ($versions.ToArray() | Sort-Object -Descending | Select-Object -First 1)
+}
+
+# Reads flyway_schema_history's own account of itself: the highest version it has recorded and whether
+# every row it holds succeeded. A schema that has never been migrated (a fresh volume) has no such
+# table at all, which is reported as `Present = $false` rather than surfaced as the MySQL error it
+# actually is - that absence is the ordinary "not migrated yet" state this function exists to detect,
+# not a fault.
+function Get-StackMySqlSchemaState {
+    try {
+        $row = @(Invoke-SqlRows -Sql @"
+SELECT COUNT(*), IFNULL(MAX(CAST(version AS UNSIGNED)), 0),
+       IFNULL(MIN(CASE WHEN success THEN 1 ELSE 0 END), 0)
+  FROM flyway_schema_history
+ WHERE version IS NOT NULL;
+"@ -Description "flyway schema history")[0]
+    }
+    catch {
+        if ($_.Exception.Message -match "doesn't exist") {
+            return [pscustomobject]@{ Present = $false; RowCount = 0L; MaxVersion = 0L; AllSucceeded = $false }
+        }
+        throw
+    }
+    return [pscustomobject]@{
+        Present = $true
+        RowCount = (ConvertTo-RequiredInt64 -Value $row[0] -Description "flyway row count")
+        MaxVersion = (ConvertTo-RequiredInt64 -Value $row[1] -Description "flyway max version")
+        AllSucceeded = ((ConvertTo-RequiredInt64 -Value $row[2] -Description "flyway all-succeeded") -eq 1L)
+    }
+}
+
+# Starts the database, waits for it, and makes sure the schema this run will read and write is the
+# repository's own latest - migrating it with one application container if it is missing or behind,
+# exactly as PLAN item 4 requires, and never by any other means: this function issues no DDL of its own.
+function Ensure-StackMySqlReady {
+    param(
+        [Parameter(Mandatory = $true)][string]$WorktreeRoot,
+        [string]$MigrationAppService = "web-1",
+        [int]$MigrationTimeoutSeconds = 300
+    )
+
+    $config = Get-RecoveryConfig
+    if (-not $config.StackMySqlAuth) {
+        throw "Ensure-StackMySqlReady is only meaningful in stack-MySQL mode."
+    }
+    $targetVersion = Get-FlywayTargetVersion -WorktreeRoot $WorktreeRoot
+    [void](Invoke-Compose -Arguments @("up", "-d", "mysql"))
+    Wait-ContainerHealthy -Name $config.DbContainer -TimeoutSeconds $MigrationTimeoutSeconds
+
+    $state = Get-StackMySqlSchemaState
+    if ($state.Present -and $state.AllSucceeded -and $state.MaxVersion -ge $targetVersion) {
+        return [pscustomobject]@{ Migrated = $false; Before = $state; After = $state; TargetVersion = $targetVersion }
+    }
+
+    # Not current: bring up one application container so Spring Boot's own Flyway integration migrates
+    # the schema (spring.flyway.enabled=true, spring.jpa.hibernate.ddl-auto=validate - this harness never
+    # runs DDL itself). It is stopped again afterwards; step 3 of the runner (re)creates the full app
+    # tier once the run's trace and recovery-mode environment are set.
+    [void](Invoke-Compose -Arguments @("up", "-d", "--no-deps", $MigrationAppService))
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($MigrationTimeoutSeconds)
+    $after = $state
+    $lastError = $null
+    while ([DateTimeOffset]::UtcNow -lt $deadline) {
+        Start-Sleep -Seconds 2
+        try {
+            $after = Get-StackMySqlSchemaState
+            if ($after.Present -and $after.AllSucceeded -and $after.MaxVersion -ge $targetVersion) {
+                break
+            }
+            if ($after.Present -and -not $after.AllSucceeded) {
+                # A recorded failure will not fix itself by waiting out the rest of the timeout.
+                $lastError = "flyway_schema_history records a failed migration (max version $($after.MaxVersion))."
+                break
+            }
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+    }
+    try { [void](Invoke-Compose -Arguments @("stop", $MigrationAppService)) }
+    catch { Write-Output "  Ensure-StackMySqlReady: stopping '$MigrationAppService' after migration failed: $($_.Exception.Message)" }
+    if (-not ($after.Present -and $after.AllSucceeded -and $after.MaxVersion -ge $targetVersion)) {
+        throw "The schema in '$($config.DbName)' did not reach Flyway version $targetVersion within $MigrationTimeoutSeconds seconds " +
+        "(present=$($after.Present), maxVersion=$($after.MaxVersion), allSucceeded=$($after.AllSucceeded)). Last error: $lastError"
+    }
+    return [pscustomobject]@{ Migrated = $true; Before = $state; After = $after; TargetVersion = $targetVersion }
+}
+
+# Drops only this stack's own MySQL volume - never any other named volume - so a run can start from an
+# empty database when asked. `docker compose down` is not used here: it would also stop and remove
+# every other service this run needs untouched. The container is removed by name (forced, so a stopped
+# one from an earlier run does not block re-creation) and the volume by the exact name
+# compose.loadtest.yaml gives it, not a wildcard.
+function Reset-StackMySqlVolume {
+    $config = Get-RecoveryConfig
+    if (-not $config.StackMySqlAuth) {
+        throw "Reset-StackMySqlVolume is only meaningful in stack-MySQL mode."
+    }
+    Write-Output "  -ResetMySqlVolume: removing container '$($config.DbContainer)' and volume 'oj-loadtest-mysql-data'"
+    try { [void](Invoke-Compose -Arguments @("rm", "-f", "-s", "-v", "mysql")) }
+    catch { Write-Output "  Reset-StackMySqlVolume: removing the mysql container: $($_.Exception.Message)" }
+    try { [void](Invoke-NativeCommand -Executable "docker" -Arguments @("volume", "rm", "oj-loadtest-mysql-data")) }
+    catch { Write-Output "  Reset-StackMySqlVolume: removing the volume: $($_.Exception.Message)" }
 }
 
 # --- the shared MySQL instance ---------------------------------------------------------------------
