@@ -292,7 +292,12 @@ wget -q -T 5 -O - http://batch-1:9000/actuator/health && echo && echo "SBRE_HEAL
         if ($persistAfterRestart.Contains($key)) { $events["persist.afterRestart.$key"] = $persistAfterRestart[$key] }
     }
 
-    $processedAfterRestart = @(Get-RedisSetMembers -Key $config.ProcessedKey)
+    # NOT wrapped in @(...): Get-RedisSetMembers already returns `, @($members...)` (comma-wrapped so a
+    # one-member result survives as an array rather than unwrapping to a scalar). Wrapping the call in
+    # @() again makes PowerShell treat that single emitted array as ONE pipeline object and re-wrap IT,
+    # collapsing any result - regardless of its real size - to a 1-element array whose lone element is
+    # the true list. Found this the hard way: it silently reported "1" for a genuine ~90,000-member set.
+    $processedAfterRestart = Get-RedisSetMembers -Key $config.ProcessedKey
     $events["processedCountAfterRestart"] = $processedAfterRestart.Count
     Write-Output "  processed set after restart: $($processedAfterRestart.Count) submission id(s)"
 
