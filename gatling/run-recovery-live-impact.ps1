@@ -341,7 +341,9 @@ try {
         # still effectively no floor.
         "-Dperf.assert.minSuccessPercent=0.0001",
         "-Dperf.assert.p95Millis=600000",
-        "-Dperf.assert.minRequests=0",
+        # LoadTestAssertions requires this greater than 0 as well (same reasoning as minSuccessPercent
+        # above); 1 is still effectively no floor for a run sized in the tens of thousands of requests.
+        "-Dperf.assert.minRequests=1",
         "-cp", $classpath,
         "io.gatling.app.Gatling",
         "-s", "my.oj.perf.ContestSubmissionSimulation",
