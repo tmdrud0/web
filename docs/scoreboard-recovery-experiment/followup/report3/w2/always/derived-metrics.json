@@ -1,0 +1,8 @@
+{
+  "applyLatencyMs": {"n": 15497, "p50": 141436, "p95": 257714, "p99": 269542, "max": 269800, "windowMs": [1790457390355, 1790457690355], "note": "backlog was growing throughout the window (verdict=backlog-growing); these percentiles describe a queue that had not reached steady state, not a stable per-event latency"},
+  "scoreboardQueryLatencyMs": {"n": 275, "achievedRps": 0.92, "targetRps": 50, "p50": 981.42, "p99": 3798.68, "max": 4782.57, "http200Ratio": "275/275", "note": "achieved rate collapsed from ~22-27/s (no/everysec) to <1/s: each read waits behind Redis's single-threaded event loop, which always blocks on the same per-write fsync as the appliers"},
+  "redisCpuCoresAvg": 0.0756,
+  "redisContainerCpuLimit": 0.5,
+  "redisErrorsOrTimeoutsInBatchLog": 0,
+  "note": "Redis CPU is LOWER than no/everysec (0.076 vs 0.25-0.29 cores) despite far worse latency: Redis is I/O-wait-bound on fsync, not CPU-bound, under always. LATENCY LATEST/HISTORY read post-run without a reset beforehand, so the recorded aof-fsync-always/command samples (148ms/292ms) understate the true tail; the calibration.csv's appliedPerSecond (51.657 vs judgedPerSecond 453.053) and backlogSlopePerSecond (406.948/s) are the reliable throughput-side numbers for this condition."
+}
