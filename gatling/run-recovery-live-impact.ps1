@@ -81,7 +81,19 @@ param(
     [switch]$KeepStackRunning,
     # Leaves this run's rows and Redis keys in place for inspection. They are removed by hand afterwards
     # with the statements logged in cleanup-scope.json.
-    [switch]$SkipCleanup
+    [switch]$SkipCleanup,
+    # Runs against the loadtest stack's own `mysql` service (container oj-loadtest-mysql, database
+    # oj_loadtest) instead of the external oj-test-mysql instance. That container starts with its own
+    # committed test root password (compose.loadtest.yaml), so nothing here ever reads, holds, or prints
+    # one: Invoke-SqlScript authenticates inside the container using its own environment variable. The
+    # external-DB mode (the default) is unchanged by this switch.
+    [switch]$StackMySql,
+    # Drops only the loadtest stack's own MySQL volume (oj-loadtest-mysql-live-impact-data) before starting it, so a
+    # run can begin from an empty database. No other volume is touched. Meaningless without -StackMySql.
+    [switch]$ResetMySqlVolume,
+    # The one application container this runner starts on its own, before the rest of the stack, so
+    # Spring Boot's own Flyway integration migrates a fresh or behind schema. Only used with -StackMySql.
+    [string]$MigrationAppService = "web-1"
 )
 
 Set-StrictMode -Version Latest
@@ -129,19 +141,39 @@ $stamp = Get-Date -Format "yyyyMMddHHmmss"
 $runId = "li{0}_{1}{2}_{3}" -f ($Mode -replace '-', ''), $Phase.Substring(0, 1), $RunIndex, $stamp
 $artifacts = Join-Path $repoRoot (Join-Path $ArtifactRoot $runId)
 
-if ([string]::IsNullOrWhiteSpace($env:DB_PASSWORD)) {
-    throw "DB_PASSWORD is not set. Export it before running; it is never read from a file or written to an artifact."
+if (-not $StackMySql) {
+    # Only the external-DB mode carries a password at all, and only through this one environment
+    # variable, read once, here - never in stack-MySQL mode, where authentication happens inside the
+    # database container with its own environment.
+    if ([string]::IsNullOrWhiteSpace($env:DB_PASSWORD)) {
+        throw "DB_PASSWORD is not set. Export it before running; it is never read from a file or written to an artifact."
+    }
 }
 $resolvedDbName = if (-not [string]::IsNullOrWhiteSpace($DbName)) { $DbName }
+elseif ($StackMySql) { "oj_loadtest" }
 elseif (-not [string]::IsNullOrWhiteSpace($env:RECOVERY_PILOT_DB_NAME)) { $env:RECOVERY_PILOT_DB_NAME }
 elseif (-not [string]::IsNullOrWhiteSpace($env:DB_NAME)) { $env:DB_NAME }
 else { "oj_test" }
 $resolvedDbPort = if (-not [string]::IsNullOrWhiteSpace($DbPort)) { $DbPort }
 elseif (-not [string]::IsNullOrWhiteSpace($env:DB_PORT)) { $env:DB_PORT }
 else { "3306" }
+$resolvedDbContainer = if ($StackMySql) { "oj-loadtest-mysql" } else { "oj-test-mysql" }
 
-[void](Initialize-RecoveryExperiment -WorktreeRoot $repoRoot -ArtifactDirectory $artifacts -RunId $runId `
-        -Mode $Mode -DbPassword $env:DB_PASSWORD -DbName $resolvedDbName -DbPort $resolvedDbPort -JavaExe $JavaExe)
+$initializeArguments = @{
+    WorktreeRoot = $repoRoot
+    ArtifactDirectory = $artifacts
+    RunId = $runId
+    Mode = $Mode
+    DbName = $resolvedDbName
+    DbPort = $resolvedDbPort
+    DbContainer = $resolvedDbContainer
+    JavaExe = $JavaExe
+    StackMySqlAuth = [bool]$StackMySql
+}
+if (-not $StackMySql) {
+    $initializeArguments["DbPassword"] = $env:DB_PASSWORD
+}
+[void](Initialize-RecoveryExperiment @initializeArguments)
 $config = Get-RecoveryConfig
 # The live-impact overlay goes last, so the batch role's trace settings are the only thing it changes.
 $config.ComposeArgs = @($config.ComposeArgs) + @("-f", "compose.live-impact.yaml")
@@ -215,13 +247,28 @@ try {
             throw "Missing '$required'. Build first: gradlew.bat :gatling:classes :gatling:prepareStandaloneGatling (and set -JavaExe)."
         }
     }
+    # redis comes up before any stack-MySQL migration: the one application container that migration
+    # starts (compose.yaml's web-depends-on) will not become healthy without it. rabbitmq is not on
+    # web-1's dependency list, but starting both together here rather than splitting the pair changes
+    # nothing this run measures - no load has started and no fault has been injected.
+    [void](Invoke-Compose -Arguments @("up", "-d", "redis", "rabbitmq"))
+    Wait-ResetTargetsReady
+
+    if ($StackMySql) {
+        if ($ResetMySqlVolume) {
+            Reset-StackMySqlVolume
+        }
+        $schema = Ensure-StackMySqlReady -WorktreeRoot $repoRoot -MigrationAppService $MigrationAppService
+        $events["stackMySqlSchemaMigratedThisRun"] = $schema.Migrated
+        $events["stackMySqlSchemaVersion"] = $schema.After.MaxVersion
+        $events["stackMySqlSchemaTargetVersion"] = $schema.TargetVersion
+        Write-Output "  stack MySQL: schema version $($schema.After.MaxVersion) (target $($schema.TargetVersion)), migrated this run=$($schema.Migrated)"
+    }
     $script:sentinelBefore = Get-NonInterferenceSentinel
     $script:residualBefore = Get-ResidualRowCounts
     Write-Output "  residual rows before: $(($script:residualBefore.Keys | ForEach-Object { "$_=$($script:residualBefore[$_])" }) -join ' ')"
     [void](Assert-ExperimentDataAbsent -Phase "before this run seeds")
 
-    [void](Invoke-Compose -Arguments @("up", "-d", "redis", "rabbitmq"))
-    Wait-ResetTargetsReady
     $redisIdentity = Assert-RedisIsDedicated
     $queues = Get-RabbitQueueState
     Assert-OnlyProjectQueues -Queues $queues
@@ -278,9 +325,21 @@ try {
     # A jar from before the trace existed starts without complaint and writes nothing, which would read as
     # a pipeline that applied nothing. The file is created when the trace starts, so its absence is a
     # refusal here rather than an empty series later.
-    $traceProbe = @(Invoke-Docker -Arguments @("exec", $config.BatchContainer, "sh", "-c", "test -f $traceDirectory/live-apply.csv && echo SBRE_TRACE_ON || echo SBRE_TRACE_OFF"))
-    if (-not ($traceProbe -contains "SBRE_TRACE_ON")) {
-        throw "The batch role did not start the experiment trace in $traceDirectory. The jar predates it or the overlay was not applied."
+    #
+    # The container's own healthcheck (worker-healthcheck: "grep -aq java /proc/1/cmdline") only proves the
+    # JVM process exists, not that Spring context refresh has reached the trace bean - on this machine that
+    # takes ~40s (JPA/Hibernate init dominates), so Wait-PilotStackHealthy above returns healthy long before
+    # the file exists. A single probe here reads as a stale jar every run. Retry it like the other
+    # readiness waits in this codebase (Wait-PilotStackHealthy, Wait-PrometheusTargetsHealthy) instead.
+    $traceDeadline = [DateTimeOffset]::UtcNow.AddSeconds($config.ReadyTimeoutSeconds)
+    $traceOn = $false
+    do {
+        $traceProbe = @(Invoke-Docker -Arguments @("exec", $config.BatchContainer, "sh", "-c", "test -f $traceDirectory/live-apply.csv && echo SBRE_TRACE_ON || echo SBRE_TRACE_OFF"))
+        $traceOn = $traceProbe -contains "SBRE_TRACE_ON"
+        if (-not $traceOn) { Start-Sleep -Seconds 1 }
+    } while (-not $traceOn -and [DateTimeOffset]::UtcNow -lt $traceDeadline)
+    if (-not $traceOn) {
+        throw "The batch role did not start the experiment trace in $traceDirectory within $($config.ReadyTimeoutSeconds) seconds. The jar predates it or the overlay was not applied."
     }
     Reset-EdgeRouting
     Wait-PrometheusTargetsHealthy
@@ -333,9 +392,14 @@ try {
         # an account already handed out; a queued feeder would end the whole run instead.
         "-Dperf.feeder.circular=true",
         # The run is not judged by Gatling's assertions - they are recorded, and the summarizer reads the log.
-        "-Dperf.assert.minSuccessPercent=0",
+        # LoadTestAssertions requires this in (0, 100]; 0 itself throws at Gatling startup
+        # ("perf.assert.minSuccessPercent must be in (0, 100]"), so this is the smallest value that is
+        # still effectively no floor.
+        "-Dperf.assert.minSuccessPercent=0.0001",
         "-Dperf.assert.p95Millis=600000",
-        "-Dperf.assert.minRequests=0",
+        # LoadTestAssertions requires this greater than 0 as well (same reasoning as minSuccessPercent
+        # above); 1 is still effectively no floor for a run sized in the tens of thousands of requests.
+        "-Dperf.assert.minRequests=1",
         "-cp", $classpath,
         "io.gatling.app.Gatling",
         "-s", "my.oj.perf.ContestSubmissionSimulation",
