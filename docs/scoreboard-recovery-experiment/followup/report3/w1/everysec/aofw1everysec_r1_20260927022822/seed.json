@@ -1,0 +1,19 @@
+﻿{
+    "RunId":  "aofw1everysec_r1_20260927022822",
+    "ContestId":  5,
+    "ContestName":  "sbrec_aofw1everysec_r1_20260927022822_contest",
+    "StartTimeMysql":  "2026-09-26 17:28:09.000000",
+    "EndTimeMysql":  "2026-09-26 19:29:09.000000",
+    "FinalizedAtMysql":  "NULL",
+    "ProblemIdStart":  41,
+    "ProblemIdEnd":  50,
+    "ProblemCount":  10,
+    "UserIdStart":  40001,
+    "UserIdEnd":  50000,
+    "UserCount":  10000,
+    "UserPrefix":  "sbrec_aofw1everysec_r1_20260927022822_user",
+    "FeederUserPrefix":  "sbrec_aofw1everysec_r1_20260927022822",
+    "Password":  "pass",
+    "SeededAtUtc":  "2026-09-26T17:29:09.7017903Z",
+    "SeededAtMysql":  "2026-09-26 17:29:09.794883"
+}

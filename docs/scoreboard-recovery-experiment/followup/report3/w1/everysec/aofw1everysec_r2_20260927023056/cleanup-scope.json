@@ -1,0 +1,35 @@
+﻿{
+    "contestId":  6,
+    "seedPrefix":  "sbrec_aofw1everysec_r2_20260927023056_",
+    "redisPattern":  "contest:scoreboard:6:*",
+    "counts":  {
+                   "contest_submission_outbox":  0,
+                   "contest_submission_result":  100000,
+                   "contest_judge_outbox":  0,
+                   "contest_submission":  100000,
+                   "contest_final_score":  0,
+                   "accepted_submission":  0,
+                   "submission":  0,
+                   "user_problem_guard":  0,
+                   "daily_active_users":  0,
+                   "longest_streak_rank_snapshot":  0,
+                   "problem":  10,
+                   "contest":  1,
+                   "`user`":  10000
+               },
+    "statements":  [
+                       "DELETE FROM contest_submission_outbox WHERE contest_id = 6",
+                       "DELETE FROM contest_submission_result WHERE contest_id = 6",
+                       "DELETE FROM contest_judge_outbox WHERE submission_id IN (SELECT id FROM contest_submission WHERE contest_id = 6)",
+                       "DELETE FROM contest_submission WHERE contest_id = 6",
+                       "DELETE FROM contest_final_score WHERE contest_id = 6",
+                       "DELETE FROM accepted_submission WHERE user_id IN (SELECT id FROM `user` WHERE name LIKE \u0027sbrec_aofw1everysec_r2_20260927023056_%\u0027) OR problem_id IN (SELECT id FROM problem WHERE contest_id = 6)",
+                       "DELETE FROM submission WHERE user_id IN (SELECT id FROM `user` WHERE name LIKE \u0027sbrec_aofw1everysec_r2_20260927023056_%\u0027) OR problem_id IN (SELECT id FROM problem WHERE contest_id = 6)",
+                       "DELETE FROM user_problem_guard WHERE user_id IN (SELECT id FROM `user` WHERE name LIKE \u0027sbrec_aofw1everysec_r2_20260927023056_%\u0027) OR problem_id IN (SELECT id FROM problem WHERE contest_id = 6)",
+                       "DELETE FROM daily_active_users WHERE user_id IN (SELECT id FROM `user` WHERE name LIKE \u0027sbrec_aofw1everysec_r2_20260927023056_%\u0027)",
+                       "DELETE FROM longest_streak_rank_snapshot WHERE user_id IN (SELECT id FROM `user` WHERE name LIKE \u0027sbrec_aofw1everysec_r2_20260927023056_%\u0027)",
+                       "DELETE FROM problem WHERE contest_id = 6",
+                       "DELETE FROM contest WHERE id = 6",
+                       "DELETE FROM `user` WHERE name LIKE \u0027sbrec_aofw1everysec_r2_20260927023056_%\u0027"
+                   ]
+}
