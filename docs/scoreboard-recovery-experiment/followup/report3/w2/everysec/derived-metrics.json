@@ -1,0 +1,9 @@
+{
+  "applyLatencyMs": {"n": 139472, "p50": 147, "p95": 603, "p99": 899, "max": 1277, "windowMs": [1790456220454, 1790456520454]},
+  "scoreboardQueryLatencyMs": {"n": 6706, "achievedRps": 22.4, "targetRps": 50, "p50": 30.03, "p99": 198.10, "max": 4745.25, "http200Ratio": "6706/6706"},
+  "redisCpuCoresAvg": 0.254,
+  "redisContainerCpuLimit": 0.5,
+  "redisErrorsOrTimeoutsInBatchLog": 0,
+  "aofWriteLatencySamplesPostRun": 0,
+  "note": "aof-write latency samples read post-run without a LATENCY RESET before this run (unlike W1); 0 here does not mean no slow aof-write events occurred during the window, only that none remained in the fixed-size ring buffer read afterwards. redisCpuCoresAvg from Prometheus redis_cpu_sys_seconds_total+redis_cpu_user_seconds_total rate over the measured window."
+}

@@ -1,0 +1,39 @@
+﻿{
+    "Matches":  false,
+    "ApiDigest":  "fd925a5eb2fce7e84b31222a37b7203d11f759a3cdd791fad47474c6fe2f82c6",
+    "OracleDigest":  "8c2dae9e28d1358b94592b7caed6f0670d1b62bf5f80df66954a387c82630dc0",
+    "ApiParticipants":  10000,
+    "OracleParticipants":  10000,
+    "Difference":  {
+                       "MissingFromScoreboard":  0,
+                       "MissingSample":  [
+
+                                         ],
+                       "NotInOracle":  0,
+                       "NotInOracleSample":  [
+
+                                             ],
+                       "WrongScoreOrPenalty":  2499,
+                       "WrongScoreOrPenaltySample":  [
+                                                         "10156:got(10,28)want(8,7)",
+                                                         "10284:got(10,28)want(8,7)",
+                                                         "12488:got(10,26)want(9,9)",
+                                                         "11090:got(10,28)want(8,7)",
+                                                         "12128:got(10,27)want(9,9)",
+                                                         "10557:got(10,29)want(8,8)",
+                                                         "11590:got(10,29)want(8,7)",
+                                                         "12180:got(10,29)want(8,8)"
+                                                     ],
+                       "WrongRank":  7500,
+                       "WrongRankSample":  [
+                                               12799,
+                                               13574,
+                                               14506,
+                                               15294,
+                                               15416,
+                                               16514,
+                                               16537,
+                                               18157
+                                           ]
+                   }
+}
