@@ -6,6 +6,7 @@ import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.ContestScoreboardSequenceSource;
+import my.oj.web.contest.scoreboard.stream.ContestScoreboardAppliedAtRepair;
 import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamRecoveryService;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
@@ -15,6 +16,9 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -322,6 +326,98 @@ class ContestScoreboardRecoveryModeWiringTests {
                 });
     }
 
+    /**
+     * The background full-replay drains {@code stream:db-pending} after its pass, under the apply lock the
+     * live batch completes under - its only way to drain the ids a rollback restored, because it never
+     * restarts the consumer.
+     */
+    @Test
+    void theBackgroundFullReplayDrainsDbPendingUnderTheApplyLockAfterItsPass() {
+        contextRunner
+                .withPropertyValues("contest.scoreboard.recovery.mode=full-replay")
+                .run(context -> {
+                    RecordingRepair repair = context.getBean(RecordingRepair.class);
+                    ContestScoreboardRecoveryStrategy strategy = context.getBean(ContestScoreboardRecoveryStrategy.class);
+
+                    assertThat(strategy.rebuildHistory(new ContestScoreboardRecoveryStrategy.LostRange(20L, 40L, 40L, -1L)))
+                            .isEqualTo(ContestScoreboardRecoveryStrategy.Outcome.COVERED);
+
+                    long deadline = System.nanoTime() + 10_000_000_000L;
+                    while (repair.calls.get() == 0 && System.nanoTime() < deadline) {
+                        Thread.sleep(10L);
+                    }
+                    assertThat(repair.calls.get()).isEqualTo(1);
+                    assertThat(repair.callsUnderLock.get()).isEqualTo(1);
+                });
+    }
+
+    /**
+     * Everything else is built as before and never reaches the repair: the synchronous full-replay, and
+     * the other two modes, drain the set on the consumer restart that follows their rollback.
+     */
+    @Test
+    void theOtherPathsDoNotDrainDbPendingFromTheStrategy() {
+        contextRunner
+                .withPropertyValues(
+                        "contest.scoreboard.recovery.mode=full-replay",
+                        "contest.scoreboard.recovery.full-replay.rollback-replay=synchronous")
+                .run(context -> {
+                    ContestScoreboardRecoveryStrategy strategy = context.getBean(ContestScoreboardRecoveryStrategy.class);
+                    assertThat(strategy.rebuildHistory(new ContestScoreboardRecoveryStrategy.LostRange(20L, 40L, 40L, -1L)))
+                            .isEqualTo(ContestScoreboardRecoveryStrategy.Outcome.COVERED);
+                    assertThat(context.getBean(RecordingRepair.class).calls.get()).isZero();
+                });
+        for (String mode : new String[]{"stream-offset", "redis-seq"}) {
+            contextRunner
+                    .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                    .run(context -> {
+                        assertThat(context).hasSingleBean(ContestScoreboardRecoveryStrategy.class);
+                        assertThat(context.getBean(RecordingRepair.class).calls.get()).as("mode=%s", mode).isZero();
+                    });
+        }
+    }
+
+    /** A real lock that says whether the calling thread is inside it. */
+    static class RecordingApplyLock extends ContestScoreboardApplyLock {
+
+        private final ThreadLocal<Boolean> held = ThreadLocal.withInitial(() -> false);
+
+        @Override
+        public <T> T withLock(Supplier<T> work) {
+            return super.withLock(() -> {
+                held.set(true);
+                try {
+                    return work.get();
+                } finally {
+                    held.set(false);
+                }
+            });
+        }
+
+        boolean heldByCurrentThread() {
+            return held.get();
+        }
+    }
+
+    static class RecordingRepair implements ContestScoreboardAppliedAtRepair {
+
+        private final RecordingApplyLock lock;
+        final AtomicInteger calls = new AtomicInteger();
+        final AtomicInteger callsUnderLock = new AtomicInteger();
+
+        RecordingRepair(RecordingApplyLock lock) {
+            this.lock = lock;
+        }
+
+        @Override
+        public void repairPending() {
+            calls.incrementAndGet();
+            if (lock.heldByCurrentThread()) {
+                callsUnderLock.incrementAndGet();
+            }
+        }
+    }
+
     private void assertStrategy(String mode,
                                 ContestScoreboardRecoveryMode expected,
                                 boolean rewindsOnCheckpointRegression) {
@@ -353,8 +449,13 @@ class ContestScoreboardRecoveryModeWiringTests {
         }
 
         @Bean
-        ContestScoreboardApplyLock applyLock() {
-            return mock(ContestScoreboardApplyLock.class);
+        RecordingApplyLock applyLock() {
+            return new RecordingApplyLock();
+        }
+
+        @Bean
+        RecordingRepair appliedAtRepair(RecordingApplyLock applyLock) {
+            return new RecordingRepair(applyLock);
         }
 
         @Bean

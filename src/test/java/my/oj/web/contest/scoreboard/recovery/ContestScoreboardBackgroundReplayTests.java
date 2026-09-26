@@ -12,6 +12,8 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -275,6 +277,111 @@ class ContestScoreboardBackgroundReplayTests {
         assertThat(strategy.rebuildHistory(new LostRange(20L, 40L, 40L, -1L))).isEqualTo(Outcome.RETRYABLE_FAILURE);
     }
 
+    /**
+     * The rollback restored {@code stream:db-pending} to its snapshot value, so ids the live path had
+     * already completed are listed again. The consumer is never restarted in this mode, so the pass is
+     * what drains them - after it has run, not before.
+     */
+    @Test
+    void aCompletedPassDrainsTheIdsTheRollbackPutBackInDbPending() throws Exception {
+        Set<Long> dbPending = new TreeSet<>(Set.of(101L, 102L, 103L));
+        ConcurrentLinkedQueue<String> steps = new ConcurrentLinkedQueue<>();
+        when(replayService.replayContestsNewestFirst(any())).thenAnswer(invocation -> {
+            steps.add("replay");
+            return 3;
+        });
+        ContestScoreboardTouchedContests touched = new ContestScoreboardTouchedContests();
+        touched.touched(9L, 30L);
+        ContestScoreboardBackgroundReplay background = background(() -> {
+            steps.add("repair");
+            synchronized (dbPending) {
+                dbPending.clear();
+            }
+        });
+        FullReplayRecoveryStrategy strategy = new FullReplayRecoveryStrategy(replayService, gate, touched, background);
+
+        assertThat(strategy.rebuildHistory(new LostRange(20L, 40L, 40L, -1L))).isEqualTo(Outcome.COVERED);
+
+        assertThat(background.awaitIdle(WAIT)).isTrue();
+        assertThat(steps).containsExactly("replay", "repair");
+        synchronized (dbPending) {
+            assertThat(dbPending).isEmpty();
+        }
+    }
+
+    /** A pass that failed and was retried drains once, after the attempt that completed. */
+    @Test
+    void theDrainWaitsForThePassThatCompletes() throws Exception {
+        ConcurrentLinkedQueue<String> steps = new ConcurrentLinkedQueue<>();
+        AtomicInteger attempts = new AtomicInteger();
+        when(replayService.replayAllContestsNewestFirst()).thenAnswer(invocation -> {
+            if (attempts.incrementAndGet() == 1) {
+                steps.add("failed");
+                throw new IllegalStateException("MySQL went away");
+            }
+            steps.add("replay");
+            return 1;
+        });
+        ContestScoreboardBackgroundReplay background = background(() -> steps.add("repair"));
+
+        assertThat(background.request(20L, 40L, null)).isTrue();
+
+        assertThat(background.awaitIdle(WAIT)).isTrue();
+        assertThat(steps).containsExactly("failed", "replay", "repair");
+    }
+
+    /**
+     * A drain that failed does not undo the pass: it is counted as completed, the worker keeps serving
+     * requests, and the next pass drains again.
+     */
+    @Test
+    void aFailedDrainNeitherFailsThePassNorStopsTheWorker() throws Exception {
+        AtomicInteger drains = new AtomicInteger();
+        ContestScoreboardBackgroundReplay background = background(() -> {
+            if (drains.incrementAndGet() == 1) {
+                throw new IllegalStateException("Redis went away");
+            }
+        });
+
+        assertThat(background.request(20L, 40L, null)).isTrue();
+        assertThat(background.awaitIdle(WAIT)).isTrue();
+        assertThat(background.completedPasses()).isEqualTo(1L);
+
+        assertThat(background.request(21L, 41L, null)).isTrue();
+        assertThat(background.awaitIdle(WAIT)).isTrue();
+        assertThat(background.completedPasses()).isEqualTo(2L);
+        assertThat(drains.get()).isEqualTo(2);
+    }
+
+    /** A pass that never completes - here, one the gate keeps out until close - never drains. */
+    @Test
+    void aPassHeldOutByTheGateDoesNotDrain() throws Exception {
+        AtomicInteger drains = new AtomicInteger();
+        CountDownLatch holding = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Thread other = new Thread(() -> gate.tryRun(PassKind.MYSQL_REPLAY, () -> {
+            holding.countDown();
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return Boolean.TRUE;
+        }));
+        other.start();
+        assertThat(holding.await(10, TimeUnit.SECONDS)).isTrue();
+        ContestScoreboardBackgroundReplay background = background(drains::incrementAndGet);
+
+        assertThat(background.request(20L, 40L, null)).isTrue();
+        assertThat(background.awaitIdle(Duration.ofMillis(200))).isFalse();
+        assertThat(drains.get()).isZero();
+
+        release.countDown();
+        other.join();
+        assertThat(background.awaitIdle(WAIT)).isTrue();
+        assertThat(drains.get()).isEqualTo(1);
+    }
+
     @Test
     void aContestIsTouchedAtOrAboveACheckpointByItsLatestStamp() {
         ContestScoreboardTouchedContests touched = new ContestScoreboardTouchedContests();
@@ -291,6 +398,13 @@ class ContestScoreboardBackgroundReplayTests {
     private ContestScoreboardBackgroundReplay background() {
         ContestScoreboardBackgroundReplay background =
                 new ContestScoreboardBackgroundReplay(replayService, gate, Duration.ofMillis(10));
+        opened.add(background);
+        return background;
+    }
+
+    private ContestScoreboardBackgroundReplay background(Runnable afterPass) {
+        ContestScoreboardBackgroundReplay background =
+                new ContestScoreboardBackgroundReplay(replayService, gate, Duration.ofMillis(10), afterPass);
         opened.add(background);
         return background;
     }

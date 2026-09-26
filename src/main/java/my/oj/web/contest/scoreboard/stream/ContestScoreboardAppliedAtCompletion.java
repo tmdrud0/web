@@ -13,7 +13,7 @@ import java.util.Set;
 /** Repairs the non-authoritative MySQL staleness timestamp without moving the Redis checkpoint. */
 @Component
 @ConditionalOnProperty(prefix = "contest.scoreboard.stream.consumer", name = "enabled", havingValue = "true")
-class ContestScoreboardAppliedAtCompletion {
+class ContestScoreboardAppliedAtCompletion implements ContestScoreboardAppliedAtRepair {
 
     private final StringRedisTemplate redisTemplate;
     private final ContestScoreboardAppliedMarker appliedMarker;
@@ -44,7 +44,8 @@ class ContestScoreboardAppliedAtCompletion {
         );
     }
 
-    void repairPending() {
+    @Override
+    public void repairPending() {
         Set<String> rawIds = redisTemplate.opsForSet().members(
                 RedisContestScoreboardApplier.STREAM_DB_PENDING_KEY
         );

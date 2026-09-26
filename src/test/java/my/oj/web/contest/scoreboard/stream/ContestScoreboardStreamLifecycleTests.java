@@ -59,9 +59,11 @@ class ContestScoreboardStreamLifecycleTests {
     private ContestScoreboardRecoveryStrategy strategy;
     private ContestScoreboardRecoveryCutover cutover;
     private SimpleMeterRegistry registry;
+    private ContestScoreboardAppliedAtCompletion completion;
 
     @BeforeEach
     void setUp() {
+        completion = mock(ContestScoreboardAppliedAtCompletion.class);
         container = mock(SimpleMessageListenerContainer.class);
         applier = mock(ContestScoreboardApplier.class);
         position = new ContestScoreboardStreamPosition();
@@ -627,6 +629,49 @@ class ContestScoreboardStreamLifecycleTests {
         assertThat(consumerArguments()).containsEntry("x-stream-offset", 2L);
     }
 
+    /**
+     * Where the {@code db-pending} set is drained: on every consumer start, and nowhere else in this
+     * class. A Redis rollback restores that set with the rest of the scoreboard, so the ids it puts back
+     * are drained only if something starts the consumer afterwards.
+     *
+     * <p>The rewinding mode restarts the consumer as its answer to the rollback, so it drains.</p>
+     */
+    @Test
+    void theRewindThatAnswersARollbackDrainsTheDbPendingSet() {
+        when(applier.currentStreamOffset()).thenReturn(4L, 2L);
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(true);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        verify(completion, times(1)).repairPending();
+        position.recordAppliedOffset(4L);
+
+        lifecycle.recoverConsumption();
+
+        verify(completion, times(2)).repairPending();
+    }
+
+    /**
+     * A mode that answers a rollback without touching the consumer does not drain the set here. When
+     * its answer is followed by a failed batch - what a busy gate produced in the current code's
+     * full-replay and redis-seq runs - the resubscribe for that batch drains it.
+     */
+    @Test
+    void aNonRewindingModeDrainsTheDbPendingSetOnlyWhenAFailedBatchRestartsTheConsumer() {
+        when(applier.currentStreamOffset()).thenReturn(4L, 2L, 2L);
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordAppliedOffset(4L);
+
+        lifecycle.recoverConsumption();
+        verify(completion, times(1)).repairPending();
+
+        position.recordFailedBatch();
+        lifecycle.recoverConsumption();
+        verify(completion, times(2)).repairPending();
+    }
+
     /** A healthy consumer must be left alone: this pass runs on an interval, all day. */
     @Test
     void aConsumerInStepWithTheScoreboardIsLeftAlone() {
@@ -653,7 +698,7 @@ class ContestScoreboardStreamLifecycleTests {
         return new ContestScoreboardStreamLifecycle(
                 listenerContainer,
                 applier,
-                mock(ContestScoreboardAppliedAtCompletion.class),
+                completion,
                 position,
                 new ContestScoreboardStreamMetrics(registry),
                 properties(startupOffset),

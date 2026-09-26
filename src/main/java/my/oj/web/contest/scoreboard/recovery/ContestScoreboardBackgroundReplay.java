@@ -33,6 +33,16 @@ import java.util.TreeSet;
  *
  * <p>What the gate keeps apart is unchanged: a background pass takes {@link PassKind#MYSQL_REPLAY} like
  * every other replay, so it never overlaps the startup replay or an operator's pass.</p>
+ *
+ * <h2>What runs after a pass</h2>
+ *
+ * <p>A completed pass is followed by {@code afterPass}, which in production drains the
+ * {@code stream:db-pending} set ({@code ContestScoreboardAppliedAtRepair}). The other modes drain it as a
+ * side effect of the consumer restart that follows their rollback; this mode never restarts the consumer,
+ * and a Redis rollback restores the set to its snapshot value, so without this the ids the rollback put
+ * back would stay listed until the JVM restarts. It runs once per completed pass - every rollback is
+ * followed by one - outside the gate, and a failure is logged rather than retried: the pass itself is
+ * done, and the ids stay listed for the next pass or the next consumer start to drain.</p>
  */
 @Slf4j
 public class ContestScoreboardBackgroundReplay implements AutoCloseable {
@@ -42,6 +52,7 @@ public class ContestScoreboardBackgroundReplay implements AutoCloseable {
 
     private final ContestScoreboardFullReplayService replayService;
     private final ContestScoreboardRecoveryPassGate gate;
+    private final Runnable afterPass;
     private final long retryBackoffMillis;
     private final Object monitor = new Object();
     /** The rollbacks merged into the pass that has not started yet. Cleared when it starts. */
@@ -59,8 +70,20 @@ public class ContestScoreboardBackgroundReplay implements AutoCloseable {
     public ContestScoreboardBackgroundReplay(ContestScoreboardFullReplayService replayService,
                                              ContestScoreboardRecoveryPassGate gate,
                                              Duration retryBackoff) {
+        this(replayService, gate, retryBackoff, () -> {
+        });
+    }
+
+    /**
+     * @param afterPass run on the replay thread after each completed pass; see "What runs after a pass"
+     */
+    public ContestScoreboardBackgroundReplay(ContestScoreboardFullReplayService replayService,
+                                             ContestScoreboardRecoveryPassGate gate,
+                                             Duration retryBackoff,
+                                             Runnable afterPass) {
         this.replayService = replayService;
         this.gate = gate;
+        this.afterPass = afterPass;
         this.retryBackoffMillis = Math.max(1L, retryBackoff.toMillis());
         this.worker = new Thread(this::runWorker, "scoreboard-full-replay");
         this.worker.setDaemon(true);
@@ -169,6 +192,15 @@ public class ContestScoreboardBackgroundReplay implements AutoCloseable {
         }
     }
 
+    private void runAfterPass() {
+        try {
+            afterPass.run();
+        } catch (RuntimeException failure) {
+            log.error("The step after a completed background scoreboard replay failed; what it had to drain "
+                    + "stays listed for the next pass or the next consumer start", failure);
+        }
+    }
+
     private void runUntilComplete(Set<Long> contests) {
         while (true) {
             synchronized (monitor) {
@@ -190,6 +222,7 @@ public class ContestScoreboardBackgroundReplay implements AutoCloseable {
                     return Boolean.TRUE;
                 }).isPresent();
                 if (ran) {
+                    runAfterPass();
                     synchronized (monitor) {
                         completedPasses++;
                     }
