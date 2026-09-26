@@ -1,0 +1,38 @@
+﻿{
+    "oj-loadtest-web-1":  {
+                              "cpus":  1,
+                              "memoryBytes":  1342177280
+                          },
+    "oj-loadtest-web-2":  {
+                              "cpus":  1,
+                              "memoryBytes":  1342177280
+                          },
+    "oj-loadtest-batch-1":  {
+                                "cpus":  0.5,
+                                "memoryBytes":  1073741824
+                            },
+    "oj-loadtest-judge-1":  {
+                                "cpus":  0.75,
+                                "memoryBytes":  805306368
+                            },
+    "oj-loadtest-judge-2":  {
+                                "cpus":  0.75,
+                                "memoryBytes":  805306368
+                            },
+    "oj-loadtest-redis":  {
+                              "cpus":  0.5,
+                              "memoryBytes":  536870912
+                          },
+    "oj-loadtest-rabbitmq":  {
+                                 "cpus":  0.75,
+                                 "memoryBytes":  1073741824
+                             },
+    "oj-loadtest-nginx":  {
+                              "cpus":  0.25,
+                              "memoryBytes":  134217728
+                          },
+    "oj-loadtest-mysql":  {
+                              "cpus":  2,
+                              "memoryBytes":  2684354560
+                          }
+}

@@ -1,0 +1,25 @@
+﻿{
+    "message":  "The rebuild of contest 1 did not answer \u0027rebuilt\u0027: wget: can\u0027t connect to remote host (172.26.0.11): Connection refused |  | SBRE_REBUILD_EXIT=1",
+    "position":  "At C:\\Users\\Home\\spring\\web\\web-live-impact\\gatling\\lib\\RecoveryExperiment.LiveImpact.ps1:135 char:9\r\n+         throw \"The rebuild of contest $($config.ContestId) did not an ...\r\n+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~",
+    "events":  {
+                   "runId":  "aofw1no_r1_20260927021948",
+                   "condition":  "no",
+                   "runIndex":  1,
+                   "gitHead":  "4efef42412cd4e789fdfa2087c79f4a0dfaf508f",
+                   "gitDirty":  true,
+                   "targetN":  100000,
+                   "userCount":  10000,
+                   "problemCount":  10,
+                   "acceptPermille":  400,
+                   "redisAppendonly":  "no",
+                   "redisAppendfsync":  "everysec",
+                   "stackMySqlSchemaMigratedThisRun":  true,
+                   "aofEnabledConfigured":  "0",
+                   "aofRewriteInProgressBefore":  "0",
+                   "confAppendonly":  "no",
+                   "confAppendfsync":  "everysec",
+                   "usedMemoryBefore":  "110537296",
+                   "contestId":  1,
+                   "seededResults":  100000
+               }
+}
