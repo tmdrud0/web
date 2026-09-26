@@ -61,6 +61,9 @@ var/
 # See docs/scoreboard-recovery-experiment/README.md §6.2.
 !docs/scoreboard-recovery-experiment/results/
 !docs/scoreboard-recovery-experiment/results/**
+# Same exception for the live-impact sub-experiment's curated results.
+!docs/scoreboard-recovery-experiment/live-impact/results/
+!docs/scoreboard-recovery-experiment/live-impact/results/**
 
 ### Generated performance data ###
 /batch_updates.sql
