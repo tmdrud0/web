@@ -1,0 +1,108 @@
+﻿{
+    "runId":  "aofw1always_r2_20260927024433",
+    "contestId":  9,
+    "seedPrefix":  "sbrec_aofw1always_r2_20260927024433_",
+    "removedAtUtc":  "2026-09-26T17:53:37.7431020Z",
+    "removedAtMysql":  "2026-09-26 17:53:37.831989",
+    "totalDeleted":  210011,
+    "steps":  [
+                  {
+                      "table":  "contest_submission_outbox",
+                      "sql":  "DELETE FROM contest_submission_outbox WHERE contest_id = 9",
+                      "deleted":  0,
+                      "remaining":  0,
+                      "note":  "legacy outbox; no current code writes it, but it is contest-scoped and this experiment owns the contest"
+                  },
+                  {
+                      "table":  "contest_submission_result",
+                      "sql":  "DELETE FROM contest_submission_result WHERE contest_id = 9",
+                      "deleted":  100000,
+                      "remaining":  0,
+                      "note":  "one row per judged submission; carries scoreboard_applied_at"
+                  },
+                  {
+                      "table":  "contest_judge_outbox",
+                      "sql":  "DELETE FROM contest_judge_outbox WHERE submission_id IN (SELECT id FROM contest_submission WHERE contest_id = 9)",
+                      "deleted":  0,
+                      "remaining":  0,
+                      "note":  "the live judge outbox, cascaded from contest_submission"
+                  },
+                  {
+                      "table":  "contest_submission",
+                      "sql":  "DELETE FROM contest_submission WHERE contest_id = 9",
+                      "deleted":  100000,
+                      "remaining":  0,
+                      "note":  "the contest submissions themselves"
+                  },
+                  {
+                      "table":  "contest_final_score",
+                      "sql":  "DELETE FROM contest_final_score WHERE contest_id = 9",
+                      "deleted":  0,
+                      "remaining":  0,
+                      "note":  "written only by finalization, which this experiment never runs; counted to prove it stayed empty"
+                  },
+                  {
+                      "table":  "accepted_submission",
+                      "sql":  "DELETE FROM accepted_submission WHERE user_id IN (SELECT id FROM `user` WHERE name LIKE \u0027sbrec_aofw1always_r2_20260927024433_%\u0027) OR problem_id IN (SELECT id FROM problem WHERE contest_id = 9)",
+                      "deleted":  0,
+                      "remaining":  0,
+                      "note":  "plain-path table; scoped because a submission outside the contest window would land here instead of the contest pipeline"
+                  },
+                  {
+                      "table":  "submission",
+                      "sql":  "DELETE FROM submission WHERE user_id IN (SELECT id FROM `user` WHERE name LIKE \u0027sbrec_aofw1always_r2_20260927024433_%\u0027) OR problem_id IN (SELECT id FROM problem WHERE contest_id = 9)",
+                      "deleted":  0,
+                      "remaining":  0,
+                      "note":  "plain-path table, same reason; a non-empty count here is evidence the contest window closed mid-run"
+                  },
+                  {
+                      "table":  "user_problem_guard",
+                      "sql":  "DELETE FROM user_problem_guard WHERE user_id IN (SELECT id FROM `user` WHERE name LIKE \u0027sbrec_aofw1always_r2_20260927024433_%\u0027) OR problem_id IN (SELECT id FROM problem WHERE contest_id = 9)",
+                      "deleted":  0,
+                      "remaining":  0,
+                      "note":  "plain-path guard row"
+                  },
+                  {
+                      "table":  "daily_active_users",
+                      "sql":  "DELETE FROM daily_active_users WHERE user_id IN (SELECT id FROM `user` WHERE name LIKE \u0027sbrec_aofw1always_r2_20260927024433_%\u0027)",
+                      "deleted":  0,
+                      "remaining":  0,
+                      "note":  "date-keyed, so it is scoped by user rather than by contest"
+                  },
+                  {
+                      "table":  "longest_streak_rank_snapshot",
+                      "sql":  "DELETE FROM longest_streak_rank_snapshot WHERE user_id IN (SELECT id FROM `user` WHERE name LIKE \u0027sbrec_aofw1always_r2_20260927024433_%\u0027)",
+                      "deleted":  0,
+                      "remaining":  0,
+                      "note":  "a scheduled snapshot; this run\u0027s users can appear in it"
+                  },
+                  {
+                      "table":  "problem",
+                      "sql":  "DELETE FROM problem WHERE contest_id = 9",
+                      "deleted":  10,
+                      "remaining":  0,
+                      "note":  "deleted before the contest, because the FK is ON DELETE SET NULL and an orphaned problem silently routes to the plain path"
+                  },
+                  {
+                      "table":  "contest",
+                      "sql":  "DELETE FROM contest WHERE id = 9",
+                      "deleted":  1,
+                      "remaining":  0,
+                      "note":  "the contest itself"
+                  },
+                  {
+                      "table":  "`user`",
+                      "sql":  "DELETE FROM `user` WHERE name LIKE \u0027sbrec_aofw1always_r2_20260927024433_%\u0027",
+                      "deleted":  10000,
+                      "remaining":  0,
+                      "note":  "the experiment\u0027s users, deleted last because the tables above reference them"
+                  }
+              ],
+    "residualRows":  {
+                         "user":  0,
+                         "daily_active_users":  0,
+                         "longest_streak_bucket":  0,
+                         "longest_streak_rank_snapshot":  0,
+                         "contest":  0
+                     }
+}
