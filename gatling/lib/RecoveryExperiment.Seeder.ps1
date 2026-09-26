@@ -32,8 +32,17 @@
 # is the delete order: children before parents, and `problem` before `contest`.
 function Get-ExperimentTableScope {
     $config = Get-RecoveryConfig
-    $contestId = [string]$config.ContestId
     $prefix = $config.SeedPrefix
+    # Before a seed, ContestId is only the placeholder default (1), and that can be another experiment's
+    # contest: the stack's oj_loadtest still holds the peak-dispatch runs' contests 1 and 2. The pre-seed
+    # absence check counted those rows as this run's and refused to start. Until the seed sets the scope,
+    # this run's contest is the one carrying its seeded name, and a fresh run has none. The scalar
+    # subquery answers NULL then, so every `contest_id = ...` below matches nothing.
+    if ($config.ContestScopeFromSeed) {
+        $contestId = [string]$config.ContestId
+    } else {
+        $contestId = "(SELECT id FROM contest WHERE name = '${prefix}contest')"
+    }
     # Single-quoted so the backticks reach MySQL as identifier quotes rather than being read as
     # PowerShell's escape character.
     $tUser = '`user`'
