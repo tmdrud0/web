@@ -70,7 +70,7 @@ $traceDirectory = "/tmp/sbrec-trace/$runId"
         -DbContainer "oj-loadtest-mysql" -DbName "oj_loadtest" -StackMySqlAuth `
         -JavaExe $JavaExe)
 $config = Get-RecoveryConfig
-$config.ComposeArgs = @($config.ComposeArgs) + @("-f", "compose.redis-persistence.yaml")
+$config.ComposeArgs = @($config.ComposeArgs) + @("-f", "compose.live-impact.yaml", "-f", "compose.redis-persistence.yaml")
 
 $env:REDIS_APPENDONLY = if ($Condition -eq "no") { "no" } else { "yes" }
 $env:REDIS_APPENDFSYNC = if ($Condition -eq "always") { "always" } else { "everysec" }
@@ -111,6 +111,17 @@ Write-Output "  artifacts: $artifacts"
 
 try {
     # --- stack up (never -ResetMySqlVolume: see the everysec contamination incident in W2) -----------
+    # If a redis from an earlier condition is still running, force a synchronous SAVE before recreating
+    # it for this condition's command-line change. `docker compose up -d redis` recreates on a config
+    # diff via a graceful stop (SIGTERM) that *should* itself trigger a save, but relying on that timing
+    # is exactly what produced an empty restart once already in this report (the everysec run right
+    # after a W3 crash test came up with no RDB to load at all - "Creating AOF base file ... on server
+    # start" with no preceding "Loading RDB" line). A blocking SAVE here removes that race entirely.
+    $existingRedis = @(Invoke-Docker -Arguments @("inspect", "-f", "{{.State.Running}}", $config.RedisContainer) 2>$null)
+    if ($existingRedis -contains "true") {
+        try { [void](Invoke-RedisText -RedisArguments @("SAVE")) }
+        catch { Write-Output "  pre-recreate SAVE on the previous condition's redis failed (continuing): $($_.Exception.Message)" }
+    }
     [void](Invoke-Compose -Arguments @("up", "-d", "rabbitmq"))
     [void](Invoke-Compose -Arguments @("up", "-d", "redis"))
     Wait-ResetTargetsReady
@@ -155,15 +166,27 @@ try {
     $events["seededResults"] = $seeded.ResultRows
     Write-Output "  seeded $($seeded.ResultRows) judged result(s); rebuilding the board"
 
-    $readyDeadline = [DateTimeOffset]::UtcNow.AddSeconds(120)
-    $rebuildOutput = $null
-    while ($null -eq $rebuildOutput) {
-        try { $rebuildOutput = Invoke-LiveImpactScoreboardRebuild }
-        catch {
-            if ([DateTimeOffset]::UtcNow -gt $readyDeadline) { throw "The rebuild endpoint did not answer within 120s: $($_.Exception.Message)" }
-            Start-Sleep -Seconds 3
+    # A health probe first, and the rebuild call exactly once: retrying the rebuild itself risks two
+    # concurrent rebuildFromContestResults() runs overlapping if the first one is merely slow to answer
+    # rather than truly unreachable (batch-1's worker healthcheck is satisfied long before Spring context
+    # refresh - see the live-impact runner's own note on this), and two interleaved reset()+replay passes
+    # can double-apply a submission before the second reset's dedup-set wipe catches up with the first
+    # pass's progress. Found this the hard way: an earlier run here left 2499 users' solved counts wrong
+    # (score inflated to 10/10) with a normal-looking log, traced back to this exact retry loop.
+    $healthDeadline = [DateTimeOffset]::UtcNow.AddSeconds(120)
+    $healthScript = @'
+wget -q -T 5 -O - http://batch-1:9000/actuator/health && echo && echo "SBRE_HEALTH_EXIT=0" || echo "SBRE_HEALTH_EXIT=1"
+'@
+    $healthy = $false
+    while (-not $healthy) {
+        $healthOutput = @(Invoke-ContainerScript -Container $config.RedisContainer -ScriptText $healthScript -Description "batch-1 actuator health probe")
+        $healthy = (@($healthOutput) -match '"status"\s*:\s*"UP"') -and (@($healthOutput) -match 'SBRE_HEALTH_EXIT=0')
+        if (-not $healthy) {
+            if ([DateTimeOffset]::UtcNow -gt $healthDeadline) { throw "batch-1's actuator health did not report UP within 120s: $($healthOutput -join ' | ')" }
+            Start-Sleep -Seconds 2
         }
     }
+    $rebuildOutput = Invoke-LiveImpactScoreboardRebuild
     [void](Wait-PipelineQuiescent -TimeoutSeconds $DrainTimeoutSeconds -Description "the pipeline before the load")
     $aligned = Compare-LiveImpactUserTotals
     Write-JsonFile -Path (Join-Path $artifacts "consistency-before-load.json") -Object $aligned
