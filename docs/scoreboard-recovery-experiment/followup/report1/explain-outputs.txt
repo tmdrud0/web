@@ -1,0 +1,156 @@
+Captured against liredisseq_r1_20260927010033's data, contest_submission_result @ 286,557 rows
+(scoreboard_applied_seq range 286698..573254), BEFORE this run's cleanup deleted the rows.
+Database: oj_loadtest on container oj-loadtest-mysql (loadtest stack's own MySQL 8.0.45).
+
+================================================================================
+1) findSequencedRowsDescending (afterSequence = NULL, checkWindowSize = 1000)
+   -- the descending tail-walk window, first call of a round
+================================================================================
+
+SQL (Hibernate-rendered, from performance_schema digest text, with the two-way
+`? IS NULL OR ... < ?` bind parameters both substituted with NULL, LIMIT 1000):
+
+SELECT s1_0.id, csr1_0.scoreboard_applied_seq, csr1_0.contest_id, s1_0.problem_id,
+       s1_0.user_id, c1_0.start_time, s1_0.submitted_time,
+       COALESCE(csr1_0.final_result, csr1_0.provisional_result)
+FROM contest_submission_result csr1_0
+JOIN contest_submission s1_0 ON s1_0.id = csr1_0.submission_id
+JOIN contest c1_0 ON c1_0.id = s1_0.contest_id
+WHERE csr1_0.scoreboard_applied_seq IS NOT NULL
+  AND (NULL IS NULL OR csr1_0.scoreboard_applied_seq < NULL)
+ORDER BY csr1_0.scoreboard_applied_seq DESC
+LIMIT 1000;
+
+--- EXPLAIN FORMAT=TREE ---
+
+-> Limit: 1000 row(s)
+    -> Sort: csr1_0.scoreboard_applied_seq DESC, limit input to 1000 row(s) per chunk
+        -> Stream results  (cost=90800 rows=68451)
+            -> Nested loop inner join  (cost=90800 rows=68451)
+                -> Inner hash join (no condition)  (cost=42362 rows=138397)
+                    -> Table scan on c1_0  (cost=0.00198 rows=1)
+                    -> Hash
+                        -> Index range scan on csr1_0 using idx_csr_scoreboard_applied_seq
+                           over (NULL < scoreboard_applied_seq), with index condition:
+                           (csr1_0.scoreboard_applied_seq is not null)  (cost=28249 rows=138397)
+                -> Filter: (s1_0.contest_id = c1_0.id)  (cost=0.25 rows=0.495)
+                    -> Single-row index lookup on s1_0 using PRIMARY (id=csr1_0.submission_id)
+                       (cost=0.25 rows=1)
+
+--- EXPLAIN ANALYZE (actual execution against the real 286,557-row table) ---
+
+-> Limit: 1000 row(s)  (actual time=685..685 rows=1000 loops=1)
+    -> Sort: csr1_0.scoreboard_applied_seq DESC, limit input to 1000 row(s) per chunk
+       (actual time=685..685 rows=1000 loops=1)
+        -> Stream results  (cost=90800 rows=68451) (actual time=245..636 rows=286557 loops=1)
+            -> Nested loop inner join  (cost=90800 rows=68451) (actual time=245..535 rows=286557 loops=1)
+                -> Inner hash join (no condition)  (cost=42362 rows=138397)
+                   (actual time=245..278 rows=286557 loops=1)
+                    -> Table scan on c1_0  (cost=0.00198 rows=1) (actual time=0.012..0.016 rows=1 loops=1)
+                    -> Hash
+                        -> Index range scan on csr1_0 using idx_csr_scoreboard_applied_seq
+                           over (NULL < scoreboard_applied_seq), with index condition:
+                           (csr1_0.scoreboard_applied_seq is not null)
+                           (cost=28249 rows=138397) (actual time=0.156..222 rows=286557 loops=1)
+                -> Filter: (s1_0.contest_id = c1_0.id)  (cost=0.25 rows=0.495)
+                   (actual time=714e-6..781e-6 rows=1 loops=286557)
+                    -> Single-row index lookup on s1_0 using PRIMARY (id=csr1_0.submission_id)
+                       (cost=0.25 rows=1) (actual time=609e-6..631e-6 rows=1 loops=286557)
+
+READING: the index range scan itself is fine (222ms, correctly restricted to the
+scoreboard_applied_seq IS NOT NULL rows). But the optimizer picks an *inner hash join*
+against `contest` before the sort, and streams the FULL join result (286,557 rows -
+every row in the table, not just the qualifying ~138K the optimizer estimated) into a
+filesort, and only then applies LIMIT 1000. The index's own DESC order is discarded;
+LIMIT is evaluated after materializing and sorting the whole matching set. Total: 685ms,
+286,557 rows examined/joined for a call whose caller only wanted 1,000 rows back.
+
+Note: run against an EMPTY table (after this run's own data was cleaned up, as a
+sanity check), the optimizer instead picks a reverse index range scan + nested-loop
+(index order preserved, no filesort, early LIMIT) - see below. The bad plan is a
+cardinality-estimate-dependent choice the optimizer makes only once the table is
+non-trivially sized; it is not a fixed defect of the SQL shape alone, but repeatably
+wrong at the row counts this experiment actually reaches (100K+ per contest).
+
+--- EXPLAIN ANALYZE, same query, empty table (0 rows, after cleanup) ---
+
+-> Limit: 1000 row(s)  (cost=1.41 rows=1) (actual time=0.045..0.045 rows=0 loops=1)
+    -> Nested loop inner join  (cost=1.41 rows=1) (actual time=0.0447..0.0447 rows=0 loops=1)
+        -> Nested loop inner join  (cost=1.06 rows=1) (actual time=0.0443..0.0443 rows=0 loops=1)
+            -> Index range scan on csr1_0 using idx_csr_scoreboard_applied_seq
+               over (NULL < scoreboard_applied_seq) (reverse), with index condition:
+               (csr1_0.scoreboard_applied_seq is not null)  (cost=0.71 rows=1)
+               (actual time=0.044..0.044 rows=0 loops=1)
+            -> Single-row index lookup on s1_0 using PRIMARY (id=csr1_0.submission_id)
+               (cost=0.35 rows=1) (never executed)
+        -> Single-row index lookup on c1_0 using PRIMARY (id=s1_0.contest_id)
+           (cost=0.35 rows=1) (never executed)
+
+================================================================================
+2) findDuplicateAppliedSequences (afterSequence = NULL, checkWindowSize = 1000)
+================================================================================
+
+SELECT csr1_0.scoreboard_applied_seq, COUNT(csr1_0.submission_id)
+FROM contest_submission_result csr1_0
+WHERE csr1_0.scoreboard_applied_seq IS NOT NULL
+  AND (NULL IS NULL OR csr1_0.scoreboard_applied_seq > NULL)
+GROUP BY csr1_0.scoreboard_applied_seq
+HAVING COUNT(csr1_0.submission_id) > 1
+ORDER BY csr1_0.scoreboard_applied_seq
+LIMIT 1000;
+
+--- EXPLAIN FORMAT=TREE ---
+
+-> Limit: 1000 row(s)  (cost=41591 rows=1000)
+    -> Filter: (count(csr1_0.submission_id) > 1)  (cost=41591 rows=138397)
+        -> Group aggregate: count(csr1_0.submission_id), count(csr1_0.submission_id)
+           (cost=41591 rows=138397)
+            -> Filter: (csr1_0.scoreboard_applied_seq is not null)  (cost=27751 rows=138397)
+                -> Covering index range scan on csr1_0 using idx_csr_scoreboard_applied_seq
+                   over (NULL < scoreboard_applied_seq)  (cost=27751 rows=138397)
+
+READING: no join, no filesort - a covering index scan feeding a streaming group
+aggregate. This is the efficient shape: cost is proportional to the number of rows
+with scoreboard_applied_seq set (all of them, once the contest is fully judged), which
+is structurally required to prove no group has count > 1 - a HAVING COUNT(*) > 1 cannot
+stop early on a clean range. Rows examined here scale with table size, but the per-row
+cost is a covering-index compare, not a join.
+
+================================================================================
+3) findReplayRowsByContestId (full-replay mode's page query - reference only,
+   shared with report 2)
+================================================================================
+
+SELECT csr.submission_id, s.problem_id, s.user_id, c.start_time, s.submitted_time,
+       COALESCE(csr.final_result, csr.provisional_result)
+FROM contest_submission_result csr
+JOIN contest_submission s ON s.id = csr.submission_id
+JOIN contest c ON c.id = s.contest_id
+WHERE csr.contest_id = 1
+  AND (100 IS NULL OR s.id > 100)
+  AND COALESCE(csr.final_result, csr.provisional_result) <> 'PENDING'
+ORDER BY s.id
+LIMIT 1000;
+
+--- EXPLAIN FORMAT=TREE ---
+
+-> Limit: 1000 row(s)
+    -> Sort: s.id, limit input to 1000 row(s) per chunk
+        -> Stream results  (cost=39766 rows=34226)
+            -> Nested loop inner join  (cost=39766 rows=34226)
+                -> Nested loop inner join  (cost=15547 rows=69198)
+                    -> Table scan on c  (cost=0.35 rows=1)
+                    -> Filter: (coalesce(csr.final_result,csr.provisional_result) <> 'PENDING')
+                       (cost=8627 rows=69198)
+                        -> Index lookup on csr using idx_csr_contest_result_submission
+                           (contest_id=1), with index condition: (csr.submission_id > 100)
+                           (cost=8627 rows=138397)
+                -> Filter: (s.contest_id = c.id)  (cost=0.25 rows=0.495)
+                    -> Single-row index lookup on s using PRIMARY (id=csr.submission_id)
+                       (cost=0.25 rows=1)
+
+READING: same family of plan as (1) - a sort-then-limit over a join whose driving
+index (idx_csr_contest_result_submission) is per-contest and already keyset-ordered on
+submission_id, but the plan still materializes and sorts the qualifying set rather than
+walking the index in order and stopping at LIMIT. Recorded for report 2's cross-check;
+not analyzed further here.

@@ -1,0 +1,227 @@
+digest,text,count_delta,rows_examined_delta,rows_sent_delta,timer_wait_delta_ps,no_index_used_delta,sort_rows_delta
+da113483d890d79438e19adf6db06588aae0ee0ad5e5b36278761405470bb68a,"SELECT `s1_0` . `id` , `csr1_0` . `scoreboard_applied_seq` , `csr1_0` . `contest_id` , `s1_0` . `problem_id` , `s1_0` . ",41,5625127,40000,8155863666000,41,40000
+2e29b7b034e858edfb69ddf80722bc30d059e7b413303ce335aa693b656176a0,"SELECT `csr1_0` . `scoreboard_applied_seq` , COUNT ( `csr1_0` . `submission_id` ) FROM `contest_submission_result` `csr1",5,289519,0,89835309000,0,0
+0e4e5b16f261d9c6e0e1616ea8e5fc5acfcd18158325ee8e5afb935017c3d060,SELECT COUNT ( * ) FROM `contest_submission_result` WHERE `contest_id` = ? AND `scoreboard_applied_at` IS NULL,3,260380,3,232858097000,0,0
+7e50500a45bf06b8b876dbcd366437cad3f9a23c710985614b935ee6d580adea,"INSERT INTO `contest_submission` ( `id` , `contest_id` , `problem_id` , `user_id` , `submitted_time` , CODE , `code_hash",1,154236,0,2143160326000,1,0
+5f1319daeaeab0d7bca7232d17a4bd3354f9bcbfa2f29e9cf0b4bb1d017a376c,"SELECT `CONCAT` ( ? , COUNT ( * ) , ? , SUM ( `r` . `submission_id` IS NOT NULL ) ) FROM `contest_submission` `cs` LEFT ",1,154226,1,79912654000,0,0
+6bac9e28cd909ff6c564db52c2e10d9d989198e3622506f63b6572661d0d9bab,"UPDATE `contest_submission_result` SET `scoreboard_applied_at` = COALESCE ( `scoreboard_applied_at` , NOW (?) ) , `score",103209,103208,0,14700409261000,0,0
+84f6453515fe66673d0de93ff8da79994041e53b84ec0e8378c2979e7ae814c6,"SELECT `csr1_0` . `submission_id` , `csr1_0` . `contest_id` , `csr1_0` . `final_judged_at` , `csr1_0` . `final_result` ,",78,77113,77113,274181596000,0,0
+a8e0cadfa3228402e2084983322d7baab7b16519de450844f7d34ae904d4af62,"SELECT `cs1_0` . `id` , `cs1_0` . `code` , `cs1_0` . `code_hash` , `cs1_0` . `contest_id` , `cs1_0` . `problem_id` , `cs",78,77113,77113,194257185000,0,0
+09a429b4074221d8fea7de51741675c736991e35bc8b6e7d4666cdf2c8d3c4bd,"INSERT INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_judged_at",1,77113,0,959910788000,0,0
+a2a0778ca8ff9f27b5d78f6dbb00f0dc86677cfd02e84392df643ed8e34c49d4,SELECT `csr1_0` . `submission_id` FROM `contest_submission_result` `csr1_0` WHERE `csr1_0` . `contest_id` = ? AND ( ? IS,79,77113,77113,51386849000,0,0
+629ddefcce28838eb5f9819275c3048e920a7f1c47a02fcd314f5c3df822a609,"SELECT `id` , `submission_id` FROM `contest_judge_outbox` WHERE STATUS = ? OR ( STATUS = ? AND `claimed_at` < ? ) ORDER ",900,58482,28220,346486396000,0,28175
+ce48a5726426f40c4619e67be3eb2ea3607c31bfed3c01d48df5f40ebe1b1323,"WITH `resolved` AS ( SELECT `cs` . `user_id` AS `user_id` , `cs` . `problem_id` AS `problem_id` , `cs` . `id` AS `submis",1,29781,10000,310591487000,1,40798
+176d59cc5ee22a02be3be23ce920170d39d1b8b8a55d1d2e5324eff2749dff5f,"SELECT `id` , `contest_id` , `problem_id` , `user_id` , `code_hash` FROM `contest_submission` WHERE `id` IN (...)",1776,29236,29236,640660767000,0,0
+4d9bf13d4a1990aa91cffd35637070e11cc2812a95ea5b224abd382e3193f09d,"UPDATE `contest_judge_outbox` SET STATUS = ? , `claim_token` = ? , `claimed_at` = NOW (?) , `attempts` = `attempts` + ? ",28220,28220,0,5338383068000,0,0
+b02b21dff0741a3335b3af49ab1c8d291f7857c6b6cd2dfb111f8d9ecf9ff078,"UPDATE `contest_judge_outbox` SET STATUS = ? , `published_at` = NOW (?) , `claim_token` = ? , `claimed_at` = ? , `last_e",27834,27834,0,6031193968000,0,0
+81e71767f9d8d10901e5e1b2b402065eba99ca9108449cdf9529df3d19b2aecd,"SELECT `cs1_0` . `id` , `c1_0` . `id` , `cs1_0` . `problem_id` , `cs1_0` . `user_id` , `c1_0` . `start_time` , `cs1_0` .",27637,27700,27710,7341976100000,0,0
+c0066ea11affd8cfdecf6e133173291d0456413df0e3c1d722cf87551260c749,SHOW GLOBAL VARIABLES,21,13251,13251,66811341000,21,0
+070e38632eb4444e50cdcbf0b17474ba801e203add89783a24584951442a2317,SHOW GLOBAL STATUS,21,10374,10374,33181118000,21,0
+00151ebb35dda2ba4f617852e8b3da038588c3984312a4941e615a9882e1b8c6,"SELECT `CONCAT` ( ? , MIN ( `id` ) , ? , MAX ( `id` ) , ? , COUNT ( * ) , ? , SUM ( `pass` != ? ) , ? , SUM ( NAME NOT L",1,10000,1,6377811000,1,0
+c16f24f908846019a741db580f6545a5933e9435a7cf1579c50794a6ca287739,SELECT @@SESSION . `transaction_read_only`,9141,9142,9142,1214708177000,0,0
+bcf6e713de01dcd39204e71874044a80a2886e20b925b442edc8b04a286a11c6,"SELECT NAME , `subsystem` , TYPE , COMMENT , `count` FROM `information_schema` . `innodb_metrics` WHERE `status` = ?",21,6594,1554,11641377000,21,0
+a9971bbbfe401fb5c32b3ec7e966a3160fbf00717bbb24365224a858d422c7bb,"SELECT `TABLE_SCHEMA` , ? , TABLE_NAME , COLUMN_NAME , CASE WHEN `UPPER` ( `DATA_TYPE` ) = ? THEN ? WHEN `UPPER` ( `DATA",10,5310,1180,38459964000,0,1180
+ba1a1cfbb255ec82e146498171a2b339c0c6d5222efe1ff9234f43aa56577461,SELECT `WORD` FROM `INFORMATION_SCHEMA` . `KEYWORDS` WHERE `RESERVED` = ? ORDER BY `WORD`,10,5240,2620,17328374000,0,2620
+45c79d834234f8163da1d36a7a75eeb3550dea809f3eb85d9eec639fd73829d2,"SELECT STATUS , COUNT ( * ) AS ROW_COUNT FROM ( SELECT STATUS FROM `contest_judge_outbox` WHERE STATUS IN (...) LIMIT ? ",29,5000,21,24481929000,29,0
+94900e11c7f8e7c5cada86bba4aa98e5c43d48890136f7cd19235698e97e0451,"SELECT `u1_0` . `id` , `u1_0` . `name` , `u1_0` . `pass` , `u1_0` . `solved_count` , `u1_0` . `streak_current_streak` , ",2494,2498,2498,1399885970000,0,0
+6d566561958340058295103a4a5d0bea98e37d7d59e89bf511f424d887b605fa,"SELECT `DIGEST` , LEFT ( `DIGEST_TEXT` , ? ) , `COUNT_STAR` , `SUM_ROWS_EXAMINED` , `SUM_ROWS_SENT` , `SUM_TIMER_WAIT` ,",15,2345,2345,38421298000,15,0
+eda52df0898742aba9e5102719abb85ccbadef25aded983b31ae691b46717081,"SELECT SYSTEM_USER , `SUBSTRING_INDEX` ( HOST , ?, ... ) AS HOST , COALESCE ( `command` , ? ) AS `command` , COALESCE ( ",21,2170,2149,22899803000,21,0
+5e073c151eab856302cb0ecb3e1aa5bb8a4d0c3c8362a8d9f42643c449f5ac67,"SELECT `TABLE_SCHEMA` AS `TABLE_CAT` , ? AS `TABLE_SCHEM` , TABLE_NAME , CASE WHEN `TABLE_TYPE` = ? THEN CASE WHEN `TABL",51,1173,51,36425298000,0,51
+284ed8f763d9220df7bbbca74c4e4d54bd9a883884953e278ad64c89d4a6435e,"SELECT `page_size` , `buffer_pool_instance` , `pages_used` , `pages_free` , `relocation_ops` , `relocation_time` FROM `i",21,630,630,6143573000,21,0
+7519fba1562ea8a9674b468c1f2978fadd0c9f7b26004b985a7707ba7c8c5879,SELECT COUNT ( * ) FROM `contest_judge_outbox` WHERE STATUS != ?,3,603,3,1392933000,0,0
+c5967ff0da90e14faf734ee81d89070f01682f51bf2732e0293212cce0cb7756,"SELECT `TABLE_SCHEMA` AS `TABLE_CAT` , ? AS `TABLE_SCHEM` , TABLE_NAME , CASE WHEN `TABLE_TYPE` = ? THEN CASE WHEN `TABL",10,590,190,12462856000,0,190
+0f72a2f7ecd2522d4b0415deb4c27383196094ae0d2c62e6cbdedc486b287d00,SELECT COLUMN_NAME FROM `information_schema` . `columns` WHERE `table_schema` = ? AND TABLE_NAME = ? AND COLUMN_NAME IN ,21,336,21,21608189000,0,0
+c20fcea11911be36651b7ca7bd3712d4ed9ac1134cee9c6620039e1fb13b5eff,"SELECT @@SESSION . `auto_increment_increment` AS `auto_increment_increment` , @@`character_set_client` AS `character_set",228,228,228,64695812000,0,0
+2923bd93f82d9e17f8226b0fe6fb6dd8589823870cb44f6f6a9214cacaf1fb11,"SELECT `installed_rank` , `version` , `description` , `type` , `script` , `checksum` , `installed_on` , `installed_by` ,",9,162,162,3961399000,0,0
+739c845cdc8f54c3ebcf2abe9fd8ba13474f3415fd6cd0b61cee9b51663face9,"SELECT `page_size` , `compress_ops` , `compress_ops_ok` , `compress_time` , `uncompress_ops` , `uncompress_time` FROM `i",21,105,105,3344029000,21,0
+95c8507923edcddc0ae27658c89ed840d33d788d005c6834667b35ad26c51d62,SELECT COUNT (?) FROM `information_schema` . `schemata` WHERE SCHEMA_NAME = ? LIMIT ?,23,92,23,10152181000,0,0
+6d98f6a02d34e0f0456ad46ec8693c0c0326eeaa342e846f3302ae300bf313df,SELECT * FROM `oj_loadtest` . `flyway_schema_history` FOR UPDATE,6,87,87,730658000,6,0
+accf90a57ac0e2f73a777ce7f2332a69a1da35e21a891c54ba1b3dbf5735c01f,"SELECT `c1_0` . `id` , `c1_0` . `end_time` , `c1_0` . `finalized_at` , `c1_0` . `name` , `c1_0` . `start_time` FROM `con",78,78,78,11256199000,0,0
+0bd52df5a6e81880a88240d0ee10dc4b5216af65873f704072a88b2db08af010,SHOW SCHEMAS LIKE ?,9,54,0,8080847000,9,0
+d91a28e3a99d2b0a2c2cab0deef6edee65504bacdcc5237481b50baf6a02d3a8,"SELECT `p1_0` . `id` , `c1_0` . `id` , `c1_0` . `end_time` , `c1_0` . `finalized_at` , `c1_0` . `name` , `c1_0` . `start",40,40,40,11386847000,0,0
+46f5249814f7d2a6390ad8bc3b5336b7c7b90c2262d30266cf1f37c158e13a8f,"SELECT COUNT ( * ) , `IFNULL` ( MAX ( CAST ( `version` AS UNSIGNED ) ) , ? ) , `IFNULL` ( MIN ( CASE WHEN `success` THEN",2,31,2,594223000,2,0
+ce04eda080d3f5605113e1d0d47c2f20e23b091e2487ba586f07b32cda423942,SELECT SCHEMA ( ),27,27,27,2834264000,0,0
+6c34c9edb36fd2d575a66f1762f0bb40569b0049df13f95423e358ef409930b6,SELECT `version` ( ),23,23,23,2847849000,0,0
+d210015a0c276d85b92323714234cff1ce4a2a740ac094a87abf8f25e21f1e3d,SELECT @@`version`,21,21,21,2776727000,0,0
+0043eb5be5b35c6fd2a45dfdfe42895c8c24dfa6f4ee1a0e205121fb1cd810da,"SELECT `CONCAT` ( ? , COUNT ( * ) , ? , `IFNULL` ( MAX ( `installed_rank` ) , ? ) , ? , `IFNULL` ( MAX ( `version` ) , ?",1,18,1,180685000,1,0
+9f6606aa4a617001be69c6327abdcbecf410b1281756802de955c77df12d101e,SELECT `RELEASE_LOCK` (?),16,16,16,1414130000,0,0
+44e35cee979ba420eb49a8471f852bbe15b403c89742704817dfbaace0d99dbb,SELECT @@`version_comment` LIMIT ?,15,15,15,1995213000,0,0
+210f83c02903215c675fba4b4d27b8f5699d2c738724bdcba3482ab3124c4bb9,SELECT `GET_LOCK` (...),15,15,15,1570216000,0,0
+b0a2105f85f781a2af3593f66431f1528f14f14566499839ea27e23911fb9a5a,SHOW GLOBAL STATUS WHERE `Variable_name` IN (...),1,12,12,4068459000,1,0
+07e5a3dca381a1eec824ab08aa6edf99d8c17e583d6a419e0bb329b25b511f45,"SELECT TIMESTAMPDIFF ( MICROSECOND , `created_at` , NOW (?) ) FROM `contest_judge_outbox` WHERE STATUS = ? ORDER BY `cla",29,12,12,6116827000,0,0
+885d633fc9f53bb4ee250bebcc9bdfef462af29ac2633d37264efeba6ed90240,"SELECT @@`character_set_database` , @@`sql_mode`",10,10,10,1858733000,0,0
+a6c347d6e29ab3aa4adea495ea991c6ea04c473726209241082451eb33de36a1,"SELECT `CONCAT` ( ? , MIN ( `id` ) , ? , MAX ( `id` ) , ? , COUNT ( * ) , ? , SUM ( `contest_id` != @? ) , ? , SUM ( `co",1,10,1,161093000,0,0
+a103cb960fa15d12f28bb0574809fefdf3ad3568ba0e00938c34f64f91db5cf4,SELECT @@`foreign_key_checks`,9,9,9,855847000,0,0
+a038f297780575bae2edb831de036f83aadd2ea324cf49eab2a2ac4857823645,SELECT @@GLOBAL . `ENFORCE_GTID_CONSISTENCY`,9,9,9,1975008000,0,0
+6ed56857f2cfaf3373f175ec4188104e49cb7465f0a658cee54d7f8f82ed0089,SELECT @@`sql_safe_updates`,9,9,9,731738000,0,0
+782d35290c4f6c3f27184b80e9b6b143640e2533cf44e654b8858cec708c731c,"SELECT `SUBSTRING_INDEX` ( SYSTEM_USER ( ) , ?, ... )",9,9,9,925946000,0,0
+a724a21545b602d4ae826ae58bbf526427a94f1e68ebec539ec3c53bfaa88281,SELECT @@SESSION . `transaction_isolation`,9,9,9,760550000,0,0
+b45232c5837b8db921d41dcace6fd1caeee0cad95015bdfb8cbefe3b9c756fa1,SELECT CAST ( `FLOOR` ( `UNIX_TIMESTAMP` ( NOW (?) ) * ? ) AS SIGNED ),7,7,7,585363000,0,0
+5d11cd2301cd941bcb4dda3eaea789bb78caeac1e9e0a312d023b09a9c4fe257,"SELECT `installed_rank` , `version` , `description` , `type` , `script` , `checksum` , `installed_on` , `installed_by` ,",21,6,6,3335731000,0,0
+461c083edd59a7791ee7a84282c3201306f12d693f776fff36263cdbdcd601f4,"SELECT `CONCAT` ( ? , @? )",1,1,1,99141000,0,0
+804ae5d4f3ec30389ca575837e2481022ada53ee7b909dba9ada4bc96fe7a020,"SELECT `CONCAT` ( ? , `DATE_FORMAT` ( `start_time` , ? ) , ? , `DATE_FORMAT` ( `end_time` , ? ) , ? , `IFNULL` ( `DATE_F",1,1,1,141247000,0,0
+992e5146488c47b8d870c689116fe0c75a0ed17fa1f0fa242399dc889c5666e0,"SELECT `DATE_FORMAT` ( `finalized_at` , ? ) , NOW (?) BETWEEN `start_time` AND `end_time` , TIMESTAMPDIFF ( SQL_TSI_SECO",1,1,1,304575000,0,0
+b651d4988ab131bf59c919aecb7f18613da05a675901be75e5c9650876f706d8,SET @? = ( SELECT CAST ( `FLOOR` ( `UNIX_TIMESTAMP` ( `start_time` ) * ? ) AS SIGNED ) FROM `contest` WHERE `id` = ? ),1,1,0,192281000,0,0
+16bba19c9575285d052c97016ed2accec3e724a7b1a101b82b4d5f99121a5388,SELECT NOW (?),1,1,1,69807000,0,0
+5501f7c558257c1f53ae10898b79c71eaa89601c1b06c68d852651aa97fcd614,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",15,0,0,109330533000,0,0
+8081579668aef8bbb1b899092b95385f3ce0b04492523f9fbc11b010fbf02a29,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",253,0,0,208094631000,0,0
+0097c08b9e27d96cece0d670fa3428bbcf5d9b5da3193c434e8fea127c9a28e9,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",66,0,0,148113287000,0,0
+8a23e88bbcc012e6ab4936233f788ec0d07aec96cc9a04e60bcc2f4ff8d1656f,ALTER TABLE `contest_submission` MODIFY COLUMN `submitted_time` DATETIME (?) NOT NULL,1,0,0,54545667000,0,0
+684ecaad7a57812384de101406f06d6088b13b203118aaddebe340da3fd8cdee,"CREATE TABLE IF NOT EXISTS `user_guard` ( `user_id` INT8 NOT NULL , PRIMARY KEY ( `user_id` ) , CONSTRAINT `fk_user_guar",0,0,0,0,0,0
+b4471163132bb380a951dc27d6d78458477b23550b9068fdbfae2d88a661dacb,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",214,0,0,168867516000,0,0
+d2a06a1efdc2bb7f51d7befae30855bfb520004920ec7f4a225407a2ba88cbf5,"CREATE TABLE IF NOT EXISTS `user_streak_rank_snapshot` ( `snapshot_rank` INT8 NOT NULL , `user_id` INT8 NOT NULL , `curr",0,0,0,0,0,0
+4aac8f33f9e0c8db4285d4cc68cdcf73bca96b90e65509044ba59c8ed2ad9ec4,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",18,0,0,220812965000,0,0
+a7e3f033228a089d344760c8a846eeee6d3bcb00f750a4455f9cd4a9e3c6592a,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",134,0,0,81615461000,0,0
+2910653829fbd4c3a75cf48156aa9dd3eee915ec75ec2bae02f457697e0c7d24,SELECT COUNT ( * ) FROM `user_problem_guard` WHERE `user_id` IN ( SELECT `id` FROM `user` WHERE NAME LIKE ? ) OR `proble,1,0,1,1389701000,1,0
+7ac7693ade36787de0b34e3b656ca62702b819fdc9e24363286dc9577d2853e1,ALTER TABLE `contest_submission_outbox` DROP FOREIGN KEY `fk_cs_outbox_submission`,0,0,0,0,0,0
+54519d22f4dffeb03944bc20a36b0a0d1fd7547044ce0c8e83bec82e01da2e02,"CREATE TABLE `contest_final_score` ( `id` INT8 NOT NULL AUTO_INCREMENT , `contest_id` INT8 NOT NULL , `user_id` INT8 NOT",0,0,0,0,0,0
+4949fbf9702ed03a0fc82fd26ff7fc44724880ef7e6b1d02cab36d7450b48313,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",9,0,0,97560838000,0,0
+a75f7fc134a2e83644f736b2e6407403a7ef1e5e7d00e605ced89959f9b0dbd6,SELECT COUNT ( * ) FROM `contest_submission_result` WHERE `contest_id` = ( SELECT `id` FROM `contest` WHERE NAME = ? ),1,0,1,351989000,1,0
+3ff8c8daed309ed2e1bb8c4743803fab5f9aac41552db00bb1b4c3ce932b2e9c,SET `lock_wait_timeout` = ?,21,0,0,3145339000,0,0
+2c3512b06c7fd476a5666b5c3dcd1b83458cf5c7c761e595346a11302ae9c22f,SELECT COUNT ( DISTINCTROW `contest_id` ) FROM `contest_submission_result`,1,0,1,344498000,0,0
+adcfaf1a6f568bd03534a6e934f570d8cb031ae0ad514a46aa3f6c8ca72603fc,"INSERT INTO `contest` ( NAME , `start_time` , `end_time` ) VALUES ( ? , NOW (?) - INTERVAL ? SQL_TSI_MINUTE , NOW (?) + ",1,0,0,2523482000,0,0
+410d40e4c9e68cd1120fef22f2bca6a75e8726b0eefb840f4eb054bfe7ef44d7,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",35,0,0,92776368000,0,0
+69644ef6f936b44b994bca96508044ba00c25a7ef6caf0d003600c2b2b887a59,"SET @? = `GREATEST` ( @? - @?, ... )",1,0,0,42327000,0,0
+f71eb97da4c0fa761a800516789917c870caddb5947974557fb8aec8951dcdcd,ALTER TABLE `contest_submission_outbox` ADD COLUMN `next_attempt_at` DATETIME (?) NULL,1,0,0,50207752000,0,0
+ca8c47866cf708b221bc028c759001e9789ab948695a00303f7079b6043503cf,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",46,0,0,112218112000,0,0
+8b39900cd21b04e12df59844b1fe374a11cbe24258433d3304f52e4ad23dcdc9,SET SESSION `cte_max_recursion_depth` = ?,1,0,0,43048000,0,0
+52fb9d849f64b53767314a2728ac0a8fa514039fbe2bc47c9847bcf0ce6ad40f,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",193,0,0,157535931000,0,0
+7befa6bf5b7d57ec767ccc6d8717afbc73839d6da12a406489c7d6533089d972,ALTER TABLE `contest_submission_outbox` ADD COLUMN `due_at` DATETIME (?) NULL,1,0,0,52879411000,0,0
+fa38903197c0a771f311ad6c0e0afe936668b8a40dce777c914ebbc434ab5772,"INSERT INTO `problem` ( NAME , `contest_id` , `contest_num` ) VALUES ( ? , @?, ... ) , ( ? , @?, ... ) , ( ? , @?, ... )",1,0,0,2815112000,0,0
+3550f4e5a2b18f89152c0dfd4b79afc8ac4c8f8013b26c7526698f8d6c8e8e7c,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",19,0,0,205375941000,0,0
+ff979c7dbffbee08f37dec9aa4786cf33a341484294d45c71dc61337fc41b4a4,"SELECT `CONCAT` ( ? , `IFNULL` ( GROUP_CONCAT ( `CONCAT_WS` ( ? , `snapshot_rank` , `user_id` , `longest_streak` , `IFNU",1,0,1,277725000,1,0
+612a65c64b06b1110311d082b87c8832f9a65006f34b6f67f8143becfb153fed,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",9,0,0,87437209000,0,0
+3a05326daa568e37dd4102df0ef1265cc54acc529fefcd1565924b76ef9101a5,SELECT `VARIABLE_VALUE` FROM `performance_schema` . `global_variables` WHERE `variable_name` = ?,9,0,0,24588438000,0,0
+17126f57b34ccca7504f2cd73d52d328e7cd0511784bd78cfee7a86206019e55,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",307,0,0,218642497000,0,0
+2c6d70273175cce9be0e6c0b40395c32a33c01e3e6aa0803221b0e3c58798632,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",31,0,0,77057431000,0,0
+b0d739aa4c4bf95d2f798586d260da31c28354909bf7ba3b943874f132d0e104,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",96,0,0,559226819000,0,0
+1ac9ff4bd85c14c06042d7f2b5bb21ce9df99f05a583f0b0c80ebf642eb0906e,"CREATE INDEX `idx_cs_outbox_retry` ON `contest_submission_outbox` ( STATUS , `next_attempt_at` , `created_at` , `id` )",1,0,0,15729372000,0,0
+b1eb866acfa98b877dba9dc06997da738247e0a3d968ade5b307734d3372549f,"SELECT `CONCAT` ( ? , `IFNULL` ( GROUP_CONCAT ( `CONCAT_WS` ( ? , SQL_TSI_DAY , `user_id` , `last_active_time` ) ORDER B",1,0,1,1371136000,1,0
+5bf03dc8d911f0d18b1d2de5a36708ddd591b22b0024d0d4d605b97b55a2e330,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",15,0,0,76865814000,0,0
+1f425996f14dca07595e627aea2fa1eadcf0d184b532c5526594e48b20a05629,SELECT COUNT ( * ) FROM `longest_streak_bucket`,1,0,1,232410000,0,0
+32f2c6af88fe9ee3d4af08fb50fbd2bd59cbe3774a378df7f42efb22275acfd1,ALTER TABLE `contest_submission_result` ADD CONSTRAINT `fk_cs_result_submission` FOREIGN KEY ( `submission_id` ) REFEREN,0,0,0,0,0,0
+d37b2bff16e3439ea29cdf45172af4234f2a71b3d097a268d2dec59713bbc530,"INSERT INTO `user` ( NAME , `pass` , `solved_count` , `streak_last_solved_date` , `streak_current_streak` , `streak_long",1,0,0,279694678000,0,0
+0bfc9058adf072ed8365e00af37b384aa30215d59737995b3c4ac9a4bcbb3c8f,SET @? = `LAST_INSERT_ID` ( ),1,0,0,48809000,0,0
+2e05c62cbd3dd24a2cbf305dcd7f4131fe07307503edd8d733eb40970f57afa3,SELECT SUM ( FOUND ) FROM ( ( SELECT ? AS FOUND FROM `information_schema` . `tables` WHERE `table_schema` = ? ) UNION AL,0,0,0,0,0,0
+caad905d3b4340fb3e8605e5e09bfd563706ae01ae9078cbfdfcb47e5ef3a79e,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",31,0,0,73926920000,0,0
+8884f9513509614ace7ad9ba68778386afedf7834a401950da83398f812c31d3,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",5,0,0,86005806000,0,0
+750cc53a6c76f57104ea6afed7db4499bf5d5ed56ff02baed8246a121a7ef8f5,"CREATE TABLE `contest_submission_result` ( `submission_id` INT8 NOT NULL , `contest_id` INT8 NOT NULL , `provisional_res",0,0,0,0,0,0
+e5d441ce7b8aae71cd50f2973dc335efcae07216d39f4fde1f1dc5dca5d369de,SELECT COUNT ( * ) FROM `longest_streak_rank_snapshot` WHERE `user_id` IN ( SELECT `id` FROM `user` WHERE NAME LIKE ? ),1,0,1,406614000,0,0
+70e3678c29baa662fb3ec7484568a93b531a7c454901c2728d9db12eb15acb06,ALTER TABLE `contest_submission` MODIFY COLUMN `id` INT8 NOT NULL,0,0,0,0,0,0
+2ba49f9acdbca50cc58279ed466fd5692cb24509fbe8f154d2c0b8652da2598f,"CREATE TABLE `submission` ( `id` INT8 NOT NULL AUTO_INCREMENT , `user_id` INT8 , `submitted_time` DATETIME , `problem_id",0,0,0,0,0,0
+bb4020fb25a9f140f97f0c6f0b76ecfab948150af6a060471c67376c042ff8a1,"CREATE INDEX `idx_user_current_streak` ON SYSTEM_USER ( `streak_current_streak` DESC , `streak_last_solved_date` ASC , `",0,0,0,0,0,0
+4a6a7040b6af213576557a1f45d6b80cebd4902a30eca0d1a6c0476ab48115dd,SELECT COUNT ( * ) FROM `contest_submission` WHERE `contest_id` = ( SELECT `id` FROM `contest` WHERE NAME = ? ),1,0,1,350596000,1,0
+6d84a9a4e3eca94adec011336e808809058143ada72252bd5a221ce02670b1a7,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",13,0,0,63093774000,0,0
+9cc3ea8cffc2cfabfbe69f82dd7658976180bc02db7c54bb3cc05bd19763305a,"CREATE TABLE `accepted_submission` ( `id` INT8 NOT NULL AUTO_INCREMENT , `user_id` INT8 , `problem_id` INT8 , `submitted",0,0,0,0,0,0
+3b6a8233d044ff9f2438c00f135aaf5e776ebf3518fa0c7b345bb2b1226b6432,SELECT COUNT ( * ) FROM `user` `u` JOIN `submission` `s` ON `s` . `user_id` = `u` . `id` WHERE `u` . `name` LIKE ?,1,0,1,427857000,0,0
+2f44f8112b504f2846f12b923aaec1da8e0489fe3feb69d36ee3073f87ec0c8a,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",76,0,0,196195688000,0,0
+664a2aec28f52c38fac12d5adf14d7f8da06346ba3a594072cc152ad9bcecb59,SET SESSION TRANSACTION READ WRITE,29328,0,0,2760079998000,0,0
+3c321f65d775f7a1038cb4bdf2d739811942ef640761512e99c9728b2d967a3e,CREATE INDEX `idx_longest_streak_snapshot_rank` ON `longest_streak_rank_snapshot` ( `snapshot_rank` ),0,0,0,0,0,0
+2d566314273f15d82b5fc065e6e5f786926fe928d234f06e864c6a16f0b920af,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",130,0,0,65488593000,0,0
+63ec3e1e771e86ed53efa1b2704730fcf16bf844ad7ae301e169886beacccb44,SELECT COUNT ( * ) FROM `contest_final_score` WHERE `contest_id` = ( SELECT `id` FROM `contest` WHERE NAME = ? ),1,0,1,1970429000,1,0
+24d05167d5cc2a08dbca32261d890d1271dbe8b6d5548966c3285dc430e83b7f,"CREATE TABLE `user_problem_guard` ( `user_id` INT8 NOT NULL , `problem_id` INT8 NOT NULL , PRIMARY KEY ( `user_id` , `pr",0,0,0,0,0,0
+0fbd2ac08ebf6bb21b19e95c16771e61d098bda1d28805e0463d8133ff7ff9ec,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",41,0,0,260297487000,0,0
+20fb72f1f1869074b66bde02aad27ee62dc10eec5d18416962536d19a9a6a5cd,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",45,0,0,136298941000,0,0
+32748d49533e61d9cd4740f8476c180b29c09e032eaecaa32d552707cc2902dc,"CREATE INDEX `idx_cs_outbox_due` ON `contest_submission_outbox` ( `due_at` , `id` )",1,0,0,14380729000,0,0
+0f094887d4d294232c476e6b541151c234e49ffe3d5a4cc31064dda00f3f02e0,ALTER TABLE `contest_submission_outbox` ADD COLUMN `redis_seq` INT8 NULL,0,0,0,0,0,0
+74fad343f6cd5b13f69bf431ad916e12c281b1fec1cea8e92ebe82996ceeb713,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",258,0,0,179455511000,0,0
+bea5ce9985044648518884aad3633801e8446d0006f2efd6a76028555e59719f,TRUNCATE `performance_schema` . `events_statements_summary_by_digest`,0,0,0,0,0,0
+158bfe3d4b4b0a372a4acdb38affe2cb4f6b3cb21a9af0ea9fad9a9a083ac18a,SET `autocommit` = ?,72521,0,0,8270435597000,0,0
+262d79d581b645680b507066715d9d9954fe97dd4bfea64f6df2c9cd46c1fb40,"SELECT `CONCAT` ( ? , `IFNULL` ( GROUP_CONCAT ( `n` ORDER BY `n` ) , ? ) ) FROM `longest_streak_bucket`",1,0,1,403589000,0,0
+5926826ecd62acfd1df2703b2367eebea0e865e772ecf247914bf3fde6202bb7,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",65,0,0,179279571000,0,0
+43e9758e4c4664cc30ea5ee17f61cde0c0feda3b7feccaf3f2dffc479c77282d,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",10,0,0,55602093000,0,0
+af5841a9c9e590bc8f4e1a23577ee1c5a0e70d129571f5df8e9be9f239a98459,SELECT COUNT ( * ) FROM `user` WHERE NAME LIKE ?,2,0,2,522695000,0,0
+997995a19bda13088b72fb4a174a2f09e8f34ff9976f6e664ea84795afd589b7,SELECT COUNT ( * ) FROM `contest` WHERE `id` = ( SELECT `id` FROM `contest` WHERE NAME = ? ),1,0,1,602083000,1,0
+8411e9868cab588461c9768cca44fbc6d77a289ecd0d1e96dc7edb6829292893,"CREATE TABLE `contest_submission` ( `id` INT8 NOT NULL AUTO_INCREMENT , `contest_id` INT8 NOT NULL , `problem_id` INT8 N",0,0,0,0,0,0
+7efa2ef0ee7f2afd2d69f4d7eb108b7f159b0cd2ef23749a1984f60ac96f78c3,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",12,0,0,34771782000,0,0
+e0b0b577f681c9b5f6a5c28fac8bbc1f0543627e425f87073b6bde372052c9cf,UPDATE `contest_submission_outbox` SET `due_at` = CASE STATUS WHEN ? THEN `created_at` WHEN ? THEN COALESCE ( `next_atte,1,0,0,135707000,0,0
+9efd75599d967c131e5f55653b8d86c622668d5f4ad1bb329353d37392cdcf02,"CREATE TABLE `solved_count_bucket` ( `n` INT8 NOT NULL , `user_count` INT8 NOT NULL , `cum_higher_count` INT8 NOT NULL ,",0,0,0,0,0,0
+b03700f4deaee31272723764b21b2d1e25041682120a759f9c0b473b37b816f9,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",46,0,0,35153537000,0,0
+4a1ce2c5d2b34e3165ba963f6538fe0f33ecaa150adc4318030bedb9bde22cdc,SELECT COUNT ( * ) FROM `contest`,1,0,1,211381000,0,0
+9f5603ebc124e6f02b9b8f75353b243d824359ff2b022cc5b581836a0cbf7d45,"CREATE TABLE `oj_loadtest` . `flyway_schema_history` ( `installed_rank` INTEGER NOT NULL , `version` VARCHARACTER (?) , ",0,0,0,0,0,0
+76579dcb0d45a382c151e0957293496c9c03f350113b2c86f3dce0e5025159d9,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",8,0,0,117174764000,0,0
+590760304e0b530f7ab311a61e5d440b00ede0bc46c359783b6d416b1bc2ca50,CREATE INDEX `idx_cs_outbox_redis_seq` ON `contest_submission_outbox` ( `redis_seq` ),0,0,0,0,0,0
+af5f84c20c8fa1a95c234a97f161a19f334ba22f831d9d2abbec69c3d009f8a0,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",45,0,0,112733111000,0,0
+09471a6ffed2ee89f3f5f27a889cad010819c3b75fb3f8c72837bec0811853ae,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",98,0,0,397782642000,0,0
+a9c022a32fc53a8324542891abcc17ae2824c6414232f52490f16a9df21e4c29,"ALTER TABLE `contest_submission_outbox` ADD COLUMN `claim_token` VARCHARACTER (?) NULL , ADD COLUMN `claimed_at` DATETIM",0,0,0,0,0,0
+88cebc2d4464e4e201b7805306fbaa0284d26e78e376edfd27a8f40475e12693,ALTER TABLE `contest_submission_outbox` ADD CONSTRAINT `fk_cs_outbox_submission` FOREIGN KEY ( `contest_submission_id` ),0,0,0,0,0,0
+9d5403d6b0a714031e441e42312801d68741f68a5f17c5440e4f50c1b6c41a54,SELECT COUNT ( * ) FROM `daily_active_users` WHERE `user_id` IN ( SELECT `id` FROM `user` WHERE NAME LIKE ? ),1,0,1,341246000,0,0
+5886916484fbcb6b329472856503b1029dddc5f0cb482d6bddb18b5144d2d339,SET @? = CAST ( `FLOOR` ( `UNIX_TIMESTAMP` ( NOW (?) ) * ? ) AS SIGNED ) - ?,1,0,0,51123000,0,0
+82a5c4c98da93c15cd303c5d3c188bfc4b7b3e2641a163bc626ed91c7966453a,"SET `foreign_key_checks` = ? , `sql_safe_updates` = ?",75,0,0,5563153000,0,0
+1f334f2f6debdefa6a0dda3a85fb83aa25ec5e255dc137edf6cbb48bcf362939,"INSERT IGNORE INTO `contest_submission` ( `id` , `contest_id` , `problem_id` , `user_id` , `submitted_time` , CODE , `co",1645,0,0,3848417031000,0,0
+e2495d567ce7e30c668039162d171646ef2b2c8036a6e54ca385579609a6c9d6,SELECT COUNT ( * ) FROM `daily_active_users`,1,0,1,229835000,0,0
+377e221a842890d6191443291375a75e488a65c86c82528507765dcb9285e6ec,SELECT COUNT ( * ) FROM SYSTEM_USER,1,0,1,189751000,0,0
+9cf78ec1ee2746bb4c688b21593f69a1eba7026ba2277d7717cd8defb167449a,SET SESSION TRANSACTION READ ONLY,29246,0,0,3723367265000,0,0
+2f86f23eba58071eaf284fe5ec8cbcba04d47fe0c278fd0d7c4ba4e81ede8787,"CREATE TABLE `contest` ( `id` INT8 NOT NULL AUTO_INCREMENT , `name` VARCHARACTER (?) , `start_time` DATETIME , `end_time",0,0,0,0,0,0
+fbcf0d84e3f75331e780d2bfefeba332a070b88ef8c2c085915c169ffd25f5db,"ALTER TABLE `contest_submission_result` ADD COLUMN `result_saved_at` DATETIME (?) NULL AFTER `final_judged_at` , ADD COL",1,0,0,33263022000,0,0
+fa9781e84a2621a5dd43d0087e41090e30513dcbe608193fd8d9a54d3794d1c8,SELECT COUNT ( * ) FROM `submission` WHERE `user_id` IN ( SELECT `id` FROM `user` WHERE NAME LIKE ? ) OR `problem_id` IN,1,0,1,540973000,1,0
+9f92119f46b3753d82865347aad22f2fbdc13f4638d1b561d62080e70a51973b,CREATE INDEX `idx_csr_scoreboard_applied_seq` ON `contest_submission_result` ( `scoreboard_applied_seq` ),1,0,0,12249003000,0,0
+f3c27fde89e2e622bf351f40aee9493e36a777e45d0022fba47ea433d648bdeb,SELECT COUNT ( * ) FROM `contest_submission_outbox` WHERE `contest_id` = ( SELECT `id` FROM `contest` WHERE NAME = ? ),1,0,1,213153000,1,0
+52a0a2ef453ba9905d1b56f0cea9257be41a238021d1181fb5d25c1d1e79d9cf,USE `oj_loadtest`,15,0,0,1126799000,0,0
+1cbdd136696058348376cad4636de3c3a7bfeefa6cc79cb2ddc09b9dc4586838,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",8,0,0,45962901000,0,0
+8397bb1a928caeb8616f8e828517dc4e0ecf8a5ea9976d0670245a2c4a49c453,SELECT COUNT ( * ) FROM `problem` WHERE `contest_id` = ( SELECT `id` FROM `contest` WHERE NAME = ? ),1,0,1,324645000,1,0
+e6a5314a4c78d3c881b548da857e22a927d55ecf48bc339aefb9edea2c4fb4db,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",85,0,0,552989146000,0,0
+92826a68b80a2a6e6be262a38b7f1a4aaf160a6ac1e8316e20117bdec61d3dcc,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",9,0,0,109488615000,0,0
+69603d96f7a5a8c0d4ac3408f0a71c72f32cc2512c1f3e7a1b9ea93ab3232812,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",6,0,0,8864454000,0,0
+df8b500419b611f7f178e5bc3fb263f49f4fa274a8a443e91dcb6f94875fc328,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",167,0,0,128926431000,0,0
+6dc32d1230a500af308a96902c2d2b850dc832a5eee6d41ac0f9c06748e87e45,"INSERT IGNORE INTO `contest_submission` ( `id` , `contest_id` , `problem_id` , `user_id` , `submitted_time` , CODE , `co",131,0,0,48777508000,0,0
+36243526d8add20b964a844cfaedf3248dbf26ea41fefc38fab6ccc205841976,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",38,0,0,347272680000,0,0
+1201f354212d000b259b621b3eddca04c6606711c7e001c1b8f872e1c1abc81f,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",261,0,0,212650182000,0,0
+bb0dfe490b54377366465f39ef64400d8975c888f165b958906990d5ebce8a2c,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",233,0,0,124573260000,0,0
+c705fad1f4a24c56c50cab23cf1b93bec38919510384fa626535a597232da441,DELETE `o1` FROM `contest_submission_outbox` `o1` JOIN `contest_submission_outbox` `o2` ON `o1` . `contest_submission_id,0,0,0,0,0,0
+bcd9fc0eab5353481001deb451b019b02df1649c8e24414df8657a1e45b0e824,"ALTER TABLE `contest_submission_result` MODIFY COLUMN `provisional_judged_at` DATETIME (?) NULL , MODIFY COLUMN `final_j",1,0,0,44291518000,0,0
+d3180beaeaa3603b609453d5cc89a78c347c42f0594d6d89090f5c7756427ce5,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",37,0,0,198569829000,0,0
+6d631211d940af327fe3f82a008b908dc6cba3912cae61881353006e73354eee,SET NAMES `utf8mb4`,0,0,0,0,0,0
+cc3a2760b3b5553e4efd69e0613ab460f4676ff2f292045e0bf96a9b79fae0d7,"CREATE INDEX `idx_submission_problem_result_id` ON `submission` ( `problem_id` , `result` , `id` )",0,0,0,0,0,0
+de4512cc2fb9280be853d09830d46ad20a8169e38edc24d2171ec2413871130a,SELECT COUNT ( * ) FROM `performance_schema` . `events_statements_summary_by_digest`,0,0,0,0,0,0
+a82553e4e46448d6f2936977bc34d7a11e638dfddafc275115336b066d998d57,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",131,0,0,188393528000,0,0
+bd1bb159cb3192efb428a5f024c3cb8c1dcaf7677ac25d29c426caa877187b6d,"CREATE TABLE `problem` ( `id` INT8 NOT NULL AUTO_INCREMENT , `name` VARCHARACTER (?) , `contest_id` INT8 , `contest_num`",0,0,0,0,0,0
+20dea723cc292186089a98b5ad9669dfa34fef7fa988ae69d84ffcb00c2622e8,"CREATE TABLE IF NOT EXISTS `longest_streak_rank_snapshot` ( `snapshot_rank` INT8 PRIMARY KEY , `user_id` INT8 NOT NULL ,",0,0,0,0,0,0
+1b2b0ee5a8c85176ddf4ce541d3eefd75b22ea9ec28cea730f0633e7a462ccf4,"CREATE TABLE `streak_snapshot_user` ( `id` INT8 NOT NULL AUTO_INCREMENT , `snapshot_date` DATE NOT NULL , `user_id` INT8",0,0,0,0,0,0
+7719b60532f0d4970404963129fbed70b74fe7ec1b91a5c50dd5345a091a54d9,"CREATE TABLE IF NOT EXISTS `longest_streak_bucket` ( `n` INTEGER NOT NULL , `user_count` INT8 NOT NULL , `cum_higher_cou",0,0,0,0,0,0
+9d688d00bcae8d23a5040098e87a2f2ec0e9b60e69cb193d18f08f2f170890cd,"SELECT `csr1_0` . `submission_id` , `csr1_0` . `contest_id` , `s1_0` . `problem_id` , `s1_0` . `user_id` , `c1_0` . `sta",27627,0,0,11372747601000,0,0
+aeea8d14c430e6eaaf2ffc1c542f366c21a261cbe130323702b18c3c36cf92ae,SHOW SLAVE STATUS,21,0,0,2654368000,0,0
+5ea4eb76dc338a71b60a5ba3ac9d3dda78d1e14f4be6b5a515792e8fdea1b39c,"CREATE TABLE `user` ( `id` INT8 NOT NULL AUTO_INCREMENT , `name` VARCHARACTER (?) , `pass` VARCHARACTER (?) , `solved_co",0,0,0,0,0,0
+942d8e8870749239b628ba6dac1878ec00ba92aa6b25c631d264c0ff3e1ed525,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",150,0,0,117300821000,0,0
+87ce8b6130632dc588309390a3cdb6f4f8bea5b89013d9bc3305797295d3d8b8,"CREATE TABLE `contest_submission_outbox` ( `id` INT8 NOT NULL AUTO_INCREMENT , `contest_submission_id` INT8 NOT NULL , `",0,0,0,0,0,0
+2468edcdce373fbdcb0a5738febfae928f94f0cffdc3bfaf925cfacf4b4f7ffa,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",312,0,0,168650084000,0,0
+081898b47d7c879f61c05ab1fcc1a3e359a5a7ccdadde0a35eae36a1e1b4430d,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",52,0,0,178289637000,0,0
+b57b0fac8f4d90d4b3e5f7d928c72b92082b1db5d0e4438afbab223b2406e58b,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",8,0,0,13504436000,0,0
+9deaf078dc197dbbb2f5df0cfa8e533b67bb1416d73f45197d7f9212bf0aec72,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",181,0,0,128933956000,0,0
+86abe47f95df13d33c25c1fe0bbcabb5cd709a37b6783e8608b36a99f6f86dd1,ALTER TABLE `contest_submission_outbox` ADD CONSTRAINT `uk_cs_outbox_submission` UNIQUE ( `contest_submission_id` ),0,0,0,0,0,0
+e948ed1f3dbc45f55c0c3b874577e74fd41866c4c18244211f9d445dbd9068b7,"CREATE TABLE `contest_judge_outbox` ( `id` INT8 NOT NULL AUTO_INCREMENT , `submission_id` INT8 NOT NULL , STATUS VARCHAR",0,0,0,0,0,0
+c35082008bedac91ec87fad575e37c59bd0c355acf0c02860a759dab0f4a442a,"ALTER TABLE `contest_submission_outbox` MODIFY COLUMN `submitted_time` DATETIME (?) NOT NULL , MODIFY COLUMN `judged_at`",1,0,0,65516165000,0,0
+7092c95abebe2e2c35ea1be9260545702bea2dc1b843f7731431cf7307d055de,CREATE INDEX `idx_longest_streak_snapshot_user` ON `longest_streak_rank_snapshot` ( `user_id` ),0,0,0,0,0,0
+d0eaedfa398b87faddf88744feacb5e4473b65af5c76078819bbfce322bbd721,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",52,0,0,280867201000,0,0
+8a38586b58b06fd01eed66f2e781dfc9b02de55c015ca187a0a149c5584df989,SELECT `variable_name` FROM `performance_schema` . `user_variables_by_thread` WHERE `variable_value` IS NOT NULL,84,0,0,15862400000,84,0
+3c15396ca4c27ba0488698b472212868333fbc8929631c67b135290210183095,SELECT COUNT ( * ) FROM `longest_streak_rank_snapshot`,1,0,1,212543000,0,0
+e243a8f4d6c8deb987226dad3cb54a1f43056e67b605779a3cd085d90db39142,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",103,0,0,93985223000,0,0
+c0f7939d3412570401d3db8da19c4ae9f1e862c5142c39c828759c08fd08b806,SET SESSION `group_concat_max_len` = ?,2,0,0,127153000,0,0
+f89eda22f76d2489f9602ea4c9f83f84161adccf08c6df1f7866d19638834732,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",127,0,0,124211888000,0,0
+7d6457eca8f6a37a02b800759cf5deb225d928e40aeb800adb73deab2c41170e,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",9,0,0,13074155000,0,0
+fbf8556e8a5d97410b7f1a5150a1eb8b482d011c470a4645ac3092d19df509f8,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",36,0,0,409530198000,0,0
+1f9adeb7ba8419c414dba6c983e932b600fc34bd687b33c7738afe971dbbafe1,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",38,0,0,153223735000,0,0
+da2ecf91bd8cf8353486828180129fad528c79e0e726aaf3a1404e484a4381a4,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",14,0,0,78758090000,0,0
+e598940757e6cdeafe0ca0cf434bb9226caa15986e78043676cdba24e9aad9a5,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",43,0,0,195880529000,0,0
+b53c18780bff52a0f0b05e57e7acf19185f89f3d5a7d8bb79c5a299485c0c8cf,"CREATE INDEX `idx_user_longest_streak` ON SYSTEM_USER ( `streak_longest_streak` DESC , `streak_last_solved_date` ASC , `",0,0,0,0,0,0
+f189f588fd3c090849028fac774f813c53193766dcae0ba0c093d9af65e87a9c,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",119,0,0,768679646000,0,0
+1192594b2396138f895eb6ee773f4171bbadb7bd2c3051c20f33a683909b4d06,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",37,0,0,27748324000,0,0
+67540599c0a720fef0d2895533a8c53bc8971a2b8205be7ec06467a6eac90d22,CREATE INDEX `flyway_schema_history_s_idx` ON `oj_loadtest` . `flyway_schema_history` ( `success` ),0,0,0,0,0,0
+04d8b584ef15dc8d435ad5fcbf243a82870afa00ffd83fbbb9b4a202be0568d5,"CREATE TABLE `daily_active_users` ( `day` DATE NOT NULL , `user_id` INT8 NOT NULL , `last_active_time` DATETIME NOT NULL",0,0,0,0,0,0
+6cda0d1a167383d26c477a7412c208b5bd848d7d5a76733e96aa0499ff301b31,ALTER TABLE `contest_submission_result` ADD COLUMN `scoreboard_applied_seq` INT8 NULL,1,0,0,33461833000,0,0
+926e5acab7a230934d26cbb25b142f9f11ddff6e8afe23deb3573b68f4c106cf,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",53,0,0,208779451000,0,0
+af0e6b55b6db303e10d58defcc71422ef2e4e8efc3269b0e734e686d9dca453c,"SELECT `CONCAT` ( ? , `IFNULL` ( GROUP_CONCAT ( `CONCAT_WS` ( ? , `id` , `IFNULL` ( NAME , ? ) , `solved_count` , `IFNUL",1,0,1,664945000,1,0
+9be27eb9279adad3be5421a1db091b06ab9bb1957059a7b03051b62197b41a5a,"INSERT IGNORE INTO `contest_submission_result` ( `submission_id` , `contest_id` , `provisional_result` , `provisional_ju",246,0,0,187756966000,0,0
+f2b9be5f0f32ca7507e4ddf133cd2fad0993a1c26fde9caa6f067b1af2b7603c,COMMIT,36171,0,0,60455175152000,0,0
+2aa02db6508a55a7fe01723e68f2e1ed4f986c3c4ffd4e463af3c4c4522803af,ALTER TABLE `contest` ADD COLUMN `finalized_at` DATETIME NULL,0,0,0,0,0,0
+354dfeb294b5fa92060f27122301af859f3f9ff4c09224829b01cd1b28a440ef,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",6,0,0,5236970000,0,0
+4a9ce2e333b9d72778ca37a8ab0e540002bc58838b581063911d11162b25ad96,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",48,0,0,119761441000,0,0
+438a829af364d2a58c2c7d4591465f07f917b68c7aea4ce2fb3c84c15ef3439d,ALTER TABLE `contest_submission_result` DROP FOREIGN KEY `fk_cs_result_submission`,0,0,0,0,0,0
+63934716ce0e588ce3a7329a1409e37fa6990cdb3a185459ef2b8ae5e8c0beb2,SELECT COUNT ( * ) FROM `contest_judge_outbox` WHERE `submission_id` IN ( SELECT `id` FROM `contest_submission` WHERE `c,1,0,1,1110456000,1,0
+a975dd473c248e5451f400b48644ee973e3ba732da605d3d4edd6f9ee611abfd,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",25,0,0,133666536000,0,0
+fbd0c1c69d41838ab054bbe33647722c5fdd9bd6f98b2619e8b78ba89c76fbc8,"INSERT INTO `oj_loadtest` . `flyway_schema_history` ( `installed_rank` , `version` , `description` , `type` , `script` ,",6,0,0,749150000,0,0
+fd0638676f92483c9b85d388fa67abb3c25805313860ff50d89ae3a59a192039,"CREATE INDEX `idx_cs_outbox_claim` ON `contest_submission_outbox` ( STATUS , `claimed_at` , `created_at` , `id` )",1,0,0,15816792000,0,0
+bb7efef5af3cb7d0cc75d9ba83af9bc7096238e4e97efdfc4241e5676469f96f,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",58,0,0,38306966000,0,0
+040aadfc153ff8e7d3640984d5627f885825bf803cc6d8e21e5698e5a617990b,"INSERT INTO `contest_judge_outbox` ( `submission_id` , STATUS , `attempts` , `created_at` , `updated_at` ) VALUES ( ?, .",10,0,0,28237838000,0,0
+b6a26f4205108c5d82d090d18a9e847d7dc1007f55abc290c05463e8d6491579,SELECT COUNT ( * ) FROM `accepted_submission` WHERE `user_id` IN ( SELECT `id` FROM `user` WHERE NAME LIKE ? ) OR `probl,1,0,1,2044705000,1,0
+ee697e4b4152b6204eb23d2a055339cc8262297cf42467b78c1e241ddfcfbce3,SET `character_set_results` = ?,228,0,0,20579607000,0,0

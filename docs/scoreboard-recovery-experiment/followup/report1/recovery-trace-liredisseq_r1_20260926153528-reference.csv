@@ -1,0 +1,73 @@
+event,thread,startEpochMs,lockedAtEpochMs,endEpochMs,rows,detail,outcome
+PASS_START,main,1790404587917,-1,-1,-1,sequence-check,started
+PASS_END,main,1790404587917,-1,1790404589503,-1,sequence-check,true
+PASS_START,oj-batch-scheduling-3,1790404617609,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-4,1790404617609,-1,1790404617609,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-3,1790404617609,-1,1790404618809,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-3,1790404647610,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-1,1790404648810,-1,1790404648810,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-3,1790404647610,-1,1790404649309,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-4,1790404678811,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-2,1790404679311,-1,1790404679311,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-4,1790404678811,-1,1790404681503,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-4,1790404709312,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-1,1790404711504,-1,1790404711504,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-4,1790404709312,-1,1790404712013,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-1,1790404741425,-1,-1,-1,sequence-check,started
+GAP,contestScoreboardStreamListenerContainer-1,1790404741433,-1,1790404741434,-1,retention checkpoint=589951 delivery=593484,unrecoverable
+PASS_SKIPPED,oj-batch-scheduling-3,1790404741506,-1,1790404741506,-1,sequence-check,skipped
+PASS_SKIPPED,oj-batch-scheduling-3,1790404742028,-1,1790404742028,-1,sequence-check,skipped
+GAP,contestScoreboardStreamListenerContainer-1,1790404742560,-1,1790404742560,-1,retention checkpoint=589951 delivery=593984,unrecoverable
+GAP,contestScoreboardStreamListenerContainer-1,1790404743614,-1,1790404743615,-1,retention checkpoint=589951 delivery=594418,unrecoverable
+GAP,contestScoreboardStreamListenerContainer-1,1790404744635,-1,1790404744635,-1,retention checkpoint=589951 delivery=594590,unrecoverable
+GAP,contestScoreboardStreamListenerContainer-1,1790404745711,-1,1790404745711,-1,retention checkpoint=589951 delivery=595091,unrecoverable
+CHUNK,oj-batch-scheduling-1,1790404745430,1790404745430,1790404746107,500,sequenced results,applied
+CHUNK,oj-batch-scheduling-1,1790404746110,1790404746110,1790404746518,500,sequenced results,applied
+CHUNK,oj-batch-scheduling-1,1790404746520,1790404746520,1790404746807,500,sequenced results,applied
+GAP,contestScoreboardStreamListenerContainer-1,1790404746822,-1,1790404746822,-1,retention checkpoint=589951 delivery=595591,unrecoverable
+CHUNK,oj-batch-scheduling-1,1790404746809,1790404746809,1790404747207,500,sequenced results,applied
+CHUNK,oj-batch-scheduling-1,1790404747210,1790404747210,1790404747490,500,sequenced results,applied
+CHUNK,oj-batch-scheduling-1,1790404747494,1790404747494,1790404747807,500,sequenced results,applied
+GAP,contestScoreboardStreamListenerContainer-1,1790404748008,-1,1790404748008,-1,retention checkpoint=589951 delivery=596091,unrecoverable
+CHUNK,oj-batch-scheduling-1,1790404747809,1790404747809,1790404748107,500,sequenced results,applied
+CHUNK,oj-batch-scheduling-1,1790404748107,1790404748107,1790404748124,32,sequenced results,applied
+GAP,contestScoreboardStreamListenerContainer-1,1790404749105,-1,1790404749105,-1,retention checkpoint=589951 delivery=596253,unrecoverable
+GAP,contestScoreboardStreamListenerContainer-1,1790404750158,-1,1790404750158,-1,retention checkpoint=589951 delivery=596642,unrecoverable
+PASS_END,oj-batch-scheduling-1,1790404741425,-1,1790404751212,-1,sequence-check,RETRYABLE_FAILURE
+GAP,contestScoreboardStreamListenerContainer-1,1790404751223,-1,1790404751224,-1,retention checkpoint=589951 delivery=596753,unrecoverable
+PASS_START,oj-batch-scheduling-3,1790404771507,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-1,1790404772030,-1,1790404772030,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-3,1790404771507,-1,1790404774851,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-4,1790404802029,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-3,1790404804851,-1,1790404804851,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-4,1790404802029,-1,1790404805825,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-1,1790404834852,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-4,1790404835826,-1,1790404835826,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-1,1790404834852,-1,1790404839343,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-3,1790404865827,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-2,1790404869344,-1,1790404869344,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-3,1790404865827,-1,1790404871025,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-3,1790404899345,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-2,1790404901027,-1,1790404901027,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-3,1790404899345,-1,1790404904607,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-2,1790404931028,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-4,1790404934609,-1,1790404934609,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-2,1790404931028,-1,1790404936653,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-3,1790404964611,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-2,1790404966656,-1,1790404966656,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-3,1790404964611,-1,1790404970669,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-4,1790404996659,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-1,1790405000672,-1,1790405000672,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-4,1790404996659,-1,1790405003209,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-2,1790405030675,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-3,1790405033212,-1,1790405033212,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-2,1790405030675,-1,1790405043775,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-3,1790405063212,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-2,1790405073776,-1,1790405073776,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-3,1790405063212,-1,1790405075972,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-1,1790405103781,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-2,1790405105977,-1,1790405105977,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-1,1790405103781,-1,1790405110414,-1,sequence-check,false
+PASS_START,oj-batch-scheduling-4,1790405135981,-1,-1,-1,sequence-check,started
+PASS_SKIPPED,oj-batch-scheduling-2,1790405140415,-1,1790405140415,-1,sequence-check,skipped
+PASS_END,oj-batch-scheduling-4,1790405135981,-1,1790405142353,-1,sequence-check,false
