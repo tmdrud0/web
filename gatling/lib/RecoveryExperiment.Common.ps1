@@ -472,6 +472,18 @@ function Get-RedisSetMembers {
     return , @($members | Sort-Object -Unique)
 }
 
+# SCARD of a Redis set, as a long. Used to watch stream:db-pending across a run without walking its
+# members (SMEMBERS would be another way to look, but the count is all these call sites need).
+function Get-RedisSetCard {
+    param([Parameter(Mandatory = $true)][string]$Key)
+
+    $value = @(Invoke-RedisText -RedisArguments @("SCARD", $Key)) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+        Select-Object -Last 1
+    if ($null -eq $value) { return 0L }
+    return [long]$value
+}
+
 # Writes a shell script into the container and runs it there. The injector's capture and restore are
 # shell programs because they have to be: Redis DUMP payloads are binary and cannot survive a trip
 # through PowerShell's string-oriented stdout. Keeping them as files also means the shell text that

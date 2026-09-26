@@ -474,7 +474,9 @@ try {
         $events["snapshotContestKeys"] = $snapshot.ContestKeys
         $events["snapshotProcessed"] = $snapshot.ProcessedCount
         $events["snapshotCheckpoint"] = $snapshot.Checkpoint
-        Write-Output "  snapshot: $($snapshot.ContestKeys)+$($snapshot.GlobalKeys) key(s), processed $($snapshot.ProcessedCount), checkpoint $($snapshot.Checkpoint); batch-1 paused $($events['snapshotPauseMs'])ms (Lua $($events['snapshotEvalMs'])ms)"
+        $dbPendingKey = "$((Get-RecoveryConfig).ScoreboardKeyPrefix)stream:db-pending"
+        $events["dbPendingAfterSnapshot"] = Get-RedisSetCard -Key $dbPendingKey
+        Write-Output "  snapshot: $($snapshot.ContestKeys)+$($snapshot.GlobalKeys) key(s), processed $($snapshot.ProcessedCount), checkpoint $($snapshot.Checkpoint); batch-1 paused $($events['snapshotPauseMs'])ms (Lua $($events['snapshotEvalMs'])ms); db-pending $($events['dbPendingAfterSnapshot'])"
 
         # --- 8. tail -----------------------------------------------------------------------------------
         $tailElapsed = ([DateTimeOffset]::UtcNow - $pauseEnded).TotalMilliseconds
@@ -511,7 +513,8 @@ try {
                 -MaxSeconds ($RecoveryBudgetSeconds + $ObserveAfterRecoverySeconds + 300))
         $script:pollerStarted = $true
         $events["pollerStartedAtMs"] = Get-NowContainerMs
-        Write-Output "  rollback: checkpoint $($rollback.PreRollbackCheckpoint) -> $($rollback.RestoredCheckpoint), $($lost.LostCount) result(s) lost; batch-1 paused $($events['faultPauseMs'])ms (Lua $($events['rollbackEvalMs'])ms)"
+        $events["dbPendingAfterRollback"] = Get-RedisSetCard -Key $dbPendingKey
+        Write-Output "  rollback: checkpoint $($rollback.PreRollbackCheckpoint) -> $($rollback.RestoredCheckpoint), $($lost.LostCount) result(s) lost; batch-1 paused $($events['faultPauseMs'])ms (Lua $($events['rollbackEvalMs'])ms); db-pending $($events['dbPendingAfterRollback'])"
 
         # Read after the pause, never inside it.
         $counts = Get-LiveImpactResultCounts -AtContainerMs $faultAtMs
@@ -556,7 +559,8 @@ try {
         Stop-TailPoller -DestinationPath (Join-Path $artifacts "tail-poll.csv")
         $script:pollerStarted = $false
     }
-    Write-Output "  load ended (Gatling exit $($events['gatlingExitCode']))"
+    $events["dbPendingAtLoadEnd"] = Get-RedisSetCard -Key $dbPendingKey
+    Write-Output "  load ended (Gatling exit $($events['gatlingExitCode'])); db-pending $($events['dbPendingAtLoadEnd'])"
 
     # --- 11. finish --------------------------------------------------------------------------------
     $drained = $true
@@ -568,6 +572,8 @@ try {
         Write-Output "  drain: $($_.Exception.Message)"
     }
     $events["drained"] = $drained
+    $events["dbPendingAfterDrain"] = Get-RedisSetCard -Key $dbPendingKey
+    Write-Output "  db-pending after drain: $($events['dbPendingAfterDrain'])"
     $final = Compare-LiveImpactUserTotals
     Write-JsonFile -Path (Join-Path $artifacts "consistency-final.json") -Object $final
     $events["finalConsistent"] = $final.Matches
