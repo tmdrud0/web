@@ -1,0 +1,20 @@
+﻿{
+    "contestId":  5,
+    "seedPrefix":  "sbrec_aofw3no_20260927064648_",
+    "redisPattern":  "contest:scoreboard:5:*",
+    "counts":  {
+                   "contest_submission_outbox":  0,
+                   "contest_submission_result":  227198,
+                   "contest_judge_outbox":  161528,
+                   "contest_submission":  227198,
+                   "contest_final_score":  0,
+                   "accepted_submission":  0,
+                   "submission":  0,
+                   "user_problem_guard":  0,
+                   "daily_active_users":  0,
+                   "longest_streak_rank_snapshot":  0,
+                   "problem":  10,
+                   "contest":  1,
+                   "`user`":  10000
+               }
+}
