@@ -145,4 +145,117 @@
 - DB가 필요한 suite 2개(5건)와 Redis/Rabbit 통합 suite(skip 30건)는 이번 변경을 검증하지 않았다.
 
 ## 7. 2부 결과
-(2부 완료 후 추가)
+
+- 실행 위치: `web-full-replay-bg`, 브랜치 `codex/full-replay-background-replay`, HEAD `683c717`(harness에 db-pending SCARD 기록 추가, 757c451 위에 쌓임).
+- run: `lifullreplay_r1_20260927014450` (단일 run). `-Mode full-replay -Phase run -StackMySql -ResetMySqlVolume -SkipCleanup -TargetRps 500 -JudgedRatePerSecond 457.733 -SubmitIntervalMillis 5000`.
+  - 원본: `var/scoreboard-recovery-live-impact/lifullreplay_r1_20260927014450/`(git-ignored). 요약·EXPLAIN·digest는 `docs/scoreboard-recovery-experiment/followup/report2/`.
+  - `run.drained=True`, `run.finalConsistent=True`, `run.gatlingExitCode=0`, `outcome: complete (exit 0)`.
+- 첫 시도(같은 커맨드, `-SkipCleanup` 없이)는 이전 시도의 `web-1` 컨테이너가 살아 있어 `Ensure-StackMySqlReady`가 빈 스키마에 마이그레이션을 다시 걸지 못해 실패했다(Flyway 버전이 300초 안에 18에 못 미침). `web-1/web-2/batch-1/judge-1/judge-2`를 강제로 지우고 재실행해 해결했다 — 이번 절차 자체의 함정이므로 기록만 남긴다.
+
+### 7.1 db-pending 추이 (문제 A 검증)
+
+| 시점 | SCARD | 비고 |
+|---|---|---|
+| 스냅샷 직후 | 60 | 평시 in-flight 배치 수준(기준선) |
+| 롤백 직후 | 191 | 스냅샷이 되살린 id 포함 |
+| 부하 종료 직후 | 54 | 두 pass가 각자 끝난 뒤 자체 drain을 이미 돌렸고, 그 뒤 진행된 라이브 트래픽의 평시 변동 |
+| drain(Wait-PipelineQuiescent) 후 | **0** | 최종 |
+
+- 이전 Run B(`lifullreplay_r1_20260926160914`)는 부하 종료 뒤 600초가 지나도 152건이 안 비워져 `drained=False`(exit 2)였다. 이번 run은 같은 지표가 0으로 수렴했고 `drained=True`(exit 0)다.
+- trace(`recovery-trace.csv`)로 확인한 두 pass의 시작/종료: PASS_START `1790441392848` → PASS_END `1790441502902`(1차, 110,054 ms, 109,732행, 220청크), PASS_START `1790441503047` → PASS_END `1790441655094`(2차, 152,047 ms, offered 162,625행). 두 pass 사이 간격은 145 ms — pass 종료 → drain(afterPass) → 다음 pass 시작이 거의 끊김 없이 이어졌다.
+- `repairPending` 성공 호출은 로그를 남기지 않는다(코드상 실패만 로그, `ContestScoreboardBackgroundReplay.runAfterPass`). 그래서 drain이 정확히 언제 얼마나 걸렸는지는 trace/로그로 직접 잡을 수 없고, SCARD 스냅샷과 pass 경계 시각으로만 추론했다 — **drain 자체의 lock 보유 시간은 unavailable**이다. 다만 `repairPending`이 처리하는 집합 크기(191건, batchSize=500 미만이라 한 번의 UPDATE 배치)로 볼 때 apply lock을 오래 붙잡을 규모는 아니었다고 판단한다.
+- **판단**: 757c451의 drain 수정은 의도대로 동작한다. 롤백이 되살린 id는 그 롤백을 처리하는 pass가 끝날 때마다 drain되고, 두 번째 pass 이후에는 db-pending이 정상적인 라이브 in-flight 수준으로만 남았다가 부하 종료 뒤 0에 도달했다.
+
+### 7.2 EXPLAIN ANALYZE (문제 B 원인 확인)
+
+`performance_schema.events_statements_summary_by_digest`를 정렬(align) 직후(`2026-09-27T01:48:43+09:00`, 부하 시작 직후)에 TRUNCATE했다. 이 시점 이후 JVM 시작 시 도는 오름차순 startup replay는 이미 끝나 있었으므로, 이 digest가 잡은 것은 **롤백 뒤 두 background pass가 실제로 낸 페이지 쿼리 부하**다.
+
+| 순위 | 쿼리(요약) | COUNT_STAR | SUM_ROWS_EXAMINED | SUM_ROWS_SENT | 비고 |
+|---|---|---|---|---|---|
+| 1 | `findReplayRowsByContestIdNewestFirst`(rollback replay 페이지 쿼리) | 275 | **39,039,842** | 272,357 | 호출당 평균 141,963행 조사 / 990행 반환 — **143배 증폭** |
+| 2 | `scoreboard_applied_at IS NULL` 카운트(오라클류) | 5 | 1,031,389 | 5 | |
+| 3 | `contest_judge_outbox` claim 조회 | 1,400 | 480,066 | 207,523 | 라이브 채점 파이프라인, 무관 |
+| 4 | `scoreboard_applied_at` UPDATE | 479,907 | 479,907 | 0 | PK UPDATE, 1건당 1행이 정상 |
+
+(전체 top-15는 `docs/scoreboard-recovery-experiment/followup/report2/digest-top15.txt`.)
+
+`findReplayRowsByContestIdNewestFirst`의 실제 SQL(digest에서 복원, `digest-replay-query-full-text.txt`):
+
+```sql
+SELECT s1_0.id, csr1_0.contest_id, s1_0.problem_id, s1_0.user_id, c1_0.start_time, s1_0.submitted_time,
+       COALESCE(csr1_0.final_result, csr1_0.provisional_result)
+  FROM contest_submission_result csr1_0
+  JOIN contest_submission s1_0 ON s1_0.id = csr1_0.submission_id
+  JOIN contest c1_0 ON c1_0.id = s1_0.contest_id
+ WHERE csr1_0.contest_id = ?
+   AND (? IS NULL OR s1_0.id < ?)
+   AND COALESCE(csr1_0.final_result, csr1_0.provisional_result) != ?
+ ORDER BY s1_0.id DESC
+ LIMIT ?
+```
+
+같은 대회(contest_id=1, 이 시점 286,753행)에 대해 세 변형을 `EXPLAIN ANALYZE`했다(원문 `explain-q*.txt`):
+
+| 쿼리 | beforeId | 계획 | 실제 조사 행수 | 실제 시간(ms, Limit 단계) |
+|---|---|---|---|---|
+| Q1 newest-first, 첫 페이지 | NULL | `idx_csr_contest_submission(contest_id)` 인덱스로 전체를 읽고 → `contest_submission` PK로 nested-loop join → **Sort(전체) → Limit 1000** | 286,753 | 771 |
+| Q2 newest-first, 중간 페이지 | 중간값 | `idx_csr_contest_result_submission(contest_id, provisional_result, submission_id)` + index condition(`submission_id < ?`)으로 남은 범위를 읽고 → 마찬가지로 join → **Sort(범위 전체) → Limit 1000** | 122,708 | 347 |
+| Q3 ascending, 첫 페이지 | (afterId NULL) | Q1과 동일한 계획, ORDER BY만 ASC | 286,753 | 743 |
+
+- **역방향 range scan이 아니다.** `submission_id`가 인덱스의 두 번째(또는 세 번째) 컬럼이라 정렬 순서 그대로 읽으며 1000행에서 멈출 수 있는 인덱스가 있는데도, 옵티마이저는 `contest_id`(와 있는 경우 `submission_id <` 조건)로 후보 전체를 인덱스 스캔한 뒤 `contest_submission`·`contest`와 조인하고, **그 다음에** `Sort`와 `Limit`을 적용한다. 페이지당 비용은 "이 페이지에 필요한 1000행"이 아니라 "beforeId보다 작은 남은 행 전체"에 비례한다.
+- **원인은 `COALESCE(final_result, provisional_result) <> 'PENDING'`이 sargable하지 않다는 것이다.** 컬럼에 함수를 씌운 식이라 인덱스 조건으로 못 쓰고 Filter로만 평가되는데, 옵티마이저는 이 필터의 선택도를 신뢰할 수 없어 "인덱스 순서대로 읽으며 1000개 통과하면 멈추기"를 선택하지 않고 "후보를 다 모아 정렬 후 자르기"를 선택한다. 게다가 이 실험 데이터에서는 이 필터가 사실상 아무것도 거르지 않는다(대부분 이미 채점됨) — 그런데도 옵티마이저는 이를 활용하지 못한다.
+- **첫 페이지가 느렸던 이유(보고서 1의 899 ms)**: newest-first에서 beforeId가 없는 첫 페이지는 상한이 전혀 없어 대회 전체(N행)를 다 읽어야 한다. beforeId가 생기는 이후 페이지는 "이미 지나온 만큼"만 줄어들 뿐 여전히 O(남은 행)이다. Q1(N=286,753, 771 ms)과 Q2(N의 약 43%인 122,708, 347 ms)의 시간 비율(0.45)이 행수 비율(0.43)과 거의 일치해, 페이지 비용이 "남은 행 수에 선형"이라는 설명과 정확히 들어맞는다.
+- **N vs N²**: 페이지 하나의 비용이 O(남은 행)이고 페이지가 N/1000개 있으므로, 대회 하나를 처음부터 끝까지 재전송하는 총 비용은 O(N²/1000) — 대회 전체를 "페이지마다 다시 읽는" 것에 가깝다. 이번 run의 digest가 그 증거다: 275번의 호출로 39,039,842행을 조사해 272,357행을 반환했다(호출당 평균 반환의 143배를 조사). 대회가 자라는 도중(109,732 → 162,625행) 두 pass가 걸렸으니 실측 배율은 이보다 더 커질 수 있다.
+
+### 7.3 Run B 대비 비교 (단일 run 대 단일 run, 배수 계산 없음)
+
+| 지표 | Run B(현재 코드, 이전) | Run B(개선판, 이번) |
+|---|---|---|
+| `run.drained` / exit | False / 2 | **True / 0** |
+| db-pending(부하 종료 시점) | 152(600초 뒤에도 안 비워짐) | 54 → drain 후 0 |
+| 신규 반영 정지(`newResumedAfterFaultMs`) | 1,426 ms | 327 ms |
+| tail 복귀(`tailReturnedAfterFaultMs`) | 10,362 ms | 8,283 ms |
+| 복구 중 반영 지연 p50/p95(`during`) | 3,181 / 4,398 ms | 2,568 / 3,183 ms |
+| `passesAfterRollback` | 2 | 2 |
+| 1차 pass `replayRows` / `replayChunks` / `replayDurationMs` | 105,308 / 211 / 116,705 | 109,732 / 220 / 110,054 |
+| Innodb_rows_read(fault→부하 종료) | 37,479,042 | 40,961,023 |
+| verdict | C(backlog 1,774→2,320) | C(backlog 1,055→1,642) |
+| `finalConsistent` | True | True |
+
+두 run 모두 verdict=C(backlog가 fault에서 늘어남)로 같은 급이고, 반영 지연·tail 복귀는 이번 run이 소폭 낮지만 각각 단일 run이라 변동 범위 안일 수 있다 — 유의미한 개선으로 주장하지 않는다. 확실히 달라진 것은 **db-pending이 비워지고 drained=True로 끝났다는 것** 하나다.
+
+### 7.4 tail 분해 (2부, `lifullreplay_r1_20260927014450`)
+
+T_fault = `1790441392944`(ms). lost = 3,539건(스냅샷~롤백 사이). PASS_START(scoreboard-full-replay 스레드) = `1790441392848`(T_fault 96 ms 전 — 시계 불확실도 안). tail-poll.csv 기준 T_tail_returned = `1790441401227` → **T_fault+8,283 ms**(요약 CSV의 `tailReturnedAfterFaultMs`와 일치).
+
+| 청크 | 시작(+ms) | lock 획득(+ms) | 종료(+ms) | lock 대기 | 보유 |
+|---|---|---|---|---|---|
+| 1 | 515 | 1,037 | 2,133 | 522 | 1,096 |
+| 2 | 2,136 | 2,522 | 3,107 | 386 | 585 |
+| 3 | 3,504 | 4,103 | 4,505 | 599 | 402 |
+| 4 | 4,507 | 4,705 | 5,004 | 198 | 299 |
+| 5 | 5,349 | 5,349 | 5,770 | 0 | 421 |
+| 6 | 5,773 | 5,928 | 6,305 | 155 | 377 |
+| 7 | 6,604 | 6,664 | 6,907 | 60 | 243 |
+| 8 | 6,909 | 6,952 | 7,364 | 43 | 412 |
+| 9 | 7,707 | 7,726 | 8,085 | 19 | 359 |
+| 10 | 8,088 | 8,212 | 8,506 | 124 | 294 |
+
+- T_tail_returned(+8,283)는 청크 10이 lock을 잡은 뒤(+8,212), 끝나기 전(+8,506) 사이에 찍힌다 — poller가 잡는 "present"는 청크 보유 구간 안에서 갱신된다는 보고서 1의 관찰이 이번 run에도 그대로다.
+- 홀수 청크 앞의 간격(=페이지 쿼리 시간)은 611 ms(1페이지, PASS_START~청크1 시작) → 397 → 345 → 299 → 343 ms로, §7.2에서 확인한 "페이지 비용이 남은 행 수에 선형"과 같은 모양으로 줄어든다.
+- 500건씩 10청크(5,000행)를 지나서야 3,539건이 다 돌아왔다 — newest-first로 가장 최근 id부터 훑지만, lost가 아닌 행(롤백 시점 backlog 등)이 섞여 있어 lost 전부를 담으려면 500건 단위로 몇 청크를 더 지나야 했다. 보고서 1(청크 1~12, 9청크 필요)과 같은 급의 현상이다.
+- 원인 배분(보고서 1과 같은 틀로): lost가 여러 청크에 걸침(주 원인, 청크 4~10) · 페이지 쿼리(청크 1~9 앞의 간격 합 1,995 ms, 약 24%) · lock 경합(대기 합 2,106 ms, 약 25%) · 청크 보유(합 4,488 ms, 약 54%, 여기엔 실제 적용 비용과 §7.2의 페이지 조회 비용 일부가 섞여 있다 — 청크의 hold 구간은 SELECT+APPLY를 함께 재는 값이라 완전히 분리되지 않는다).
+
+### 7.5 판단
+
+1. **db-pending 수정은 효과가 있다.** 이번 run은 `drained=True`(exit 0)로 끝났고, db-pending은 두 pass의 `afterPass` drain을 거쳐 0으로 수렴했다. 이전 Run B가 exit 2로 끝난 원인(롤백이 되살린 id가 안 비워짐)은 재현되지 않았다.
+2. **replay 페이지 쿼리는 N에 비례하지 않는다 — 페이지당 O(남은 N), 전체 재전송은 O(N²/pageSize)에 가깝다.** EXPLAIN이 보여주듯 인덱스 순서를 타고 1000행에서 멈추는 대신, 대상 범위 전체를 인덱스로 모아 조인·정렬한 뒤 자른다. 원인은 `COALESCE(...) <> 'PENDING'` 필터가 인덱스 조건으로 못 쓰이는 것과, 조인해야 하는 두 테이블(`contest_submission`, `contest`)이 있어 ORDER BY+LIMIT을 인덱스만으로 처리할 수 없다는 것이다.
+3. **개선안(제안만, 프로덕션 코드는 고치지 않음)**:
+   - "id만 먼저 뽑고 나중에 조인"(deferred join) 패턴으로 쿼리를 둘로 나눈다: ①`SELECT csr.submission_id FROM contest_submission_result csr WHERE csr.contest_id=? AND csr.submission_id < ? ORDER BY csr.submission_id DESC LIMIT 1000` — 이 서브쿼리는 `idx_csr_contest_submission(contest_id, submission_id)`만으로 인덱스 순서를 타고 1000행에서 멈출 수 있다(PENDING 필터가 없어도 됨). ②그 1000개 id만 `contest_submission`/`contest`와 조인해 나머지 컬럼을 채운다. 이러면 페이지당 비용이 O(pageSize)로 떨어진다.
+   - PENDING 필터가 꼭 필요하다면 `COALESCE(final_result, provisional_result)`를 저장 생성 컬럼(generated column)으로 만들어 `(contest_id, effective_result, submission_id)` 인덱스에 포함시키면 sargable해진다. 다만 이번 데이터처럼 필터의 선택도가 낮다면(대부분 이미 채점됨) 위 deferred-join만으로 충분할 가능성이 크다.
+4. **한계(2부)**
+   - 단일 run이다. §7.3의 비교는 두 개별 run 사이의 차이일 뿐 배수·유의성을 주장하지 않는다.
+   - drain(`repairPending`)의 lock 보유 시간은 로그가 없어 직접 측정하지 못했다(§7.1). SCARD 스냅샷과 pass 경계로 간접 추론했다.
+   - 청크-lost 대응은 보고서 1과 같이 poller ~110 ms 간격 폴링에 기반한 근사다.
+   - EXPLAIN ANALYZE는 대회가 286,753행으로 자란 뒤의 스냅샷 하나에 대한 것이다. pass 진행 중 대회가 계속 자라므로(109,732→162,625) 실제 각 페이지가 본 N은 이보다 작았을 수 있다 — 방향은 같지만 절대 수치는 근사다.
+   - 첫 시도가 stale 컨테이너 때문에 마이그레이션에 실패해 재시도했다(§7 서두). 재현 절차에 주의가 필요하다.
