@@ -277,7 +277,10 @@ class ContestScoreboardStreamProcessor {
                     outcome.label()
             ));
         }
-        if (!outcome.permitsLiveProgress()) {
+        boolean mayAdvance = outcome.covers()
+                || (reason == GapReason.ROLLBACK
+                && outcome == ContestScoreboardRecoveryStrategy.Outcome.LIVE_PROGRESS);
+        if (!mayAdvance) {
             throw new IllegalStateException(
                     "Scoreboard stream checkpoint " + checkpoint + " is "
                             + reason.description

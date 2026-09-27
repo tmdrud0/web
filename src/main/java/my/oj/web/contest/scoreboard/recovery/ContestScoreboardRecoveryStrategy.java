@@ -159,11 +159,6 @@ public interface ContestScoreboardRecoveryStrategy {
             return this == COVERED;
         }
 
-        /** Whether the live processor may anchor and apply above the observed rollback range. */
-        public boolean permitsLiveProgress() {
-            return this == COVERED || this == LIVE_PROGRESS;
-        }
-
         /**
          * Whether asking again could reach a different answer, so the range must not be remembered as
          * handled.

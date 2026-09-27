@@ -341,6 +341,25 @@ class ContestScoreboardStreamProcessorTests {
     }
 
     @Test
+    void liveProgressCannotAdvancePastARangeLeftUnappliedByAFailedBatch() {
+        when(applier.currentStreamOffset()).thenReturn(5L);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.LIVE_PROGRESS);
+        position.recordAppliedOffset(10L);
+        position.markAnchorVerified();
+        position.recordUnappliedRange(6L);
+
+        assertThatThrownBy(() -> processor.process(List.of(event(7L, 107L))))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("left unapplied by a failed batch")
+                .hasMessageContaining("checkpoint does not move past results the standings never saw");
+
+        verify(strategy).rebuildHistory(any());
+        verify(applier, never()).applyAll(anyList());
+        assertThat(position.unappliedFrom()).isEqualTo(6L);
+        assertThat(position.rebuiltThrough()).isEqualTo(-1L);
+    }
+
+    @Test
     void successfulRetryCountsPartiallyAppliedOffsetsButAckRedeliveryDoesNotCountTwice() {
         when(applier.currentStreamOffset()).thenReturn(5L, 5L, 6L, 5L, 5L, 6L);
         when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
