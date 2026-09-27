@@ -4,7 +4,6 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy.LostRange;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy.Outcome;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy.PassKind;
-import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRedisSequenceRecoveryService.SequenceCheckReport;
 import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamRecoveryService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -44,13 +43,13 @@ import static org.mockito.Mockito.when;
 class ContestScoreboardRecoveryStrategyTests {
 
     private ContestScoreboardFullReplayService replayService;
-    private ContestScoreboardRedisSequenceRecoveryService sequenceService;
+    private ContestScoreboardRedisSequenceLiveRecovery sequenceLiveRecovery;
     private ContestScoreboardStreamRecoveryService retentionGapService;
 
     @BeforeEach
     void setUp() {
         replayService = mock(ContestScoreboardFullReplayService.class);
-        sequenceService = mock(ContestScoreboardRedisSequenceRecoveryService.class);
+        sequenceLiveRecovery = mock(ContestScoreboardRedisSequenceLiveRecovery.class);
         retentionGapService = mock(ContestScoreboardStreamRecoveryService.class);
     }
 
@@ -110,7 +109,7 @@ class ContestScoreboardRecoveryStrategyTests {
                 .as("a basis written at apply time cannot find an offset that was never applied")
                 .isEqualTo(Outcome.UNRECOVERABLE);
 
-        verifyNoInteractions(sequenceService);
+        verifyNoInteractions(sequenceLiveRecovery);
     }
 
     /**
@@ -176,14 +175,28 @@ class ContestScoreboardRecoveryStrategyTests {
                 .isEqualTo(Outcome.UNRECOVERABLE);
     }
 
-    /** The sequence basis does answer a rollback range, because every offset in it was applied here. */
+    /** Applied history may keep moving while a prompt sequence check repairs it in the background. */
     @Test
-    void aRollbackInsideWhatThisProcessAppliedIsAnsweredByTheSequenceCheck() {
-        when(sequenceService.check()).thenReturn(new SequenceCheckReport(1, 0L, 0, false, false));
+    void aRollbackInsideWhatThisProcessAppliedAllowsLiveProgressAndTriggersRepair() {
+        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L)))
+                .isEqualTo(Outcome.LIVE_PROGRESS);
 
-        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L))).isEqualTo(Outcome.COVERED);
+        verify(sequenceLiveRecovery).trigger();
+    }
 
-        verify(sequenceService).check();
+    @Test
+    void aBusyImmediateRepairStillAllowsLiveProgressAndLeavesPeriodicRetryInCharge() {
+        when(sequenceLiveRecovery.trigger()).thenReturn(false);
+
+        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L)))
+                .isEqualTo(Outcome.LIVE_PROGRESS);
+
+        verify(sequenceLiveRecovery).trigger();
+    }
+
+    @Test
+    void redisSequenceStillRequiresColdStartCoverageBeforeConsumption() {
+        assertThat(redisSequence().recoversHistoryBeforeConsuming()).isTrue();
     }
 
     /**
@@ -193,42 +206,13 @@ class ContestScoreboardRecoveryStrategyTests {
      */
     @Test
     void aRangeReachingPastTheAppliedWatermarkIsRefusedHoweverDeepTheRebuild() {
-        when(sequenceService.check()).thenReturn(new SequenceCheckReport(1, 0L, 0, false, false));
-
-        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L))).isEqualTo(Outcome.COVERED);
+        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L)))
+                .isEqualTo(Outcome.LIVE_PROGRESS);
         assertThat(redisSequence().rebuildHistory(range(2L, 6L, 4L, 4L)))
                 .as("offsets 5 and 6 were never applied here, so no sequence was ever issued for them")
                 .isEqualTo(Outcome.UNRECOVERABLE);
 
-        verify(sequenceService, times(1)).check();
-    }
-
-    /**
-     * A check that spent every round and still found results to replay has not covered the set, and
-     * another round is not the repair: replaying a result the scoreboard already applied cannot take
-     * the sequence back off it, so the next round finds the same group.
-     *
-     * <p>This is the outcome that keeps the range from being re-checked on every supervisor cycle. The
-     * refusal is recorded as an answer and logged at ERROR by the strategy, so the one thing it must not
-     * be is quiet.</p>
-     */
-    @Test
-    void aCheckThatSpentEveryRoundIsReportedUnrecoverable() {
-        when(sequenceService.check()).thenReturn(new SequenceCheckReport(5, 3L, 2, false, true));
-
-        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L))).isEqualTo(Outcome.UNRECOVERABLE);
-    }
-
-    /**
-     * A check that ran out of window budget is the other half of that split, and the opposite answer:
-     * it stopped before it had looked everywhere it was allowed to, and every round replays what it
-     * finds, so a later pass has less to look at. The range is asked about again.
-     */
-    @Test
-    void aCheckThatSpentItsWindowBudgetIsRetried() {
-        when(sequenceService.check()).thenReturn(new SequenceCheckReport(2, 1L, 1, true, false));
-
-        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L))).isEqualTo(Outcome.RETRYABLE_FAILURE);
+        verify(sequenceLiveRecovery, times(1)).trigger();
     }
 
     /**
@@ -246,7 +230,7 @@ class ContestScoreboardRecoveryStrategyTests {
         gate.tryRun(PassKind.MYSQL_REPLAY, () -> {
             answers.add(new FullReplayRecoveryStrategy(replayService, gate)
                     .rebuildHistory(range(2L, 4L, 4L, -1L)));
-            answers.add(new RedisSequenceRecoveryStrategy(sequenceService, gate)
+            answers.add(new RedisSequenceRecoveryStrategy(sequenceLiveRecovery)
                     .rebuildHistory(range(2L, 4L, 4L, -1L)));
             answers.add(new StreamOffsetRecoveryStrategy(retentionGapService, gate)
                     .rebuildHistory(range(5L, 12L, 5L, -1L)));
@@ -254,8 +238,9 @@ class ContestScoreboardRecoveryStrategyTests {
         });
 
         assertThat(answers).containsExactly(
-                Outcome.BUSY_RETRY_LATER, Outcome.BUSY_RETRY_LATER, Outcome.BUSY_RETRY_LATER);
-        verifyNoInteractions(replayService, sequenceService, retentionGapService);
+                Outcome.BUSY_RETRY_LATER, Outcome.LIVE_PROGRESS, Outcome.BUSY_RETRY_LATER);
+        verify(sequenceLiveRecovery).trigger();
+        verifyNoInteractions(replayService, retentionGapService);
     }
 
     /**
@@ -270,13 +255,10 @@ class ContestScoreboardRecoveryStrategyTests {
     @Test
     void anAttemptThatThrewIsRetriedRatherThanRemembered() {
         when(replayService.replayAllContests()).thenThrow(new IllegalStateException("MySQL is away"));
-        when(sequenceService.check()).thenThrow(new IllegalStateException("Redis is away"));
         when(retentionGapService.recoverRetentionGap(anyLong(), anyLong()))
                 .thenThrow(new IllegalStateException("MySQL is away"));
 
         assertThat(fullReplay().rebuildHistory(range(2L, 4L, 4L, -1L)))
-                .isEqualTo(Outcome.RETRYABLE_FAILURE);
-        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L)))
                 .isEqualTo(Outcome.RETRYABLE_FAILURE);
         assertThat(streamOffset().rebuildHistory(range(5L, 12L, 5L, -1L)))
                 .isEqualTo(Outcome.RETRYABLE_FAILURE);
@@ -302,7 +284,7 @@ class ContestScoreboardRecoveryStrategyTests {
     }
 
     private RedisSequenceRecoveryStrategy redisSequence() {
-        return new RedisSequenceRecoveryStrategy(sequenceService, gate());
+        return new RedisSequenceRecoveryStrategy(sequenceLiveRecovery);
     }
 
     private StreamOffsetRecoveryStrategy streamOffset() {

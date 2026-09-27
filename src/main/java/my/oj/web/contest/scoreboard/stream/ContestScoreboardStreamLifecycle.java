@@ -385,6 +385,13 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
                         appliedOffset, strategy.mode().propertyValue());
                 return true;
             }
+            if (outcome == ContestScoreboardRecoveryStrategy.Outcome.LIVE_PROGRESS) {
+                log.warn("The {} basis allowed live progress for rollback offsets {} through {} while its "
+                                + "repair continues in the background; the range is not marked rebuilt and "
+                                + "the periodic checks remain the retry path",
+                        strategy.mode().propertyValue(), range.firstLostOffset(), range.lastLostOffset());
+                return true;
+            }
             if (outcome == ContestScoreboardRecoveryStrategy.Outcome.UNRECOVERABLE) {
                 metrics.recordRollbackUnrecoverable();
                 log.error("The {} basis cannot rebuild the history the rollback took away between offsets {} "

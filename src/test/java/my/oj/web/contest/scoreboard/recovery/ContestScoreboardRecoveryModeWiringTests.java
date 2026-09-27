@@ -73,6 +73,7 @@ class ContestScoreboardRecoveryModeWiringTests {
                 ContestScoreboardRedisSequenceConfig.class,
                 ContestScoreboardRedisSequenceRecoveryService.class,
                 ContestScoreboardRedisSequenceScheduler.class,
+                ContestScoreboardRedisSequenceLiveRecovery.class,
                 ContestScoreboardRedisSequenceStartupCheck.class
         };
     }
@@ -157,6 +158,7 @@ class ContestScoreboardRecoveryModeWiringTests {
                 .run(context -> {
                     assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceRecoveryService.class);
                     assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceScheduler.class);
+                    assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceLiveRecovery.class);
                     assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceStartupCheck.class);
                     assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceMetrics.class);
                 });
@@ -171,6 +173,7 @@ class ContestScoreboardRecoveryModeWiringTests {
                         assertThat(context)
                                 .as("mode=%s", mode)
                                 .doesNotHaveBean(ContestScoreboardRedisSequenceMetrics.class);
+                        assertThat(context).doesNotHaveBean(ContestScoreboardRedisSequenceLiveRecovery.class);
                     });
         }
     }
@@ -211,6 +214,7 @@ class ContestScoreboardRecoveryModeWiringTests {
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context).doesNotHaveBean(ContestScoreboardRedisSequenceScheduler.class);
+                    assertThat(context).doesNotHaveBean(ContestScoreboardRedisSequenceLiveRecovery.class);
                     assertThat(context).doesNotHaveBean(ContestScoreboardRedisSequenceStartupCheck.class);
                     assertThat(context)
                             .hasSingleBean(ContestScoreboardRedisSequenceRecoveryService.class);

@@ -68,13 +68,16 @@ public interface ContestScoreboardRecoveryStrategy {
     boolean rewindsOnCheckpointRegression();
 
     /**
-     * Rebuilds the history this mode treats as its basis.
+     * Answers how the history this mode treats as its basis affects the live range.
      *
      * <p>Idempotent, and expected to run once per lost range: a mode whose basis already covers the
-     * range returns {@link Outcome#COVERED} immediately rather than rebuilding it twice.</p>
+     * range returns {@link Outcome#COVERED} immediately rather than rebuilding it twice. Redis-seq is
+     * the live exception: a range inside this JVM's applied history can return
+     * {@link Outcome#LIVE_PROGRESS}, allowing the live checkpoint to advance while repair continues
+     * asynchronously without claiming that the range is rebuilt.</p>
      *
-     * @return what the attempt achieved, which is what decides if the checkpoint may move to the
-     *         offset above the range and whether the range has to be asked about again
+     * @return what the attempt achieved, which decides whether the live checkpoint may move and
+     *         whether the range has to be asked about again
      */
     Outcome rebuildHistory(LostRange range);
 
@@ -84,8 +87,8 @@ public interface ContestScoreboardRecoveryStrategy {
      * <h2>Why this is not a boolean</h2>
      *
      * <p>The callers do two different things with the answer, and one boolean could not tell them
-     * apart. The live path only needs to know whether the range is covered, because that is what
-     * decides if the checkpoint may move above it. The supervisor pass additionally needs to know
+     * apart. The live path needs to know whether the range is covered or whether the selected mode
+     * permits safe progress while repair continues. The supervisor additionally needs to know
      * whether the range has been <em>answered</em> - whether asking again could reach a different
      * answer - because that is what decides if the same rollback is looked at again on the next cycle.
      * Under one boolean, "another pass held the gate" and "the rebuild ran and failed" were the same
@@ -93,7 +96,7 @@ public interface ContestScoreboardRecoveryStrategy {
      * could not be rebuilt at that moment was therefore never looked at again: with no new stream
      * delivery to re-ask, and nothing else on this interval asking, the history stayed missing.</p>
      *
-     * <p>The four below are separated by that question alone. {@link #COVERED} and
+     * <p>The outcomes below are separated by that question alone. {@link #COVERED} and
      * {@link #UNRECOVERABLE} are answers - one that the range is rebuilt, one that this mode cannot
      * rebuild it - so neither is repeated until the observed offsets change. {@link #BUSY_RETRY_LATER}
      * and {@link #RETRYABLE_FAILURE} are not answers at all: nothing was learned about the range, so it
@@ -107,6 +110,16 @@ public interface ContestScoreboardRecoveryStrategy {
          * <p>The only outcome that lets the checkpoint move above the range.</p>
          */
         COVERED,
+
+        /**
+         * The range lies inside history this JVM already applied, so the live path may keep moving
+         * while this mode repairs its sequence history asynchronously.
+         *
+         * <p>This is deliberately not {@link #COVERED}. It permits only the live checkpoint advance;
+         * it does not say that a check completed and must not advance {@code rebuiltThrough}. The
+         * immediate check is one bounded attempt; the existing fixed-delay checks own retries.</p>
+         */
+        LIVE_PROGRESS,
 
         /**
          * Another pass held the gate, so this attempt never ran.
@@ -144,6 +157,11 @@ public interface ContestScoreboardRecoveryStrategy {
         /** Whether the range is rebuilt, which is what decides if the checkpoint may move above it. */
         public boolean covers() {
             return this == COVERED;
+        }
+
+        /** Whether the live processor may anchor and apply above the observed rollback range. */
+        public boolean permitsLiveProgress() {
+            return this == COVERED || this == LIVE_PROGRESS;
         }
 
         /**

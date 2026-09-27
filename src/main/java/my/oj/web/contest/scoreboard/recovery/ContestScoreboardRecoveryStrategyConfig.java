@@ -43,12 +43,12 @@ public class ContestScoreboardRecoveryStrategyConfig {
             ContestScoreboardRecoveryPassGate gate,
             ObjectProvider<ContestScoreboardStreamRecoveryService> streamRecovery,
             ContestScoreboardFullReplayService fullReplay,
-            ObjectProvider<ContestScoreboardRedisSequenceRecoveryService> sequenceRecovery
+            ObjectProvider<ContestScoreboardRedisSequenceLiveRecovery> sequenceLiveRecovery
     ) {
         return switch (properties.mode()) {
             case STREAM_OFFSET -> new StreamOffsetRecoveryStrategy(streamRecovery.getObject(), gate);
             case FULL_REPLAY -> new FullReplayRecoveryStrategy(fullReplay, gate);
-            case REDIS_SEQ -> new RedisSequenceRecoveryStrategy(sequenceRecovery.getObject(), gate);
+            case REDIS_SEQ -> new RedisSequenceRecoveryStrategy(sequenceLiveRecovery.getObject());
         };
     }
 }

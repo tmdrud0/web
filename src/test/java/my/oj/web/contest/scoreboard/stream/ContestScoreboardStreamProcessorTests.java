@@ -197,6 +197,23 @@ class ContestScoreboardStreamProcessorTests {
         assertThat(requests().get(0).advance()).isEqualTo(CheckpointAdvance.ANCHOR);
     }
 
+    @Test
+    void redisSequenceLiveProgressLetsARollbackBatchApplyWithoutClaimingCoverage() {
+        when(applier.currentStreamOffset()).thenReturn(2L, 2L, 5L);
+        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(strategy.mode()).thenReturn(ContestScoreboardRecoveryMode.REDIS_SEQ);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.LIVE_PROGRESS);
+        position.recordAppliedOffset(4L);
+        position.markAnchorVerified();
+
+        processor.process(List.of(event(5L, 105L)));
+
+        assertThat(requests().get(0).advance()).isEqualTo(CheckpointAdvance.ANCHOR);
+        assertThat(position.rebuiltThrough())
+                .as("live progress is not a completed reconstruction")
+                .isEqualTo(-1L);
+    }
+
     /**
      * What a completed rebuild reached is handed to the mode, so a range the supervisor already
      * rebuilt is not rebuilt a second time by the delivery that anchors past it.

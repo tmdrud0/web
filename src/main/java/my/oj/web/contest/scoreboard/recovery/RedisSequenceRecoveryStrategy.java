@@ -30,13 +30,10 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 class RedisSequenceRecoveryStrategy implements ContestScoreboardRecoveryStrategy {
 
-    private final ContestScoreboardRedisSequenceRecoveryService recoveryService;
-    private final ContestScoreboardRecoveryPassGate gate;
+    private final ContestScoreboardRedisSequenceLiveRecovery liveRecovery;
 
-    RedisSequenceRecoveryStrategy(ContestScoreboardRedisSequenceRecoveryService recoveryService,
-                                  ContestScoreboardRecoveryPassGate gate) {
-        this.recoveryService = recoveryService;
-        this.gate = gate;
+    RedisSequenceRecoveryStrategy(ContestScoreboardRedisSequenceLiveRecovery liveRecovery) {
+        this.liveRecovery = liveRecovery;
     }
 
     @Override
@@ -47,11 +44,11 @@ class RedisSequenceRecoveryStrategy implements ContestScoreboardRecoveryStrategy
     /**
      * True: the consumer waits for the startup check.
      *
-     * <p>This mode's check judges every stored sequence against the allocator it read, and the contract
-     * that makes that reading correct is that every database read comes before the allocator read. A
-     * consumer applying results while the check runs would be issuing sequences into the middle of that
-     * window - the one thing the mode's own check cannot survive, since each side would judge the
-     * other's in-flight results as lost.</p>
+     * <p>This mode's check judges every stored sequence against the allocator it reads, and the contract
+     * that makes that reading correct is that every database read comes before the allocator read. The
+     * startup hold preserves mode isolation; once this JVM has applied history, live writes may proceed
+     * while a later check runs because rows committed after its database snapshot are outside that pass
+     * and are picked up by a later periodic check if necessary.</p>
      *
      * <p>The cold start is also where the mode's isolation is easiest to lose. A consumer that started
      * first would re-read the stream from the stored checkpoint and put the restored history back
@@ -89,30 +86,7 @@ class RedisSequenceRecoveryStrategy implements ContestScoreboardRecoveryStrategy
             // a range nobody can rebuild from becoming a sequence check per supervisor cycle.
             return Outcome.UNRECOVERABLE;
         }
-        try {
-            return gate.tryRun(PassKind.SEQUENCE_CHECK, () -> {
-                ContestScoreboardRedisSequenceRecoveryService.SequenceCheckReport report = recoveryService.check();
-                // A pass that spent every round, or every window in a round, has not seen the whole
-                // set. Reporting the range as rebuilt on either would let the checkpoint move over
-                // candidates the check never reached.
-                if (report.coveredTheWholeSet()) {
-                    return Outcome.COVERED;
-                }
-                if (report.unresolved()) {
-                    // Rounds were spent and results are still to be replayed: replaying a result the
-                    // scoreboard already applied cannot take the sequence back off it, so the next
-                    // round finds the same group. Another round is not the repair.
-                    return Outcome.UNRECOVERABLE;
-                }
-                // The window budget ran out before the tail was walked to its end. Rounds replay what
-                // they find, so the next pass has less to look at - this one is worth taking again.
-                return Outcome.RETRYABLE_FAILURE;
-            }).orElse(Outcome.BUSY_RETRY_LATER);
-        } catch (RuntimeException failure) {
-            log.error("The sequence check could not rebuild the scoreboard history the rollback took away "
-                            + "between offsets {} and {}; the check is retried on the next supervisor cycle",
-                    range.firstLostOffset(), range.lastLostOffset(), failure);
-            return Outcome.RETRYABLE_FAILURE;
-        }
+        liveRecovery.trigger();
+        return Outcome.LIVE_PROGRESS;
     }
 }

@@ -73,6 +73,9 @@ class ContestScoreboardRecoveryModeStartupRedisIntegrationTests {
         assertThat(context.getBeanNamesForType(ContestScoreboardRedisSequenceScheduler.class))
                 .as("the periodic trigger this mode runs on")
                 .hasSize(1);
+        assertThat(context.getBeanNamesForType(ContestScoreboardRedisSequenceLiveRecovery.class))
+                .as("the managed single-flight trigger for live rollback checks")
+                .hasSize(1);
         assertThat(context.getBeanNamesForType(ContestScoreboardRedisSequenceStartupCheck.class))
                 .as("the mode-conditional startup check, present even with the check itself disabled")
                 .hasSize(1);

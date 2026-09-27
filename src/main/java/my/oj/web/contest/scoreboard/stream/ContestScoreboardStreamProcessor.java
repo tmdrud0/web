@@ -240,9 +240,10 @@ class ContestScoreboardStreamProcessor {
      *
      * <p>A delivery above the checkpoint means the offsets between them are not readable from the
      * stream, so the results they carried exist only in whatever the mode treats as its history. The
-     * mode is the only thing that may say whether they are there - and its answer covers the range only
-     * if it can find every offset in it, which is what {@code lastLostOffset} tells it and what a mode
-     * whose basis is written at apply time has to refuse.</p>
+     * mode is the only thing that may say whether they are there. Most modes must cover the range
+     * before progress; redis-seq may instead allow live progress for a rollback wholly inside this
+     * JVM's applied history while its idempotent repair continues asynchronously. A range containing
+     * an offset never applied here is still refused.</p>
      *
      * <p>The range handed over states both of its ends: the offset just below this delivery, and the
      * highest offset this process applied. Its answer is read against the same ends, so a
@@ -276,7 +277,7 @@ class ContestScoreboardStreamProcessor {
                     outcome.label()
             ));
         }
-        if (!outcome.covers()) {
+        if (!outcome.permitsLiveProgress()) {
             throw new IllegalStateException(
                     "Scoreboard stream checkpoint " + checkpoint + " is "
                             + reason.description
@@ -287,11 +288,12 @@ class ContestScoreboardStreamProcessor {
                             + "the standings never saw");
         }
         position.markAnchorVerified();
-        log.warn("Scoreboard stream checkpoint {} was {}; the {} basis rebuilt the range below {} "
-                        + "and the checkpoint may now move there",
+        log.warn("Scoreboard stream checkpoint {} was {}; the {} basis returned {} for the range below {} "
+                        + "and the live checkpoint may now move there",
                 checkpoint,
                 reason.description,
                 strategy.mode().propertyValue(),
+                outcome.label(),
                 firstDelivery);
         return CheckpointAdvance.ANCHOR;
     }

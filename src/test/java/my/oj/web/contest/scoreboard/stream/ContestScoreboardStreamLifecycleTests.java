@@ -439,6 +439,22 @@ class ContestScoreboardStreamLifecycleTests {
         assertThat(counter("contest.scoreboard.stream.rollback.observed")).isEqualTo(1.0);
     }
 
+    @Test
+    void liveProgressIsRememberedWithoutBeingRecordedAsRebuilt() {
+        when(applier.currentStreamOffset()).thenReturn(4L, 2L, 2L);
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.LIVE_PROGRESS);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordAppliedOffset(4L);
+
+        lifecycle.recoverConsumption();
+        lifecycle.recoverConsumption();
+
+        verify(strategy, times(1)).rebuildHistory(any());
+        assertThat(position.rebuiltThrough()).isEqualTo(-1L);
+    }
+
     /**
      * The defect this pins: a rollback the mode could not answer at that moment was recorded as
      * answered and never looked at again.
