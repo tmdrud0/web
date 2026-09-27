@@ -204,17 +204,17 @@
 
   <div class="row" style="margin-top: 4px">
     <div style="flex: 1.2">
-      <div class="sec"><span class="t" style="color: var(--amber)">측정 ① — 짧은 lease의 비용은 실재했다</span><span class="rule"></span><span class="cond">110 RPS · in-flight 16 · worker 16/node · 채점 95% 50ms / 5% 2s · 각 1회</span></div>
+      <div class="sec"><span class="t" style="color: var(--amber)">측정 ① — lease를 줄이면 2초 작업부터 샌다</span><span class="rule"></span><span class="cond">in-flight 64 · worker 16/node · 채점 95% 50ms / 5% 2s · 실제 중복 채점 수</span></div>
       <div class="tbl">
         <table>
-          <tr><th style="width: 26%">지표</th><th>lease 2.5초</th><th class="hot" style="color: var(--amber)">lease 1초</th><th>읽는 법</th></tr>
-          <tr><td>실제 중복 채점</td><td class="num">0건</td><td class="num hot red">354건</td><td class="note">전체의 <b>4.9%</b> · 전부 2초짜리 작업</td></tr>
-          <tr><td>계산상 worker 비용</td><td class="num" style="color:var(--muted)">기준</td><td class="num hot red">+67.7%</td><td class="note">5%만 중복됐는데 긴 작업이라 <b>비용은 2/3 늘었다</b></td></tr>
-          <tr><td>중복 안 된 50ms 작업 p95</td><td class="num">715ms</td><td class="num hot red">16,358ms</td><td class="note">중복이 worker를 점유해 <b>멀쩡한 작업까지</b> 밀렸다</td></tr>
-          <tr><td>유실 · 최종 불일치</td><td class="num">0 / 0</td><td class="num hot">0 / 0</td><td class="note"><b>정합성은 지켜졌다</b> — 비용과 지연의 문제</td></tr>
+          <tr><th style="width: 22%">lease</th><th>100 RPS</th><th>140 RPS (포화의 약 94%)</th></tr>
+          <tr><td>2초</td><td class="num red">163건</td><td class="num" style="color:var(--muted)">—</td></tr>
+          <tr class="hot"><td>2.5초</td><td class="num">0건</td><td class="num red">7건 <span style="font-family: Pretendard; font-size: 12.5px">(9,136건 중 · 2초 작업만)</span></td></tr>
+          <tr><td>4초</td><td class="num" style="color:var(--green)">0건</td><td class="num" style="color:var(--green)">0건</td></tr>
+          <tr><td>10초</td><td class="num">0건</td><td class="num" style="color:var(--muted)">—</td></tr>
         </table>
       </div>
-      <p class="note" style="margin-top: 9px; line-height: 1.6"><b>하지만 안전한 값은 고를 수 있었다.</b> in-flight 64 · 100 RPS에서 lease 2초는 중복 163건을 만들었지만 4초와 10초는 모두 0건, 처리량도 같았다. 돌이켜 보면 heartbeat로 “오래 걸리는 작업”과 “죽은 서버”를 구분할 수도 있었지만, 4초에서 이미 중복이 없어 그 복잡도를 더할 이유가 없었다.</p>
+      <p class="note" style="margin-top: 9px; line-height: 1.6"><b>안전선은 채점 시간 + 미리 가져온 작업의 대기다.</b> 부하가 오르면 로컬 대기가 늘어 선이 올라간다 — 2.5초는 평소엔 안전했지만 포화 근처에서 2초 작업부터 새기 시작했다. 그래서 여유를 두고 4초. 돌이켜 보면 heartbeat로 “오래 걸리는 작업”과 “죽은 서버”를 구분할 수도 있었지만, 4초에서 이미 중복이 없어 그 복잡도를 더할 이유가 없었다.</p>
     </div>
     <div style="flex: 1">
       <div class="sec"><span class="t" style="color: var(--amber)">측정 ② — 지연을 좌우한 건 lease가 아니었다</span><span class="rule"></span></div>
