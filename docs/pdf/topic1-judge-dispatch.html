@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>주제 1 · 채점 작업 분배</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+  @page { size: 1080pt 607.5pt; margin: 0; }
+  :root {
+    --ink: #111827; --ink2: #374151; --muted: #6b7280; --line: #e5e7eb; --soft: #f9fafb;
+    --blue: #2563eb; --blue-bg: #eff6ff; --blue-line: #bfdbfe;
+    --purple: #7c3aed; --purple-bg: #f5f3ff; --purple-line: #ddd6fe;
+    --amber: #b45309; --amber-bg: #fffbeb; --amber-line: #fde68a;
+    --red: #dc2626; --red-bg: #fef2f2;
+    --green: #047857; --green-bg: #ecfdf5; --green-line: #a7f3d0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #fff; }
+  body { font-family: "Pretendard", "Malgun Gothic", sans-serif; color: var(--ink); -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .page { width: 1440px; height: 810px; padding: 34px 52px 30px; position: relative; overflow: hidden; page-break-after: always; display: flex; flex-direction: column; }
+  .page:last-child { page-break-after: auto; }
+  .bar { position: absolute; top: 0; left: 0; right: 0; height: 5px; }
+  .mono { font-family: "JetBrains Mono", Consolas, "Pretendard", monospace; }
+  .label { font-family: "Pretendard", sans-serif; font-size: 13px; font-weight: 700; letter-spacing: .02em; }
+  h1 { font-size: 33px; font-weight: 800; letter-spacing: -.02em; margin: 8px 0 8px; line-height: 1.2; }
+  .lead { font-size: 15px; color: var(--ink2); line-height: 1.6; max-width: 1240px; }
+  .lead b { color: var(--ink); }
+  .row { display: flex; gap: 18px; }
+  .card { border: 1.3px solid var(--line); border-radius: 12px; padding: 14px 18px; background: #fff; }
+  .card h3 { font-size: 14.5px; font-weight: 700; margin-bottom: 9px; }
+  .sec { display: flex; align-items: center; gap: 12px; margin: 16px 0 8px; }
+  .sec .t { font-family: "Pretendard", sans-serif; font-size: 13.5px; font-weight: 700; white-space: nowrap; }
+  .sec .rule { flex: 1; height: 1px; background: var(--line); }
+  .sec .cond { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-weight: 600; color: var(--muted); font-size: 11.5px; padding: 7px 10px; background: var(--soft); border-bottom: 1px solid var(--line); }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; line-height: 1.45; }
+  tr:last-child td { border-bottom: 0; }
+  .tbl { border: 1.3px solid var(--line); border-radius: 12px; overflow: hidden; }
+  td.num { font-family: "JetBrains Mono", Consolas, "Pretendard", monospace; font-size: 13px; white-space: nowrap; }
+  .hot { background: var(--amber-bg); }
+  .red { color: var(--red); font-weight: 600; }
+  .note { font-size: 12.5px; color: var(--ink2); }
+  .note b { color: var(--ink); }
+  .chip { display: inline-block; font-family: "JetBrains Mono", Consolas, "Pretendard", monospace; font-size: 12px; padding: 4px 10px; border-radius: 7px; border: 1.3px solid var(--line); }
+  .arrow { color: var(--muted); margin: 0 6px; }
+  .pill { display: inline-block; font-size: 11.5px; font-weight: 700; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
+  .p-no { background: var(--red-bg); color: var(--red); }
+  .p-small { background: #f3f4f6; color: var(--ink2); }
+  .p-yes { background: var(--green-bg); color: var(--green); }
+  .foot { margin-top: auto; display: flex; border-top: 1.3px solid var(--line); padding-top: 14px; gap: 28px; }
+  .foot > div { flex: 1; font-size: 13.5px; line-height: 1.6; color: var(--ink2); }
+  .foot b { color: var(--ink); }
+  .foot .big { font-size: 16px; font-weight: 700; color: var(--ink); margin-bottom: 4px; line-height: 1.45; }
+  .vsep { width: 1px; background: var(--line); flex: 0 0 1px !important; }
+  .band { margin-top: auto; display: flex; border: 1.5px solid var(--green-line); border-radius: 14px; overflow: hidden; }
+  .band > div { padding: 15px 22px; font-size: 13.5px; line-height: 1.6; color: var(--ink2); }
+  .band .l { flex: 1.15; background: var(--green-bg); }
+  .band .r { flex: 1; border-left: 1.5px solid var(--green-line); }
+  .band .big { font-size: 17px; font-weight: 800; color: var(--ink); margin-bottom: 5px; }
+  .band .small-h { font-size: 12.5px; font-weight: 700; color: var(--muted); margin-bottom: 5px; }
+  .band b { color: var(--ink); }
+  .em-g { color: var(--green); font-weight: 700; }
+  .em-r { color: var(--red); font-weight: 700; }
+  ul.tight { list-style: none; font-size: 13px; line-height: 1.55; color: var(--ink2); }
+  ul.tight li { padding-left: 14px; position: relative; margin-bottom: 3px; }
+  ul.tight li::before { content: ""; position: absolute; left: 2px; top: 8px; width: 5px; height: 5px; border-radius: 50%; background: var(--purple); }
+  ul.tight b { color: var(--ink); }
+
+  .roomy .lead { font-size: 16px; }
+  .roomy .row { gap: 22px; }
+  .roomy .card { padding: 18px 22px; }
+  .roomy .ptitle { font-size: 16px; margin-bottom: 14px; }
+  .roomy .node { font-size: 14px; padding: 12px 12px; }
+  .roomy .node small { font-size: 12px; }
+  .roomy .fa { font-size: 12.5px; }
+  .roomy .ann { font-size: 14px; line-height: 1.65; margin-top: 14px; }
+  .roomy .ann .mono { font-size: 13px !important; }
+  .roomy .exp > div { font-size: 14px; line-height: 1.6; padding: 14px 16px; }
+  .roomy .exp .n { font-size: 15px; margin-bottom: 6px; }
+  .roomy .card h3 { font-size: 16px; margin-bottom: 12px; }
+  .roomy .note { font-size: 14px; }
+  .roomy table { font-size: 14px; }
+  .roomy td { padding: 11px 12px; }
+  .roomy th { font-size: 12.5px; padding: 9px 12px; }
+  .roomy td.num { font-size: 14px; }
+  .roomy .sec { margin: 22px 0 10px; }
+  .roomy .sec .t { font-size: 15px; }
+  .roomy .verdict { font-size: 14px; padding: 9px 0; }
+  .roomy .verdict .k { flex-basis: 175px; }
+  .roomy .foot > div { font-size: 15px; }
+  .roomy .foot .big { font-size: 18px; }
+  .roomy .row + .row { margin-top: 22px !important; }
+</style>
+</head>
+<body>
+<style>
+  .flow { display: flex; align-items: center; gap: 6px; }
+  .node { border: 1.4px solid var(--line); border-radius: 9px; padding: 8px 10px; font-size: 12.5px; font-weight: 700; background: #fff; text-align: center; line-height: 1.3; }
+  .node small { display: block; font-weight: 400; color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .n-db { border-color: #93c5fd; background: var(--blue-bg); }
+  .n-mq { border-color: #c4b5fd; background: var(--purple-bg); }
+  .n-j { border-color: #d1d5db; background: var(--soft); }
+  .fa { color: var(--muted); font-size: 12px; text-align: center; line-height: 1.1; white-space: nowrap; }
+  .fa b { display: block; font-size: 16px; color: #9ca3af; font-weight: 400; }
+  .ann { font-size: 12.5px; color: var(--ink2); line-height: 1.55; margin-top: 10px; }
+  .ann div { padding-left: 16px; position: relative; margin-bottom: 3px; }
+  .ann div::before { position: absolute; left: 0; top: 0; }
+  .ann .ok::before { content: "•"; color: var(--muted); }
+  .ann .bad::before { content: "!"; color: var(--red); font-weight: 800; }
+  .ann .good::before { content: "✓"; color: var(--green); font-weight: 800; }
+  .ann b { color: var(--ink); }
+  .ptitle { font-size: 14.5px; font-weight: 800; margin-bottom: 10px; display: flex; align-items: baseline; gap: 8px; }
+  .ptitle span { font-size: 12px; font-weight: 500; color: var(--muted); }
+  .exp { display: flex; gap: 12px; }
+  .exp > div { flex: 1; border: 1.3px solid var(--purple-line); border-radius: 10px; padding: 10px 14px; background: var(--purple-bg); font-size: 12.8px; line-height: 1.5; color: var(--ink2); }
+  .exp .n { font-weight: 800; color: var(--purple); font-size: 13.5px; margin-bottom: 3px; }
+  .exp b { color: var(--ink); }
+  .verdict { display: flex; gap: 10px; align-items: flex-start; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 13px; line-height: 1.5; color: var(--ink2); }
+  .verdict:last-child { border-bottom: 0; }
+  .verdict .k { flex: 0 0 150px; font-weight: 700; color: var(--ink); }
+  .verdict b { color: var(--ink); }
+</style>
+
+<!-- ============================ PAGE A ============================ -->
+<section class="page roomy">
+  <div class="bar" style="background: var(--blue)"></div>
+  <div class="label" style="color: var(--blue)">주제 1 · 채점 작업 분배 — 문제와 첫 판단</div>
+  <h1>채점 서버가 죽으면, 처리 중이던 제출은 누가 책임지나?</h1>
+  <p class="lead">제출 원본은 MySQL에 안전하게 남는다. 문제는 채점 서버가 가져간 작업이 그 서버와 함께 주인을 잃는다는 것이다 — 제출은 “채점 중”인 채로 남고, 참가자는 결과를 받지 못한다. 풀어야 할 것은 데이터 유실이 아니라 <b>진행 중인 작업의 소유권</b>이었다.</p>
+
+  <div class="row" style="margin-top: 16px">
+    <!-- MySQL claim -->
+    <div class="card" style="flex: 1; border-color: var(--blue-line)">
+      <div class="ptitle" style="color: var(--blue)">① 첫 구조 — MySQL claim / lease <span>새 인프라 없이, 제출이 있는 DB에서 해결</span></div>
+      <div class="flow">
+        <div class="node" style="flex: 0 0 92px">웹 서버<small>제출 접수</small></div>
+        <div class="fa">저장<b>→</b></div>
+        <div class="node n-db" style="flex: 1">MySQL<small>제출 + 채점 작업 행 (대기 · 채점 중 · 완료)</small></div>
+        <div class="fa">100ms마다 poll<b>⇄</b>claim · 완료</div>
+        <div class="node n-j" style="flex: 0 0 104px">채점 서버 ×2<small>노드당 worker 16</small></div>
+      </div>
+      <div class="ann">
+        <div class="ok">동시에 가져가지 않게 — <span class="mono" style="font-size:12px">FOR UPDATE SKIP LOCKED</span>: 다른 서버가 잠근 행은 기다리지 않고 건너뛴다</div>
+        <div class="ok">늦은 덮어쓰기 막기 — 가져갈 때마다 <b>새 토큰</b>, 완료는 토큰이 일치할 때만 기록</div>
+        <div class="bad">서버가 죽으면 — 가져간 시각 + <b>lease</b>가 지나야 다음 claim이 회수한다. <b>작업의 주인을 시간으로 추론</b>한다</div>
+      </div>
+    </div>
+    <!-- RabbitMQ -->
+    <div class="card" style="flex: 1; border-color: var(--purple-line)">
+      <div class="ptitle" style="color: var(--purple)">② 옮긴 구조 — outbox + RabbitMQ <span>작업의 주인을 브로커의 ACK 상태로</span></div>
+      <div class="flow">
+        <div class="node" style="flex: 0 0 70px">웹 서버</div>
+        <div class="fa"><b>→</b></div>
+        <div class="node n-db" style="flex: 1">MySQL<small>제출 + outbox<br>(같은 트랜잭션)</small></div>
+        <div class="fa">relay<b>→</b></div>
+        <div class="node n-mq" style="flex: 1">Quorum Queue<small>durable · 디스크 복제</small></div>
+        <div class="fa">push<b>→</b>prefetch</div>
+        <div class="node n-j" style="flex: 0 0 96px">채점 서버 ×2<small>결과 commit → ACK</small></div>
+      </div>
+      <div class="ann">
+        <div class="good">서버가 죽으면 — 연결이 끊기는 즉시 <b>ACK 안 된 메시지를 재전달</b>. 정할 lease도, 회수 로직도 없다</div>
+        <div class="good">새 작업은 브로커가 밀어준다 — poll 사이에 worker가 놀 틈이 없다</div>
+        <div class="bad">대가 — DB와 브로커 사이 트랜잭션이 없어 <b>중복 전달이 가능</b>하다. 재전달되면 결과부터 조회하고, 있으면 채점 없이 저장된 결과만 다시 보낸다</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 16px">
+    <div class="card" style="flex: 1; background: var(--amber-bg); border-color: var(--amber-line)">
+      <h3 style="color: var(--amber)">옮긴 이유 — lease에는 고를 기준이 없는 트레이드오프가 있다</h3>
+      <div style="display:flex; border: 1.3px solid var(--amber-line); border-radius: 8px; overflow: hidden; font-size: 12.5px; font-weight: 700; margin-bottom: 8px">
+        <div style="flex:1; padding: 6px 10px; background:#fef3c7">짧게</div>
+        <div style="flex:1.3; padding: 6px 10px; background:#fde68a; text-align:center">고를 기준이 없다</div>
+        <div style="flex:1; padding: 6px 10px; background:#fef3c7; text-align:right">길게</div>
+      </div>
+      <div style="display:flex; justify-content: space-between; font-size: 12.5px; color: var(--ink2)">
+        <span>오래 걸린 정상 채점을 죽은 것으로 보고 <b style="color:var(--ink)">중복 실행</b></span><span>진짜 장애에서 <b style="color:var(--ink)">회수가 늦다</b></span>
+      </div>
+      <p class="note" style="margin-top: 9px; line-height: 1.6">소유를 “시간이 지났으니 죽었을 것”이라는 추론이 아니라 “받았고 아직 확인하지 않았다”는 상태로 판단하면, 이 선택 자체가 사라진다고 봤다. <b>이 판단은 이론이었다.</b></p>
+    </div>
+    <div style="flex: 1.25; display: flex; flex-direction: column">
+      <div class="sec" style="margin-top: 0"><span class="t" style="color: var(--purple)">그래서 브로커에 기대한 것</span><span class="rule"></span><span class="cond">측정은 옮긴 뒤, 두 방식을 모두 남겨 두고 했다</span></div>
+      <div class="exp" style="flex: 1">
+        <div><div class="n">① 더 빠른 회복</div>lease를 기다리지 않고 <b>즉시 재전달</b>되니 장애 때 사용자 지연이 줄어들 것</div>
+        <div><div class="n">② 덜 노는 채점 서버</div>poll 공백이 없으니 <b>같은 서버로 더 많이</b> 채점할 것</div>
+        <div><div class="n">③ 가벼운 DB</div>claim·완료 갱신이 사라지니 제출을 받는 <b>DB의 경합이 줄</b> 것</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <div><b>잃은 것도 분명했다.</b> 운영할 인프라가 하나 늘었고, “한 번만 전달”을 포기하고 중복을 애플리케이션에서 흡수해야 했다. 이 대가가 기대만큼의 가치가 있는지 — 다음 페이지에서 쟀다.</div>
+  </div>
+</section>
+
+<!-- ============================ PAGE B ============================ -->
+<section class="page roomy">
+  <div class="bar" style="background: var(--amber)"></div>
+  <div class="label" style="color: var(--amber)">주제 1 · 채점 작업 분배 — 기대와 첫 측정</div>
+  <h1>재 보니, 트레이드오프는 실재했지만 풀던 문제가 달랐다</h1>
+  <p class="lead">기대 ①(더 빠른 회복)부터 확인했다. lease가 정말 고를 수 없는 값인지, 그리고 회복 속도가 사용자 지연을 좌우하는지 — MySQL 방식을 그대로 남겨 두고 두 질문을 따로 쟀다.</p>
+
+  <div class="row" style="margin-top: 4px">
+    <div style="flex: 1.2">
+      <div class="sec"><span class="t" style="color: var(--amber)">측정 ① — 짧은 lease의 비용은 실재했다</span><span class="rule"></span><span class="cond">110 RPS · in-flight 16 · worker 16/node · 채점 95% 50ms / 5% 2s · 각 1회</span></div>
+      <div class="tbl">
+        <table>
+          <tr><th style="width: 26%">지표</th><th>lease 2.5초</th><th class="hot" style="color: var(--amber)">lease 1초</th><th>읽는 법</th></tr>
+          <tr><td>실제 중복 채점</td><td class="num">0건</td><td class="num hot red">354건</td><td class="note">전체의 <b>4.9%</b> · 전부 2초짜리 작업</td></tr>
+          <tr><td>계산상 worker 비용</td><td class="num" style="color:var(--muted)">기준</td><td class="num hot red">+67.7%</td><td class="note">5%만 중복됐는데 긴 작업이라 <b>비용은 2/3 늘었다</b></td></tr>
+          <tr><td>중복 안 된 50ms 작업 p95</td><td class="num">715ms</td><td class="num hot red">16,358ms</td><td class="note">중복이 worker를 점유해 <b>멀쩡한 작업까지</b> 밀렸다</td></tr>
+          <tr><td>유실 · 최종 불일치</td><td class="num">0 / 0</td><td class="num hot">0 / 0</td><td class="note"><b>정합성은 지켜졌다</b> — 비용과 지연의 문제</td></tr>
+        </table>
+      </div>
+      <p class="note" style="margin-top: 9px; line-height: 1.6"><b>하지만 안전한 값은 고를 수 있었다.</b> in-flight 64 · 100 RPS에서 lease 2초는 중복 163건을 만들었지만 4초와 10초는 모두 0건, 처리량도 같았다. 돌이켜 보면 heartbeat로 “오래 걸리는 작업”과 “죽은 서버”를 구분할 수도 있었지만, 4초에서 이미 중복이 없어 그 복잡도를 더할 이유가 없었다.</p>
+    </div>
+    <div style="flex: 1">
+      <div class="sec"><span class="t" style="color: var(--amber)">측정 ② — 지연을 좌우한 건 lease가 아니었다</span><span class="rule"></span></div>
+      <div class="tbl">
+        <table>
+          <tr><th>채점 서버 1대 SIGKILL · 짧은 작업 p95</th><th>lease 4초</th><th>lease 10초</th></tr>
+          <tr><td>50 RPS <span style="color:var(--muted); font-size:12px">남은 1대가 감당</span></td><td class="num">0.88s</td><td class="num">0.44s</td></tr>
+          <tr><td>100 RPS <span style="color:var(--muted); font-size:12px">남은 1대의 용량 초과</span></td><td class="num red">10.5s</td><td class="num red">10.1s</td></tr>
+        </table>
+      </div>
+      <p class="note" style="margin-top: 9px; line-height: 1.6">lease가 바꾼 건 죽는 순간 잡혀 있던 <b>수십 건</b>(50 RPS 4건, 100 RPS 20건)의 회수 시점뿐. 전체 지연은 <b>남은 서버가 들어오는 제출을 감당하느냐</b>로 갈렸다 — 감당하면 1초 미만, 못 하면 lease와 무관하게 약 10초.</p>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 16px">
+    <div class="card" style="flex: 1; border-color: var(--amber-line)">
+      <h3>그래서 생각이 바뀐 것</h3>
+      <div class="verdict"><div class="k">이론의 트레이드오프</div><div>실재했다. 하지만 4초로 풀렸고, <b>사용자 경험을 좌우하는 요인이 아니었다.</b> 이론만 보고 내린 결정이었다.</div></div>
+      <div class="verdict"><div class="k">대회에서의 회복 속도</div><div>대회 부하는 평시 위에 몇 분짜리 <b>5배 피크</b>, 그 안에 짧은 <b>10배 피크</b>가 얹힌다. 5배 구간에서 대기열이 쌓이지 않게 용량을 잡으면 평시엔 한 대가 죽어도 여유가 충분하고, 피크엔 참가자가 이미 수십 초를 기다린다. <b>어느 쪽에서도 회복 속도는 체감되기 어렵다.</b></div></div>
+      <div class="verdict"><div class="k">남은 기대 ② ③</div><div>처리량과 DB는 아직 모른다. 앞서 1,000 starts/s burst를 1회 재 봤지만 진입부 503이 섞여 근거로 쓰지 않았다.</div></div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <div><div class="big">문제는 회복 속도가 아니라 용량이었다.</div>그렇다면 브로커를 계속 둘 이유는 하나뿐이다 — <b>같은 피크 경험을 더 적은 자원으로 주는가.</b> 이것을 대회 모양의 부하로 다시 쟀다.</div>
+  </div>
+</section>
+
+<!-- ============================ PAGE 3 ============================ -->
+<section class="page">
+  <div class="bar" style="background: var(--purple)"></div>
+  <div class="label" style="color: var(--purple)">주제 1 · 채점 작업 분배 — 문제를 다시 정의하고 검증하다</div>
+  <h1>회복 속도가 아니라 용량이 문제라면, 그 비용은 누가 치르는가</h1>
+  <p class="lead">질문을 바꿨다 — 브로커는 <b>같은 피크 경험을 더 적은 자원으로 주는가?</b> 평시 위에 5배·10배 피크가 얹힌 대회 모양의 부하를 만들고, 두 방식에 같은 채점 용량을 준 뒤 대기열이 얼마나 오래 남는지를 비교했다.</p>
+
+  <div class="row" style="margin-top: 16px">
+    <div class="card" style="flex: 0.9; border-color: var(--purple-line)">
+      <h3 style="color: var(--purple)">실험 설계</h3>
+      <svg width="100%" viewBox="0 0 420 92" style="display:block; margin-bottom: 8px">
+        <line x1="0" y1="80" x2="420" y2="80" stroke="#d1d5db" stroke-width="1"/>
+        <path d="M0 80 V72 H105 V40 H175 V8 H210 V40 H280 V72 H420 V80 Z" fill="#ede9fe"/>
+        <path d="M0 72 H105 V40 H175 V8 H210 V40 H280 V72 H420" fill="none" stroke="#7c3aed" stroke-width="2"/>
+        <text x="52" y="66" font-size="11" fill="#6b7280" text-anchor="middle" font-family="Pretendard">평시 1배</text>
+        <text x="140" y="34" font-size="11" fill="#6b7280" text-anchor="middle" font-family="Pretendard">5배</text>
+        <text x="192" y="22" font-size="11" fill="#7c3aed" font-weight="700" text-anchor="middle" font-family="Pretendard">10배</text>
+        <text x="245" y="34" font-size="11" fill="#6b7280" text-anchor="middle" font-family="Pretendard">5배</text>
+        <text x="350" y="66" font-size="11" fill="#6b7280" text-anchor="middle" font-family="Pretendard">평시 1배</text>
+        <text x="192" y="92" font-size="10" fill="#9ca3af" text-anchor="middle" font-family="Pretendard">5배 2분 30초 · 그 안의 10배 30초</text>
+      </svg>
+      <ul class="tight">
+        <li><b>변수</b> — 채점 worker 수로 정한 용량 = 평시의 5.4 / 6.8 / 8.1배</li>
+        <li><b>지표</b> — p99 대신 <b>대기열이 남아 있는 시간</b>. p99는 대회가 길수록 평시 제출에 희석되어 피크를 가린다</li>
+        <li><b>규칙</b> — 반복 실행 · 503이 1건이라도 나오면 버린다(거절된 제출이 통계에서 빠지므로)</li>
+      </ul>
+    </div>
+
+    <div style="flex: 1.35; display:flex; flex-direction: column">
+      <div class="tbl">
+        <table>
+          <tr><th style="width: 24%">세 가지 기대의 최종 결과</th><th style="width: 15%">결과</th><th>근거</th></tr>
+          <tr><td style="font-weight:600">장애 때 더 빨리 회복</td><td><span class="pill p-no">아니었다</span></td><td class="note">피크 중 채점 서버를 죽여도 두 방식 모두 <b>대기열 170초</b>. 재전달 지연을 0·4·30초로 바꿔 넣어도 같았다</td></tr>
+          <tr><td style="font-weight:600">채점 서버가 덜 논다</td><td><span class="pill p-small">조금</span></td><td class="note">실제 용량이 명목 대비 MySQL <b>77~80%</b>, 브로커 <b>79~84%</b> — 차이 3~5%p</td></tr>
+          <tr><td style="font-weight:600">DB 경합이 준다</td><td><span class="pill p-yes">예상보다 컸다</span></td><td class="note">처리량을 14배로 키우자 드러났다 — 아래</td></tr>
+        </table>
+      </div>
+      <p class="note" style="margin-top: 8px; color: var(--muted)">스스로 의심한 것 — MySQL을 덜 튜닝했나(poll 100→20ms: 처리량 그대로, DB CPU만 +34~44%) · 가짜 채점이라 그런가(실제 CPU 연산으로 바꿔도 같은 결론). 어느 쪽도 결론을 바꾸지 않았다.</p>
+    </div>
+  </div>
+
+  <div class="sec" style="margin-top: 14px"><span class="t" style="color: var(--green)">차이는 DB에서 났다</span><span class="rule"></span><span class="cond">평시 70 RPS(14배) · 같은 용량 배수 · MySQL 컨테이너 CPU 한도 2코어</span></div>
+  <div class="row" style="align-items: stretch">
+    <div class="card" style="flex: 1.35; padding: 12px 18px">
+      <svg width="100%" viewBox="0 0 760 118" style="display:block">
+        <text x="0" y="14" font-size="12" fill="#6b7280" font-family="Pretendard">최고 피크 30초의 평균 DB CPU</text>
+        <text x="760" y="14" font-size="12" fill="#6b7280" text-anchor="end" font-family="Pretendard">한도에 막힌 시간 (30초 중)</text>
+        <!-- scale: 0..2 cores -> 110..600 -->
+        <text x="0" y="48" font-size="13" fill="#111827" font-weight="700" font-family="Pretendard">MySQL 방식</text>
+        <rect x="110" y="34" width="490" height="20" rx="4" fill="#f3f4f6"/>
+        <rect x="110" y="34" width="404" height="20" rx="4" fill="#f87171"/>
+        <text x="506" y="49" font-size="12" fill="#fff" font-weight="700" text-anchor="end" font-family="JetBrains Mono, Consolas, Pretendard">1.6~1.7</text>
+        <text x="760" y="49" font-size="15" fill="#dc2626" font-weight="800" text-anchor="end" font-family="JetBrains Mono, Consolas, Pretendard">23~28초</text>
+        <text x="0" y="88" font-size="13" fill="#111827" font-weight="700" font-family="Pretendard">브로커 방식</text>
+        <rect x="110" y="74" width="490" height="20" rx="4" fill="#f3f4f6"/>
+        <rect x="110" y="74" width="294" height="20" rx="4" fill="#34d399"/>
+        <text x="396" y="89" font-size="12" fill="#fff" font-weight="700" text-anchor="end" font-family="JetBrains Mono, Consolas, Pretendard">약 1.2</text>
+        <text x="760" y="89" font-size="15" fill="#047857" font-weight="800" text-anchor="end" font-family="JetBrains Mono, Consolas, Pretendard">4~6초</text>
+        <line x1="600" y1="28" x2="600" y2="100" stroke="#111827" stroke-width="1.5" stroke-dasharray="3 3"/>
+        <text x="600" y="114" font-size="11" fill="#111827" text-anchor="middle" font-family="Pretendard">한도 2코어</text>
+        <text x="110" y="114" font-size="11" fill="#9ca3af" text-anchor="middle" font-family="JetBrains Mono, Consolas, Pretendard">0</text>
+      </svg>
+    </div>
+    <div class="card" style="flex: 1; font-size: 13.5px; line-height: 1.65; color: var(--ink2)">
+      피크가 끝나도 MySQL 방식은 대기열을 비우는 동안 <b style="color:var(--ink)">120초 중 18~84초</b> 더 막혔다(브로커 방식 0초). claim과 완료 처리가 <b style="color:var(--ink)">유입이 아니라 채점 속도를 따라</b> DB를 두드리기 때문이다.
+      그리고 이 DB는 <b style="color:var(--ink)">유실되면 안 되는 제출 원본도 저장한다</b> — 이 차이는 비용이 아니라 위험이다.
+    </div>
+  </div>
+
+  <div class="band" style="margin-top: 14px">
+    <div class="l">
+      <div class="big">기대는 채점 서버였지만, <span class="em-g">브로커가 아낀 건 DB였다.</span></div>
+      장애 지연도 채점 처리량도 크게 달라지지 않았다. 달라진 건 피크에 제출 저장과 같은 DB가 남기는 여유였다.
+      어느 방식이든 필요한 채점 서버는 명목이 아니라 <b>실측 용량</b>(명목의 67~84%, 규모가 클수록 낮았다)으로 계산해야 하고, 이 값 하나로 대기열 길이가 재현됨을 모델로 확인했다.
+    </div>
+    <div class="r">
+      <div class="small-h">다시 설계한다면</div>
+      지금 규모에서는 <b>MySQL 방식도 충분히 유효하다</b> — 채점 효율 차이는 3~5%p이고 운영할 인프라가 하나 적다.
+      브로커를 유지하는 이유는 채점 효율이 아니라 <b>DB 여유</b>이고, 처리량이 커져 그 여유가 제출 저장을 위협할 때 의미가 커진다. 그래서 피크 중 DB CPU 여유를 지켜볼 지표로 둔다.
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
