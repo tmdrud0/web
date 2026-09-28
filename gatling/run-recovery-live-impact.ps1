@@ -273,6 +273,10 @@ try {
         finally {
             Pop-Location
         }
+        # The stack-MySQL migration below starts web-1 from whatever image already exists, before the
+        # `up --build` in step 3. Rebuild the app images now so the migration runs this build's Flyway
+        # scripts rather than an older image's.
+        [void](Invoke-Compose -Arguments @("build", "web-1", "web-2", "batch-1", "judge-1", "judge-2"))
     }
     foreach ($required in @($config.JavaExe, $classpathFile, (Join-Path $summarizerClasses "my\oj\perf\liveimpact\LiveImpactSummarizer.class"))) {
         if (-not (Test-Path -LiteralPath $required)) {
