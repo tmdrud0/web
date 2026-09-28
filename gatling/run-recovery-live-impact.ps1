@@ -714,6 +714,8 @@ finally {
         }
     }
     catch { Write-Output "  non-interference: $($_.Exception.Message)"; $exitCode = 1 }
+    # A "false" left in this session's environment would reach the next harness started from it.
+    Remove-Item -Path Env:\CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING -ErrorAction SilentlyContinue
     Write-Output "  outcome: $($script:outcome) (exit $exitCode)"
 }
 exit $exitCode
