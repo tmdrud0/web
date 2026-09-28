@@ -467,7 +467,7 @@ outbox 행 수, 비교 기준 result stream 메시지 수를 기록한다. 전�
 |---|---|---|
 | `contest_scoreboard_pending_events` | batch-1의 AMQP 0.9.1 tail probe + Redis Lua checkpoint | 관측한 stream 최신 offset - Redis 적용 offset |
 | `contest_scoreboard_oldest_ready_seconds` | batch-1 stream consumer | 현재 적용 또는 retry 중인 head batch의 `judgedAt` 나이 |
-| `contest_scoreboard_applied_total` | batch-1 stream consumer | Redis Lua와 `scoreboard_applied_at` JDBC batch를 모두 완료한 새 offset 수 |
+| `contest_scoreboard_applied_total` | batch-1 stream consumer | Redis Lua(와 applied-at tracking이 켜져 있으면 `scoreboard_applied_at` JDBC batch)를 완료한 새 offset 수 |
 
 AMQP 0.9.1 consumer는 RabbitMQ의 broker-managed offset tracking 대상이 아니므로
 `stream_consumer_metrics`에 lag sample을 만들지 않는다. batch-1은 5초마다
@@ -1066,7 +1066,11 @@ outbox와 미래 stream 구현이 마지막에 공유하는 `RedisContestScorebo
 
 | Micrometer | Prometheus | 의미 |
 |---|---|---|
-| `contest.scoreboard.redis.pipeline` | `contest_scoreboard_redis_pipeline_seconds_*` | `applyAll` 한 번의 전체 시간. command error 뒤 개별 분류 fallback도 포함한다. |
+| `contest.scoreboard.redis.pipeline` | `contest_scoreboard_redis_pipeline_seconds_*` | `applyAll` batch 한 번의 전체 시간. 이름은 과거 run과의 비교를 위해 유지했지만 pipeline이 아니라 chunk(`contest.scoreboard.redis.apply-chunk-size`, 기본 100)마다 batched Lua `EVAL` 1회를 순서대로 보내고 첫 실패에서 멈춘다. |
+| `contest.scoreboard.redis.apply.calls` | `contest_scoreboard_redis_apply_calls_*` | batch 하나가 쓴 Redis 왕복(batched `EVAL`) 수 = 도달한 chunk 수 |
+| `contest.scoreboard.apply.staleness{replayed}` | `contest_scoreboard_apply_staleness_seconds_*` | 새로 `APPLIED`된 결과의 적용 시각 − `judgedAt`. `DUPLICATE`는 제외, 롤백 뒤 재독으로 다시 반영된 결과는 `replayed=true`. applied-at tracking이 꺼진 배포에서 `scoreboard_applied_at − result_saved_at`을 대신한다. |
+| `contest.scoreboard.stream.rollback.detected{path}` | `contest_scoreboard_stream_rollback_detected_total{path}` | 이 consumer가 대응한 Redis 롤백, 감지 경로별(`supervisor` / `apply-cas`) |
+| `contest.scoreboard.stream.checkpoint.regressed` | `contest_scoreboard_stream_checkpoint_regressed_total` | checkpoint CAS가 아무것도 쓰지 않고 거부한 stream batch 수 |
 | `contest.scoreboard.redis.lua.errors{kind}` | `contest_scoreboard_redis_lua_errors_total{kind}` | 개별 Lua 실패. pipeline 예외와 fallback 예외를 이중으로 세지 않는다. |
 | `contest.scoreboard.redis.wrong.attempt` | `contest_scoreboard_redis_wrong_attempt_fields` | 모든 problem hash의 `w:*` 총량 추정값 |
 | `contest.scoreboard.redis.wrong.attempt.poll` | `contest_scoreboard_redis_wrong_attempt_poll_seconds_*` | 예약 폴러 한 번의 시간 |

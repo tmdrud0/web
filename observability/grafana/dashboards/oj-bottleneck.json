@@ -813,7 +813,7 @@
       "id": 25,
       "type": "timeseries",
       "title": "Scoreboard apply rate",
-      "description": "Events per second completed by the scoreboard stream consumer. The counter advances only after Redis offset application and the JDBC scoreboard_applied_at batch both succeed.",
+      "description": "Events per second completed by the scoreboard stream consumer. The counter advances only after Redis offset application succeeds and, when contest.scoreboard.stream-offset.applied-at-tracking is on, the JDBC scoreboard_applied_at batch as well.",
       "gridPos": { "h": 8, "w": 6, "x": 12, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "oj-prometheus" },
       "fieldConfig": {
