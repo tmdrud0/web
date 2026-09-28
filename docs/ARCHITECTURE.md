@@ -25,8 +25,8 @@ flowchart LR
     Judge --> Result["contest_submission_result"]
     Judge --> Stream["contest.judge.result.stream"]
     Stream --> Consumer["Batch stream consumer"]
-    Consumer --> Lua["Redis Lua: scoreboard + offset"]
-    Consumer --> AppliedAt["JDBC batch: scoreboard_applied_at"]
+    Consumer --> Lua["Redis batched Lua: scoreboard + offset (+ checkpoint CAS)"]
+    Consumer -.->|"applied-at-tracking=true only"| AppliedAt["JDBC batch: scoreboard_applied_at"]
 ```
 
 judge listener의 완료 순서는 반드시 다음과 같다.
@@ -41,10 +41,27 @@ scoreboard consumer의 완료 순서도 고정되어 있다.
 
 ```text
 stream delivery
-  -> Redis Lua(scoreboard + applied offset + DB-completion repair marker)
-  -> contest_submission_result.scoreboard_applied_at JDBC batch
+  -> Redis batched Lua, chunk 단위(checkpoint CAS + scoreboard + applied offset
+                                  [+ DB-completion repair marker: applied-at-tracking=true일 때만])
+  -> [contest_submission_result.scoreboard_applied_at JDBC batch: applied-at-tracking=true일 때만]
   -> stream delivery ACK
 ```
+
+- **batched Lua.** batch(기본 500건)는 `contest.scoreboard.redis.apply-chunk-size`(기본 100)건씩
+  `ContestScoreboardRedisBatchScript` 한 번의 `EVAL`로 적용한다. 이벤트마다 단건 script와 같은 규칙
+  (processed set dedupe, `continue`/`anchor` claim, offset ≤ checkpoint 무시, seq 발급)을 따르고,
+  **첫 실패에서 멈춘다** — chunk 안에서도, 다음 chunk를 보내지 않으므로 chunk 경계를 넘어서도. 결과는
+  이벤트별 `APPLIED`/`DUPLICATE`/`FAILED`/`ROLLBACK`과 발급된 seq다. batch당 Redis 왕복은 chunk 수와
+  같다(`contest.scoreboard.redis.apply.calls`). 단일 Redis 노드 배포이며 Redis Cluster는 쓰지 않는다
+  (단건 script도 전역 키와 contest 키를 한 호출에서 썼다).
+- **checkpoint CAS.** stream batch는 이 JVM이 현재 consumer 위치에 대해 이미 관측했거나 기록한
+  checkpoint(`ContestScoreboardStreamPosition.checkpointFloor`)를 floor로 함께 보낸다. script는 첫
+  이벤트 전에 `저장된 checkpoint < floor`이면 아무 키도 바꾸지 않고 `ROLLBACK`을 반환한다. 이것이
+  `resolveAdvance`(lock 밖)와 적용 사이에 snapshot 복원이 끼어드는 race를 닫는다(§3.2).
+- **applied-at tracking.** `contest.scoreboard.stream-offset.applied-at-tracking`이 꺼져 있으면
+  (stream-offset의 기본값) Lua는 db-pending set에 쓰지 않고, `ContestScoreboardAppliedAtCompletion`은
+  MySQL UPDATE도 SREM도 repair도 하지 않는다. ACK는 Lua 직후 나간다. 반영 지연은 대신
+  `contest.scoreboard.apply.staleness`(적용 시각 − `judgedAt`, `APPLIED`만, `replayed` 태그)로 본다.
 
 `contest_submission_outbox` 테이블은 롤백 호환을 위해 schema에 남아 있지만 현재 코드가 쓰거나
 읽지 않는다. `contest_judge_outbox`는 제출 원본 commit과 Rabbit publish 사이의 복구 경로로 계속
@@ -83,7 +100,7 @@ stream delivery
 | `redis-seq` | Redis가 발급해 DB `scoreboard_applied_seq`에 남긴 seq | 움직이지 않는다 |
 
 복구 방식은 **전송이나 채점을 바꾸지 않는다.** 세 모드 모두 같은 RabbitMQ stream 경로와 같은 Lua
-script(`ContestScoreboardRedisScript.APPLY`), 같은 `ContestScoreboardApplier.applyAll`을 지난다.
+script(`ContestScoreboardRedisBatchScript.APPLY`, 단건 `ContestScoreboardRedisScript`와 같은 규칙), 같은 `ContestScoreboardApplier.applyAll`을 지난다.
 모드가 바꾸는 것은 **체크포인트와 복구 기전**뿐이다. 그래야 세 방식을 같은 조건에서 비교할 수 있다.
 
 모드별 빈은 `@ConditionalOnProperty(prefix="contest.scoreboard.recovery", name="mode", havingValue=...)`로
@@ -274,7 +291,37 @@ offset**이다 — 정확한 watermark가 아니라 그 **하한**이다(부분 
 - per-contest processed set은 정확성 checkpoint가 아니다. commutative 규칙이 정확성을 보장하고,
   set은 중복 replay의 계산만 줄인다. contest rebuild 때는 해당 set도 지운다.
 - Redis 적용 후 MySQL batch 전에 죽는 구간은 Redis `contest:scoreboard:stream:db-pending` set으로
-  복구한다. 이 set도 Lua에서 offset과 함께 기록하고 DB 완료 후 제거한다.
+  복구한다. 이 set도 Lua에서 offset과 함께 기록하고 DB 완료 후 제거한다. **단 이것은
+  `applied-at-tracking=true`일 때만이다.** stream-offset의 복구는 `scoreboard_applied_at`을 읽지 않으므로
+  이 모드의 기본값은 `false`이고, 그때는 set도 UPDATE도 없다. 남아 있는 set(모드 전환 직후)은 읽히지도
+  쓰이지도 않는다. `full-replay`·`redis-seq`에서 `false`는 validator가 기동을 거부한다.
+
+#### 적용과 롤백 사이의 race — checkpoint CAS
+
+`resolveAdvance`는 apply lock **밖에서** checkpoint를 읽고 `CONTINUE`를 결정한다. 그 뒤 적용 전에
+Redis가 snapshot으로 복원되면(checkpoint 19 → 9), CAS 없는 script는 "들어온 20 > 저장된 9"만 보고
+적용하며 checkpoint를 29로 올린다. 10..19는 건너뛰어지고, `highestAppliedOffset`이 max로 누적되므로
+supervisor의 `stored < applied` 비교도 29 대 29로 아무것도 못 본다(Lettuce의 재전송이 이 창을 넓힐 수
+있다). `ContestScoreboardStreamCheckpointRaceRedisIntegrationTests`가 이 순서를 실제 Redis로 재현한다.
+
+그래서 stream batch는 **floor**를 함께 보낸다.
+
+- floor는 적용 직전에 Redis에서 다시 읽은 값이 **아니다** — 그러면 복원 직후 값을 기대값으로 삼게 된다.
+  anchor가 검증될 때 그 판정의 checkpoint로 **설정**되고(롤백 후 재검증이면 롤백된 값), 검증된 위치에서
+  live path가 읽은 checkpoint와 완료된 batch가 남긴 checkpoint로만 **올라가며**, 재구독 때 `-1`로
+  돌아간다. `highestAppliedOffset`과 달리 내려갈 수 있어야 재구독이 자기 복구를 거부하지 않는다.
+- floor가 `-1`(첫 기동, 재구독 직후 검증 전)이면 검사를 생략한다. rebuild 요청(offset 없음)은 floor를
+  받아도 검사하지 않는다. chunk가 여럿이면 다음 chunk의 floor는 이전 chunk가 남긴 checkpoint다.
+- `ROLLBACK`은 실패가 아니다. failed batch도, unapplied range도 기록하지 않고 anchor만 해제한다.
+  listener는 `ContestScoreboardStreamRollbackSignal`로 lifecycle에 알리고, lifecycle은 supervisor 주기를
+  기다리지 않고 **별도 스레드에서** 모드의 기존 롤백 응답(`handleRollback`: stream-offset은 저장된
+  checkpoint에서 재구독, 나머지는 자기 basis로 재구성)을 실행한다. consumer thread에서 container를
+  멈추면 그 listener 호출 자신을 기다리게 되기 때문이다. 같은 monitor 아래에서 consumer generation이
+  바뀌었으면(이미 누군가 재구독) 건너뛰고, 답한 (stored, applied) 쌍을 supervisor와 같은 방식으로
+  기록하므로 중복 재구독이 없다. supervisor의 주기 검사는 유입이 없을 때를 위해 그대로 둔다.
+- 감지 경로는 `contest.scoreboard.stream.rollback.detected{path="supervisor"|"apply-cas"}`로,
+  거부된 batch 수는 `contest.scoreboard.stream.checkpoint.regressed`로 센다. experiment trace에는
+  `GAP` 레코드(detail `apply-cas checkpoint=... floor=... delivery=...`, outcome `refused`)로 남는다.
 - 운영자가 한 contest를 명시적으로 rebuild할 때는 내부 관리 endpoint
   `POST /actuator/contestscoreboard?contestId={id}`를 사용한다. live 적용과 같은 lock을 사용한다.
 
@@ -565,7 +612,10 @@ bounds를 빌리지 않는다 — 그것은 chunk replay의 bounds이고, 여기
 - scoreboard 결과는 event 순서와 중복 횟수에 무관해야 한다. Redis Lua와
   `InMemoryContestScoreboard`는 같은 commutative 규칙을 유지한다.
 - live stream batch는 offset 순서로 fail-fast 적용한다. Redis pipeline은 앞 script 실패 뒤의
-  명령도 실행할 수 있으므로 이 경로에서는 사용하지 않는다.
+  명령도 실행할 수 있으므로 이 경로에서는 사용하지 않는다. 대신 chunk 하나를 **하나의 Lua 호출**로
+  적용하고 script 안에서 첫 실패에 멈춘다(§1). 메트릭 이름 `contest.scoreboard.redis.pipeline`은
+  기존 harness·대시보드와의 비교를 위해 유지했지만 의미는 "batch 하나의 wall-clock"이다.
+- stream batch는 저장된 checkpoint가 이 JVM이 관측한 floor보다 낮으면 아무것도 쓰지 않는다(§3.2).
 - poison event를 건너뛰지 않는다. batch 전체를 적용하지 않고 실패시키고, Redis 복구 또는 payload 수정
   후 **같은 offset부터** 다시 처리한다. 재시도 자체는 requeue가 아니라 저장된 checkpoint에서의
   재구독이 만든다(§3.2). checkpoint는 실패한 batch를 넘어 전진하지 않으므로 그 사이 결과가 조용히
