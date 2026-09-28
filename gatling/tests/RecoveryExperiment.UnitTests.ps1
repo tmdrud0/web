@@ -1156,6 +1156,61 @@ Test-Case "redis-seq runs on the MySQL poller with every scoreboard Stream flag 
     }
 }
 
+# --- applied-at tracking (live-impact) ------------------------------------------------------------
+
+. "$PSScriptRoot\..\lib\RecoveryExperiment.LiveImpact.ps1"
+
+# In place of the real MySQL client for the rest of this file, at the top level for the reason the
+# Prometheus stub above gives. No case after this one reads MySQL.
+$script:sqlInt64StubValue = 0L
+function Invoke-SqlInt64 {
+    param(
+        [Parameter(Mandatory = $true)][string]$Sql,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+    return [long]$script:sqlInt64StubValue
+}
+
+function New-AppliedAtUnitConfig {
+    $root = (Get-Item "$PSScriptRoot\..\..").FullName
+    $artifacts = Join-Path ([IO.Path]::GetTempPath()) "sbrec-unittests"
+    [void](Initialize-RecoveryExperiment -WorktreeRoot $root -ArtifactDirectory $artifacts `
+            -RunId "unit" -Mode "stream-offset" -DbPassword "x")
+    return (Set-ExperimentContestScope -ContestId 7 -ProblemIdStart 11 -ProblemIdEnd 15 `
+            -ContestStartTimeMysql "2026-01-01 00:00:00.000000")
+}
+
+Test-Case "applied-at tracking is on unless a live-impact run turned it off" {
+    [void](New-AppliedAtUnitConfig)
+    Assert-True (Test-AppliedAtTrackingEnabled) "a config no runner marked keeps the historical drain gate"
+    $saved = [Environment]::GetEnvironmentVariable("CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING")
+    try {
+        Assert-Equal "false" (Set-LiveImpactAppliedAtTracking -Mode "stream-offset" -Value "false") "stream-offset may turn it off"
+        Assert-Equal "false" ([string]$env:CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING) "and compose sees the value"
+        Assert-True (-not (Test-AppliedAtTrackingEnabled)) "and the drain gate follows it"
+        Assert-Equal "true" (Set-LiveImpactAppliedAtTracking -Mode "full-replay" -Value "true") "every mode may keep it on"
+        Assert-True (Test-AppliedAtTrackingEnabled) "and the gate is back on the column"
+        Assert-Throws { Set-LiveImpactAppliedAtTracking -Mode "full-replay" -Value "false" } "full-replay recovers from the column and may not turn it off"
+    } finally {
+        [Environment]::SetEnvironmentVariable("CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING", $saved)
+        [void](New-AppliedAtUnitConfig)
+    }
+}
+
+Test-Case "without applied-at the backlog is judged results minus the processed set, never negative" {
+    [void](New-AppliedAtUnitConfig)
+    $script:sqlInt64StubValue = 10L
+    Assert-Equal 3 (Get-UnappliedResultCountFromProcessedSet -ProcessedCardinality 7) "three judged results are not in the set"
+    Assert-Equal 0 (Get-UnappliedResultCountFromProcessedSet -ProcessedCardinality 10) "a drained contest reads zero"
+    Assert-Equal 0 (Get-UnappliedResultCountFromProcessedSet -ProcessedCardinality 12) "a set ahead of the count is floored, not negative"
+}
+
+Test-Case "a batch role started with the other applied-at value is refused" {
+    Assert-Throws { Assert-LiveImpactAppliedAtTracking -Runtime ([pscustomobject]@{ AppliedAtTracking = "true" }) -Expected "false" } "the container disagrees with the run"
+    Assert-Throws { Assert-LiveImpactAppliedAtTracking -Runtime ([pscustomobject]@{ AppliedAtTracking = $null }) -Expected "true" } "a container from before the setting existed"
+    Assert-LiveImpactAppliedAtTracking -Runtime ([pscustomobject]@{ AppliedAtTracking = "false" }) -Expected "false"
+}
+
 # --- report -------------------------------------------------------------------------------------
 
 Write-TestSummary -Suite "RecoveryExperiment unit tests"

@@ -56,6 +56,12 @@ services:
       SPRING_PROFILES_ACTIVE: multi-batch,loadtest
       DB_NAME: oj_loadtest
       CONTEST_SUBMISSION_WORKER_ID: 100
+      # The application's own default is false in stream-offset (it recovers from the stored offset and
+      # never reads scoreboard_applied_at). Every harness on this stack starts with it on unless the shell
+      # says otherwise, so the earlier stream-offset measurements keep meaning what they meant; a run that
+      # measures the new default sets CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING=false
+      # (run-recovery-live-impact.ps1 -AppliedAtTracking false).
+      CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING: ${CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING:-true}
 
   # JUDGE_* passes through from the shell so a run can give the judge a latency profile without
   # editing a file. Off by default, which keeps every earlier measurement comparable. See

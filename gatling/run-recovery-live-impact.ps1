@@ -66,6 +66,10 @@ param(
     # 40-130k MySQL rows a run and was part of what it measured). >0 reads the digest every N seconds.
     [int]$OraclePollSeconds = 0,
     [int]$TailPollIntervalMilliseconds = 100,
+    # contest.scoreboard.stream-offset.applied-at-tracking on the stack. "true" (the default) keeps the
+    # earlier runs' write path; "false" measures stream-offset without the scoreboard_applied_at UPDATE and
+    # the db-pending set. See Set-LiveImpactAppliedAtTracking for which figures change source.
+    [ValidateSet("true", "false")][string]$AppliedAtTracking = "true",
     # The baseline has to show the pipeline keeping up before a fault is injected; this lets a run proceed
     # when it does not, and records that it did.
     [switch]$AllowUnflatBaseline,
@@ -192,6 +196,8 @@ $config.ComposeArgs = @($config.ComposeArgs) + @("-f", "compose.live-impact.yaml
 foreach ($extraComposeFile in $ExtraComposeFiles) {
     $config.ComposeArgs = @($config.ComposeArgs) + @("-f", $extraComposeFile)
 }
+# Checked before anything is touched; the value reaches the batch role through compose.loadtest.yaml.
+[void](Set-LiveImpactAppliedAtTracking -Mode $Mode -Value $AppliedAtTracking)
 
 $concurrentUsers = [long][math]::Ceiling($TargetRps * $SubmitIntervalMillis / 1000.0)
 if ($concurrentUsers -gt $UserCount) {
@@ -238,6 +244,7 @@ $events = [ordered]@{
     oraclePollSeconds = $OraclePollSeconds
     tailPollIntervalMs = $TailPollIntervalMilliseconds
     replayChunkSize = "500 (contest.scoreboard.recovery.full-replay.replay-batch-size default; not overridden)"
+    appliedAtTracking = $AppliedAtTracking
 }
 
 $script:clock = $null
@@ -340,6 +347,7 @@ try {
     [void](Invoke-Compose -Arguments @("up", "-d", "--force-recreate", "--no-deps", "web-1", "web-2", "batch-1", "judge-1", "judge-2"))
     Wait-PilotStackHealthy
     $runtime = Assert-BatchRecoveryMode
+    Assert-LiveImpactAppliedAtTracking -Runtime $runtime -Expected $AppliedAtTracking
     if ([string]$runtime.DbName -ne $config.DbName -or [string]$runtime.DbPort -ne $config.DbPort) {
         throw "The batch role is connected to '$($runtime.DbName)' on port $($runtime.DbPort); this run reads '$($config.DbName)' on $($config.DbPort)."
     }

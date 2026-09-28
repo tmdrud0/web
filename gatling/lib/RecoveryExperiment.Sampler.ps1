@@ -530,6 +530,39 @@ function Get-UnappliedResultCount {
         -Description "unapplied scoreboard result rows"
 }
 
+# Whether this run's batch role stamps `scoreboard_applied_at` (and keeps the db-pending repair set).
+# `run-recovery-live-impact.ps1 -AppliedAtTracking false` records false on the config; every other runner
+# leaves the property absent, which is the historical true - compose.loadtest.yaml starts the batch role
+# with tracking on unless the shell says otherwise.
+function Test-AppliedAtTrackingEnabled {
+    $config = Get-RecoveryConfig
+    $property = $config.PSObject.Properties["AppliedAtTracking"]
+    if ($null -eq $property) {
+        return $true
+    }
+    return [bool]$property.Value
+}
+
+# The scoreboard's backlog when nothing stamps `scoreboard_applied_at`: judged (non-PENDING) results of the
+# contest in MySQL minus the contest's Redis processed set, floored at zero. The rebuild before the load
+# puts every seeded judged result in the set and each live result joins it when it is applied, so at a
+# drained pipeline the two agree.
+#
+# The cardinality is read before the MySQL count, never after: the set only grows and the count only grows,
+# so reading the set first can only overstate the difference - a drain gate that waits a poll longer, never
+# one that passes early. The one way it can understate is a result the Stream delivered as PENDING (it joins
+# the set, and MySQL does not count it); the judge publishes final results, so that is a theoretical gap
+# rather than an observed one.
+function Get-UnappliedResultCountFromProcessedSet {
+    param([Parameter(Mandatory = $true)][long]$ProcessedCardinality)
+
+    $config = Get-RecoveryConfig
+    $judged = Invoke-SqlInt64 `
+        -Sql "SELECT COUNT(*) FROM contest_submission_result WHERE contest_id = $($config.ContestId) AND COALESCE(final_result, provisional_result) <> 'PENDING'" `
+        -Description "judged scoreboard result rows"
+    return [long][math]::Max(0L, $judged - $ProcessedCardinality)
+}
+
 # The mysql-poll delivery's own backlog beside `scoreboard_applied_at IS NULL`: a rollback leaves the rows
 # it took away stamped as applied, so what says they are still owed to the scoreboard is the pending
 # recovery range the batch role persisted for them. Not scoped to the contest - ranges are sequence
@@ -592,12 +625,27 @@ function Test-PipelineQuiescent {
 function Get-PipelineOperationalState {
     $pipelineWatch = [Diagnostics.Stopwatch]::StartNew()
     $judgeNonPublished = Get-JudgeOutboxNonPublished
-    $scoreboardUnapplied = Get-UnappliedResultCount
+    # With applied-at tracking off nothing stamps `scoreboard_applied_at` or fills the db-pending set, so
+    # neither can say the pipeline drained: the backlog comes from the processed set instead (read first -
+    # see Get-UnappliedResultCountFromProcessedSet), and a db-pending set left from an earlier run is not a
+    # term, because nothing will ever empty it.
+    $appliedAtTracking = Test-AppliedAtTrackingEnabled
+    $scoreboard = $null
+    if ($appliedAtTracking) {
+        $scoreboardUnapplied = Get-UnappliedResultCount
+    }
+    else {
+        $scoreboard = Get-ScoreboardState
+        $scoreboardUnapplied = Get-UnappliedResultCountFromProcessedSet -ProcessedCardinality $scoreboard.ProcessedCardinality
+    }
     $rabbitWatch = [Diagnostics.Stopwatch]::StartNew()
     $queues = Get-RabbitQueueState
     $rabbitPollMs = $rabbitWatch.ElapsedMilliseconds
     Assert-OnlyProjectQueues -Queues $queues
-    $scoreboard = Get-ScoreboardState
+    if ($null -eq $scoreboard) {
+        $scoreboard = Get-ScoreboardState
+    }
+    $streamDbPendingTerm = if ($appliedAtTracking) { $scoreboard.StreamDbPending } else { 0L }
 
     $config = Get-RecoveryConfig
     # `contest_scoreboard_pending_events` is a meter of the Stream consumer, so under mysql-poll there is
@@ -627,11 +675,12 @@ function Get-PipelineOperationalState {
     # they measure on a stream and why they made this unsatisfiable.
     $quiescent = Test-PipelineQuiescent -Delivery $config.Delivery -JudgeNonPublished $judgeNonPublished `
         -ScoreboardUnapplied $scoreboardUnapplied -Live $live -Dead $dead -Stream $stream `
-        -StreamDbPending $scoreboard.StreamDbPending -PendingEvents $pendingEvents `
+        -StreamDbPending $streamDbPendingTerm -PendingEvents $pendingEvents `
         -PendingRecoveryRanges $pendingRecoveryRanges
 
     return [pscustomobject][ordered]@{
         Quiescent = $quiescent
+        ScoreboardUnappliedSource = if ($appliedAtTracking) { "scoreboard_applied_at" } else { "processed-set" }
         PendingRecoveryRanges = $pendingRecoveryRanges
         RabbitPollMs = $rabbitPollMs
         DurationMs = $pipelineWatch.ElapsedMilliseconds
@@ -716,6 +765,7 @@ function Get-BatchRuntimeConfig {
         DbPort = if ($environment.Contains("DB_PORT")) { $environment["DB_PORT"] } else { $null }
         ConsumerEnabled = if ($environment.Contains("CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED")) { $environment["CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED"] } else { $null }
         Delivery = if ($environment.Contains("CONTEST_SCOREBOARD_DELIVERY")) { $environment["CONTEST_SCOREBOARD_DELIVERY"] } else { $null }
+        AppliedAtTracking = if ($environment.Contains("CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING")) { $environment["CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING"] } else { $null }
     }
 }
 

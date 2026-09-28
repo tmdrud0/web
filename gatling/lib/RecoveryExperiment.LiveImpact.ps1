@@ -27,6 +27,58 @@ function Get-LiveImpactSeedWorkerId {
     return $script:liveImpactSeedWorkerId
 }
 
+# `contest.scoreboard.stream-offset.applied-at-tracking` for this run's stack. "true" is the default and
+# is passed explicitly, so a stream-offset run measures what the earlier ones measured even though the
+# application's own default in that mode is now false. "false" is allowed in stream-offset only - the
+# application refuses it in the other modes - and switches the harness's drain gate from
+# `scoreboard_applied_at IS NULL` to the processed-set count (Get-UnappliedResultCountFromProcessedSet).
+#
+# Where each live-impact summary figure comes from, and whether this switch changes it:
+#   trace/live-apply.csv (written by the batch role when a batch is applied, before any MySQL write):
+#     T_new_resumed, liveRows*, liveSubmissionsApplied, judgedLiveNeverApplied, <phase>.appliedPerSecond,
+#     <phase>.reflectLatency*, backlog*/T_max_backlog/T_backlog_drained, newApplyStall*, reconsumedAfterFault,
+#     T_recovered (with the tail), duringThroughputRatio, verdict                        - same either way
+#   trace/recovery-trace.csv: T_detected, detectedBy, replay*, passes*, gapQuestionsAfterRollback, chunk*
+#                                                                                        - same either way
+#   tail-poll.csv (Redis processed set against the lost set): lostCount, T_tail_returned,
+#     tailReturnedAfterFaultMs                                                           - same either way
+#   judged.csv / result counts (MySQL judged-at, never applied-at): N, judged*, <phase>.judgedPerSecond
+#                                                                                        - same either way
+#   Gatling simulation.log: submit*, gatling.*                                           - same either way
+#   run.drained (and so the run's outcome): Wait-PipelineQuiescent - `scoreboard_applied_at IS NULL` and the
+#     db-pending set with tracking on, judged-minus-processed-set with tracking off
+#   run.finalConsistent: API standings against every resolved MySQL result              - same either way
+#   run.baselineFlat / baselineStreamPending: judge queue and Stream pending events     - same either way
+#   run.counters.faultToLoadEnd.mysql.Com_update: counts fewer UPDATEs with tracking off - that is the effect
+#     being measured, not a missing source
+function Set-LiveImpactAppliedAtTracking {
+    param(
+        [Parameter(Mandatory = $true)][string]$Mode,
+        [Parameter(Mandatory = $true)][ValidateSet("true", "false")][string]$Value
+    )
+
+    if ($Value -eq "false" -and $Mode -ne "stream-offset") {
+        throw "-AppliedAtTracking false is a stream-offset setting; mode '$Mode' recovers from scoreboard_applied_at and the application refuses to start without it."
+    }
+    $env:CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING = $Value
+    $config = Get-RecoveryConfig
+    $config | Add-Member -NotePropertyName AppliedAtTracking -NotePropertyValue ($Value -eq "true") -Force
+    return $Value
+}
+
+# The batch role has to have been started with the value this run recorded; a container left from another
+# run with the other value would measure a different write path under this run's name.
+function Assert-LiveImpactAppliedAtTracking {
+    param(
+        [Parameter(Mandatory = $true)]$Runtime,
+        [Parameter(Mandatory = $true)][string]$Expected
+    )
+
+    if ([string]$Runtime.AppliedAtTracking -ne $Expected) {
+        throw "The batch role carries CONTEST_SCOREBOARD_STREAM_OFFSET_APPLIED_AT_TRACKING='$($Runtime.AppliedAtTracking)'; this run was started with '$Expected'. Is compose.loadtest.yaml from this revision?"
+    }
+}
+
 # Inserts `Count` judged results into the seeded contest, spread over its users and problems:
 # result n goes to user (n mod U)+1 and problem ((n div U) mod P)+1, so every user has a result before
 # any user has two on the same problem. `AcceptPermille` of them are ACCEPTED, decided by a hash of the
