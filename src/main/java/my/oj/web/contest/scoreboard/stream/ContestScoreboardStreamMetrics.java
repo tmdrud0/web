@@ -5,6 +5,7 @@ import org.springframework.context.annotation.Conditional;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
@@ -51,6 +52,15 @@ public class ContestScoreboardStreamMetrics {
     private volatile Counter unappliedRefusals;
     private volatile Counter tailProbeFailures;
     private volatile Counter checkpointRegressedRefusals;
+    private volatile Timer stalenessFirstApply;
+    private volatile Timer stalenessReplayed;
+
+    private static final Duration[] STALENESS_BUCKETS = {
+            Duration.ofMillis(10), Duration.ofMillis(25), Duration.ofMillis(50), Duration.ofMillis(100),
+            Duration.ofMillis(250), Duration.ofMillis(500), Duration.ofSeconds(1), Duration.ofMillis(2500),
+            Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(60),
+            Duration.ofSeconds(120), Duration.ofSeconds(300)
+    };
     private final Map<String, Counter> rollbackDetections = new java.util.concurrent.ConcurrentHashMap<>();
     private MeterRegistry registry;
 
@@ -123,6 +133,35 @@ public class ContestScoreboardStreamMetrics {
         for (String path : List.of(DETECTED_BY_SUPERVISOR, DETECTED_BY_APPLY_CAS)) {
             rollbackDetection(path);
         }
+        this.stalenessFirstApply = stalenessTimer(registry, false);
+        this.stalenessReplayed = stalenessTimer(registry, true);
+    }
+
+    /**
+     * Apply time minus {@code judgedAt}, for each event the scoreboard newly reflected.
+     *
+     * <p>The replacement for reading {@code scoreboard_applied_at - result_saved_at} out of MySQL, which a
+     * deployment without applied-at tracking no longer writes. Only events the batch script answered
+     * {@code APPLIED} are recorded - a re-delivery or a re-read the scoreboard already held is not a
+     * result reaching the standings. {@code replayed=true} marks an event at or below the highest offset
+     * this JVM had already applied, which after a rollback is the lost range coming back through the
+     * resubscribe; the watermark is in memory, so a range re-read after a JVM restart is counted as
+     * {@code replayed=false}.</p>
+     */
+    private static Timer stalenessTimer(MeterRegistry registry, boolean replayed) {
+        return Timer.builder("contest.scoreboard.apply.staleness")
+                .tag("replayed", Boolean.toString(replayed))
+                .description("Time from judgedAt to the Lua call that newly applied the result to the scoreboard")
+                .serviceLevelObjectives(STALENESS_BUCKETS)
+                .register(registry);
+    }
+
+    void recordStaleness(LocalDateTime judgedAt, LocalDateTime appliedAt, boolean replayed) {
+        if (judgedAt == null || appliedAt == null) {
+            return;
+        }
+        Duration staleness = Duration.between(judgedAt, appliedAt);
+        (replayed ? stalenessReplayed : stalenessFirstApply).record(staleness.isNegative() ? Duration.ZERO : staleness);
     }
 
     private Counter rollbackDetection(String path) {

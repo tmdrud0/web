@@ -13,6 +13,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -348,7 +349,9 @@ class ContestScoreboardStreamProcessor {
         // The floor is what this JVM already observed or wrote for the position, never a fresh read: a
         // checkpoint read now would be the restored one, and the check would pass exactly when it must not.
         long floor = position.checkpointFloor();
+        long appliedBefore = position.highestAppliedOffset();
         List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(requests, floor);
+        LocalDateTime appliedAt = LocalDateTime.now();
         long answeredAt = trace.enabled() ? System.currentTimeMillis() : 0L;
         ContestScoreboardApplier.ApplyResult rollback = results.stream()
                 .filter(ContestScoreboardApplier.ApplyResult::rolledBack)
@@ -357,6 +360,9 @@ class ContestScoreboardStreamProcessor {
         if (rollback != null) {
             refuseRegressedCheckpoint(batch, floor, rollback, generation, answeredAt);
         }
+        // Before the failure check: a batch that stopped half way did apply what came before the failure,
+        // and a later re-read answers those as duplicates, so this is the only time they are seen applied.
+        recordStaleness(batch, results, appliedBefore, appliedAt);
         ContestScoreboardApplier.ApplyResult failed = results.stream()
                 .filter(result -> !result.succeeded())
                 .findFirst()
@@ -434,6 +440,18 @@ class ContestScoreboardStreamProcessor {
                         + "back underneath it, so the batch from {} was refused without writing anything",
                 stored, floor, batch.get(0).offset());
         throw new ContestScoreboardCheckpointRegressedException(floor, stored, generation);
+    }
+
+    private void recordStaleness(List<ContestScoreboardStreamEvent> batch,
+                                 List<ContestScoreboardApplier.ApplyResult> results,
+                                 long appliedBefore,
+                                 LocalDateTime appliedAt) {
+        for (int i = 0; i < results.size() && i < batch.size(); i++) {
+            if (results.get(i).newlyApplied()) {
+                ContestScoreboardStreamEvent event = batch.get(i);
+                metrics.recordStaleness(event.message().judgedAt(), appliedAt, event.offset() <= appliedBefore);
+            }
+        }
     }
 
     /** The stream offset a request carried, or {@code -1} when it carried none. */
