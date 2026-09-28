@@ -3,6 +3,8 @@ package my.oj.web.contest.scoreboard.redis;
 import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.RedisCallback;
+import org.springframework.data.redis.core.RedisOperations;
+import org.springframework.data.redis.core.SessionCallback;
 import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
@@ -11,11 +13,12 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /**
  * An RDB restore of the scoreboard keys, done in place: {@link #take} {@code DUMP}s every scoreboard key
- * and {@link #restoreInto} deletes the current ones and {@code RESTORE}s the dump - which is what the
- * scoreboard sees when Redis comes back from an older snapshot.
+ * and {@link #restoreInto} atomically deletes the current ones and {@code RESTORE}s the dump - which is
+ * what the scoreboard sees when Redis comes back from an older snapshot.
  */
 public final class RedisScoreboardSnapshot {
 
@@ -40,14 +43,26 @@ public final class RedisScoreboardSnapshot {
         });
     }
 
+    /**
+     * Deletes the current scoreboard keys and restores the dump in one {@code MULTI/EXEC}, so no reader
+     * can observe the half-restored state in between - an RDB restore is atomic too, and a check that ran
+     * between the delete and the restore would see an allocator of zero that no real restore produces.
+     */
     public void restoreInto(StringRedisTemplate redisTemplate) {
-        redisTemplate.execute((RedisCallback<Void>) connection -> {
-            List<byte[]> current = keys(connection);
-            if (!current.isEmpty()) {
-                connection.keyCommands().del(current.toArray(new byte[0][]));
+        List<String> current = redisTemplate.execute((RedisCallback<List<String>>) connection ->
+                keys(connection).stream().map(RedisScoreboardSnapshot::text).toList());
+        redisTemplate.execute(new SessionCallback<List<Object>>() {
+            @Override
+            @SuppressWarnings("unchecked")
+            public List<Object> execute(RedisOperations operations) {
+                RedisOperations<String, String> redis = operations;
+                redis.multi();
+                if (!current.isEmpty()) {
+                    redis.delete(current);
+                }
+                dumps.forEach((key, value) -> redis.restore(text(key), value, 0, TimeUnit.MILLISECONDS, true));
+                return redis.exec();
             }
-            dumps.forEach((key, value) -> connection.keyCommands().restore(key, 0, value, true));
-            return null;
         });
     }
 
