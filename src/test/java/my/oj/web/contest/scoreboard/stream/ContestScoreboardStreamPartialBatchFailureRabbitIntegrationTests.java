@@ -108,6 +108,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
 @ActiveProfiles("test")
 @TestPropertySource(properties = {
+        // These tests read scoreboard_applied_at, which stream-offset no longer writes by default.
+        "contest.scoreboard.stream-offset.applied-at-tracking=true",
         "contest.scoreboard.store=redis",
         "contest.scoreboard.stream.consumer.enabled=true",
         // This context consumes the stream, so it is the recovery owner by definition.

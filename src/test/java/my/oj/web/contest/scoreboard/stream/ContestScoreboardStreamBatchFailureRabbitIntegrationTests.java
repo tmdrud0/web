@@ -51,6 +51,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest
 @ActiveProfiles("test")
 @TestPropertySource(properties = {
+        // These tests read scoreboard_applied_at, which stream-offset no longer writes by default.
+        "contest.scoreboard.stream-offset.applied-at-tracking=true",
         "contest.scoreboard.store=redis",
         "contest.scoreboard.stream.consumer.enabled=true",
         // This context consumes the stream, so it runs the supervisor pass and is the
