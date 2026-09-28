@@ -1036,6 +1036,26 @@ Test-Case "an elapsed interval runs from its first argument to its second" {
         "and not to it, which is the spelling that published the sign reversed"
 }
 
+Test-Case "live-impact Build creates the application artifact before rebuilding Docker" {
+    # The application Dockerfile copies build/libs/*.jar. Compose's --build does not invoke Gradle, so
+    # without this ordering a clean image can still carry a stale bootJar and validate yesterday's code.
+    $runnerPath = Join-Path (Get-Item (Join-Path $PSScriptRoot "..")).FullName "run-recovery-live-impact.ps1"
+    $tokens = $null
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile(
+        $runnerPath,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    Assert-True ($parseErrors.Count -eq 0) "the live-impact runner parses"
+
+    $text = Get-Content -LiteralPath $runnerPath -Raw
+    $bootJar = $text.IndexOf('& .\gradlew.bat bootJar :gatling:classes :gatling:prepareStandaloneGatling')
+    $composeBuild = $text.IndexOf('if ($Build) { $upArguments += "--build" }')
+    Assert-True ($bootJar -ge 0) "-Build invokes Gradle to create the bootJar and Gatling artifacts"
+    Assert-True ($composeBuild -gt $bootJar) "the Docker image is rebuilt only after the bootJar"
+}
+
 Test-Case "every mode's artifact probe names a class the tree actually has" {
     # `Assert-BatchArtifactCarriesMode` refuses to measure a jar that lacks the class this map names for
     # the run's mode, so a map that has drifted from the source does not fail quietly: it fails every run

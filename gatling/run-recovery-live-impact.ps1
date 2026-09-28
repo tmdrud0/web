@@ -247,6 +247,22 @@ Write-Output ""
 
 try {
     # --- 1. guard ----------------------------------------------------------------------------------
+    if ($Build) {
+        # Dockerfile copies the already-built bootJar. `docker compose --build` alone can therefore
+        # produce a fresh image that still contains an old application binary, making a run appear to
+        # validate code that was never executed. Keep the switch's two halves together: first produce
+        # every host artifact this runner consumes, then let Compose rebuild the image below.
+        Push-Location $repoRoot
+        try {
+            & .\gradlew.bat bootJar :gatling:classes :gatling:prepareStandaloneGatling --console=plain
+            if ($LASTEXITCODE -ne 0) {
+                throw "Gradle artifact build failed with exit code $LASTEXITCODE."
+            }
+        }
+        finally {
+            Pop-Location
+        }
+    }
     foreach ($required in @($config.JavaExe, $classpathFile, (Join-Path $summarizerClasses "my\oj\perf\liveimpact\LiveImpactSummarizer.class"))) {
         if (-not (Test-Path -LiteralPath $required)) {
             throw "Missing '$required'. Build first: gradlew.bat :gatling:classes :gatling:prepareStandaloneGatling (and set -JavaExe)."
