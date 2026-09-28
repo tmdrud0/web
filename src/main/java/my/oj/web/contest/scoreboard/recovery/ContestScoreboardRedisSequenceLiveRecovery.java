@@ -19,8 +19,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Starts at most one immediate sequence check without making a live stream batch wait for it.
  *
  * <p>The periodic scheduler remains the retry owner. This component contributes one prompt attempt
- * when a live rollback is observed, shares the same recovery-pass gate as every other trigger, and
- * never queues a second attempt behind one already submitted by this component.</p>
+ * when a live rollback is observed, records the rollback obligation before competing for the shared
+ * recovery-pass gate, and never queues a second attempt behind one already submitted by this
+ * component. If the prompt attempt loses the gate, the obligation remains for the next periodic
+ * pass, including the judged rows caught between Redis apply and MySQL sequence marking.</p>
  */
 @Component
 @ConditionalOnProperty(
@@ -68,6 +70,10 @@ class ContestScoreboardRedisSequenceLiveRecovery {
      * in both cases the fixed-delay checks remain the retry path.
      */
     boolean trigger() {
+        // Every observed rollback is a correctness obligation, even when the prompt worker is already
+        // submitted for an earlier one. A duplicate request costs one bounded scan; dropping a later
+        // request could leave its apply-before-marker window unrepaired.
+        recoveryService.requestRollbackRepair();
         if (!submitted.compareAndSet(false, true)) {
             log.debug("An immediate redis-seq live-recovery check is already submitted");
             return false;

@@ -76,6 +76,8 @@ class ContestScoreboardRedisSequenceRecoveryServiceTests {
         when(resultRepository.findDuplicateAppliedSequences(any(), any())).thenReturn(List.of());
         when(resultRepository.findSequencedRowsDescending(any(), any())).thenReturn(List.of());
         when(resultRepository.findRowsByAppliedSequences(anyList())).thenReturn(List.of());
+        when(resultRepository.findHighestUnsequencedJudgedSubmissionId(any())).thenReturn(null);
+        when(resultRepository.findUnsequencedJudgedRows(any(), any(), any(), any())).thenReturn(List.of());
         when(scoreboardApplier.applyAll(anyList())).thenAnswer(invocation -> {
             List<ContestScoreboardApplier.ApplyRequest> requests = invocation.getArgument(0);
             return requests.stream()
@@ -111,6 +113,64 @@ class ContestScoreboardRedisSequenceRecoveryServiceTests {
         assertThat(report.unresolved()).isFalse();
         verifyNoInteractions(scoreboardApplier);
         verifyNoInteractions(appliedMarker);
+    }
+
+    @Test
+    void aRollbackReplaysJudgedRowsWhoseRedisApplyFinishedBeforeTheirSequenceMarker() {
+        when(resultRepository.findHighestUnsequencedJudgedSubmissionId(SubmissionResult.PENDING))
+                .thenReturn(SUBMISSION_102);
+        when(resultRepository.findUnsequencedJudgedRows(
+                isNull(), eq(SUBMISSION_102), eq(SubmissionResult.PENDING), any()))
+                .thenReturn(List.of(row(SUBMISSION_101, null), row(SUBMISSION_102, null)))
+                .thenReturn(List.of());
+        when(resultRepository.findUnsequencedJudgedRows(
+                eq(SUBMISSION_102), eq(SUBMISSION_102), eq(SubmissionResult.PENDING), any()))
+                .thenReturn(List.of());
+        when(sequenceSource.allocatorSequence()).thenReturn(10L);
+        ContestScoreboardRedisSequenceRecoveryService service = service(config());
+
+        service.requestRollbackRepair();
+        ContestScoreboardRedisSequenceRecoveryService.SequenceCheckReport report = service.check();
+
+        assertThat(report.replayed()).isEqualTo(2);
+        assertThat(report.unresolved()).isFalse();
+        List<ContestScoreboardApplier.ApplyRequest> requests = replayedRequests();
+        assertThat(requests).extracting(request -> request.update().contestSubmissionId())
+                .containsExactly(SUBMISSION_101, SUBMISSION_102);
+        assertThat(requests).allSatisfy(request -> assertThat(request.streamOffset()).isNull());
+        verify(appliedMarker).markApplied(List.of(SUBMISSION_101, SUBMISSION_102));
+    }
+
+    @Test
+    void ordinaryPeriodicChecksDoNotScanTheUnsequencedLiveBacklog() {
+        when(sequenceSource.allocatorSequence()).thenReturn(10L);
+
+        service(config()).check();
+
+        verify(resultRepository, never()).findHighestUnsequencedJudgedSubmissionId(any());
+        verify(resultRepository, never()).findUnsequencedJudgedRows(any(), any(), any(), any());
+    }
+
+    @Test
+    void anUnfinishedUnsequencedRepairRemainsRequestedForTheNextPass() {
+        when(resultRepository.findHighestUnsequencedJudgedSubmissionId(SubmissionResult.PENDING))
+                .thenReturn(SUBMISSION_101);
+        when(resultRepository.findUnsequencedJudgedRows(
+                isNull(), eq(SUBMISSION_101), eq(SubmissionResult.PENDING), any()))
+                .thenReturn(List.of(row(SUBMISSION_101, null)))
+                .thenReturn(List.of(row(SUBMISSION_101, null)))
+                .thenReturn(List.of());
+        when(sequenceSource.allocatorSequence()).thenReturn(10L);
+        ContestScoreboardRedisSequenceRecoveryService service = service(config());
+        service.requestRollbackRepair();
+
+        ContestScoreboardRedisSequenceRecoveryService.SequenceCheckReport first = service.check();
+        ContestScoreboardRedisSequenceRecoveryService.SequenceCheckReport second = service.check();
+
+        assertThat(first.unresolved()).isTrue();
+        assertThat(second.unresolved()).isFalse();
+        verify(resultRepository, times(2))
+                .findHighestUnsequencedJudgedSubmissionId(SubmissionResult.PENDING);
     }
 
     /**

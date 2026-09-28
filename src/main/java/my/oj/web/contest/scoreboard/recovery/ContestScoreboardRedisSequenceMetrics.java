@@ -28,7 +28,7 @@ public class ContestScoreboardRedisSequenceMetrics {
                 .description("Scoreboard sequences found recorded against more than one stored result")
                 .register(registry);
         this.resultsReplayed = Counter.builder("contest.scoreboard.redis.sequence.replayed")
-                .description("Stored results re-applied because their sequence was reused or lost")
+                .description("Stored results re-applied because their sequence was reused, lost, or not marked")
                 .register(registry);
         this.rounds = Counter.builder("contest.scoreboard.redis.sequence.rounds")
                 .description("Sequence check rounds completed")

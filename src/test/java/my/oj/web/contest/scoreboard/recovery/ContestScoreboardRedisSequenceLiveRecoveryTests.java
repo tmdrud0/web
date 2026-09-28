@@ -13,6 +13,7 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -35,6 +36,7 @@ class ContestScoreboardRedisSequenceLiveRecoveryTests {
         assertThat(recovery.trigger()).isTrue();
         assertThat(recovery.trigger()).isFalse();
         assertThat(recovery.submitted()).isTrue();
+        verify(recoveryService, times(2)).requestRollbackRepair();
         verify(recoveryService, never()).check();
 
         executor.runNext();
@@ -51,6 +53,7 @@ class ContestScoreboardRedisSequenceLiveRecoveryTests {
             return Boolean.TRUE;
         });
 
+        verify(recoveryService).requestRollbackRepair();
         verify(recoveryService, never()).check();
         assertThat(recovery.submitted()).isFalse();
     }

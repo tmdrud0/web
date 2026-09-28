@@ -136,6 +136,30 @@ class ContestScoreboardSequenceRecoveryMySqlIntegrationTests {
         assertThat(second.rounds()).isEqualTo(1);
     }
 
+    @Test
+    void aRollbackRepairsJudgedRowsLeftWithoutAnAppliedSequence() {
+        SeededContest contest = seedContest("seq-unmarked", 1, 3);
+        List<Judged> judged = attempts(contest, 2);
+        Judged pending = unjudged(contest, 925_000_000_000_000_000L, contest.userIds().get(2));
+
+        // The first row models Redis having applied it before the JVM was paused, while the missing
+        // MySQL marker models the process stopping before completion. The second row models a judged
+        // result that had not reached Redis yet. Re-applying both is safe and closes both sides of
+        // the cross-store failure window.
+        apply(judged.get(0));
+        recoveryService.requestRollbackRepair();
+
+        ContestScoreboardRedisSequenceRecoveryService.SequenceCheckReport report = recoveryService.check();
+
+        assertThat(report.replayed()).isEqualTo(2);
+        assertThat(report.unresolved()).isFalse();
+        assertThat(storedSequences(judged)).doesNotContainNull().doesNotHaveDuplicates();
+        assertThat(storedSequences(List.of(pending))).containsOnlyNulls();
+        assertThat(rankingUserIds(contest)).containsExactlyInAnyOrderElementsOf(
+                judged.stream().map(one -> one.attempt().userId()).toList());
+        assertThat(applier.currentStreamOffset()).isEqualTo(-1L);
+    }
+
     /**
      * One sequence on three results in three different contests - and a sequence the walking path
      * cannot see.
