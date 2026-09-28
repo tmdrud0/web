@@ -15,6 +15,10 @@ java {
 	}
 }
 
+// Boot 3.4.3 manages Testcontainers 1.20.5, whose Docker client speaks API 1.32; Docker Engine 29 refuses
+// anything below 1.40. 1.21.4 is the first 1.x release that works against it.
+ext['testcontainers.version'] = '1.21.4'
+
 configurations {
 	compileOnly {
 		extendsFrom annotationProcessor
@@ -40,6 +44,10 @@ dependencies {
 	annotationProcessor 'org.projectlombok:lombok'
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'com.h2database:h2:2.2.224'
+    // Real MySQL and Redis for the mysql-poll integration tests; versions come from the Boot BOM.
+    // Those tests are skipped, not failed, where no Docker daemon is reachable.
+    testImplementation 'org.testcontainers:junit-jupiter'
+    testImplementation 'org.testcontainers:mysql'
 	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 
 	implementation 'jakarta.validation:jakarta.validation-api:3.0.2'
