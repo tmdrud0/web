@@ -170,6 +170,64 @@ class LiveImpactAnalysisTests {
         assertEquals("A", result.verdict());
     }
 
+    /**
+     * The mysql-poll poller applies the seeded results itself, before the measured window. Counted as
+     * first applications they would sit against no judged row and drive the backlog negative by the size
+     * of the seed; they are set aside and reported on their own.
+     */
+    @Test
+    void seededResultsAppliedByTheLivePathAreSetAside() {
+        for (int i = 0; i < 1_000; i++) {
+            judged.add(new Judged(9_000_000L + i, T0 - 60_000L, true));
+            live.add(new LiveApply(T0 - 30_000L, 100_000L + i, 9_000_000L + i, -1L));
+        }
+        load((k, judgedAt) -> judgedAt + 100L);
+        tailReturnsAt(FAULT + 1_000L);
+
+        Result result = analyze();
+
+        assertEquals("1", result.metrics().get("baselineBacklog"));
+        assertEquals("1000", result.metrics().get("liveRowsSeed"));
+        assertEquals("750", result.metrics().get("liveRowsTotal"));
+        assertEquals("750", result.metrics().get("liveSubmissionsApplied"));
+        assertEquals("A", result.verdict());
+    }
+
+    /**
+     * mysql-poll: the detector's record is the detection, with the check that found it, and the range
+     * recovery is the pass. The recovery re-applies the lost results under the sequences they held in the
+     * range, so they are re-consumed rather than new, exactly like a Stream re-read.
+     */
+    @Test
+    void theMySqlPollDetectionAndRangeRecoveryReadLikeAStreamModeRecovery() {
+        load((k, judgedAt) -> judgedAt + 100L);
+        for (int k = 200; k < 250; k++) {
+            live.add(new LiveApply(FAULT + 1_500L, k, submission(k), -1L));
+        }
+        tailReturnsAt(FAULT + 1_500L);
+        recovery.add(new Recovery("ROLLBACK_DETECTED", "scoreboard-mysql-poll-1", FAULT + 40L, FAULT + 40L,
+                FAULT + 45L, -1, "(199, 249] generation 3 fenced to 249", "poll-batch"));
+        recovery.add(new Recovery("PASS_START", "scoreboard-mysql-poll-3", FAULT + 1_000L, -1L, FAULT + 1_000L, -1,
+                "range-recovery (199, 249] generation 3", "started"));
+        recovery.add(new Recovery("CHUNK", "scoreboard-mysql-poll-3", FAULT + 1_010L, FAULT + 1_020L, FAULT + 1_500L,
+                50, "range generation 3", "applied"));
+        recovery.add(new Recovery("PASS_END", "scoreboard-mysql-poll-3", FAULT + 1_000L, -1L, FAULT + 1_600L, -1,
+                "range-recovery (199, 249] generation 3", "COMPLETED"));
+
+        Result result = analyze();
+
+        assertEquals(Long.toString(FAULT + 40L), result.metrics().get("T_detected"));
+        assertEquals("ROLLBACK_DETECTED (poll-batch) on scoreboard-mysql-poll-1", result.metrics().get("detectedBy"));
+        assertEquals(Long.toString(FAULT + 1_000L), result.metrics().get("T_replay_start"));
+        assertEquals("600", result.metrics().get("replayDurationMs"));
+        assertEquals("COMPLETED", result.metrics().get("replayOutcome"));
+        assertEquals("1", result.metrics().get("replayChunks"));
+        assertEquals("50", result.metrics().get("replayRows"));
+        assertEquals("50", result.metrics().get("reconsumedAfterFault"));
+        assertEquals("1500", result.metrics().get("tailReturnedAfterFaultMs"));
+        assertEquals("A", result.verdict(), result.metrics().get("verdictReasons"));
+    }
+
     @Test
     void theRecoveryTraceGivesTheDetectionAndThePassOnItsThread() {
         load((k, judgedAt) -> judgedAt + 100L);

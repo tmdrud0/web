@@ -38,6 +38,9 @@ public final class LiveImpactSummarizer {
 
     static final String DEFAULT_SUBMIT_REQUEST = "api-contest-submit";
 
+    /** {@code delivery} in {@code run-events.properties} of a redis-seq run: no Stream, a MySQL poller. */
+    static final String MYSQL_POLL = "mysql-poll";
+
     private LiveImpactSummarizer() {
     }
 
@@ -73,13 +76,16 @@ public final class LiveImpactSummarizer {
         try (Reader reader = LiveImpactReader.open(runDir.resolve("run-events.properties"))) {
             events = LiveImpactReader.properties(reader);
         }
+        boolean mysqlPoll = MYSQL_POLL.equals(events.get("delivery"));
         RunEvents run = new RunEvents(
                 required(events, "measureFromMs"),
                 required(events, "snapshotAtMs"),
                 required(events, "rollbackAtMs"),
                 required(events, "faultAtMs"),
                 required(events, "measureToMs"),
-                required(events, "preRollbackOffset"));
+                // "New" is above the highest position applied before the rollback: the Stream offset, or
+                // under mysql-poll the Redis sequence allocator.
+                required(events, mysqlPoll ? "preRollbackSeq" : "preRollbackOffset"));
         long gatlingOffset = Long.parseLong(events.getOrDefault("gatlingClockOffsetMs", "0"));
 
         Path trace = runDir.resolve("trace");
@@ -110,7 +116,9 @@ public final class LiveImpactSummarizer {
         }
 
         Result result = LiveImpactAnalysis.analyze(run, thresholds, live, judged, requests, tail, recovery);
-        Map<String, String> metrics = new LinkedHashMap<>(result.metrics());
+        Map<String, String> metrics = mysqlPoll
+                ? mysqlPollMetrics(result.metrics(), run.preRollbackOffset())
+                : new LinkedHashMap<>(result.metrics());
         metrics.putAll(ingress(requests, run));
         metrics.put("traceComplete", Boolean.toString(traceComplete(traceStatus, live.isEmpty())));
         metrics.putAll(observation(metrics, run, events.get("requiredObservationSeconds")));
@@ -124,6 +132,31 @@ public final class LiveImpactSummarizer {
         writeSummary(runDir.resolve("live-impact-summary.csv"), metrics);
         writeMarkdown(runDir.resolve("live-impact-summary.md"), metrics);
         return new Result(metrics, result.seconds());
+    }
+
+    /**
+     * The same figures under their mysql-poll meaning. The position "new" is decided against is a Redis
+     * sequence, so it is reported as {@code preRollbackSeq} beside a {@code preRollbackOffset} that is
+     * {@code unavailable} - there is no Stream offset to report, and a sequence under the offset's name
+     * would read as one. Gap questions and skipped passes are Stream-consumer and pass-gate events that
+     * this delivery does not have; a count of zero would claim they were looked for, so they are
+     * {@code unavailable} too. Every other figure keeps its name and its meaning.
+     */
+    static Map<String, String> mysqlPollMetrics(Map<String, String> metrics, long preRollbackSeq) {
+        Map<String, String> rewritten = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : metrics.entrySet()) {
+            switch (entry.getKey()) {
+                case "preRollbackOffset" -> {
+                    rewritten.put("preRollbackOffset", LiveImpactAnalysis.UNAVAILABLE);
+                    rewritten.put("preRollbackSeq", Long.toString(preRollbackSeq));
+                }
+                case "gapQuestionsAfterRollback", "passesSkippedAfterRollback" ->
+                        rewritten.put(entry.getKey(), LiveImpactAnalysis.UNAVAILABLE);
+                default -> rewritten.put(entry.getKey(), entry.getValue());
+            }
+        }
+        rewritten.putIfAbsent("preRollbackSeq", Long.toString(preRollbackSeq));
+        return rewritten;
     }
 
     /**

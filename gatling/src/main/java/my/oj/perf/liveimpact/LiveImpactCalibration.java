@@ -75,11 +75,20 @@ final class LiveImpactCalibration {
             }
         }
         java.util.Set<Long> contestSubmissions = new java.util.HashSet<>();
+        // Seeded results are not in the judged side, so they stay out of the applied side too: the
+        // mysql-poll delivery applies them through the live path, before the window.
+        java.util.Set<Long> seedSubmissions = new java.util.HashSet<>();
         for (Judged row : judgedRows) {
             contestSubmissions.add(row.submissionId());
+            if (row.seed()) {
+                seedSubmissions.add(row.submissionId());
+            }
         }
         Map<Long, Long> first = new HashMap<>();
         for (LiveApply row : liveRows) {
+            if (seedSubmissions.contains(row.submissionId())) {
+                continue;
+            }
             if (contestSubmissions.isEmpty() || contestSubmissions.contains(row.submissionId())) {
                 first.merge(row.submissionId(), row.appliedAtMs(), Math::min);
             }

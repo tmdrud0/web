@@ -26,6 +26,12 @@ import java.util.Map;
  * tail as new work in one mode and not in another. A live row at or below {@code H} applied after the
  * fault is <em>re-consumed</em>, and is reported in its own column.</p>
  *
+ * <p>Under the {@code mysql-poll} delivery there is no stream offset. The position of a result in the
+ * delivery order is its Redis sequence, so a live row's offset is that sequence and {@code H} is the Redis
+ * allocator just before the rollback ({@code preRollbackSeq}). The poller issues new results sequences
+ * above the fenced watermark, and a range recovery reports each lost result under the sequence it held
+ * inside the range: the same "new" and "re-consumed" as the Stream modes.</p>
+ *
  * <h2>Backlog, over one event set</h2>
  *
  * <p>{@code backlog(t)} is the load's judged results up to {@code t} minus the same results whose
@@ -33,6 +39,13 @@ import java.util.Map;
  * experiment contest, so the difference is a count of real results waiting for the scoreboard and
  * returns to its baseline once the pipeline has caught up. A submission's first application is the
  * earliest live row that carried it; for everything above {@code H} that is its only application.</p>
+ *
+ * <h2>Seeded rows</h2>
+ *
+ * <p>A seeded result is on the scoreboard before the load, and it is not part of the event set. Under the
+ * Stream it never appears in the trace (the pre-load rebuild puts it there); under the {@code mysql-poll}
+ * delivery the poller itself applies it, before the measured window, so its live rows are set aside here
+ * and counted on their own.</p>
  *
  * <h2>What this does not know</h2>
  *
@@ -43,6 +56,9 @@ import java.util.Map;
 final class LiveImpactAnalysis {
 
     static final String UNAVAILABLE = "unavailable";
+
+    /** The {@code mysql-poll} detector's record: the Redis allocator found below the MySQL watermark. */
+    static final String ROLLBACK_DETECTED = "ROLLBACK_DETECTED";
 
     /** The instants and offsets the runner recorded, all in the container frame. */
     record RunEvents(long measureFromMs,
@@ -126,15 +142,24 @@ final class LiveImpactAnalysis {
         // Only the experiment contest's submissions: the trace records every contest the consumer
         // applies, and another contest's rows counted as new applies could hide this contest's stop.
         java.util.Set<Long> contestSubmissions = new java.util.HashSet<>();
+        java.util.Set<Long> seedSubmissions = new java.util.HashSet<>();
         for (Judged row : judgedRows) {
             contestSubmissions.add(row.submissionId());
+            if (row.seed()) {
+                seedSubmissions.add(row.submissionId());
+            }
         }
         Map<Long, LiveApply> first = new HashMap<>();
         List<LiveApply> reconsumed = new ArrayList<>();
         long outsideContest = 0L;
+        long seedRows = 0L;
         for (LiveApply row : liveRows) {
             if (!contestSubmissions.isEmpty() && !contestSubmissions.contains(row.submissionId())) {
                 outsideContest++;
+                continue;
+            }
+            if (seedSubmissions.contains(row.submissionId())) {
+                seedRows++;
                 continue;
             }
             LiveApply known = first.get(row.submissionId());
@@ -352,7 +377,7 @@ final class LiveImpactAnalysis {
         metrics.put("newApplyStallLongestSeconds", Integer.toString(longestStall));
         metrics.put("T_longest_stall_start", instant(longestStallStartedAt));
         metrics.put("reconsumedAfterFault", Long.toString(reconsumed.size()));
-        metrics.put("liveRowsTotal", Long.toString(liveRows.size()));
+        metrics.put("liveRowsTotal", Long.toString(liveRows.size() - seedRows));
         metrics.put("liveSubmissionsApplied", Long.toString(first.size()));
         metrics.put("judgedLiveTotal", Long.toString(live.size()));
         long neverApplied = live.stream().filter(row -> !first.containsKey(row.submissionId())).count();
@@ -372,6 +397,10 @@ final class LiveImpactAnalysis {
         }
 
         metrics.put("liveRowsOutsideContest", Long.toString(outsideContest));
+        if (seedRows > 0L) {
+            // Only a delivery that applies seeded rows through the live path has any; the Stream never does.
+            metrics.put("liveRowsSeed", Long.toString(seedRows));
+        }
         metrics.put("backlogAtFault", Long.toString(backlogAtFault));
         verdict(thresholds, phases, longestStall, peakIndex < 0 ? null : peakBacklog, growthReference,
                 backlogTolerance, metrics);
@@ -440,11 +469,11 @@ final class LiveImpactAnalysis {
                 .toList();
         Recovery detected = afterRollback.stream()
                 .filter(row -> row.event().equals("GAP") || row.event().equals("PASS_START")
-                        || row.event().equals("PASS_SKIPPED"))
+                        || row.event().equals("PASS_SKIPPED") || row.event().equals(ROLLBACK_DETECTED))
                 .findFirst()
                 .orElse(null);
         metrics.put("T_detected", detected == null ? UNAVAILABLE : Long.toString(detected.startMs()));
-        metrics.put("detectedBy", detected == null ? UNAVAILABLE : detected.event() + " on " + detected.thread());
+        metrics.put("detectedBy", detected == null ? UNAVAILABLE : detectedBy(detected));
         Recovery passStart = afterRollback.stream()
                 .filter(row -> row.event().equals("PASS_START"))
                 .findFirst()
@@ -487,6 +516,17 @@ final class LiveImpactAnalysis {
         metrics.put("chunkLockWaitMaxMs", optional(percentile(waits, 100)));
         metrics.put("chunkHoldP50Ms", optional(percentile(holds, 50)));
         metrics.put("chunkHoldMaxMs", optional(percentile(holds, 100)));
+    }
+
+    /**
+     * The event and its thread; for the {@code mysql-poll} detector also the check that found the rollback,
+     * which its record carries as the outcome, because that delivery's threads are a shared pool.
+     */
+    private static String detectedBy(Recovery detected) {
+        if (detected.event().equals(ROLLBACK_DETECTED)) {
+            return detected.event() + " (" + detected.outcome() + ") on " + detected.thread();
+        }
+        return detected.event() + " on " + detected.thread();
     }
 
     // --- phases ---------------------------------------------------------------------------------------
