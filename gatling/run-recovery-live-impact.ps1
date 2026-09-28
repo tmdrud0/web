@@ -18,6 +18,7 @@
 #   3. start      the stack in the mode under test, with the batch role's experiment trace on
 #   4. align      the product's own rebuild puts the seeded results on the scoreboard, and a digest of
 #                 every participant's (solved, penalty) proves Redis and MySQL agree before any load
+#                 (redis-seq: no rebuild endpoint under mysql-poll - the poller applies the seed itself)
 #   5. load       Gatling starts; its ramp is the warm-up
 #   6. baseline   a window of normal operation, and a check that the pipeline is keeping up
 #   7. snapshot   batch-1 paused; the contest's keys copied inside Redis; resumed
@@ -104,15 +105,11 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\lib\RecoveryExperiment.ps1"
 . "$PSScriptRoot\lib\RecoveryExperiment.LiveImpact.ps1"
 
-# This experiment is built on the scoreboard RabbitMQ Stream: "new" results are the ones above the Stream
-# checkpoint at the fault, the per-apply trace is written by the Stream processor, and the reference
-# rebuild goes through the Stream-gated actuator endpoint. redis-seq runs on the MySQL poller and has none
-# of the three, so a run in that mode would measure nothing it claims to. Refused up front, before the
-# stack is touched; run-recovery-pilot.ps1 measures redis-seq on the poller.
-if ($Mode -eq "redis-seq") {
-    throw ("run-recovery-live-impact.ps1 measures the scoreboard Stream path, and redis-seq no longer has one " +
-        "(contest.scoreboard.delivery=mysql-poll). Use run-recovery-pilot.ps1 for redis-seq.")
-}
+# redis-seq runs on the MySQL poller (contest.scoreboard.delivery=mysql-poll), which has no Stream
+# checkpoint, no Stream processor and no Stream-gated rebuild endpoint. Each of the three has a poller-side
+# counterpart - the Redis sequence allocator, the poller's own experiment trace, and the poller applying
+# the seed - chosen by the mysql-poll functions in lib\RecoveryExperiment.LiveImpact.ps1, so the summary
+# carries the same figures for every mode.
 
 function Write-JsonFile {
     param(
@@ -238,6 +235,10 @@ $events = [ordered]@{
     oraclePollSeconds = $OraclePollSeconds
     tailPollIntervalMs = $TailPollIntervalMilliseconds
     replayChunkSize = "500 (contest.scoreboard.recovery.full-replay.replay-batch-size default; not overridden)"
+}
+if (Test-LiveImpactMySqlPoll) {
+    $pollEvents = Get-LiveImpactMySqlPollRunEvents
+    foreach ($key in @($pollEvents.Keys)) { $events[$key] = $pollEvents[$key] }
 }
 
 $script:clock = $null
@@ -373,7 +374,7 @@ try {
     Write-Output "  stack healthy in mode $($runtime.Mode); trace on in $traceDirectory"
 
     # --- 4. align ----------------------------------------------------------------------------------
-    [void](Invoke-LiveImpactScoreboardRebuild)
+    [void](Invoke-LiveImpactScoreboardAlignment)
     [void](Wait-PipelineQuiescent -TimeoutSeconds $DrainTimeoutSeconds -Description "the pipeline before the load")
     $aligned = Compare-LiveImpactUserTotals
     Write-JsonFile -Path (Join-Path $artifacts "consistency-before-load.json") -Object $aligned
@@ -465,8 +466,10 @@ try {
     else {
         # --- 6. baseline -------------------------------------------------------------------------------
         $baselineStart = Get-PipelineOperationalState
+        if (Test-LiveImpactMySqlPoll) { $pollBacklogStart = Get-LiveImpactPollBacklog }
         Start-Sleep -Seconds $BaselineSeconds
         $baselineEnd = Get-PipelineOperationalState
+        if (Test-LiveImpactMySqlPoll) { $pollBacklogEnd = Get-LiveImpactPollBacklog }
         # Keeping up means the backlog in front of the scoreboard is a few seconds of inflow at most, at
         # both queues that feed it. The summarizer's before-window backlog is the precise figure; this is
         # the gate that stops a fault from being injected into a pipeline that is already falling behind.
@@ -475,6 +478,14 @@ try {
         $events["baselineJudgeQueueReady"] = "$($baselineStart.LiveReady)->$($baselineEnd.LiveReady)"
         $events["baselineStreamPending"] = "$($baselineStart.PendingEvents)->$($baselineEnd.PendingEvents)"
         $events["baselineFlat"] = $flat
+        if (Test-LiveImpactMySqlPoll) {
+            # No Stream: the poller's backlog takes the place of the Stream's pending events.
+            $gate = Get-LiveImpactMySqlPollBaselineGate -LiveReadyEnd $baselineEnd.LiveReady `
+                -PollBacklogStart $pollBacklogStart -PollBacklogEnd $pollBacklogEnd -Allowed $allowed
+            $flat = $gate.Flat
+            foreach ($key in @($gate.Events.Keys)) { $events[$key] = $gate.Events[$key] }
+            Write-Output "  baseline: poller backlog $($events['baselinePollBacklog'])"
+        }
         Write-Output "  baseline: judge queue $($events['baselineJudgeQueueReady']), stream pending $($events['baselineStreamPending']), flat=$flat"
         if (-not $flat -and -not $AllowUnflatBaseline) {
             throw "The pipeline is not keeping up before the fault (limit $allowed). Lower -TargetRps (see calibration) or pass -AllowUnflatBaseline."
@@ -530,6 +541,11 @@ try {
         }
         if ($rollback.RestoredCheckpoint -ne $snapshot.Checkpoint) {
             throw "The rollback restored checkpoint $($rollback.RestoredCheckpoint), not the snapshot's $($snapshot.Checkpoint)."
+        }
+        if (Test-LiveImpactMySqlPoll) {
+            # The "checkpoint" the scripts read was the Redis sequence allocator; recorded under its own names.
+            $positions = ConvertTo-LiveImpactMySqlPollPositionEvents -Snapshot $snapshot -Rollback $rollback
+            foreach ($key in @($positions.Keys)) { $events[$key] = $positions[$key] }
         }
         $lost = New-ShortPauseLostSet -Snapshot $snapshot -Rollback $rollback
         $events["lostCount"] = $lost.LostCount
@@ -612,6 +628,10 @@ try {
         }
         $timeline = @(Get-BatchRecoveryTimeline -SinceUtc $loadStartedAt.UtcDateTime.ToString("o"))
         Write-JsonFile -Path (Join-Path $artifacts "recovery-log-events.json") -Object $timeline
+        if (Test-LiveImpactMySqlPoll) {
+            $detection = Get-LiveImpactMySqlPollDetectionEvents -Events $timeline -RollbackAtMs ([long]$events["rollbackAtMs"])
+            foreach ($key in @($detection.Keys)) { $events[$key] = $detection[$key] }
+        }
     }
     $judgedRows = Export-LiveImpactJudged -Path (Join-Path $artifacts "judged.csv")
     $events["judgedRowsExported"] = $judgedRows

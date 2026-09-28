@@ -364,3 +364,163 @@ function Get-LiveImpactCounterDelta {
     }
     return $delta
 }
+
+# --- redis-seq on the mysql-poll delivery ---------------------------------------------------------
+#
+# The experiment was written against the scoreboard Stream, and three of its sources are the Stream's.
+# Under mysql-poll (the only delivery redis-seq runs on) each has a poller-side counterpart, and the
+# figures keep their names and their meaning:
+#
+#   Stream                                       mysql-poll
+#   ------                                       ----------
+#   "new" = offset above the Stream checkpoint   "new" = sequence above the Redis allocator R just before
+#     just before the rollback (preRollbackOffset) the rollback (preRollbackSeq). The snapshot and rollback
+#                                                  scripts read the allocator where they read the checkpoint
+#                                                  (Get-ShortPausePositionKey).
+#   per-apply trace from the Stream processor    the same trace from ContestScoreboardSequencedApplication:
+#                                                  each chunk Redis applied is one live batch; a range
+#                                                  recovery reports the lost results under the sequences
+#                                                  they held in the range, so they are re-consumed.
+#   detection / replay: GAP, PASS_* records      ROLLBACK_DETECTED (with the check that found it), then the
+#                                                  range recovery as PASS_START / CHUNK / PASS_END.
+#   pre-load rebuild via the Stream-gated        nothing to call: the seeded rows are judged rows with no
+#     actuator endpoint                            sequence, which is exactly what the poller applies. The
+#                                                  alignment is the poller draining them, and the digest
+#                                                  after the drain proves it as it does for a rebuild.
+#   baseline gate: Stream pending events         judged results of the contest the poller has not
+#                                                  sequenced yet (Get-LiveImpactPollBacklog).
+#
+# The lost set and the tail poller are unchanged: the pre-rollback processed set minus the snapshot's is
+# exactly the results whose sequence the rollback took away, (R_snapshot, R_prerollback], and the
+# recovery puts each back into the processed set as it re-applies it.
+
+function Test-LiveImpactMySqlPoll {
+    return ((Get-RecoveryConfig).Delivery -eq "mysql-poll")
+}
+
+# Step 4. Under the Stream the product's rebuild endpoint puts the seeded results on the scoreboard; that
+# endpoint exists only on the Stream delivery. Under mysql-poll the poller applies them - they are
+# judged and unsequenced - so there is nothing to ask for, and the caller's drain wait is the alignment.
+function Invoke-LiveImpactScoreboardAlignment {
+    if (Test-LiveImpactMySqlPoll) {
+        return "mysql-poll: the poller applies the seeded results; aligned when the pipeline drains"
+    }
+    return Invoke-LiveImpactScoreboardRebuild
+}
+
+# The poller's backlog in the contest: judged results with no recorded sequence. The mysql-poll
+# counterpart of the Stream's pending events.
+function Get-LiveImpactPollBacklog {
+    $config = Get-RecoveryConfig
+    return Invoke-SqlInt64 -Sql @"
+SELECT COUNT(*) FROM contest_submission_result
+ WHERE contest_id = $($config.ContestId)
+   AND scoreboard_applied_seq IS NULL
+   AND COALESCE(final_result, provisional_result) <> 'PENDING';
+"@ -Description "judged results the poller has not sequenced"
+}
+
+# The baseline gate under mysql-poll, from the two readings the caller took: the judge queue and the
+# poller's backlog both at most `Allowed`. The Stream's pending-events reading does not exist here and is
+# recorded as unavailable rather than as the empty value it would otherwise print.
+function Get-LiveImpactMySqlPollBaselineGate {
+    param(
+        [Parameter(Mandatory = $true)][long]$LiveReadyEnd,
+        [Parameter(Mandatory = $true)][long]$PollBacklogStart,
+        [Parameter(Mandatory = $true)][long]$PollBacklogEnd,
+        [Parameter(Mandatory = $true)][double]$Allowed
+    )
+
+    $flat = ($LiveReadyEnd -le $Allowed) -and ($PollBacklogEnd -le $Allowed)
+    return [pscustomobject][ordered]@{
+        Flat = $flat
+        Events = [ordered]@{
+            baselineStreamPending = "unavailable"
+            baselinePollBacklog = "$PollBacklogStart->$PollBacklogEnd"
+            baselineFlat = $flat
+        }
+    }
+}
+
+# What run-events.properties records for the positions around the fault under mysql-poll. The snapshot
+# and rollback scripts read the Redis allocator in place of the Stream checkpoint, so their "checkpoint"
+# values are sequences: recorded under sequence names, with the Stream names unavailable - a sequence
+# under an offset's name would read as one.
+function ConvertTo-LiveImpactMySqlPollPositionEvents {
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [Parameter(Mandatory = $true)]$Rollback
+    )
+
+    foreach ($value in @($Snapshot.Checkpoint, $Rollback.PreRollbackCheckpoint, $Rollback.RestoredCheckpoint)) {
+        if ([string]$value -notmatch '^\d+$') {
+            throw "The Redis sequence allocator was not readable around the rollback ('$value'); 'new' cannot be defined."
+        }
+    }
+    return [ordered]@{
+        delivery = "mysql-poll"
+        snapshotCheckpoint = "unavailable"
+        snapshotSeq = [string]$Snapshot.Checkpoint
+        preRollbackOffset = "unavailable"
+        preRollbackSeq = [string]$Rollback.PreRollbackCheckpoint
+        restoredCheckpoint = "unavailable"
+        restoredSeq = [string]$Rollback.RestoredCheckpoint
+    }
+}
+
+# The detector's and the range recovery's own log lines after the rollback (recovery-log-events.json):
+# the range (R, H] it persisted, the fence and the completion. H is the MySQL watermark at the detection,
+# the durable counterpart of preRollbackSeq. An event that did not happen is `unavailable`, not zero.
+# `Events` are Select-RecoveryLogEvents output; events earlier than a second before the rollback belong to
+# the stack's own startup check and are ignored.
+function Get-LiveImpactMySqlPollDetectionEvents {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Events,
+        [Parameter(Mandatory = $true)][long]$RollbackAtMs
+    )
+
+    $after = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($event in $Events) {
+        if ($event.Instant.ToUnixTimeMilliseconds() -ge $RollbackAtMs - 1000L) {
+            $after.Add($event)
+        }
+    }
+    $afterArray = $after.ToArray()
+    $detected = Get-FirstRecoveryEvent -Events $afterArray -Kinds @("detected-watermark")
+    $fenced = Get-FirstRecoveryEvent -Events $afterArray -Kinds @("allocator-fenced")
+    $values = [ordered]@{
+        detectedAllocator = "unavailable"
+        detectedWatermark = "unavailable"
+        detectedRangeSize = "unavailable"
+        recoveryRangeGeneration = "unavailable"
+        detectionsAfterRollback = [string](@($afterArray | Where-Object { $_.Kind -eq "detected-watermark" }).Count)
+        fencedTo = "unavailable"
+        rangeRecoveredLogged = "false"
+    }
+    if ($null -ne $detected) {
+        $fields = @($detected.Fields)
+        $values["detectedAllocator"] = [string]$fields[0]
+        $values["detectedWatermark"] = [string]$fields[1]
+        $values["detectedRangeSize"] = [string]([long]$fields[1] - [long]$fields[0])
+        $values["recoveryRangeGeneration"] = [string]$fields[2]
+        foreach ($event in $afterArray) {
+            if ($event.Kind -eq "range-recovered" -and [string]@($event.Fields)[2] -eq [string]$fields[2]) {
+                $values["rangeRecoveredLogged"] = "true"
+                break
+            }
+        }
+    }
+    if ($null -ne $fenced) {
+        $values["fencedTo"] = [string]@($fenced.Fields)[0]
+    }
+    return $values
+}
+
+# The events a redis-seq run records up front, beside the shared ones: its delivery, and the chunk size
+# its recovery replays with - the mysql-poll setting, not full-replay's.
+function Get-LiveImpactMySqlPollRunEvents {
+    return [ordered]@{
+        delivery = "mysql-poll"
+        replayChunkSize = "500 (contest.scoreboard.mysql-poll.recovery-chunk-size default; not overridden)"
+    }
+}

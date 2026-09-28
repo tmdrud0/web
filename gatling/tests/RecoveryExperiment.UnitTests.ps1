@@ -14,6 +14,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 . "$PSScriptRoot\..\lib\RecoveryExperiment.ps1"
+. "$PSScriptRoot\..\lib\RecoveryExperiment.LiveImpact.ps1"
 . "$PSScriptRoot\RecoveryExperiment.TestHarness.ps1"
 
 # --- Common ----------------------------------------------------------------------------------------
@@ -553,12 +554,100 @@ Test-Case "quiescence reads the Stream's lag only where there is a Stream" {
         "Stream lag keeps rabbit-stream busy"
 }
 
-Test-Case "the live-impact experiment refuses redis-seq before touching the stack" {
-    $script = Join-Path $PSScriptRoot "..\run-recovery-live-impact.ps1"
-    $message = $null
-    try { & $script -Mode "redis-seq" *> $null } catch { $message = $_.Exception.Message }
-    Assert-True ($null -ne $message -and $message.Contains("run-recovery-pilot.ps1")) `
-        "redis-seq is refused with a pointer to the harness that measures it (got: '$message')"
+Test-Case "the live-impact runner accepts redis-seq and still parses" {
+    # It used to refuse redis-seq before touching the stack. Not invoked here: without the refusal a
+    # redis-seq invocation goes on to start the stack. Read as source instead.
+    $path = (Resolve-Path (Join-Path $PSScriptRoot "..\run-recovery-live-impact.ps1")).Path
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+    Assert-Equal "0" ([string]@($errors).Count) "the runner parses under this PowerShell"
+    $text = [IO.File]::ReadAllText($path)
+    Assert-True (-not $text.Contains("Use run-recovery-pilot.ps1 for redis-seq")) "the redis-seq refusal is gone"
+    $modeParameter = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq "Mode" })
+    Assert-Equal "1" ([string]$modeParameter.Count) "the runner still takes -Mode"
+    Assert-True ($modeParameter[0].Extent.Text.Contains('"redis-seq"')) "and redis-seq is one of its values"
+    foreach ($call in @("Invoke-LiveImpactScoreboardAlignment", "Get-LiveImpactMySqlPollBaselineGate",
+            "ConvertTo-LiveImpactMySqlPollPositionEvents", "Get-LiveImpactMySqlPollDetectionEvents",
+            "Get-LiveImpactMySqlPollRunEvents")) {
+        Assert-True ($text.Contains($call)) "the runner calls $call"
+    }
+}
+
+# --- live impact on the mysql-poll delivery --------------------------------------------------------
+
+Test-Case "the short-pause scripts read the sequence allocator under mysql-poll and the checkpoint otherwise" {
+    $root = (Get-Item "$PSScriptRoot\..\..").FullName
+    $artifacts = Join-Path ([IO.Path]::GetTempPath()) "sbrec-unittests"
+    [void](Initialize-RecoveryExperiment -WorktreeRoot $root -ArtifactDirectory $artifacts `
+            -RunId "unit" -Mode "redis-seq" -DbPassword "x")
+    Assert-Equal "contest:scoreboard:seq" (Get-ShortPausePositionKey) "redis-seq's position is the Redis allocator"
+    Assert-True (Test-LiveImpactMySqlPoll) "and it is recognised as the poll delivery"
+    Assert-True (@(Get-ShortPauseGlobalKeys) -contains "contest:scoreboard:seq") "the allocator is carried by the snapshot and put back by the rollback"
+    Assert-Equal "mysql-poll" ([string](Get-LiveImpactMySqlPollRunEvents)["delivery"]) "a redis-seq run records its delivery"
+    Assert-True (([string](Get-LiveImpactMySqlPollRunEvents)["replayChunkSize"]).Contains("mysql-poll.recovery-chunk-size")) "and the recovery chunk size it runs with"
+    foreach ($mode in @("full-replay", "stream-offset")) {
+        [void](Initialize-RecoveryExperiment -WorktreeRoot $root -ArtifactDirectory $artifacts `
+                -RunId "unit" -Mode $mode -DbPassword "x")
+        Assert-Equal "contest:scoreboard:stream:offset" (Get-ShortPausePositionKey) "$mode keeps reading the Stream checkpoint"
+        Assert-True (-not (Test-LiveImpactMySqlPoll)) "$mode is not the poll delivery"
+    }
+}
+
+Test-Case "the mysql-poll baseline gate reads the poller's backlog and says the Stream figure is unavailable" {
+    $flat = Get-LiveImpactMySqlPollBaselineGate -LiveReadyEnd 64 -PollBacklogStart 120 -PollBacklogEnd 180 -Allowed 2000
+    Assert-True $flat.Flat "a poller keeping up is flat"
+    Assert-Equal "unavailable" ([string]$flat.Events["baselineStreamPending"]) "there is no Stream pending figure to report"
+    Assert-Equal "120->180" ([string]$flat.Events["baselinePollBacklog"]) "the poller backlog is recorded the way the Stream's was"
+    Assert-Equal "True" ([string]$flat.Events["baselineFlat"]) "and the flag goes with it"
+    $behind = Get-LiveImpactMySqlPollBaselineGate -LiveReadyEnd 64 -PollBacklogStart 1500 -PollBacklogEnd 2500 -Allowed 2000
+    Assert-True (-not $behind.Flat) "a poller falling behind is not flat"
+    $queued = Get-LiveImpactMySqlPollBaselineGate -LiveReadyEnd 2500 -PollBacklogStart 0 -PollBacklogEnd 0 -Allowed 2000
+    Assert-True (-not $queued.Flat) "a judge queue falling behind is not flat either"
+}
+
+Test-Case "the allocator read around the rollback is recorded under sequence names, never as an offset" {
+    $snapshot = [pscustomobject]@{ Checkpoint = "1395173" }
+    $rollback = [pscustomobject]@{ PreRollbackCheckpoint = "1397171"; RestoredCheckpoint = "1395173" }
+    $events = ConvertTo-LiveImpactMySqlPollPositionEvents -Snapshot $snapshot -Rollback $rollback
+    Assert-Equal "1397171" ([string]$events["preRollbackSeq"]) "R just before the rollback is what 'new' is decided against"
+    Assert-Equal "1395173" ([string]$events["snapshotSeq"]) "R at the snapshot"
+    Assert-Equal "1395173" ([string]$events["restoredSeq"]) "R the rollback restored"
+    foreach ($streamName in @("preRollbackOffset", "snapshotCheckpoint", "restoredCheckpoint")) {
+        Assert-Equal "unavailable" ([string]$events[$streamName]) "$streamName is a Stream figure and has no value here"
+    }
+    Assert-Equal "mysql-poll" ([string]$events["delivery"]) "the summarizer is told which H to read"
+    Assert-Throws {
+        ConvertTo-LiveImpactMySqlPollPositionEvents -Snapshot $snapshot `
+            -Rollback ([pscustomobject]@{ PreRollbackCheckpoint = "absent"; RestoredCheckpoint = "1395173" })
+    } "an allocator that was not there is refused rather than recorded"
+}
+
+Test-Case "the detection after the rollback is read off the poller's log lines" {
+    $lines = @(
+        # The stack's own startup check, minutes before the rollback: not this rollback's detection.
+        "2026-09-28T09:50:00.000000001Z 2026-09-28T09:50:00.000Z  WARN 1 --- [scoreboard-mysql-poll-1] m.o.w.c.s.p.ContestScoreboardRollbackDetector : Redis scoreboard rollback detected: allocator 5 is below the MySQL watermark 9; recovery range generation 1 persisted",
+        "2026-09-28T10:00:00.050000001Z 2026-09-28T10:00:00.050Z  WARN 1 --- [scoreboard-mysql-poll-2] m.o.w.c.s.p.ContestScoreboardRollbackDetector : Redis scoreboard rollback detected: allocator 1395173 is below the MySQL watermark 1397171; recovery range generation 4 persisted",
+        "2026-09-28T10:00:00.060000001Z 2026-09-28T10:00:00.060Z  WARN 1 --- [scoreboard-mysql-poll-2] m.o.w.c.s.p.ContestScoreboardRollbackDetector : Redis scoreboard allocator fenced to 1397171; new results resume above it while (1395173, 1397171] is recovered in the background",
+        "2026-09-28T10:00:03.000000001Z 2026-09-28T10:00:03.000Z  INFO 1 --- [scoreboard-mysql-poll-3] m.o.w.c.s.p.ContestScoreboardRangeRecovery : Recovered scoreboard sequence range (1395173, 1397171] generation 4: 1998 result(s) re-applied in this pass"
+    )
+    $events = @(Select-RecoveryLogEvents -Lines $lines)
+    $rollbackAtMs = [DateTimeOffset]::Parse("2026-09-28T10:00:00.000Z", [Globalization.CultureInfo]::InvariantCulture).ToUnixTimeMilliseconds()
+    $values = Get-LiveImpactMySqlPollDetectionEvents -Events $events -RollbackAtMs $rollbackAtMs
+    Assert-Equal "1395173" ([string]$values["detectedAllocator"]) "R the detector saw"
+    Assert-Equal "1397171" ([string]$values["detectedWatermark"]) "H the detector saw"
+    Assert-Equal "1998" ([string]$values["detectedRangeSize"]) "the range it persisted"
+    Assert-Equal "4" ([string]$values["recoveryRangeGeneration"]) "its generation, not the startup check's"
+    Assert-Equal "1" ([string]$values["detectionsAfterRollback"]) "one detection after the rollback"
+    Assert-Equal "1397171" ([string]$values["fencedTo"]) "the fence"
+    Assert-Equal "true" ([string]$values["rangeRecoveredLogged"]) "and the completion of that generation"
+
+    $none = Get-LiveImpactMySqlPollDetectionEvents -Events @($events[0]) -RollbackAtMs $rollbackAtMs
+    Assert-Equal "unavailable" ([string]$none["detectedWatermark"]) "a detection that did not happen is unavailable"
+    Assert-Equal "0" ([string]$none["detectionsAfterRollback"]) "and none is counted"
+    Assert-Equal "false" ([string]$none["rangeRecoveredLogged"]) "nor a completion"
+    $empty = Get-LiveImpactMySqlPollDetectionEvents -Events @() -RollbackAtMs $rollbackAtMs
+    Assert-Equal "unavailable" ([string]$empty["fencedTo"]) "an empty timeline is read, not refused"
 }
 
 # --- leftovers -------------------------------------------------------------------------------------

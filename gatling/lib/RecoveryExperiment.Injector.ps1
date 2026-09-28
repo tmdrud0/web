@@ -682,6 +682,18 @@ function Get-ShortPauseGlobalKeys {
     )
 }
 
+# The key whose value is the scoreboard's position in its delivery order, read by the snapshot and the
+# rollback scripts inside the pause (their "checkpoint"): the Stream checkpoint under rabbit-stream, and
+# under mysql-poll - which has no Stream offset - the Redis sequence allocator R. The rollback therefore
+# reports R just before it and the R it restored, which is what defines "new" and the lost range (R, H].
+function Get-ShortPausePositionKey {
+    $config = Get-RecoveryConfig
+    if ($config.Delivery -eq "mysql-poll") {
+        return "$($config.ScoreboardKeyPrefix)seq"
+    }
+    return $config.CheckpointKey
+}
+
 function Get-ShortPauseContestPattern {
     $config = Get-RecoveryConfig
     if (-not $config.ContestScopeFromSeed) {
@@ -863,7 +875,7 @@ function Export-ContestScoreboardShortPauseSnapshot {
     $config = Get-RecoveryConfig
     $shadow = Get-ShortPauseSnapshotPrefix -Label $Label
     $run = Invoke-ShortPauseScript -Lua $script:shortPauseSnapshotLua -ProcessedFile "processed-$Label.txt" `
-        -LuaArguments (@((Get-ShortPauseContestPattern), $shadow, $config.CheckpointKey) + (Get-ShortPauseGlobalKeys)) `
+        -LuaArguments (@((Get-ShortPauseContestPattern), $shadow, (Get-ShortPausePositionKey)) + (Get-ShortPauseGlobalKeys)) `
         -Description "short-pause snapshot '$Label'"
     if ($run.Eval.Count -lt 5) {
         throw "Snapshot '$Label' returned $($run.Eval.Count) value(s): $($run.Eval -join ' ')"
@@ -891,7 +903,7 @@ function Invoke-ContestScoreboardShortPauseRollback {
     $config = Get-RecoveryConfig
     $shadow = Get-ShortPauseSnapshotPrefix -Label $Label
     $run = Invoke-ShortPauseScript -Lua $script:shortPauseRollbackLua -ProcessedFile "processed-prerollback.txt" `
-        -LuaArguments (@((Get-ShortPauseContestPattern), $shadow, $config.CheckpointKey) + (Get-ShortPauseGlobalKeys)) `
+        -LuaArguments (@((Get-ShortPauseContestPattern), $shadow, (Get-ShortPausePositionKey)) + (Get-ShortPauseGlobalKeys)) `
         -Description "short-pause rollback to '$Label'"
     if ($run.Eval.Count -lt 7) {
         throw "Rollback to '$Label' returned $($run.Eval.Count) value(s): $($run.Eval -join ' ')"
