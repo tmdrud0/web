@@ -643,6 +643,116 @@ class ContestScoreboardStreamLifecycleTests {
         assertThat(consumerArguments()).containsEntry("x-stream-offset", 2L);
     }
 
+    /**
+     * A rewind's catch-up keeps the checkpoint below the applied watermark for as long as it runs, and
+     * the checkpoint moves with every batch - so each pass sees a pair nothing answered yet. That is the
+     * catch-up, not a rollback, while the generation the rewind started is the one consuming.
+     */
+    @Test
+    void aRewindsCatchUpIsNotTakenForAFreshRollback() {
+        ContestScoreboardStreamLifecycle lifecycle = rewoundAt4With10Applied();
+
+        catchUpTo(lifecycle, 6L, 8L, 9L);
+
+        verify(container, times(2)).start();
+        assertThat(counter("contest.scoreboard.stream.rollback.restarts")).isEqualTo(1.0);
+        assertThat(registry.get("contest.scoreboard.stream.rollback.detected").tag("path", "supervisor")
+                .counter().count()).isEqualTo(1.0);
+    }
+
+    /** A checkpoint below what the catch-up already reached is a new rollback, and it is rewound. */
+    @Test
+    void aRollbackBelowWhatTheCatchUpReachedIsRewoundAgain() {
+        ContestScoreboardStreamLifecycle lifecycle = rewoundAt4With10Applied();
+        catchUpTo(lifecycle, 6L, 8L);
+
+        when(applier.currentStreamOffset()).thenReturn(5L);
+        lifecycle.recoverConsumption();
+
+        verify(container, times(3)).start();
+        assertThat(consumerArguments()).containsEntry("x-stream-offset", 5L);
+        assertThat(counter("contest.scoreboard.stream.rollback.restarts")).isEqualTo(2.0);
+    }
+
+    /**
+     * Even when it shows the pair the first rewind answered: the same snapshot restored again during the
+     * catch-up is below where the catch-up got to.
+     */
+    @Test
+    void theSameSnapshotRestoredDuringTheCatchUpIsRewoundAgain() {
+        ContestScoreboardStreamLifecycle lifecycle = rewoundAt4With10Applied();
+        catchUpTo(lifecycle, 6L, 8L);
+
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        lifecycle.recoverConsumption();
+
+        verify(container, times(3)).start();
+        assertThat(counter("contest.scoreboard.stream.rollback.restarts")).isEqualTo(2.0);
+    }
+
+    /**
+     * A catch-up batch that failed is re-read by a failure restart, and the catch-up goes on in the
+     * generation that restart started rather than being taken for a rollback there.
+     */
+    @Test
+    void aFailureRestartDuringTheCatchUpCarriesTheCatchUpOver() {
+        ContestScoreboardStreamLifecycle lifecycle = rewoundAt4With10Applied();
+        catchUpTo(lifecycle, 6L);
+        position.recordFailedBatch();
+
+        lifecycle.recoverConsumption();
+        assertThat(counter("contest.scoreboard.stream.failure.restarts")).isEqualTo(1.0);
+        assertThat(consumerArguments()).containsEntry("x-stream-offset", 6L);
+        position.anchorAt(6L);
+        catchUpTo(lifecycle, 8L, 9L);
+
+        verify(container, times(3)).start();
+        assertThat(counter("contest.scoreboard.stream.rollback.restarts")).isEqualTo(1.0);
+    }
+
+    /** The modes that do not rewind keep answering a rollback once per observed pair, as before. */
+    @Test
+    void aModeThatDoesNotRewindHasNoCatchUpToWaitFor() {
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(false);
+        when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordAppliedOffset(10L);
+
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        lifecycle.recoverConsumption();
+        when(applier.currentStreamOffset()).thenReturn(6L);
+        lifecycle.recoverConsumption();
+
+        verify(strategy, times(2)).rebuildHistory(any());
+        verify(container, times(1)).start();
+    }
+
+    /** Started at 4, applied through 10, Redis restored to 4, and the supervisor rewound there. */
+    private ContestScoreboardStreamLifecycle rewoundAt4With10Applied() {
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(true);
+        when(applier.currentStreamOffset()).thenReturn(4L);
+        ContestScoreboardStreamLifecycle lifecycle = lifecycle(StartupOffset.STORED);
+        lifecycle.start();
+        position.recordAppliedOffset(10L);
+        lifecycle.recoverConsumption();
+        assertThat(counter("contest.scoreboard.stream.rollback.restarts")).isEqualTo(1.0);
+        // The re-read's first batch anchors the new position at the checkpoint it resumed at.
+        position.anchorAt(4L);
+        return lifecycle;
+    }
+
+    /** The re-read applying batches that leave the given checkpoints, with a supervisor pass after each. */
+    private void catchUpTo(ContestScoreboardStreamLifecycle lifecycle, long... checkpoints) {
+        for (long checkpoint : checkpoints) {
+            when(applier.currentStreamOffset()).thenReturn(checkpoint);
+            position.recordAppliedOffset(checkpoint);
+            lifecycle.recoverConsumption();
+        }
+        assertThat(position.highestAppliedOffset()).as("the watermark stays at the pre-rollback tip").isEqualTo(10L);
+    }
+
     /** A healthy consumer must be left alone: this pass runs on an interval, all day. */
     @Test
     void aConsumerInStepWithTheScoreboardIsLeftAlone() {

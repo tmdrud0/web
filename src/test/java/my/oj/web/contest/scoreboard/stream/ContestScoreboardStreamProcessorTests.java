@@ -216,6 +216,31 @@ class ContestScoreboardStreamProcessorTests {
                 .isEqualTo(-1L);
     }
 
+    /**
+     * The catch-up after a stream-offset rewind: the checkpoint is below this JVM's watermark by
+     * construction, and that is not a rollback. The batch is an ordinary step from the position the re-read
+     * anchored, and what guards it is the floor sent to the store - not a question to the mode, whose
+     * answer for a range inside the applied history is to refuse it.
+     */
+    @Test
+    void aRewindsCatchUpIsAnOrdinaryStepEvenThoughTheCheckpointIsBelowTheWatermark() {
+        when(strategy.rewindsOnCheckpointRegression()).thenReturn(true);
+        when(applier.currentStreamOffset()).thenReturn(45L, 45L, 50L);
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        position.recordAppliedOffset(100L);
+        // The rewind resubscribed at 40 and its first batch anchored there.
+        position.consumerRestarted();
+        position.anchorAt(40L);
+
+        processor.process(List.of(event(46L, 146L), event(50L, 150L)));
+
+        verify(strategy, never()).rebuildHistory(any());
+        assertThat(requests().get(0).advance()).isEqualTo(CheckpointAdvance.CONTINUE);
+        verify(applier).applyAll(anyList(), org.mockito.ArgumentMatchers.eq(45L));
+        assertThat(position.anchorVerified()).isTrue();
+        assertThat(position.highestAppliedOffset()).as("the watermark does not come down").isEqualTo(100L);
+    }
+
     @Test
     void highestAppliedOffsetNeverRegressesWhenAnOlderBatchFinishesLater() {
         position.recordAppliedOffset(100L);
