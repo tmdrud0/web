@@ -97,5 +97,16 @@ redis-seq에서는 `mysql-poll.*` 설정을 찍는다.
   quiescence는 Stream 지연·consumer 대신 미반영 행 0 + pending recovery range 0이다.
   수집 지표는 `contest_scoreboard_mysql_poll_*`(`pollRollbacksDelta`, `pollRecoveryAppliedDelta`,
   `pollResumeMaxSeconds`, `maxPendingRecoveryRanges` 등)이고, Stream consumer 관련 수치는 `unavailable`이다.
-- `run-recovery-live-impact.ps1`: Stream checkpoint, Stream processor trace, Stream 전용 rebuild endpoint에
-  기반한 실험이라 redis-seq는 시작 전에 거부한다.
+- `run-recovery-live-impact.ps1`: redis-seq도 같은 요약 지표(이름·의미 동일)를 낸다. Stream 전용 소스 세 가지의 대응:
+  - "new" 기준: Stream checkpoint 대신 롤백 직전 Redis allocator R(`preRollbackSeq`). snapshot/rollback Lua가
+    checkpoint 자리에서 `contest:scoreboard:seq`를 읽는다. `preRollbackOffset`·`snapshotCheckpoint`·`restoredCheckpoint`는
+    `unavailable`, 값은 `preRollbackSeq`·`snapshotSeq`·`restoredSeq`.
+  - per-apply trace: 실험 trace 스위치가 켜지면 `ContestScoreboardSequencedApplication`이 Redis가 적용한 chunk마다
+    live batch를 쓴다(offset = 읽을 때의 seq, 없으면 새로 발급된 seq). range recovery는 잃은 결과를 범위 안의 옛 seq로
+    기록하므로 `reconsumedAfterFault` = 복구 범위에서 다시 적용된 결과 수다. 탐지기는 `ROLLBACK_DETECTED`(outcome = 찾은
+    검사: startup/periodic/poll-batch/script-refusal/recovery-refusal), range recovery는 `PASS_START`/`CHUNK`/`PASS_END`.
+  - 정렬(rebuild endpoint): mysql-poll에는 endpoint가 없고 필요도 없다. seed 행은 seq가 없는 채점 완료 행이라 poller가
+    직접 적용하고, drain 후 digest 비교가 정렬을 증명한다. poller가 적용한 seed 행은 요약에서 `liveRowsSeed`로 따로 센다.
+  - baseline gate: Stream pending 대신 poller backlog(`baselinePollBacklog`, seq 없는 채점 완료 행).
+  - 로그에서 `detectedAllocator`/`detectedWatermark`/`detectedRangeSize`/`recoveryRangeGeneration`/`fencedTo`/
+    `rangeRecoveredLogged`를 run-events에 남긴다. `gapQuestionsAfterRollback`/`passesSkippedAfterRollback`은 `unavailable`.
