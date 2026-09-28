@@ -46,7 +46,8 @@ final class ContestScoreboardRedisScript {
      * batch completion. It is written with the offset so a crash between Redis and MySQL can be
      * repaired without making MySQL another scoreboard checkpoint.
      */
-    static final String TEXT = """
+    /** Parsing and ordering helpers shared by every scoreboard script. */
+    static final String HELPERS = """
                     local function assertKeyType(key, expectedType)
                         local actualType = redis.call('type', key)['ok']
                         if actualType ~= 'none' and actualType ~= expectedType then
@@ -88,6 +89,120 @@ final class ContestScoreboardRedisScript {
                         return submissionId < otherSubmissionId
                     end
 
+                    """;
+
+    /** The scoring rules, shared so the Stream and the MySQL poller cannot score differently. */
+    static final String SCORING = """
+                    -- Reads a user's summary and one problem's attempt state. Returns the state, or nil and
+                    -- the error text; it writes nothing, so a caller can refuse before the standings move.
+                    local function readScoringState(summaryKey, problemKey)
+                        local initialized = redis.call('hget', summaryKey, 'initialized')
+                        if initialized and initialized ~= '1' then
+                            return nil, 'Invalid scoreboard initialized flag'
+                        end
+                        local state = {
+                            initialized = initialized,
+                            currentSolved = parseInteger(redis.call('hget', summaryKey, 'solved'), 'solved'),
+                            currentPenalty = parseInteger(redis.call('hget', summaryKey, 'penalty'), 'penalty'),
+                            acceptedMinutes = nil,
+                            acceptedSubmissionId = nil,
+                            contributedSolved = 0,
+                            contributedPenalty = 0,
+                            wrongMinutes = {}
+                        }
+                        local problemState = redis.call('hgetall', problemKey)
+                        for index = 1, #problemState, 2 do
+                            local field = problemState[index]
+                            local value = problemState[index + 1]
+                            if field == 'a:min' then
+                                state.acceptedMinutes = parseInteger(value, 'a:min')
+                            elseif field == 'a:sid' then
+                                state.acceptedSubmissionId = parseSubmissionId(value, 'a:sid')
+                            elseif field == 'c:solved' then
+                                state.contributedSolved = parseInteger(value, 'c:solved')
+                            elseif field == 'c:penalty' then
+                                state.contributedPenalty = parseInteger(value, 'c:penalty')
+                            elseif string.sub(field, 1, 2) == 'w:' then
+                                state.wrongMinutes[string.sub(field, 3)] = parseInteger(value, field)
+                            end
+                        end
+                        if (state.acceptedMinutes and not state.acceptedSubmissionId)
+                                or (state.acceptedSubmissionId and not state.acceptedMinutes) then
+                            return nil, 'Incomplete scoreboard accepted attempt state'
+                        end
+                        return state, nil
+                    end
+
+                    -- Applies one judged (non-PENDING) attempt. The problem hash keeps every attempt and
+                    -- the problem's contribution is recomputed from scratch, so the order results arrive
+                    -- in does not change the standings.
+                    local function writeJudgement(state, rankingKey, summaryKey, problemKey, result,
+                                                  contestMinutes, submissionId, wrongPenalty, solvedWeight,
+                                                  penaltyWeight, userId, userMember)
+                        if not state.initialized then
+                            redis.call('hset', summaryKey,
+                                    'solved', '0',
+                                    'penalty', '0',
+                                    'initialized', '1')
+                            redis.call('zadd', rankingKey, -userId, userMember)
+                        end
+
+                        local acceptedMinutes = state.acceptedMinutes
+                        local acceptedSubmissionId = state.acceptedSubmissionId
+                        local wrongMinutes = state.wrongMinutes
+                        if result == 'ACCEPTED' then
+                            if not acceptedMinutes or isEarlierAttempt(
+                                    contestMinutes, submissionId,
+                                    acceptedMinutes, acceptedSubmissionId) then
+                                acceptedMinutes = contestMinutes
+                                acceptedSubmissionId = submissionId
+                                redis.call('hset', problemKey,
+                                        'a:min', tostring(contestMinutes),
+                                        'a:sid', submissionId)
+                            end
+                        else
+                            wrongMinutes[submissionId] = contestMinutes
+                            redis.call('hset', problemKey, 'w:' .. submissionId, tostring(contestMinutes))
+                        end
+
+                        local newSolved = 0
+                        local newPenalty = 0
+                        if acceptedMinutes then
+                            newSolved = 1
+                            local wrongBefore = 0
+                            for wrongSubmissionId, minutes in pairs(wrongMinutes) do
+                                if isEarlierAttempt(
+                                        minutes, wrongSubmissionId,
+                                        acceptedMinutes, acceptedSubmissionId) then
+                                    wrongBefore = wrongBefore + 1
+                                end
+                            end
+                            newPenalty = acceptedMinutes + wrongBefore * wrongPenalty
+                        end
+
+                        local solvedDelta = newSolved - state.contributedSolved
+                        local penaltyDelta = newPenalty - state.contributedPenalty
+                        local solved = state.currentSolved
+                        local penalty = state.currentPenalty
+                        if solvedDelta ~= 0 then
+                            solved = redis.call('hincrby', summaryKey, 'solved', solvedDelta)
+                        end
+                        if penaltyDelta ~= 0 then
+                            penalty = redis.call('hincrby', summaryKey, 'penalty', penaltyDelta)
+                        end
+                        if solvedDelta ~= 0 or penaltyDelta ~= 0 then
+                            redis.call('hset', problemKey,
+                                    'c:solved', tostring(newSolved),
+                                    'c:penalty', tostring(newPenalty))
+                        end
+
+                        local score = solved * solvedWeight - penalty * penaltyWeight - userId
+                        redis.call('zadd', rankingKey, score, userMember)
+                    end
+
+                    """;
+
+    static final String TEXT = HELPERS + SCORING + """
                     local contestMinutes = tonumber(ARGV[5])
                     local wrongPenalty = tonumber(ARGV[6])
                     local solvedWeight = tonumber(ARGV[7])
@@ -160,41 +275,9 @@ final class ContestScoreboardRedisScript {
                         return currentOffset
                     end
 
-                    local initialized = redis.call('hget', KEYS[4], 'initialized')
-                    if initialized and initialized ~= '1' then
-                        return redis.error_reply('Invalid scoreboard initialized flag')
-                    end
-                    local currentSolved = parseInteger(
-                            redis.call('hget', KEYS[4], 'solved'),
-                            'solved')
-                    local currentPenalty = parseInteger(
-                            redis.call('hget', KEYS[4], 'penalty'),
-                            'penalty')
-
-                    local acceptedMinutes = nil
-                    local acceptedSubmissionId = nil
-                    local contributedSolved = 0
-                    local contributedPenalty = 0
-                    local wrongMinutes = {}
-                    local problemState = redis.call('hgetall', KEYS[5])
-                    for index = 1, #problemState, 2 do
-                        local field = problemState[index]
-                        local value = problemState[index + 1]
-                        if field == 'a:min' then
-                            acceptedMinutes = parseInteger(value, 'a:min')
-                        elseif field == 'a:sid' then
-                            acceptedSubmissionId = parseSubmissionId(value, 'a:sid')
-                        elseif field == 'c:solved' then
-                            contributedSolved = parseInteger(value, 'c:solved')
-                        elseif field == 'c:penalty' then
-                            contributedPenalty = parseInteger(value, 'c:penalty')
-                        elseif string.sub(field, 1, 2) == 'w:' then
-                            wrongMinutes[string.sub(field, 3)] = parseInteger(value, field)
-                        end
-                    end
-                    if (acceptedMinutes and not acceptedSubmissionId)
-                            or (acceptedSubmissionId and not acceptedMinutes) then
-                        return redis.error_reply('Incomplete scoreboard accepted attempt state')
+                    local state, stateError = readScoringState(KEYS[4], KEYS[5])
+                    if stateError then
+                        return redis.error_reply(stateError)
                     end
 
                     if ARGV[4] ~= 'PENDING' then
@@ -227,62 +310,8 @@ final class ContestScoreboardRedisScript {
                             end
                         end
 
-                        if not initialized then
-                            redis.call('hset', KEYS[4],
-                                    'solved', '0',
-                                    'penalty', '0',
-                                    'initialized', '1')
-                            redis.call('zadd', KEYS[3], -userId, ARGV[9])
-                        end
-
-                        if ARGV[4] == 'ACCEPTED' then
-                            if not acceptedMinutes or isEarlierAttempt(
-                                    contestMinutes, submissionId,
-                                    acceptedMinutes, acceptedSubmissionId) then
-                                acceptedMinutes = contestMinutes
-                                acceptedSubmissionId = submissionId
-                                redis.call('hset', KEYS[5],
-                                        'a:min', tostring(contestMinutes),
-                                        'a:sid', submissionId)
-                            end
-                        else
-                            wrongMinutes[submissionId] = contestMinutes
-                            redis.call('hset', KEYS[5], 'w:' .. submissionId, tostring(contestMinutes))
-                        end
-
-                        local newSolved = 0
-                        local newPenalty = 0
-                        if acceptedMinutes then
-                            newSolved = 1
-                            local wrongBefore = 0
-                            for wrongSubmissionId, minutes in pairs(wrongMinutes) do
-                                if isEarlierAttempt(
-                                        minutes, wrongSubmissionId,
-                                        acceptedMinutes, acceptedSubmissionId) then
-                                    wrongBefore = wrongBefore + 1
-                                end
-                            end
-                            newPenalty = acceptedMinutes + wrongBefore * wrongPenalty
-                        end
-
-                        local solvedDelta = newSolved - contributedSolved
-                        local penaltyDelta = newPenalty - contributedPenalty
-                        local solved = currentSolved
-                        local penalty = currentPenalty
-                        if solvedDelta ~= 0 then
-                            solved = redis.call('hincrby', KEYS[4], 'solved', solvedDelta)
-                        end
-                        if penaltyDelta ~= 0 then
-                            penalty = redis.call('hincrby', KEYS[4], 'penalty', penaltyDelta)
-                        end
-                        if solvedDelta ~= 0 or penaltyDelta ~= 0 then
-                            redis.call('hset', KEYS[5],
-                                    'c:solved', tostring(newSolved),
-                                    'c:penalty', tostring(newPenalty))
-                        end
-
-                        local score = solved * solvedWeight - penalty * penaltyWeight - userId
-                        redis.call('zadd', KEYS[3], score, ARGV[9])
+                        writeJudgement(state, KEYS[3], KEYS[4], KEYS[5], ARGV[4], contestMinutes,
+                                submissionId, wrongPenalty, solvedWeight, penaltyWeight, userId, ARGV[9])
 
                         if sequenceToIssue then
                             redis.call('set', KEYS[7], tostring(sequenceToIssue))
