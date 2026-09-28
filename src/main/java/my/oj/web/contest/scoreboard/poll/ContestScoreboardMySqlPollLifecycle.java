@@ -10,14 +10,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Runs the {@code mysql-poll} delivery: the poll loop and the periodic rollback check, each on its own
- * thread.
+ * Runs the {@code mysql-poll} delivery: the poll loop, the periodic rollback check and the range recovery,
+ * each on its own thread so a long recovery never holds up new results.
  *
- * <p>The first thing the poll thread does is the startup rollback check, and nothing polls
+ * <p>The first thing the poll thread does is the startup rollback check, and nothing polls or recovers
  * until it has passed - a JVM that came up on a restored Redis fences the allocator before issuing its
  * first sequence. A startup check that fails (Redis or MySQL down) is retried on the next poll tick. The
  * periodic check runs even when nothing is judged, so a restore during a quiet period is found without
- * waiting for traffic.</p>
+ * waiting for traffic. Pending ranges persisted before a restart are resumed by the recovery thread.</p>
  *
  * <p>Every tick catches its own failure: a fixed-delay task that throws is cancelled, which would stop the
  * delivery silently.</p>
@@ -27,6 +27,7 @@ public class ContestScoreboardMySqlPollLifecycle implements SmartLifecycle {
 
     private final ContestScoreboardMySqlPoller poller;
     private final ContestScoreboardRollbackDetector detector;
+    private final ContestScoreboardRangeRecovery rangeRecovery;
     private final ContestScoreboardPollOwnership ownership;
     private final ContestScoreboardMySqlPollMetrics metrics;
     private final ContestScoreboardMySqlPollProperties properties;
@@ -35,11 +36,13 @@ public class ContestScoreboardMySqlPollLifecycle implements SmartLifecycle {
 
     public ContestScoreboardMySqlPollLifecycle(ContestScoreboardMySqlPoller poller,
                                                ContestScoreboardRollbackDetector detector,
+                                               ContestScoreboardRangeRecovery rangeRecovery,
                                                ContestScoreboardPollOwnership ownership,
                                                ContestScoreboardMySqlPollMetrics metrics,
                                                ContestScoreboardMySqlPollProperties properties) {
         this.poller = poller;
         this.detector = detector;
+        this.rangeRecovery = rangeRecovery;
         this.ownership = ownership;
         this.metrics = metrics;
         this.properties = properties;
@@ -51,13 +54,14 @@ public class ContestScoreboardMySqlPollLifecycle implements SmartLifecycle {
             return;
         }
         AtomicInteger threads = new AtomicInteger();
-        ScheduledExecutorService started = Executors.newScheduledThreadPool(2, runnable -> {
+        ScheduledExecutorService started = Executors.newScheduledThreadPool(3, runnable -> {
             Thread thread = new Thread(runnable, "scoreboard-mysql-poll-" + threads.incrementAndGet());
             thread.setDaemon(true);
             return thread;
         });
         schedule(started, this::pollTick, Duration.ZERO, properties.pollInterval());
         schedule(started, this::checkTick, properties.rollbackCheckInterval(), properties.rollbackCheckInterval());
+        schedule(started, this::recoveryTick, properties.recoveryInterval(), properties.recoveryInterval());
         executor = started;
         log.info("Contest scoreboard delivery: mysql-poll (batch-size={} poll-interval={} rollback-check-interval={}"
                         + " recovery-chunk-size={} recovery-max-iterations={})",
@@ -95,6 +99,18 @@ public class ContestScoreboardMySqlPollLifecycle implements SmartLifecycle {
         } catch (RuntimeException failure) {
             metrics.recordFailure("rollback-check");
             log.error("Scoreboard rollback check failed; the next tick retries", failure);
+        }
+    }
+
+    void recoveryTick() {
+        try {
+            if (startupChecked && ownership.holds()) {
+                rangeRecovery.recoverPending();
+            }
+        } catch (RuntimeException failure) {
+            metrics.recordFailure("recovery");
+            log.error("Scoreboard range recovery failed; the range stays pending and the next tick retries",
+                    failure);
         }
     }
 

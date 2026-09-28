@@ -69,6 +69,17 @@ public class ContestScoreboardMySqlPollConfiguration {
     }
 
     @Bean
+    ContestScoreboardRangeRecovery contestScoreboardRangeRecovery(ContestScoreboardSequenceLedger ledger,
+                                                                 ContestScoreboardSequencedApplication application,
+                                                                 ContestScoreboardRollbackDetector detector,
+                                                                 ContestScoreboardApplyLock applyLock,
+                                                                 ContestScoreboardMySqlPollMetrics metrics,
+                                                                 ContestScoreboardMySqlPollProperties properties) {
+        return new ContestScoreboardRangeRecovery(ledger, application, detector, applyLock, metrics,
+                properties.recoveryChunkSize(), properties.recoveryMaxIterations());
+    }
+
+    @Bean
     ContestScoreboardPollOwnership contestScoreboardPollOwnership(DataSource dataSource,
                                                                  ContestScoreboardMySqlPollProperties properties) {
         return new MySqlNamedLockPollOwnership(dataSource, properties.ownershipLockName());
@@ -78,10 +89,11 @@ public class ContestScoreboardMySqlPollConfiguration {
     ContestScoreboardMySqlPollLifecycle contestScoreboardMySqlPollLifecycle(
             ContestScoreboardMySqlPoller poller,
             ContestScoreboardRollbackDetector detector,
+            ContestScoreboardRangeRecovery rangeRecovery,
             ContestScoreboardPollOwnership ownership,
             ContestScoreboardMySqlPollMetrics metrics,
             ContestScoreboardMySqlPollProperties properties) {
-        return new ContestScoreboardMySqlPollLifecycle(poller, detector, ownership, metrics,
+        return new ContestScoreboardMySqlPollLifecycle(poller, detector, rangeRecovery, ownership, metrics,
                 properties);
     }
 }

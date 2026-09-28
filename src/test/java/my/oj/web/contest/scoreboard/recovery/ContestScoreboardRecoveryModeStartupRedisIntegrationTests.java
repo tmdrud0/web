@@ -46,6 +46,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         "contest.scoreboard.delivery=mysql-poll",
         "contest.scoreboard.mysql-poll.poll-interval=1h",
         "contest.scoreboard.mysql-poll.rollback-check-interval=1h",
+        "contest.scoreboard.mysql-poll.recovery-interval=1h",
         "contest.scoreboard.recovery.owner.enabled=true",
         "contest.scoreboard.stream.consumer.enabled=false",
         "rank.streak.batch.enabled=false"

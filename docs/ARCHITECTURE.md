@@ -65,7 +65,7 @@ stream delivery
 | `contest/scoreboard/redis` | commutative Lua와 Redis key 계약 | `ContestScoreboardRedisScript`, `RedisContestScoreboardApplier` |
 | `contest/scoreboard/stream` | AMQP 0.9.1 stream 소비, offset 복구·tail 관측, 적용 완료 batch | `ContestScoreboardStreamListener`, `ContestScoreboardStreamProcessor`, `ContestScoreboardStreamLifecycle`, `ContestScoreboardStreamTailOffsetMonitor` |
 | `contest/scoreboard/rebuild` | MySQL 결과에서 contest scoreboard 재구성 | `ContestScoreboardRebuildService` |
-| `contest/scoreboard/recovery` | 복구 모드 선택·검증·기동 보고, 모드별 역사 복구 기전, JVM 내부 pass gate, 두 replay 모드가 공유하는 적용기 | `ContestScoreboardRecoveryProperties`, `ContestScoreboardRecoveryStrategy`, `ContestScoreboardRecoveryPassGate`, `ContestScoreboardReplayApplication`, `ContestScoreboardFullReplayService`, `ContestScoreboardRedisSequenceRecoveryService` |
+| `contest/scoreboard/recovery` | 복구 모드 선택·검증·기동 보고, 모드별 역사 복구 기전, JVM 내부 pass gate, 두 replay 모드가 공유하는 적용기 | `ContestScoreboardRecoveryProperties`, `ContestScoreboardRecoveryStrategy`, `ContestScoreboardRecoveryPassGate`, `ContestScoreboardReplayApplication`, `ContestScoreboardFullReplayService` (redis-seq의 poller·감지·복구는 `contest/scoreboard/poll`) |
 | `contest/finalization` | 대회 종료, 최종 점수, rejudge | `ContestFinalizationService` |
 | `observability` | 중립 지표와 남은 judge outbox 진단 | `ContestOutboxBacklogMetrics`, `ContestOutboxDrainMetrics` |
 
@@ -430,6 +430,11 @@ MySQL에 저장된 채점 결과만으로 scoreboard를 다시 채운다. **RDB�
   replay batch 크기는 `full-replay.replay-batch-size`다.
 
 ### 3.4 redis-seq
+
+> **변경:** redis-seq는 이제 MySQL polling delivery로만 동작한다. 아래의 Stream 기반 검사(전역 duplicate
+> scan, lost-tail walk, Stream offset 범위 변환)와 그 scheduler·startup check·live recovery는 제거됐다.
+> 현재 구조는 [`SCOREBOARD_MYSQL_POLL_REDIS_SEQ.md`](SCOREBOARD_MYSQL_POLL_REDIS_SEQ.md)를 보라. 이 절의
+> 나머지는 이전 구현의 기록이다.
 
 seq는 **Redis가 발급**하고, 할당자와 매핑이 같은 Redis에 있으므로 RDB 롤백 시 스코어보드와 함께
 되감긴다. gapless DB sequence는 도입하지 않는다(비목표). Lua의 seq 발급 플래그(`ARGV[10]`)가
