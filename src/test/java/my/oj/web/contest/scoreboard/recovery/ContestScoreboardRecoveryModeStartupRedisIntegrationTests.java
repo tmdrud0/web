@@ -2,6 +2,7 @@ package my.oj.web.contest.scoreboard.recovery;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollLifecycle;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardRollbackDetector;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -44,6 +45,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         "contest.scoreboard.recovery.mode=redis-seq",
         "contest.scoreboard.delivery=mysql-poll",
         "contest.scoreboard.mysql-poll.poll-interval=1h",
+        "contest.scoreboard.mysql-poll.rollback-check-interval=1h",
         "contest.scoreboard.recovery.owner.enabled=true",
         "contest.scoreboard.stream.consumer.enabled=false",
         "rank.streak.batch.enabled=false"
@@ -72,6 +74,9 @@ class ContestScoreboardRecoveryModeStartupRedisIntegrationTests {
                 .hasSize(1);
         assertThat(context.getBeanNamesForType(ContestScoreboardMySqlPollLifecycle.class))
                 .as("the MySQL poller that delivers this mode")
+                .hasSize(1);
+        assertThat(context.getBeanNamesForType(ContestScoreboardRollbackDetector.class))
+                .as("the watermark rollback check")
                 .hasSize(1);
         assertThat(context.containsBean("contestScoreboardStreamListenerContainer"))
                 .as("no scoreboard Stream consumer container under mysql-poll")

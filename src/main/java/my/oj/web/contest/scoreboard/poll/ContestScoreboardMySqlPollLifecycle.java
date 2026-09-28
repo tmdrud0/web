@@ -10,7 +10,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Runs the {@code mysql-poll} poll loop on its own thread.
+ * Runs the {@code mysql-poll} delivery: the poll loop and the periodic rollback check, each on its own
+ * thread.
+ *
+ * <p>The first thing the poll thread does is the startup rollback check, and nothing polls
+ * until it has passed - a JVM that came up on a restored Redis fences the allocator before issuing its
+ * first sequence. A startup check that fails (Redis or MySQL down) is retried on the next poll tick. The
+ * periodic check runs even when nothing is judged, so a restore during a quiet period is found without
+ * waiting for traffic.</p>
  *
  * <p>Every tick catches its own failure: a fixed-delay task that throws is cancelled, which would stop the
  * delivery silently.</p>
@@ -19,16 +26,20 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class ContestScoreboardMySqlPollLifecycle implements SmartLifecycle {
 
     private final ContestScoreboardMySqlPoller poller;
+    private final ContestScoreboardRollbackDetector detector;
     private final ContestScoreboardPollOwnership ownership;
     private final ContestScoreboardMySqlPollMetrics metrics;
     private final ContestScoreboardMySqlPollProperties properties;
     private volatile ScheduledExecutorService executor;
+    private volatile boolean startupChecked;
 
     public ContestScoreboardMySqlPollLifecycle(ContestScoreboardMySqlPoller poller,
+                                               ContestScoreboardRollbackDetector detector,
                                                ContestScoreboardPollOwnership ownership,
                                                ContestScoreboardMySqlPollMetrics metrics,
                                                ContestScoreboardMySqlPollProperties properties) {
         this.poller = poller;
+        this.detector = detector;
         this.ownership = ownership;
         this.metrics = metrics;
         this.properties = properties;
@@ -40,12 +51,13 @@ public class ContestScoreboardMySqlPollLifecycle implements SmartLifecycle {
             return;
         }
         AtomicInteger threads = new AtomicInteger();
-        ScheduledExecutorService started = Executors.newScheduledThreadPool(1, runnable -> {
+        ScheduledExecutorService started = Executors.newScheduledThreadPool(2, runnable -> {
             Thread thread = new Thread(runnable, "scoreboard-mysql-poll-" + threads.incrementAndGet());
             thread.setDaemon(true);
             return thread;
         });
         schedule(started, this::pollTick, Duration.ZERO, properties.pollInterval());
+        schedule(started, this::checkTick, properties.rollbackCheckInterval(), properties.rollbackCheckInterval());
         executor = started;
         log.info("Contest scoreboard delivery: mysql-poll (batch-size={} poll-interval={} rollback-check-interval={}"
                         + " recovery-chunk-size={} recovery-max-iterations={})",
@@ -62,11 +74,32 @@ public class ContestScoreboardMySqlPollLifecycle implements SmartLifecycle {
             if (!ownership.holds()) {
                 return;
             }
+            if (!startupChecked) {
+                ContestScoreboardRollbackDetector.Detection detection = detector.check();
+                startupChecked = true;
+                log.info("Startup scoreboard rollback check: allocator={} watermark={} rolledBack={}",
+                        detection.allocator(), detection.watermark(), detection.rolledBack());
+            }
             poller.pollOnce();
         } catch (RuntimeException failure) {
             metrics.recordFailure("poll");
             log.error("Scoreboard MySQL poll failed; the next tick retries", failure);
         }
+    }
+
+    void checkTick() {
+        try {
+            if (startupChecked && ownership.holds()) {
+                detector.check();
+            }
+        } catch (RuntimeException failure) {
+            metrics.recordFailure("rollback-check");
+            log.error("Scoreboard rollback check failed; the next tick retries", failure);
+        }
+    }
+
+    boolean startupChecked() {
+        return startupChecked;
     }
 
     @Override

@@ -15,23 +15,27 @@ import java.util.List;
  * <p>The same query is the repair of the cross-store window: a row Redis applied whose MySQL marker was
  * lost still has no sequence, so it is polled again and the script hands back the sequence it holds.</p>
  *
- * <p>Each batch takes the apply lock and applies. The lock is held per batch.</p>
+ * <p>Each batch takes the apply lock, runs the rollback check, and applies. The lock is held per batch
+ * so a range recovery running in the background interleaves with polling chunk by chunk.</p>
  */
 public class ContestScoreboardMySqlPoller {
 
     private final ContestScoreboardSequenceLedger ledger;
     private final ContestScoreboardSequencedApplication application;
+    private final ContestScoreboardRollbackDetector detector;
     private final ContestScoreboardApplyLock applyLock;
     private final ContestScoreboardMySqlPollMetrics metrics;
     private final int batchSize;
 
     public ContestScoreboardMySqlPoller(ContestScoreboardSequenceLedger ledger,
                                         ContestScoreboardSequencedApplication application,
+                                        ContestScoreboardRollbackDetector detector,
                                         ContestScoreboardApplyLock applyLock,
                                         ContestScoreboardMySqlPollMetrics metrics,
                                         int batchSize) {
         this.ledger = ledger;
         this.application = application;
+        this.detector = detector;
         this.applyLock = applyLock;
         this.metrics = metrics;
         this.batchSize = batchSize;
@@ -51,13 +55,16 @@ public class ContestScoreboardMySqlPoller {
             if (rows.isEmpty()) {
                 return applied;
             }
-            ContestScoreboardSequencedApplication.ChunkOutcome outcome =
-                    applyLock.withLock(() -> application.applyChunk(rows, 0L));
+            ContestScoreboardSequencedApplication.ChunkOutcome outcome = applyLock.withLock(() -> {
+                detector.check();
+                return application.applyChunk(rows, 0L);
+            });
             applied += outcome.applied();
             metrics.recordApplied(outcome.applied());
             if (outcome.rolledBack()) {
-                // Redis refused: its allocator is below the watermark. What this batch applied is
-                // recorded; nothing more is applied until the allocator is repaired.
+                // Redis was restored between the check and the script. What this batch applied is
+                // recorded, so the check now sees the full range; the rest waits for the next poll.
+                detector.check();
                 return applied;
             }
             if (rows.size() < batchSize) {

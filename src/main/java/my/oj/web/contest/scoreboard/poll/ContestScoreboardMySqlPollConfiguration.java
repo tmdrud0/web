@@ -50,12 +50,21 @@ public class ContestScoreboardMySqlPollConfiguration {
     }
 
     @Bean
+    ContestScoreboardRollbackDetector contestScoreboardRollbackDetector(ContestScoreboardSequencedApplier applier,
+                                                                       ContestScoreboardSequenceLedger ledger,
+                                                                       ContestScoreboardApplyLock applyLock,
+                                                                       ContestScoreboardMySqlPollMetrics metrics) {
+        return new ContestScoreboardRollbackDetector(applier, ledger, applyLock, metrics);
+    }
+
+    @Bean
     ContestScoreboardMySqlPoller contestScoreboardMySqlPoller(ContestScoreboardSequenceLedger ledger,
                                                              ContestScoreboardSequencedApplication application,
+                                                             ContestScoreboardRollbackDetector detector,
                                                              ContestScoreboardApplyLock applyLock,
                                                              ContestScoreboardMySqlPollMetrics metrics,
                                                              ContestScoreboardMySqlPollProperties properties) {
-        return new ContestScoreboardMySqlPoller(ledger, application, applyLock, metrics,
+        return new ContestScoreboardMySqlPoller(ledger, application, detector, applyLock, metrics,
                 properties.batchSize());
     }
 
@@ -68,10 +77,11 @@ public class ContestScoreboardMySqlPollConfiguration {
     @Bean
     ContestScoreboardMySqlPollLifecycle contestScoreboardMySqlPollLifecycle(
             ContestScoreboardMySqlPoller poller,
+            ContestScoreboardRollbackDetector detector,
             ContestScoreboardPollOwnership ownership,
             ContestScoreboardMySqlPollMetrics metrics,
             ContestScoreboardMySqlPollProperties properties) {
-        return new ContestScoreboardMySqlPollLifecycle(poller, ownership, metrics,
+        return new ContestScoreboardMySqlPollLifecycle(poller, detector, ownership, metrics,
                 properties);
     }
 }

@@ -12,6 +12,7 @@ import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
 import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollConfiguration;
 import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollLifecycle;
 import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPoller;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardRollbackDetector;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -187,6 +188,7 @@ class ContestScoreboardRecoveryModeWiringTests {
                 .run(context -> {
                     assertThat(context).hasSingleBean(ContestScoreboardMySqlPoller.class);
                     assertThat(context).hasSingleBean(ContestScoreboardMySqlPollLifecycle.class);
+                    assertThat(context).hasSingleBean(ContestScoreboardRollbackDetector.class);
                     assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceMetrics.class);
                 });
 
