@@ -87,7 +87,7 @@ class ContestScoreboardStreamPosition {
      * delivery it re-reads is applied.</p>
      */
     void recordAppliedOffset(long offset) {
-        highestAppliedOffset.set(offset);
+        highestAppliedOffset.accumulateAndGet(offset, Math::max);
         unappliedFrom.updateAndGet(current -> current >= 0L && current <= offset ? -1L : current);
     }
 

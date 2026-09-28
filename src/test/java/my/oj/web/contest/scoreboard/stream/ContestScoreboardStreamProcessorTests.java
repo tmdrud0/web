@@ -177,20 +177,20 @@ class ContestScoreboardStreamProcessorTests {
      */
     @Test
     void aRollbackIsCountedApartFromARetentionGapAndJudgedAfresh() {
-        when(applier.currentStreamOffset()).thenReturn(2L, 2L, 5L);
+        when(applier.currentStreamOffset()).thenReturn(2L, 2L, 100L);
         when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         position.recordAppliedOffset(4L);
         // The anchor was verified for the position the consumer held before Redis rolled back.
         position.markAnchorVerified();
 
-        processor.process(List.of(event(5L, 105L)));
+        processor.process(List.of(event(100L, 200L)));
 
         ContestScoreboardRecoveryStrategy.LostRange range = capturedRange();
         assertThat(range.checkpointOffset()).isEqualTo(2L);
         assertThat(range.firstLostOffset()).isEqualTo(3L);
-        // The rollback took away everything up to what this process applied, so the range a mode is
-        // asked about reaches all the way to it.
+        // The rollback took away everything up to what this process applied. The new delivery is
+        // deliberately sparse and must not enlarge that historical range to offset 99.
         assertThat(range.lastLostOffset()).isEqualTo(4L);
         assertThat(range.highestAppliedOffset()).isEqualTo(4L);
         assertThat(counter("contest.scoreboard.stream.offset.gaps")).isZero();
@@ -199,19 +199,29 @@ class ContestScoreboardStreamProcessorTests {
 
     @Test
     void redisSequenceLiveProgressLetsARollbackBatchApplyWithoutClaimingCoverage() {
-        when(applier.currentStreamOffset()).thenReturn(2L, 2L, 5L);
+        when(applier.currentStreamOffset()).thenReturn(2L, 2L, 100L);
         when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         when(strategy.mode()).thenReturn(ContestScoreboardRecoveryMode.REDIS_SEQ);
         when(strategy.rebuildHistory(any())).thenReturn(Outcome.LIVE_PROGRESS);
         position.recordAppliedOffset(4L);
         position.markAnchorVerified();
 
-        processor.process(List.of(event(5L, 105L)));
+        processor.process(List.of(event(100L, 200L)));
 
+        assertThat(capturedRange().lastLostOffset()).isEqualTo(4L);
         assertThat(requests().get(0).advance()).isEqualTo(CheckpointAdvance.ANCHOR);
         assertThat(position.rebuiltThrough())
                 .as("live progress is not a completed reconstruction")
                 .isEqualTo(-1L);
+    }
+
+    @Test
+    void highestAppliedOffsetNeverRegressesWhenAnOlderBatchFinishesLater() {
+        position.recordAppliedOffset(100L);
+
+        position.recordAppliedOffset(90L);
+
+        assertThat(position.highestAppliedOffset()).isEqualTo(100L);
     }
 
     /**

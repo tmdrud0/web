@@ -216,7 +216,7 @@ class ContestScoreboardStreamProcessor {
                     firstDelivery, checkpoint);
             return CheckpointAdvance.CONTINUE;
         }
-        return anchorAfterRebuild(checkpoint, firstDelivery,
+        return anchorAfterRebuild(checkpoint, firstDelivery, applied,
                 gapReason(aboveUnappliedRange, checkpoint, applied));
     }
 
@@ -245,21 +245,31 @@ class ContestScoreboardStreamProcessor {
      * JVM's applied history while its idempotent repair continues asynchronously. A range containing
      * an offset never applied here is still refused.</p>
      *
-     * <p>The range handed over states both of its ends: the offset just below this delivery, and the
-     * highest offset this process applied. Its answer is read against the same ends, so a
-     * reconstruction that stopped short of them is not taken for one that reached them.</p>
+     * <p>A rollback range ends at the highest offset this process had actually applied, not at the
+     * number below the next delivery. Stream offsets are sparse and the delivery may be arbitrarily
+     * far above that watermark; using {@code firstDelivery - 1} would invent a range of results that
+     * never existed and make the sequence basis refuse safe live progress. Retention and unapplied
+     * gaps keep the delivery boundary because they describe work this process did not apply.</p>
      */
-    private CheckpointAdvance anchorAfterRebuild(long checkpoint, long firstDelivery, GapReason reason) {
+    private CheckpointAdvance anchorAfterRebuild(
+            long checkpoint,
+            long firstDelivery,
+            long highestAppliedOffset,
+            GapReason reason
+    ) {
         if (reason == GapReason.RETENTION) {
             // Only a checkpoint that is gone from retention is what this counter counts. A rollback is
             // the standings moving while the broker kept every offset, and a failed batch is a range
             // the broker still serves and only this consumer cannot be handed again.
             metrics.recordOffsetGap();
         }
+        long lastLostOffset = reason == GapReason.ROLLBACK
+                ? highestAppliedOffset
+                : firstDelivery - 1L;
         ContestScoreboardRecoveryStrategy.LostRange range = new ContestScoreboardRecoveryStrategy.LostRange(
                 checkpoint,
-                firstDelivery - 1L,
-                position.highestAppliedOffset(),
+                lastLostOffset,
+                highestAppliedOffset,
                 position.rebuiltThrough()
         );
         long askedAt = trace.enabled() ? System.currentTimeMillis() : 0L;
