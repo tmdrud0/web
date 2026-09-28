@@ -28,7 +28,7 @@ import org.springframework.core.type.AnnotatedTypeMetadata;
  * answer from both. The two are read independently - binding fills the record, this condition reads
  * the environment - which is why a change to one must be made to the other.</p>
  */
-class ContestScoreboardRecoveryOwnerCondition implements Condition {
+public class ContestScoreboardRecoveryOwnerCondition implements Condition {
 
     @Override
     public boolean matches(ConditionContext context, AnnotatedTypeMetadata metadata) {

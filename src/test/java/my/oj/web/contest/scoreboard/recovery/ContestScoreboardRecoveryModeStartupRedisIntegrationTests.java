@@ -1,6 +1,7 @@
 package my.oj.web.contest.scoreboard.recovery;
 
 import io.micrometer.core.instrument.MeterRegistry;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollLifecycle;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -41,9 +42,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 @TestPropertySource(properties = {
         "contest.scoreboard.store=redis",
         "contest.scoreboard.recovery.mode=redis-seq",
-        "contest.scoreboard.recovery.redis-seq.startup-check-enabled=false",
-        "contest.scoreboard.recovery.redis-seq.duplicate-check-interval=1h",
-        "contest.scoreboard.recovery.redis-seq.lost-tail-check-interval=1h",
+        "contest.scoreboard.delivery=mysql-poll",
+        "contest.scoreboard.mysql-poll.poll-interval=1h",
         "contest.scoreboard.recovery.owner.enabled=true",
         "contest.scoreboard.stream.consumer.enabled=false",
         "rank.streak.batch.enabled=false"
@@ -70,15 +70,15 @@ class ContestScoreboardRecoveryModeStartupRedisIntegrationTests {
         assertThat(context.getBeanNamesForType(ContestScoreboardRecoveryReporter.class))
                 .as("the startup report the operator reads the selected mode from")
                 .hasSize(1);
-        assertThat(context.getBeanNamesForType(ContestScoreboardRedisSequenceScheduler.class))
-                .as("the periodic trigger this mode runs on")
+        assertThat(context.getBeanNamesForType(ContestScoreboardMySqlPollLifecycle.class))
+                .as("the MySQL poller that delivers this mode")
                 .hasSize(1);
-        assertThat(context.getBeanNamesForType(ContestScoreboardRedisSequenceLiveRecovery.class))
-                .as("the managed single-flight trigger for live rollback checks")
-                .hasSize(1);
-        assertThat(context.getBeanNamesForType(ContestScoreboardRedisSequenceStartupCheck.class))
-                .as("the mode-conditional startup check, present even with the check itself disabled")
-                .hasSize(1);
+        assertThat(context.containsBean("contestScoreboardStreamListenerContainer"))
+                .as("no scoreboard Stream consumer container under mysql-poll")
+                .isFalse();
+        assertThat(context.containsBean("contestJudgeResultStreamRabbitTemplate"))
+                .as("no judge result Stream publisher under mysql-poll")
+                .isFalse();
         // The meters come from a mode-conditional configuration class rather than from the service,
         // so this is also the assertion that the configuration class was selected.
         assertThat(context.getBeanNamesForType(ContestScoreboardRedisSequenceMetrics.class)).hasSize(1);

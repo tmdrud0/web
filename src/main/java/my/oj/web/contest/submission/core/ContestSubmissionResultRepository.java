@@ -7,7 +7,6 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
-import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
@@ -89,130 +88,6 @@ public interface ContestSubmissionResultRepository extends JpaRepository<Contest
                                                                @Param("afterId") Long afterId,
                                                                @Param("unjudged") SubmissionResult unjudged,
                                                                Pageable pageable);
-
-    /**
-     * Sequences the scoreboard handed out more than once, oldest first.
-     *
-     * <p>Deliberately global rather than per contest: the allocator and the mapping the scoreboard
-     * issues from are global, so a sequence reused across two contests is just as much a reuse as
-     * one inside a single contest, and only a global grouping sees it.</p>
-     *
-     * <p>{@code afterSequence} keysets the walk past the first page. A group is a rare event, so a
-     * healthy check reads one empty page and stops; a page that came back full is continued rather
-     * than taken for the whole answer.</p>
-     */
-    @Query("""
-            select csr.scoreboardAppliedSeq as appliedSequence,
-                   count(csr) as resultCount
-            from ContestSubmissionResult csr
-            where csr.scoreboardAppliedSeq is not null
-              and (:afterSequence is null or csr.scoreboardAppliedSeq > :afterSequence)
-            group by csr.scoreboardAppliedSeq
-            having count(csr) > 1
-            order by csr.scoreboardAppliedSeq
-            """)
-    List<ContestScoreboardDuplicateSequence> findDuplicateAppliedSequences(
-            @Param("afterSequence") Long afterSequence,
-            Pageable pageable);
-
-    /**
-     * Every stored result holding one of these sequences.
-     *
-     * <p>Not narrowed to one row per group: the reuse is only resolved by re-applying all of them,
-     * which is what gives each row a sequence of its own.</p>
-     */
-    @Query("""
-            select csr.submission.id as submissionId,
-                   csr.scoreboardAppliedSeq as appliedSequence,
-                   csr.contestId as contestId,
-                   s.problem.id as problemId,
-                   s.user.id as userId,
-                   s.contest.startTime as contestStart,
-                   s.submittedTime as submittedTime,
-                   coalesce(csr.finalResult, csr.provisionalResult) as result
-            from ContestSubmissionResult csr
-            join csr.submission s
-            where csr.scoreboardAppliedSeq in :sequences
-            order by csr.scoreboardAppliedSeq, csr.submission.id
-            """)
-    List<ContestScoreboardSequencedRow> findRowsByAppliedSequences(
-            @Param("sequences") Collection<Long> sequences);
-
-    /**
-     * One descending window of sequenced results, keyset-continued on the sequence itself.
-     *
-     * <p>The read is not filtered by the allocator, and that is the point: the ordering rule is that
-     * every database read of a sequence happens before the allocator value it will be judged
-     * against. A {@code seq > allocator} comparison is only sound in that direction, because a
-     * sequence reaches MySQL after the allocator issued it - so a row read first and still ahead of
-     * an allocator read afterwards means the allocator moved backwards.</p>
-     *
-     * <p>The walk descends past the first window because a window alone leaves a hole: when the
-     * allocator has fallen further than {@code checkWindowSize} results, the deepest missing rows
-     * are outside the first page and never become candidates.</p>
-     */
-    @Query("""
-            select csr.submission.id as submissionId,
-                   csr.scoreboardAppliedSeq as appliedSequence,
-                   csr.contestId as contestId,
-                   s.problem.id as problemId,
-                   s.user.id as userId,
-                   s.contest.startTime as contestStart,
-                   s.submittedTime as submittedTime,
-                   coalesce(csr.finalResult, csr.provisionalResult) as result
-            from ContestSubmissionResult csr
-            join csr.submission s
-            where csr.scoreboardAppliedSeq is not null
-              and (:afterSequence is null or csr.scoreboardAppliedSeq < :afterSequence)
-            order by csr.scoreboardAppliedSeq desc
-            """)
-    List<ContestScoreboardSequencedRow> findSequencedRowsDescending(
-            @Param("afterSequence") Long afterSequence,
-            Pageable pageable);
-
-    /**
-     * Freezes the upper boundary of the judged, unsequenced set for one rollback repair pass.
-     *
-     * <p>The boundary prevents a pass from chasing results that keep arriving while it repairs the
-     * cross-store window between the Redis apply and the MySQL sequence marker.</p>
-     */
-    @Query("""
-            select max(csr.submission.id)
-            from ContestSubmissionResult csr
-            where csr.scoreboardAppliedSeq is null
-              and coalesce(csr.finalResult, csr.provisionalResult) <> :unjudged
-            """)
-    Long findHighestUnsequencedJudgedSubmissionId(@Param("unjudged") SubmissionResult unjudged);
-
-    /**
-     * One stable, keyset-ordered page of judged results that have no applied sequence marker.
-     *
-     * <p>Such a row is ambiguous in the safe direction: it either has not reached Redis yet, or Redis
-     * applied it and the JVM stopped before MySQL recorded the sequence. Re-applying either case is
-     * safe because the scoreboard apply is idempotent by submission id.</p>
-     */
-    @Query("""
-            select csr.submission.id as submissionId,
-                   csr.scoreboardAppliedSeq as appliedSequence,
-                   csr.contestId as contestId,
-                   s.problem.id as problemId,
-                   s.user.id as userId,
-                   s.contest.startTime as contestStart,
-                   s.submittedTime as submittedTime,
-                   coalesce(csr.finalResult, csr.provisionalResult) as result
-            from ContestSubmissionResult csr
-            join csr.submission s
-            where csr.scoreboardAppliedSeq is null
-              and csr.submission.id <= :throughId
-              and (:afterId is null or csr.submission.id > :afterId)
-              and coalesce(csr.finalResult, csr.provisionalResult) <> :unjudged
-            order by csr.submission.id
-            """)
-    List<ContestScoreboardSequencedRow> findUnsequencedJudgedRows(
-            @Param("afterId") Long afterId,
-            @Param("throughId") Long throughId,
-            @Param("unjudged") SubmissionResult unjudged,
-            Pageable pageable);
 
     @Query("select csr from ContestSubmissionResult csr join fetch csr.submission s join fetch s.user join fetch s.problem join fetch s.contest where csr.contestId = :contestId order by s.submittedTime asc, csr.id asc")
     List<ContestSubmissionResult> findAllByContestIdWithSubmission(@Param("contestId") Long contestId);

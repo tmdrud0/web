@@ -1,5 +1,7 @@
 package my.oj.web.contest.scoreboard.stream;
 
+import my.oj.web.contest.scoreboard.delivery.RabbitStreamDeliveryCondition;
+import org.springframework.context.annotation.Conditional;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.rebuild.ContestScoreboardRebuildService;
 import org.springframework.boot.actuate.endpoint.annotation.Endpoint;
@@ -16,6 +18,7 @@ import java.util.Map;
         name = "enabled",
         havingValue = "true"
 )
+@Conditional(RabbitStreamDeliveryCondition.class)
 class ContestScoreboardRebuildEndpoint {
 
     private final ContestScoreboardRebuildService rebuildService;

@@ -9,7 +9,15 @@ import my.oj.web.contest.scoreboard.ContestScoreboardSequenceSource;
 import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamRecoveryService;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollConfiguration;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollLifecycle;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPoller;
 import org.junit.jupiter.api.Test;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import javax.sql.DataSource;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
@@ -71,10 +79,7 @@ class ContestScoreboardRecoveryModeWiringTests {
                 ContestScoreboardRecoveryStrategyConfig.class,
                 ContestScoreboardFullReplayStartupRunner.class,
                 ContestScoreboardRedisSequenceConfig.class,
-                ContestScoreboardRedisSequenceRecoveryService.class,
-                ContestScoreboardRedisSequenceScheduler.class,
-                ContestScoreboardRedisSequenceLiveRecovery.class,
-                ContestScoreboardRedisSequenceStartupCheck.class
+                ContestScoreboardMySqlPollConfiguration.class
         };
     }
 
@@ -88,7 +93,31 @@ class ContestScoreboardRecoveryModeWiringTests {
     void eachModeBringsUpItsOwnRecoveryStrategy() {
         assertStrategy("stream-offset", ContestScoreboardRecoveryMode.STREAM_OFFSET, true);
         assertStrategy("full-replay", ContestScoreboardRecoveryMode.FULL_REPLAY, false);
-        assertStrategy("redis-seq", ContestScoreboardRecoveryMode.REDIS_SEQ, false);
+    }
+
+    /**
+     * redis-seq is delivered by the MySQL poller. Under that delivery the Stream consumer - and so the
+     * strategy it would consult - is absent even though the consumer flag is on; the validator refuses
+     * the flag itself, which is asserted in the validator tests.
+     */
+    @Test
+    void redisSeqHasNoStreamStrategyUnderTheMySqlPoller() {
+        contextRunner
+                .withPropertyValues("contest.scoreboard.recovery.mode=redis-seq",
+                        "contest.scoreboard.delivery=mysql-poll")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).doesNotHaveBean(ContestScoreboardRecoveryStrategy.class);
+                    assertThat(context).doesNotHaveBean(ContestScoreboardStreamRecoveryService.class);
+                });
+    }
+
+    /** The factory refuses rather than handing the Stream consumer a strategy redis-seq no longer has. */
+    @Test
+    void redisSeqOverTheStreamHasNoStrategyToGive() {
+        contextRunner
+                .withPropertyValues("contest.scoreboard.recovery.mode=redis-seq")
+                .run(context -> assertThat(context).hasFailed());
     }
 
     /**
@@ -118,7 +147,7 @@ class ContestScoreboardRecoveryModeWiringTests {
     void theReplayServiceIsAvailableInEveryMode() {
         for (String mode : new String[]{"stream-offset", "full-replay", "redis-seq"}) {
             contextRunner
-                    .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                    .withPropertyValues("contest.scoreboard.recovery.mode=" + mode, delivery(mode))
                     .run(context -> assertThat(context)
                             .as("mode=%s", mode)
                             .hasSingleBean(ContestScoreboardFullReplayService.class));
@@ -139,7 +168,7 @@ class ContestScoreboardRecoveryModeWiringTests {
     void theOtherModesDoNotReplayAtStartup() {
         for (String mode : new String[]{"stream-offset", "redis-seq"}) {
             contextRunner
-                    .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                    .withPropertyValues("contest.scoreboard.recovery.mode=" + mode, delivery(mode))
                     .run(context -> assertThat(context)
                             .as("mode=%s", mode)
                             .doesNotHaveBean(ContestScoreboardFullReplayStartupRunner.class));
@@ -152,28 +181,23 @@ class ContestScoreboardRecoveryModeWiringTests {
      * healthy zero.
      */
     @Test
-    void onlyRedisSeqModeBringsUpTheSequenceCheck() {
+    void onlyRedisSeqModeBringsUpTheMySqlPoller() {
         contextRunner
-                .withPropertyValues("contest.scoreboard.recovery.mode=redis-seq")
+                .withPropertyValues("contest.scoreboard.recovery.mode=redis-seq", "contest.scoreboard.delivery=mysql-poll")
                 .run(context -> {
-                    assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceRecoveryService.class);
-                    assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceScheduler.class);
-                    assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceLiveRecovery.class);
-                    assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceStartupCheck.class);
+                    assertThat(context).hasSingleBean(ContestScoreboardMySqlPoller.class);
+                    assertThat(context).hasSingleBean(ContestScoreboardMySqlPollLifecycle.class);
                     assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceMetrics.class);
                 });
 
         for (String mode : new String[]{"stream-offset", "full-replay"}) {
             contextRunner
-                    .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                    .withPropertyValues("contest.scoreboard.recovery.mode=" + mode, delivery(mode))
                     .run(context -> {
-                        assertThat(context)
-                                .as("mode=%s", mode)
-                                .doesNotHaveBean(ContestScoreboardRedisSequenceStartupCheck.class);
+                        assertThat(context).as("mode=%s", mode).doesNotHaveBean(ContestScoreboardMySqlPoller.class);
                         assertThat(context)
                                 .as("mode=%s", mode)
                                 .doesNotHaveBean(ContestScoreboardRedisSequenceMetrics.class);
-                        assertThat(context).doesNotHaveBean(ContestScoreboardRedisSequenceLiveRecovery.class);
                     });
         }
     }
@@ -208,16 +232,14 @@ class ContestScoreboardRecoveryModeWiringTests {
      * meters stay, because the gate removes the triggers and not the mode.</p>
      */
     @Test
-    void anInstanceThatIsNotTheOwnerRegistersNoSequenceCheck() {
+    void anInstanceThatIsNotTheOwnerRegistersNoMySqlPoller() {
         ownerRunner(false)
-                .withPropertyValues("contest.scoreboard.recovery.mode=redis-seq")
+                .withPropertyValues("contest.scoreboard.recovery.mode=redis-seq", "contest.scoreboard.delivery=mysql-poll")
                 .run(context -> {
                     assertThat(context).hasNotFailed();
-                    assertThat(context).doesNotHaveBean(ContestScoreboardRedisSequenceScheduler.class);
-                    assertThat(context).doesNotHaveBean(ContestScoreboardRedisSequenceLiveRecovery.class);
-                    assertThat(context).doesNotHaveBean(ContestScoreboardRedisSequenceStartupCheck.class);
-                    assertThat(context)
-                            .hasSingleBean(ContestScoreboardRedisSequenceRecoveryService.class);
+                    assertThat(context).doesNotHaveBean(ContestScoreboardMySqlPoller.class);
+                    assertThat(context).doesNotHaveBean(ContestScoreboardMySqlPollLifecycle.class);
+                    assertThat(context).hasSingleBean(ContestScoreboardRedisSequenceMetrics.class);
                 });
     }
 
@@ -242,13 +264,13 @@ class ContestScoreboardRecoveryModeWiringTests {
 
     private void assertTriggerSurface(String mode, boolean replaysAtStartup, boolean checksTheSequence) {
         ownerRunner(true)
-                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode, delivery(mode))
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertTriggerSurface(context, mode, replaysAtStartup, checksTheSequence);
                 });
         ownerRunner(false)
-                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode, delivery(mode))
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertTriggerSurface(context, mode, false, false);
@@ -260,8 +282,8 @@ class ContestScoreboardRecoveryModeWiringTests {
                                              boolean replaysAtStartup,
                                              boolean checksTheSequence) {
         assertTrigger(context, ContestScoreboardFullReplayStartupRunner.class, replaysAtStartup, mode);
-        assertTrigger(context, ContestScoreboardRedisSequenceScheduler.class, checksTheSequence, mode);
-        assertTrigger(context, ContestScoreboardRedisSequenceStartupCheck.class, checksTheSequence, mode);
+        assertTrigger(context, ContestScoreboardMySqlPoller.class, checksTheSequence, mode);
+        assertTrigger(context, ContestScoreboardMySqlPollLifecycle.class, checksTheSequence, mode);
     }
 
     private static void assertTrigger(AssertableApplicationContext context,
@@ -324,11 +346,15 @@ class ContestScoreboardRecoveryModeWiringTests {
                 });
     }
 
+    private static String delivery(String mode) {
+        return "contest.scoreboard.delivery=" + ("redis-seq".equals(mode) ? "mysql-poll" : "rabbit-stream");
+    }
+
     private void assertStrategy(String mode,
                                 ContestScoreboardRecoveryMode expected,
                                 boolean rewindsOnCheckpointRegression) {
         contextRunner
-                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode, delivery(mode))
                 .run(context -> {
                     assertThat(context).hasSingleBean(ContestScoreboardRecoveryStrategy.class);
                     ContestScoreboardRecoveryStrategy strategy =
@@ -372,6 +398,26 @@ class ContestScoreboardRecoveryModeWiringTests {
         @Bean
         ContestSubmissionBatchExecutor batchExecutor() {
             return mock(ContestSubmissionBatchExecutor.class);
+        }
+
+        @Bean
+        StringRedisTemplate redisTemplate() {
+            return mock(StringRedisTemplate.class);
+        }
+
+        @Bean
+        JdbcTemplate jdbcTemplate() {
+            return mock(JdbcTemplate.class);
+        }
+
+        @Bean
+        DataSource dataSource() {
+            return mock(DataSource.class);
+        }
+
+        @Bean
+        PlatformTransactionManager transactionManager() {
+            return mock(PlatformTransactionManager.class);
         }
 
         @Bean

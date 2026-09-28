@@ -1,5 +1,7 @@
 package my.oj.web.contest.scoreboard.stream;
 
+import my.oj.web.contest.scoreboard.delivery.RabbitStreamDeliveryCondition;
+import org.springframework.context.annotation.Conditional;
 import my.oj.web.contest.scoreboard.ContestScoreboardAppliedMarker;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardApplier;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -13,6 +15,7 @@ import java.util.Set;
 /** Repairs the non-authoritative MySQL staleness timestamp without moving the Redis checkpoint. */
 @Component
 @ConditionalOnProperty(prefix = "contest.scoreboard.stream.consumer", name = "enabled", havingValue = "true")
+@Conditional(RabbitStreamDeliveryCondition.class)
 class ContestScoreboardAppliedAtCompletion {
 
     private final StringRedisTemplate redisTemplate;

@@ -663,6 +663,7 @@ function Get-BatchRuntimeConfig {
         DbName = if ($environment.Contains("DB_NAME")) { $environment["DB_NAME"] } else { $null }
         DbPort = if ($environment.Contains("DB_PORT")) { $environment["DB_PORT"] } else { $null }
         ConsumerEnabled = if ($environment.Contains("CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED")) { $environment["CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED"] } else { $null }
+        Delivery = if ($environment.Contains("CONTEST_SCOREBOARD_DELIVERY")) { $environment["CONTEST_SCOREBOARD_DELIVERY"] } else { $null }
     }
 }
 
@@ -676,6 +677,11 @@ function Assert-BatchRecoveryMode {
     if ([string]$runtime.Mode -ne $config.Mode) {
         throw "The batch role is running mode '$($runtime.Mode)'; this run was initialized for '$($config.Mode)'."
     }
+    $expectedDelivery = (Get-ScoreboardDeliveryEnvironment -Mode $config.Mode)["CONTEST_SCOREBOARD_DELIVERY"]
+    if ($config.Mode -eq "redis-seq" -and [string]$runtime.Delivery -ne $expectedDelivery) {
+        throw "The batch role runs redis-seq with delivery '$($runtime.Delivery)'; redis-seq is delivered by " +
+        "'$expectedDelivery'. Set CONTEST_SCOREBOARD_DELIVERY through Set-ScoreboardDeliveryEnvironment."
+    }
     return $runtime
 }
 
@@ -687,7 +693,7 @@ function Get-RecoveryModeClassEntry {
 
     switch ($Mode) {
         "full-replay" { return "BOOT-INF/classes/my/oj/web/contest/scoreboard/recovery/FullReplayRecoveryStrategy.class" }
-        "redis-seq" { return "BOOT-INF/classes/my/oj/web/contest/scoreboard/recovery/RedisSequenceRecoveryStrategy.class" }
+        "redis-seq" { return "BOOT-INF/classes/my/oj/web/contest/scoreboard/poll/ContestScoreboardMySqlPoller.class" }
         "stream-offset" { return "BOOT-INF/classes/my/oj/web/contest/scoreboard/recovery/StreamOffsetRecoveryStrategy.class" }
     }
     throw "Mode '$Mode' has no strategy class in this harness's map, so no jar can be checked against it."

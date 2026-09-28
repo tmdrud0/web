@@ -1,5 +1,7 @@
 package my.oj.web.contest.scoreboard.stream;
 
+import my.oj.web.contest.scoreboard.delivery.RabbitStreamDeliveryCondition;
+import org.springframework.context.annotation.Conditional;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -21,6 +23,7 @@ import java.util.concurrent.atomic.AtomicLong;
         name = "enabled",
         havingValue = "true"
 )
+@Conditional(RabbitStreamDeliveryCondition.class)
 public class ContestScoreboardStreamMetrics {
 
     private final AtomicLong appliedOffset = new AtomicLong(-1L);

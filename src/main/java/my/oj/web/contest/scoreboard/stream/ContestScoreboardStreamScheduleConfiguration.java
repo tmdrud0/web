@@ -1,5 +1,7 @@
 package my.oj.web.contest.scoreboard.stream;
 
+import my.oj.web.contest.scoreboard.delivery.RabbitStreamDeliveryCondition;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.SchedulingConfigurer;
@@ -22,6 +24,7 @@ import org.springframework.scheduling.config.ScheduledTaskRegistrar;
         name = "enabled",
         havingValue = "true"
 )
+@Conditional(RabbitStreamDeliveryCondition.class)
 class ContestScoreboardStreamScheduleConfiguration implements SchedulingConfigurer {
 
     private final ContestScoreboardStreamConsumerProperties properties;

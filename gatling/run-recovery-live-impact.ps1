@@ -319,6 +319,7 @@ try {
 
     # --- 3. start ----------------------------------------------------------------------------------
     $env:CONTEST_SCOREBOARD_RECOVERY_MODE = $Mode
+    Set-ScoreboardDeliveryEnvironment -Mode $Mode
     $env:CONTEST_SCOREBOARD_EXPERIMENT_TRACE_ENABLED = "true"
     $env:CONTEST_SCOREBOARD_EXPERIMENT_TRACE_DIRECTORY = $traceDirectory
     $upArguments = @("up", "-d")

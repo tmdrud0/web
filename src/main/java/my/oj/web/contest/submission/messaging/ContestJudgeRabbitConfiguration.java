@@ -20,7 +20,9 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
+import my.oj.web.contest.scoreboard.delivery.RabbitStreamDeliveryCondition;
 
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnExpression("'${contest.submission.judge.rabbit.publisher.enabled:false}' == 'true' || "
@@ -62,6 +64,7 @@ class ContestJudgeRabbitConfiguration {
                 .build();
     }
 
+    @Conditional(RabbitStreamDeliveryCondition.class)
     @Bean
     Queue contestJudgeResultStreamQueue() {
         return QueueBuilder.durable(ContestJudgeRabbitTopology.RESULT_STREAM_QUEUE)
@@ -89,6 +92,7 @@ class ContestJudgeRabbitConfiguration {
                 .with(ContestJudgeRabbitTopology.DEAD_LETTER_ROUTING_KEY);
     }
 
+    @Conditional(RabbitStreamDeliveryCondition.class)
     @Bean
     Binding contestJudgeResultStreamBinding(Queue contestJudgeResultStreamQueue,
                                             DirectExchange contestJudgeExchange) {
@@ -104,6 +108,7 @@ class ContestJudgeRabbitConfiguration {
         return publisherConfirmRabbitTemplate(connectionFactory, contestJudgeMessageConverter);
     }
 
+    @Conditional(RabbitStreamDeliveryCondition.class)
     @Bean("contestJudgeResultStreamRabbitTemplate")
     @ConditionalOnProperty(
             prefix = "contest.submission.judge.result-stream.publisher",

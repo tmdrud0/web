@@ -1,5 +1,7 @@
 package my.oj.web.contest.scoreboard.stream;
 
+import my.oj.web.contest.scoreboard.delivery.RabbitStreamDeliveryCondition;
+import org.springframework.context.annotation.Conditional;
 import lombok.extern.slf4j.Slf4j;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryCutover;
@@ -19,6 +21,7 @@ import java.util.Map;
         name = "enabled",
         havingValue = "true"
 )
+@Conditional(RabbitStreamDeliveryCondition.class)
 @Slf4j
 class ContestScoreboardStreamLifecycle implements SmartLifecycle {
 

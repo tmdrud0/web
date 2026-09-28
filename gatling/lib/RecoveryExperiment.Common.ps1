@@ -211,6 +211,36 @@ function Get-RecoveryConfig {
     return $script:recoveryConfig
 }
 
+# How judged results reach the scoreboard is a property of the mode: redis-seq is delivered by the MySQL
+# poller with the scoreboard RabbitMQ Stream off on every role, and the application refuses to start
+# redis-seq any other way. The compose overlays pass these through; the run scripts set them from here so
+# the mode and its delivery cannot be set apart.
+function Get-ScoreboardDeliveryEnvironment {
+    param([Parameter(Mandatory = $true)][string]$Mode)
+
+    if ($Mode -eq "redis-seq") {
+        return [ordered]@{
+            CONTEST_SCOREBOARD_DELIVERY                            = "mysql-poll"
+            CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED             = "false"
+            CONTEST_SUBMISSION_JUDGE_RESULT_STREAM_PUBLISHER_ENABLED = "false"
+        }
+    }
+    return [ordered]@{
+        CONTEST_SCOREBOARD_DELIVERY                            = "rabbit-stream"
+        CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED             = "true"
+        CONTEST_SUBMISSION_JUDGE_RESULT_STREAM_PUBLISHER_ENABLED = "true"
+    }
+}
+
+function Set-ScoreboardDeliveryEnvironment {
+    param([Parameter(Mandatory = $true)][string]$Mode)
+
+    $values = Get-ScoreboardDeliveryEnvironment -Mode $Mode
+    foreach ($name in @($values.Keys)) {
+        Set-Item -Path ("Env:" + $name) -Value $values[$name]
+    }
+}
+
 # The contest is inserted rather than assumed, so its id is not known when the experiment is
 # initialized - and two of the Redis keys this harness reads are derived from that id. This is the one
 # place those are recomputed, so a caller cannot update the id without also moving the keys that

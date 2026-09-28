@@ -1079,6 +1079,31 @@ Test-Case "every mode's artifact probe names a class the tree actually has" {
     Assert-True $refused "a mode with no entry in the map is refused rather than probed"
 }
 
+Test-Case "redis-seq runs on the MySQL poller with every scoreboard Stream flag off" {
+    # The application refuses redis-seq on any other delivery, and refuses the Stream flags under the
+    # poller, so the run scripts derive all three from the mode rather than leaving them to compose defaults.
+    $poll = Get-ScoreboardDeliveryEnvironment -Mode "redis-seq"
+    Assert-Equal "mysql-poll" ([string]$poll["CONTEST_SCOREBOARD_DELIVERY"]) "redis-seq is delivered by the MySQL poller"
+    Assert-Equal "false" ([string]$poll["CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED"]) "no scoreboard Stream consumer"
+    Assert-Equal "false" ([string]$poll["CONTEST_SUBMISSION_JUDGE_RESULT_STREAM_PUBLISHER_ENABLED"]) "no judge result Stream publisher"
+    foreach ($mode in @("full-replay", "stream-offset")) {
+        $stream = Get-ScoreboardDeliveryEnvironment -Mode $mode
+        Assert-Equal "rabbit-stream" ([string]$stream["CONTEST_SCOREBOARD_DELIVERY"]) "$mode stays on the Stream"
+        Assert-Equal "true" ([string]$stream["CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED"]) "$mode keeps its consumer"
+    }
+    # Applied to the process environment, which is what compose reads when it starts the stack.
+    $names = @($poll.Keys)
+    $saved = @{}
+    foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
+    try {
+        Set-ScoreboardDeliveryEnvironment -Mode "redis-seq"
+        Assert-Equal "mysql-poll" ([string]$env:CONTEST_SCOREBOARD_DELIVERY) "the run script's environment carries the delivery"
+        Assert-Equal "false" ([string]$env:CONTEST_SCOREBOARD_STREAM_CONSUMER_ENABLED) "and the consumer flag"
+    } finally {
+        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
+    }
+}
+
 # --- report -------------------------------------------------------------------------------------
 
 Write-TestSummary -Suite "RecoveryExperiment unit tests"

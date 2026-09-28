@@ -43,13 +43,11 @@ import static org.mockito.Mockito.when;
 class ContestScoreboardRecoveryStrategyTests {
 
     private ContestScoreboardFullReplayService replayService;
-    private ContestScoreboardRedisSequenceLiveRecovery sequenceLiveRecovery;
     private ContestScoreboardStreamRecoveryService retentionGapService;
 
     @BeforeEach
     void setUp() {
         replayService = mock(ContestScoreboardFullReplayService.class);
-        sequenceLiveRecovery = mock(ContestScoreboardRedisSequenceLiveRecovery.class);
         retentionGapService = mock(ContestScoreboardStreamRecoveryService.class);
     }
 
@@ -88,28 +86,6 @@ class ContestScoreboardRecoveryStrategyTests {
         assertThat(strategy.rebuildHistory(range(2L, 4L, 4L, 4L))).isEqualTo(Outcome.COVERED);
 
         verify(replayService, times(1)).replayAllContests();
-    }
-
-    /**
-     * A range reaching above the applied watermark, with a checkpoint below it: the sequence basis
-     * refuses rather than reporting it rebuilt.
-     *
-     * <p>Offset 41 is the state a failed batch leaves - the checkpoint is 40, the delivery is 42, and
-     * nothing applied 41 - so its row carries no sequence and neither the sequenced-tail walk nor the
-     * duplicate scan can find it. Reading the checkpoint alone would have said "inside what this
-     * process applied" and let the delivery anchor past a result the standings never saw.</p>
-     *
-     * <p>{@code UNRECOVERABLE} rather than {@code RETRYABLE_FAILURE}: the refusal is a property of what
-     * this basis records, so a second attempt reaches the same answer, and the range is remembered as
-     * answered so it does not become a check per supervisor cycle.</p>
-     */
-    @Test
-    void aRangeReachingAboveTheAppliedWatermarkIsRefusedByTheSequenceBasis() {
-        assertThat(redisSequence().rebuildHistory(range(40L, 41L, 40L, 40L)))
-                .as("a basis written at apply time cannot find an offset that was never applied")
-                .isEqualTo(Outcome.UNRECOVERABLE);
-
-        verifyNoInteractions(sequenceLiveRecovery);
     }
 
     /**
@@ -175,50 +151,10 @@ class ContestScoreboardRecoveryStrategyTests {
                 .isEqualTo(Outcome.UNRECOVERABLE);
     }
 
-    /** Applied history may keep moving while a prompt sequence check repairs it in the background. */
-    @Test
-    void aRollbackInsideWhatThisProcessAppliedAllowsLiveProgressAndTriggersRepair() {
-        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L)))
-                .isEqualTo(Outcome.LIVE_PROGRESS);
-
-        verify(sequenceLiveRecovery).trigger();
-    }
-
-    @Test
-    void aBusyImmediateRepairStillAllowsLiveProgressAndLeavesPeriodicRetryInCharge() {
-        when(sequenceLiveRecovery.trigger()).thenReturn(false);
-
-        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L)))
-                .isEqualTo(Outcome.LIVE_PROGRESS);
-
-        verify(sequenceLiveRecovery).trigger();
-    }
-
-    @Test
-    void redisSequenceStillRequiresColdStartCoverageBeforeConsumption() {
-        assertThat(redisSequence().recoversHistoryBeforeConsuming()).isTrue();
-    }
-
-    /**
-     * A range reaching past the applied watermark is refused however deep a rebuild already ran, because
-     * the two are different questions: reaching further is not the same as covering offsets that were
-     * never applied here.
-     */
-    @Test
-    void aRangeReachingPastTheAppliedWatermarkIsRefusedHoweverDeepTheRebuild() {
-        assertThat(redisSequence().rebuildHistory(range(2L, 4L, 4L, -1L)))
-                .isEqualTo(Outcome.LIVE_PROGRESS);
-        assertThat(redisSequence().rebuildHistory(range(2L, 6L, 4L, 4L)))
-                .as("offsets 5 and 6 were never applied here, so no sequence was ever issued for them")
-                .isEqualTo(Outcome.UNRECOVERABLE);
-
-        verify(sequenceLiveRecovery, times(1)).trigger();
-    }
-
     /**
      * The other way a pass does not run: another pass already holds the gate.
      *
-     * <p>All three modes are asked inside one held pass, because the answer is the gate's and not the
+     * <p>Both Stream modes are asked inside one held pass, because the answer is the gate's and not the
      * mode's - and because the caller has to be able to tell it from a failure. Nothing is asked of any
      * basis: the gate is checked before the work and no work was done.</p>
      */
@@ -230,16 +166,12 @@ class ContestScoreboardRecoveryStrategyTests {
         gate.tryRun(PassKind.MYSQL_REPLAY, () -> {
             answers.add(new FullReplayRecoveryStrategy(replayService, gate)
                     .rebuildHistory(range(2L, 4L, 4L, -1L)));
-            answers.add(new RedisSequenceRecoveryStrategy(sequenceLiveRecovery)
-                    .rebuildHistory(range(2L, 4L, 4L, -1L)));
             answers.add(new StreamOffsetRecoveryStrategy(retentionGapService, gate)
                     .rebuildHistory(range(5L, 12L, 5L, -1L)));
             return Boolean.TRUE;
         });
 
-        assertThat(answers).containsExactly(
-                Outcome.BUSY_RETRY_LATER, Outcome.LIVE_PROGRESS, Outcome.BUSY_RETRY_LATER);
-        verify(sequenceLiveRecovery).trigger();
+        assertThat(answers).containsExactly(Outcome.BUSY_RETRY_LATER, Outcome.BUSY_RETRY_LATER);
         verifyNoInteractions(replayService, retentionGapService);
     }
 
@@ -281,10 +213,6 @@ class ContestScoreboardRecoveryStrategyTests {
 
     private FullReplayRecoveryStrategy fullReplay() {
         return new FullReplayRecoveryStrategy(replayService, gate());
-    }
-
-    private RedisSequenceRecoveryStrategy redisSequence() {
-        return new RedisSequenceRecoveryStrategy(sequenceLiveRecovery);
     }
 
     private StreamOffsetRecoveryStrategy streamOffset() {

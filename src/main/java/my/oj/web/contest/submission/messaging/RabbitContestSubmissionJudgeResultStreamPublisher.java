@@ -1,5 +1,7 @@
 package my.oj.web.contest.submission.messaging;
 
+import my.oj.web.contest.scoreboard.delivery.RabbitStreamDeliveryCondition;
+import org.springframework.context.annotation.Conditional;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultCommand;
 import my.oj.web.contest.submission.judge.ContestSubmissionJudgeResultStreamPublisher;
 import org.springframework.amqp.core.MessageDeliveryMode;
@@ -20,6 +22,7 @@ import java.util.concurrent.TimeUnit;
         name = "enabled",
         havingValue = "true"
 )
+@Conditional(RabbitStreamDeliveryCondition.class)
 class RabbitContestSubmissionJudgeResultStreamPublisher
         implements ContestSubmissionJudgeResultStreamPublisher {
 

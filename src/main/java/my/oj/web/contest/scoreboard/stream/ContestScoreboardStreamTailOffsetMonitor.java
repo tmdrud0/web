@@ -1,5 +1,7 @@
 package my.oj.web.contest.scoreboard.stream;
 
+import my.oj.web.contest.scoreboard.delivery.RabbitStreamDeliveryCondition;
+import org.springframework.context.annotation.Conditional;
 import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
 import my.oj.web.contest.submission.messaging.ContestJudgeRabbitTopology;
@@ -30,6 +32,7 @@ import java.util.concurrent.atomic.AtomicReference;
         name = "enabled",
         havingValue = "true"
 )
+@Conditional(RabbitStreamDeliveryCondition.class)
 @Slf4j
 class ContestScoreboardStreamTailOffsetMonitor {
 

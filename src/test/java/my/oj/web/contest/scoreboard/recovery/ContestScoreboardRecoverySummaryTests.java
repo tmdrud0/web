@@ -175,16 +175,65 @@ class ContestScoreboardRecoverySummaryTests {
     }
 
     /**
-     * {@code redis-seq} is deliberately not refused for the same setting, because the property removes
-     * the first check rather than the mechanism: the scheduler registers both periodic checks whether or
-     * not it is set, and the first period releases the hold one interval later. The mode loses the head
-     * start the startup check exists to give it, and nothing more - so refusing here would make
-     * {@code startup-check-enabled=false} unusable on every role that consumes, while asserting a
-     * substitution that the scheduler itself prevents.
+     * redis-seq is delivered by the MySQL poller, so a role that would also consume the scoreboard Stream
+     * is refused: the same judged result could reach the scoreboard through both.
      */
     @Test
-    void allowsAConsumerWhoseRedisSeqStartupCheckIsOffBecauseThePeriodicChecksReleaseTheHold() {
-        assertThatCode(() -> consumerWith("redis-seq", true, false).afterSingletonsInstantiated())
+    void refusesAStreamConsumerUnderTheMySqlPoller() {
+        assertThatThrownBy(() -> consumerWith("redis-seq", true, true).afterSingletonsInstantiated())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(ContestScoreboardRecoveryValidator.STREAM_CONSUMER_PROPERTY)
+                .hasMessageContaining("mysql-poll");
+    }
+
+    @Test
+    void refusesAJudgeResultStreamPublisherUnderTheMySqlPoller() {
+        MockEnvironment environment = environment("redis-seq", "redis");
+        environment.setProperty(ContestScoreboardRecoveryValidator.STREAM_CONSUMER_PROPERTY, "false");
+        environment.setProperty(ContestScoreboardRecoveryValidator.RESULT_STREAM_PUBLISHER_PROPERTY, "true");
+        ContestScoreboardRecoveryValidator validator = new ContestScoreboardRecoveryValidator(
+                properties("redis-seq", true, true, true), environment);
+
+        assertThatThrownBy(validator::afterSingletonsInstantiated)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(ContestScoreboardRecoveryValidator.RESULT_STREAM_PUBLISHER_PROPERTY);
+    }
+
+    /** The pairs that are not supported are refused by name, in both directions. */
+    @Test
+    void refusesADeliveryTheModeCannotUse() {
+        assertThatThrownBy(() -> deliveryValidator("redis-seq", "rabbit-stream", "redis").afterSingletonsInstantiated())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("mode=redis-seq")
+                .hasMessageContaining("delivery=rabbit-stream");
+        assertThatThrownBy(() -> deliveryValidator("redis-seq", null, "redis").afterSingletonsInstantiated())
+                .as("an unset delivery is rabbit-stream, which redis-seq cannot use")
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> deliveryValidator("stream-offset", "mysql-poll", "redis").afterSingletonsInstantiated())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("mode=stream-offset")
+                .hasMessageContaining("delivery=mysql-poll");
+        assertThatThrownBy(() -> deliveryValidator("full-replay", "mysql-poll", "redis").afterSingletonsInstantiated())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("mode=full-replay");
+    }
+
+    @Test
+    void refusesADeliverySpellingOtherThanTheCanonicalOne() {
+        assertThatThrownBy(() -> deliveryValidator("redis-seq", "MYSQL_POLL", "redis").afterSingletonsInstantiated())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must be written as mysql-poll");
+        assertThatThrownBy(() -> deliveryValidator("redis-seq", "kafka", "redis").afterSingletonsInstantiated())
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void allowsTheSupportedDeliveryPairs() {
+        assertThatCode(() -> deliveryValidator("redis-seq", "mysql-poll", "redis").afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+        assertThatCode(() -> deliveryValidator("stream-offset", "rabbit-stream", "redis").afterSingletonsInstantiated())
+                .doesNotThrowAnyException();
+        assertThatCode(() -> deliveryValidator("full-replay", "rabbit-stream", "memory").afterSingletonsInstantiated())
                 .doesNotThrowAnyException();
     }
 
@@ -223,15 +272,26 @@ class ContestScoreboardRecoverySummaryTests {
                 .doesNotThrowAnyException();
     }
 
-    /** Every mode may consume the stream with its own startup pass on, which is the shipped default. */
+    /** Both Stream modes may consume the stream with their own startup pass on, which is the shipped default. */
     @Test
     void allowsEveryModeToConsumeBehindItsOwnStartupPass() {
         assertThatCode(() -> consumerWith("stream-offset", true, true).afterSingletonsInstantiated())
                 .doesNotThrowAnyException();
         assertThatCode(() -> consumerWith("full-replay", true, true).afterSingletonsInstantiated())
                 .doesNotThrowAnyException();
-        assertThatCode(() -> consumerWith("redis-seq", true, true).afterSingletonsInstantiated())
-                .doesNotThrowAnyException();
+    }
+
+    /** A role that consumes nothing and publishes nothing, with the delivery written as given. */
+    private static ContestScoreboardRecoveryValidator deliveryValidator(String mode, String delivery, String store) {
+        MockEnvironment environment = new MockEnvironment();
+        environment.setProperty(ContestScoreboardRecoveryValidator.MODE_PROPERTY, mode);
+        environment.setProperty(ContestScoreboardStoreProperty.NAME, store);
+        environment.setProperty(ContestScoreboardRecoveryValidator.STREAM_CONSUMER_PROPERTY, "false");
+        if (delivery != null) {
+            environment.setProperty(ContestScoreboardRecoveryValidator.DELIVERY_PROPERTY, delivery);
+        }
+        // Not the owner: stream-offset's "owner without a consumer" refusal is a different rule.
+        return new ContestScoreboardRecoveryValidator(properties(mode, false, true, true), environment);
     }
 
     private void assertSummary(String mode, String store) {
@@ -259,7 +319,8 @@ class ContestScoreboardRecoverySummaryTests {
     private static ContestScoreboardRecoveryValidator validator(String configuredMode,
                                                                 String mode,
                                                                 String store) {
-        return validator(configuredMode, mode, store, true, true);
+        // redis-seq never consumes the Stream; its delivery is the MySQL poller.
+        return validator(configuredMode, mode, store, true, !"redis-seq".equals(mode));
     }
 
     private static ContestScoreboardRecoveryValidator validator(String configuredMode,
@@ -298,6 +359,9 @@ class ContestScoreboardRecoverySummaryTests {
             environment.setProperty(ContestScoreboardRecoveryValidator.MODE_PROPERTY, configuredMode);
         }
         environment.setProperty(ContestScoreboardStoreProperty.NAME, store);
+        if ("redis-seq".equals(configuredMode)) {
+            environment.setProperty(ContestScoreboardRecoveryValidator.DELIVERY_PROPERTY, "mysql-poll");
+        }
         return environment;
     }
 

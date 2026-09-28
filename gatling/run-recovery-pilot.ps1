@@ -450,6 +450,7 @@ try {
     # The mode reaches the stack through the environment variable the overlay reads, so the container
     # that comes up is the one this run is measuring. It is read back out of that container below.
     $env:CONTEST_SCOREBOARD_RECOVERY_MODE = $Mode
+    Set-ScoreboardDeliveryEnvironment -Mode $Mode
     $upArguments = @("up", "-d")
     if ($Build) { $upArguments += "--build" }
     [void](Invoke-Compose -Arguments ($upArguments + (Get-PilotStartServices)))

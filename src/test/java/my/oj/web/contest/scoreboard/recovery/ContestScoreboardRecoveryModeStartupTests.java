@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollLifecycle;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -57,7 +58,7 @@ class ContestScoreboardRecoveryModeStartupTests {
                 .as("the replay itself, which the retention-gap fallback also uses")
                 .hasSize(1);
         // Neither of the other modes' exclusive beans may come up alongside this one.
-        assertThat(context.getBeanNamesForType(ContestScoreboardRedisSequenceScheduler.class)).isEmpty();
+        assertThat(context.getBeanNamesForType(ContestScoreboardMySqlPollLifecycle.class)).isEmpty();
         assertThat(context.getBeanNamesForType(ContestScoreboardRedisSequenceMetrics.class)).isEmpty();
         assertThat(ContestScoreboardRecoverySummary.describe(properties.mode(), "memory", properties))
                 .startsWith("mode=full-replay store=memory");

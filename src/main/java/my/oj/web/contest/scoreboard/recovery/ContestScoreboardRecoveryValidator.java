@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import my.oj.web.contest.scoreboard.delivery.ContestScoreboardDelivery;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
@@ -67,10 +68,13 @@ import org.springframework.stereotype.Component;
 public class ContestScoreboardRecoveryValidator implements SmartInitializingSingleton {
 
     static final String MODE_PROPERTY = "contest.scoreboard.recovery.mode";
-    static final String OWNER_PROPERTY = "contest.scoreboard.recovery.owner.enabled";
+    public static final String OWNER_PROPERTY = "contest.scoreboard.recovery.owner.enabled";
     static final String STREAM_CONSUMER_PROPERTY = "contest.scoreboard.stream.consumer.enabled";
     static final String STARTUP_REPLAY_PROPERTY =
             "contest.scoreboard.recovery.full-replay.startup-replay-enabled";
+    static final String DELIVERY_PROPERTY = ContestScoreboardDelivery.PROPERTY;
+    static final String RESULT_STREAM_PUBLISHER_PROPERTY =
+            "contest.submission.judge.result-stream.publisher.enabled";
 
     private final ContestScoreboardRecoveryProperties properties;
     private final Environment environment;
@@ -84,6 +88,7 @@ public class ContestScoreboardRecoveryValidator implements SmartInitializingSing
     @Override
     public void afterSingletonsInstantiated() {
         rejectNonCanonicalModeSpelling();
+        rejectUnsupportedDelivery();
         rejectOwnerMismatch();
         rejectAConsumerWithNoStartupRecovery();
         String store = ContestScoreboardStoreProperty.value(environment);
@@ -177,6 +182,51 @@ public class ContestScoreboardRecoveryValidator implements SmartInitializingSing
                             + " while claiming the recovery role. Turn the owner declaration off on this"
                             + " role, or turn the consumer on."
             );
+        }
+    }
+
+    /**
+     * Refuses a delivery the mode cannot use, and the Stream flags in a delivery that has no Stream.
+     *
+     * <p>The supported pairs are {@code stream-offset} or {@code full-replay} with {@code rabbit-stream},
+     * and {@code redis-seq} with {@code mysql-poll}. {@code redis-seq} detects a rollback by comparing the
+     * Redis allocator with the MySQL watermark, which only the poller maintains, and the other two modes
+     * checkpoint through the Stream offset, which the poller never writes - so every other pairing would
+     * start a scoreboard that no recovery check can reason about.</p>
+     *
+     * <p>Under {@code mysql-poll} the Stream beans are already absent by condition; the flags are refused
+     * as well so that a role file which still asks for a consumer or a publisher fails loudly instead of
+     * reading as if it delivered through the Stream.</p>
+     */
+    private void rejectUnsupportedDelivery() {
+        String configured = environment.getProperty(DELIVERY_PROPERTY);
+        ContestScoreboardDelivery delivery = ContestScoreboardDelivery.of(environment);
+        if (configured != null && !configured.isBlank() && !delivery.propertyValue().equals(configured)) {
+            throw new IllegalStateException(DELIVERY_PROPERTY + "=" + configured + " must be written as "
+                    + delivery.propertyValue());
+        }
+        ContestScoreboardDelivery required = properties.mode() == ContestScoreboardRecoveryMode.REDIS_SEQ
+                ? ContestScoreboardDelivery.MYSQL_POLL
+                : ContestScoreboardDelivery.RABBIT_STREAM;
+        if (delivery != required) {
+            throw new IllegalStateException(MODE_PROPERTY + "=" + properties.mode().propertyValue()
+                    + " with " + DELIVERY_PROPERTY + "=" + delivery.propertyValue() + " is not supported;"
+                    + " supported pairs are stream-offset/full-replay with rabbit-stream, and redis-seq with"
+                    + " mysql-poll. Set " + DELIVERY_PROPERTY + "=" + required.propertyValue());
+        }
+        if (delivery == ContestScoreboardDelivery.MYSQL_POLL) {
+            if (consumerEnabled()) {
+                throw new IllegalStateException(STREAM_CONSUMER_PROPERTY + "=true while " + DELIVERY_PROPERTY
+                        + "=mysql-poll: the MySQL poller is the only path into the scoreboard in this delivery,"
+                        + " so no role may consume the scoreboard Stream. Turn the consumer off.");
+            }
+            String publisher = environment.getProperty(RESULT_STREAM_PUBLISHER_PROPERTY);
+            if (publisher != null && "true".equalsIgnoreCase(publisher.trim())) {
+                throw new IllegalStateException(RESULT_STREAM_PUBLISHER_PROPERTY + "=true while "
+                        + DELIVERY_PROPERTY + "=mysql-poll: judge results reach the scoreboard through"
+                        + " MySQL in this delivery, so nothing may publish them to the Stream. Turn the"
+                        + " publisher off.");
+            }
         }
     }
 

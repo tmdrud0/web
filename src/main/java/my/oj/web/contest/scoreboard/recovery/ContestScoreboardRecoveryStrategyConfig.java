@@ -1,5 +1,7 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import my.oj.web.contest.scoreboard.delivery.RabbitStreamDeliveryCondition;
+import org.springframework.context.annotation.Conditional;
 import my.oj.web.contest.scoreboard.stream.ContestScoreboardStreamRecoveryService;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -35,6 +37,7 @@ import org.springframework.context.annotation.Configuration;
         name = "enabled",
         havingValue = "true"
 )
+@Conditional(RabbitStreamDeliveryCondition.class)
 public class ContestScoreboardRecoveryStrategyConfig {
 
     @Bean
@@ -42,13 +45,15 @@ public class ContestScoreboardRecoveryStrategyConfig {
             ContestScoreboardRecoveryProperties properties,
             ContestScoreboardRecoveryPassGate gate,
             ObjectProvider<ContestScoreboardStreamRecoveryService> streamRecovery,
-            ContestScoreboardFullReplayService fullReplay,
-            ObjectProvider<ContestScoreboardRedisSequenceLiveRecovery> sequenceLiveRecovery
+            ContestScoreboardFullReplayService fullReplay
     ) {
         return switch (properties.mode()) {
             case STREAM_OFFSET -> new StreamOffsetRecoveryStrategy(streamRecovery.getObject(), gate);
             case FULL_REPLAY -> new FullReplayRecoveryStrategy(fullReplay, gate);
-            case REDIS_SEQ -> new RedisSequenceRecoveryStrategy(sequenceLiveRecovery.getObject());
+            // redis-seq is delivered by the MySQL poller, never by the Stream consumer this strategy
+            // serves; the validator refuses that pairing, so reaching here means the two came apart.
+            case REDIS_SEQ -> throw new IllegalStateException(
+                    "redis-seq has no Stream recovery strategy: it requires contest.scoreboard.delivery=mysql-poll");
         };
     }
 }

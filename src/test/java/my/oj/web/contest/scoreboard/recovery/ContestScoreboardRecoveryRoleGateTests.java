@@ -8,7 +8,15 @@ import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
 import my.oj.web.contest.scoreboard.ContestScoreboardSequenceSource;
 import my.oj.web.contest.submission.core.ContestSubmissionResultRepository;
 import my.oj.web.contest.submission.support.ContestSubmissionBatchExecutor;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollConfiguration;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollLifecycle;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPoller;
 import org.junit.jupiter.api.Test;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import javax.sql.DataSource;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -53,7 +61,8 @@ class ContestScoreboardRecoveryRoleGateTests {
 
     @Test
     void aRoleThatDoesNotOwnRecoveryRegistersNothingEvenInARecoveryMode() {
-        assertNoRecoveryPass("multi-web", "--contest.scoreboard.recovery.mode=redis-seq");
+        assertNoRecoveryPass("multi-web,redis-seq-poll");
+        assertNoRecoveryPass("multi-judge,redis-seq-poll");
         assertNoRecoveryPass("multi-judge", "--contest.scoreboard.recovery.mode=full-replay");
     }
 
@@ -64,12 +73,12 @@ class ContestScoreboardRecoveryRoleGateTests {
                     .as("multi-batch with mode=full-replay")
                     .hasSize(1);
         }
-        try (ConfigurableApplicationContext context = run("multi-batch", "--contest.scoreboard.recovery.mode=redis-seq")) {
-            assertThat(context.getBeansOfType(ContestScoreboardRedisSequenceScheduler.class))
-                    .as("multi-batch with mode=redis-seq")
+        try (ConfigurableApplicationContext context = run("multi-batch,redis-seq-poll")) {
+            assertThat(context.getBeansOfType(ContestScoreboardMySqlPoller.class))
+                    .as("multi-batch with redis-seq-poll")
                     .hasSize(1);
-            assertThat(context.getBeansOfType(ContestScoreboardRedisSequenceStartupCheck.class))
-                    .as("multi-batch with mode=redis-seq")
+            assertThat(context.getBeansOfType(ContestScoreboardMySqlPollLifecycle.class))
+                    .as("multi-batch with redis-seq-poll")
                     .hasSize(1);
         }
     }
@@ -79,11 +88,11 @@ class ContestScoreboardRecoveryRoleGateTests {
             assertThat(context.getBeansOfType(ContestScoreboardFullReplayStartupRunner.class))
                     .as("%s should not replay at startup", profile)
                     .isEmpty();
-            assertThat(context.getBeansOfType(ContestScoreboardRedisSequenceScheduler.class))
-                    .as("%s should register no sequence-check intervals", profile)
+            assertThat(context.getBeansOfType(ContestScoreboardMySqlPoller.class))
+                    .as("%s should register no MySQL poller", profile)
                     .isEmpty();
-            assertThat(context.getBeansOfType(ContestScoreboardRedisSequenceStartupCheck.class))
-                    .as("%s should run no sequence check at startup", profile)
+            assertThat(context.getBeansOfType(ContestScoreboardMySqlPollLifecycle.class))
+                    .as("%s should run no poll, rollback check or range recovery", profile)
                     .isEmpty();
         }
     }
@@ -136,6 +145,26 @@ class ContestScoreboardRecoveryRoleGateTests {
         }
 
         @Bean
+        StringRedisTemplate redisTemplate() {
+            return mock(StringRedisTemplate.class);
+        }
+
+        @Bean
+        JdbcTemplate jdbcTemplate() {
+            return mock(JdbcTemplate.class);
+        }
+
+        @Bean
+        DataSource dataSource() {
+            return mock(DataSource.class);
+        }
+
+        @Bean
+        PlatformTransactionManager transactionManager() {
+            return mock(PlatformTransactionManager.class);
+        }
+
+        @Bean
         MeterRegistry meterRegistry() {
             return new SimpleMeterRegistry();
         }
@@ -159,9 +188,7 @@ class ContestScoreboardRecoveryRoleGateTests {
             ContestScoreboardReplayApplication.class,
             ContestScoreboardFullReplayStartupRunner.class,
             ContestScoreboardRedisSequenceConfig.class,
-            ContestScoreboardRedisSequenceRecoveryService.class,
-            ContestScoreboardRedisSequenceScheduler.class,
-            ContestScoreboardRedisSequenceStartupCheck.class
+            ContestScoreboardMySqlPollConfiguration.class
     })
     static class ProfileTestConfiguration {
     }

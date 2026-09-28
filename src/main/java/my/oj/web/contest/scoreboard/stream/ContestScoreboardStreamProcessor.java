@@ -1,5 +1,7 @@
 package my.oj.web.contest.scoreboard.stream;
 
+import my.oj.web.contest.scoreboard.delivery.RabbitStreamDeliveryCondition;
+import org.springframework.context.annotation.Conditional;
 import lombok.extern.slf4j.Slf4j;
 import my.oj.web.contest.scoreboard.CheckpointAdvance;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
@@ -61,6 +63,7 @@ import java.util.Locale;
  */
 @Component
 @ConditionalOnProperty(prefix = "contest.scoreboard.stream.consumer", name = "enabled", havingValue = "true")
+@Conditional(RabbitStreamDeliveryCondition.class)
 @Slf4j
 class ContestScoreboardStreamProcessor {
 
