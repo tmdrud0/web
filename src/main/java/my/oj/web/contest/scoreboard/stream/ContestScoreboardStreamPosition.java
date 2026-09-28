@@ -78,6 +78,29 @@ class ContestScoreboardStreamPosition {
      */
     private final AtomicLong unappliedFrom = new AtomicLong(-1L);
 
+    /**
+     * The checkpoint this JVM has already observed or written for the current consumer position, or
+     * {@code -1} before it has observed one. Sent with every stream batch as the floor the stored
+     * checkpoint must not be below - see {@code ContestScoreboardApplier#applyAll(List, long)}.
+     *
+     * <p>Not {@link #highestAppliedOffset}, although it follows it upward. That watermark never goes down,
+     * because it is the in-memory record of how far back a rollback reached; a floor that never went down
+     * would refuse every batch after a rollback, including the resubscribe that repairs it. This one is
+     * set afresh whenever the position is verified again - to the checkpoint the verification was made
+     * against - and only rises after that: to a checkpoint the live path read before applying, and to the
+     * checkpoint a completed batch left.</p>
+     *
+     * <p>It is never read back from Redis at apply time. A value read just before the apply would be the
+     * restored checkpoint itself, and a check against it would pass exactly when it should not.</p>
+     */
+    private final AtomicLong checkpointFloor = new AtomicLong(-1L);
+
+    /**
+     * Counts consumer starts, so a refusal can say which position it was read from and a resubscribe
+     * requested for an older one is not carried out twice.
+     */
+    private final AtomicLong consumerGeneration = new AtomicLong();
+
     long highestAppliedOffset() {
         return highestAppliedOffset.get();
     }
@@ -91,6 +114,7 @@ class ContestScoreboardStreamPosition {
      */
     void recordAppliedOffset(long offset) {
         highestAppliedOffset.accumulateAndGet(offset, Math::max);
+        checkpointFloor.accumulateAndGet(offset, Math::max);
         unappliedFrom.updateAndGet(current -> current >= 0L && current <= offset ? -1L : current);
     }
 
@@ -137,6 +161,32 @@ class ContestScoreboardStreamPosition {
      */
     void consumerRestarted() {
         anchorVerified.set(false);
+        checkpointFloor.set(-1L);
+        consumerGeneration.incrementAndGet();
+    }
+
+    long consumerGeneration() {
+        return consumerGeneration.get();
+    }
+
+    long checkpointFloor() {
+        return checkpointFloor.get();
+    }
+
+    /**
+     * Verifies the position against the checkpoint it was judged at, which becomes the floor.
+     *
+     * <p>Set, not raised: a verification after a rollback is made against the rolled-back checkpoint,
+     * and that is the value later batches are measured from.</p>
+     */
+    void anchorAt(long observedCheckpoint) {
+        checkpointFloor.set(observedCheckpoint);
+        anchorVerified.set(true);
+    }
+
+    /** Raises the floor to a checkpoint the live path read for the verified position. */
+    void observeCheckpoint(long observedCheckpoint) {
+        checkpointFloor.accumulateAndGet(observedCheckpoint, Math::max);
     }
 
     boolean anchorVerified() {

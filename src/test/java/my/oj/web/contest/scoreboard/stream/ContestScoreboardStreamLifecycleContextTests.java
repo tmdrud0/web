@@ -166,6 +166,7 @@ class ContestScoreboardStreamLifecycleContextTests {
     @EnableConfigurationProperties(ContestScoreboardRecoveryProperties.class)
     @Import({
             ContestScoreboardStreamLifecycle.class,
+            ContestScoreboardStreamRollbackSignal.class,
             ContestScoreboardStreamPosition.class,
             ContestScoreboardStreamMetrics.class,
             ContestScoreboardRecoveryCutover.class

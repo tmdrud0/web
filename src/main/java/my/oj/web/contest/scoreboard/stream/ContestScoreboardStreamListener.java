@@ -8,6 +8,7 @@ import org.springframework.amqp.ImmediateRequeueAmqpException;
 import org.springframework.amqp.core.BatchMessageListener;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.support.converter.MessageConverter;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
@@ -29,14 +30,28 @@ class ContestScoreboardStreamListener implements BatchMessageListener {
     private final ContestScoreboardStreamPosition position;
     private final ContestScoreboardStreamMetrics metrics;
     private final long retryBackoffNanos;
+    private final ContestScoreboardStreamRollbackSignal rollbackSignal;
 
     ContestScoreboardStreamListener(
-            @Qualifier("contestJudgeMessageConverter") MessageConverter messageConverter,
+            MessageConverter messageConverter,
             ContestScoreboardStreamProcessor processor,
             ContestScoreboardStreamPosition position,
             ContestScoreboardStreamMetrics metrics,
             ContestScoreboardStreamConsumerProperties properties
     ) {
+        this(messageConverter, processor, position, metrics, properties, new ContestScoreboardStreamRollbackSignal());
+    }
+
+    @Autowired
+    ContestScoreboardStreamListener(
+            @Qualifier("contestJudgeMessageConverter") MessageConverter messageConverter,
+            ContestScoreboardStreamProcessor processor,
+            ContestScoreboardStreamPosition position,
+            ContestScoreboardStreamMetrics metrics,
+            ContestScoreboardStreamConsumerProperties properties,
+            ContestScoreboardStreamRollbackSignal rollbackSignal
+    ) {
+        this.rollbackSignal = rollbackSignal;
         this.messageConverter = messageConverter;
         this.processor = processor;
         this.position = position;
@@ -66,6 +81,8 @@ class ContestScoreboardStreamListener implements BatchMessageListener {
                     .min(java.time.LocalDateTime::compareTo)
                     .orElse(null));
             processor.process(events);
+        } catch (ContestScoreboardCheckpointRegressedException regressed) {
+            throw refuseRolledBackBatch(regressed);
         } catch (RuntimeException failure) {
             // The processor recorded the offset this batch stopped at before throwing; what is left is
             // to count the failure and put it behind a position that has to be established again.
@@ -108,6 +125,25 @@ class ContestScoreboardStreamListener implements BatchMessageListener {
             Thread.currentThread().interrupt();
         }
         return new ImmediateRequeueAmqpException("Retry scoreboard stream batch", failure);
+    }
+
+    /**
+     * Answers a batch the checkpoint CAS refused, and returns the exception for the caller to throw.
+     *
+     * <p>Not {@link #failBatch}: nothing was written and nothing failed, so there is no failure to count,
+     * no failed batch for the supervisor to resubscribe for, and no unapplied range to hold back. The
+     * processor already dropped the anchor. What is left is the rollback answer, and it is asked for now
+     * rather than on the supervisor's next pass - for {@code stream-offset} that is the resubscribe at the
+     * stored checkpoint that re-reads what the rollback took away. The request runs on another thread,
+     * because stopping the container from its own consumer thread would wait on this very call.</p>
+     *
+     * <p>No backoff: until the resubscribe lands, each further batch meets the same floor and is refused
+     * by one script call that writes nothing, and returning promptly is what lets the container stop.</p>
+     */
+    private ImmediateRequeueAmqpException refuseRolledBackBatch(ContestScoreboardCheckpointRegressedException regressed) {
+        position.clearAnchorVerified();
+        rollbackSignal.checkpointRegressed(regressed.consumerGeneration(), regressed.expectedFloor());
+        return new ImmediateRequeueAmqpException("Scoreboard checkpoint rolled back; resubscribing", regressed);
     }
 
     /**

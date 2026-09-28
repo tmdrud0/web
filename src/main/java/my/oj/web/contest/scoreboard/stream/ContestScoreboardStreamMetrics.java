@@ -50,12 +50,21 @@ public class ContestScoreboardStreamMetrics {
     private volatile Counter failureRestarts;
     private volatile Counter unappliedRefusals;
     private volatile Counter tailProbeFailures;
+    private volatile Counter checkpointRegressedRefusals;
+    private final Map<String, Counter> rollbackDetections = new java.util.concurrent.ConcurrentHashMap<>();
+    private MeterRegistry registry;
+
+    /** A rollback seen by the supervisor's periodic comparison. */
+    static final String DETECTED_BY_SUPERVISOR = "supervisor";
+    /** A rollback seen by the checkpoint CAS of a batch being applied. */
+    static final String DETECTED_BY_APPLY_CAS = "apply-cas";
 
     public ContestScoreboardStreamMetrics(MeterRegistry registry) {
         bindTo(registry);
     }
 
     private void bindTo(MeterRegistry registry) {
+        this.registry = registry;
         Gauge.builder("contest.scoreboard.oldest.ready", this, ContestScoreboardStreamMetrics::oldestReadySeconds)
                 .baseUnit("seconds")
                 .description("Age of the oldest stream event currently ready for scoreboard application")
@@ -107,6 +116,33 @@ public class ContestScoreboardStreamMetrics {
         this.tailProbeFailures = Counter.builder("contest.scoreboard.stream.tail.probe.failures")
                 .description("AMQP 0.9.1 probes that failed to observe the latest stream offset")
                 .register(registry);
+        this.checkpointRegressedRefusals = Counter.builder("contest.scoreboard.stream.checkpoint.regressed")
+                .description("Stream batches the scoreboard refused without writing because its checkpoint was"
+                        + " below what this consumer had already observed (the apply-time checkpoint CAS)")
+                .register(registry);
+        for (String path : List.of(DETECTED_BY_SUPERVISOR, DETECTED_BY_APPLY_CAS)) {
+            rollbackDetection(path);
+        }
+    }
+
+    private Counter rollbackDetection(String path) {
+        return rollbackDetections.computeIfAbsent(path, key -> Counter.builder("contest.scoreboard.stream.rollback.detected")
+                .tag("path", key)
+                .description("Redis scoreboard rollbacks this consumer acted on, by the path that detected them")
+                .register(registry));
+    }
+
+    /**
+     * Counts a rollback this consumer acted on, apart from the restart and rebuild counters that say what
+     * the action was: {@code supervisor} for the periodic comparison, {@code apply-cas} for a batch the
+     * checkpoint CAS refused.
+     */
+    void recordRollbackDetected(String path) {
+        rollbackDetection(path).increment();
+    }
+
+    void recordCheckpointRegressedRefusal() {
+        checkpointRegressedRefusals.increment();
     }
 
     void recordBatchStarted(LocalDateTime oldestJudgedAt) {

@@ -8,12 +8,18 @@ import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryCutover;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryProperties;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryStrategy;
 import org.springframework.amqp.rabbit.listener.SimpleMessageListenerContainer;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Component
 @ConditionalOnProperty(
@@ -23,7 +29,7 @@ import java.util.Map;
 )
 @Conditional(RabbitStreamDeliveryCondition.class)
 @Slf4j
-class ContestScoreboardStreamLifecycle implements SmartLifecycle {
+class ContestScoreboardStreamLifecycle implements SmartLifecycle, DisposableBean {
 
     private final SimpleMessageListenerContainer container;
     private final ContestScoreboardApplier applier;
@@ -99,9 +105,17 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
      */
     private volatile long answeredRollbackStoredOffset = Long.MIN_VALUE;
     private volatile long answeredRollbackAppliedOffset = Long.MIN_VALUE;
+    /**
+     * Where a rollback the checkpoint CAS found is answered: never the consumer thread that found it,
+     * because stopping the container from there would wait on the listener call that is still running.
+     */
+    private final Executor casRollbackExecutor;
+    private final ExecutorService ownedCasRollbackExecutor;
+    /** One CAS answer queued at a time; further refusals before it runs are the same rollback. */
+    private final AtomicBoolean casRollbackQueued = new AtomicBoolean();
 
     ContestScoreboardStreamLifecycle(
-            @Qualifier("contestScoreboardStreamListenerContainer") SimpleMessageListenerContainer container,
+            SimpleMessageListenerContainer container,
             ContestScoreboardApplier applier,
             ContestScoreboardAppliedAtCompletion completion,
             ContestScoreboardStreamPosition position,
@@ -110,6 +124,53 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
             ContestScoreboardRecoveryStrategy strategy,
             ContestScoreboardRecoveryCutover cutover
     ) {
+        this(container, applier, completion, position, metrics, properties, strategy, cutover,
+                new ContestScoreboardStreamRollbackSignal(), null);
+    }
+
+    @Autowired
+    ContestScoreboardStreamLifecycle(
+            @Qualifier("contestScoreboardStreamListenerContainer") SimpleMessageListenerContainer container,
+            ContestScoreboardApplier applier,
+            ContestScoreboardAppliedAtCompletion completion,
+            ContestScoreboardStreamPosition position,
+            ContestScoreboardStreamMetrics metrics,
+            ContestScoreboardRecoveryProperties properties,
+            ContestScoreboardRecoveryStrategy strategy,
+            ContestScoreboardRecoveryCutover cutover,
+            ContestScoreboardStreamRollbackSignal rollbackSignal
+    ) {
+        this(container, applier, completion, position, metrics, properties, strategy, cutover, rollbackSignal, null);
+    }
+
+    /**
+     * @param casRollbackExecutor where a CAS refusal is answered, or {@code null} for a dedicated daemon
+     *                            thread owned by this lifecycle
+     */
+    ContestScoreboardStreamLifecycle(
+            SimpleMessageListenerContainer container,
+            ContestScoreboardApplier applier,
+            ContestScoreboardAppliedAtCompletion completion,
+            ContestScoreboardStreamPosition position,
+            ContestScoreboardStreamMetrics metrics,
+            ContestScoreboardRecoveryProperties properties,
+            ContestScoreboardRecoveryStrategy strategy,
+            ContestScoreboardRecoveryCutover cutover,
+            ContestScoreboardStreamRollbackSignal rollbackSignal,
+            Executor casRollbackExecutor
+    ) {
+        if (casRollbackExecutor == null) {
+            this.ownedCasRollbackExecutor = Executors.newSingleThreadExecutor(task -> {
+                Thread thread = new Thread(task, "scoreboard-cas-rollback");
+                thread.setDaemon(true);
+                return thread;
+            });
+            this.casRollbackExecutor = ownedCasRollbackExecutor;
+        } else {
+            this.ownedCasRollbackExecutor = null;
+            this.casRollbackExecutor = casRollbackExecutor;
+        }
+        rollbackSignal.register(this::requestCasRollbackAnswer);
         this.container = container;
         this.applier = applier;
         this.completion = completion;
@@ -314,6 +375,7 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
                 }
                 boolean answeredNow = false;
                 if (rollbackUnanswered) {
+                    metrics.recordRollbackDetected(ContestScoreboardStreamMetrics.DETECTED_BY_SUPERVISOR);
                     // Remembered only if this pass answered it. A rollback another pass is already
                     // rebuilding, or one whose rebuild failed, has to be asked about again - and with
                     // no new delivery arriving, this interval is the only thing that will ask.
@@ -426,6 +488,80 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle {
         // the results that move it. Without that, a checkpoint the broker no longer serves would mean
         // a stop and a start of the consumer on every pass.
         return true;
+    }
+
+    /**
+     * Queues the answer to a batch the checkpoint CAS refused. Called on the consumer thread, by way of
+     * {@link ContestScoreboardStreamRollbackSignal}, so it only hands the work over.
+     */
+    private void requestCasRollbackAnswer(long consumerGeneration, long expectedFloor) {
+        if (!casRollbackQueued.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            casRollbackExecutor.execute(() -> {
+                casRollbackQueued.set(false);
+                answerCasRollback(consumerGeneration, expectedFloor);
+            });
+        } catch (RuntimeException rejected) {
+            casRollbackQueued.set(false);
+            log.warn("Could not queue the answer to a scoreboard checkpoint rollback; the supervisor pass remains "
+                    + "the path that answers it", rejected);
+        }
+    }
+
+    /**
+     * Answers a rollback the checkpoint CAS found, without waiting for the supervisor's interval.
+     *
+     * <p>The answer is the mode's own - the same {@link #handleRollback} the supervisor uses - so
+     * {@code stream-offset} resubscribes at the stored checkpoint and the modes whose basis is not the
+     * stream rebuild from it and leave the consumer running. What makes this safe to run beside the
+     * supervisor is the monitor both take and two checks under it: a consumer position that has already
+     * been left (a resubscribe since the refusal, by either path) is not restarted again, and the observed
+     * pair is recorded as answered exactly as the supervisor records it, so its next pass does not restart
+     * for the same rollback.</p>
+     *
+     * <p>The applied watermark handed to the mode is at least the floor the batch was refused at. It can
+     * be the higher of the two: a batch that failed half way moved the checkpoint without being recorded
+     * as applied, and the floor was raised by the checkpoint the live path read afterwards.</p>
+     */
+    void answerCasRollback(long consumerGeneration, long expectedFloor) {
+        try {
+            synchronized (this) {
+                if (!consuming || stopping || position.consumerGeneration() != consumerGeneration) {
+                    return;
+                }
+                long storedOffset = applier.currentStreamOffset();
+                long appliedOffset = position.highestAppliedOffset();
+                if (storedOffset >= expectedFloor) {
+                    // Redis came back up to what was observed before this ran; nothing is behind.
+                    return;
+                }
+                metrics.recordRollbackDetected(ContestScoreboardStreamMetrics.DETECTED_BY_APPLY_CAS);
+                log.warn("The scoreboard checkpoint CAS found Redis at {} below {}; answering the rollback now "
+                        + "instead of on the next supervisor pass", storedOffset, expectedFloor);
+                long failures = position.failedBatches();
+                if (!handleRollback(storedOffset, Math.max(appliedOffset, expectedFloor))) {
+                    return;
+                }
+                answeredRollbackStoredOffset = storedOffset;
+                answeredRollbackAppliedOffset = appliedOffset;
+                if (strategy.rewindsOnCheckpointRegression() && failures > handledFailures) {
+                    // The resubscribe re-reads any failed batch on the way past, as in the supervisor.
+                    handledFailures = failures;
+                }
+            }
+        } catch (RuntimeException failure) {
+            log.warn("Could not answer the scoreboard checkpoint rollback the CAS found; the supervisor pass "
+                    + "remains the path that answers it", failure);
+        }
+    }
+
+    @Override
+    public void destroy() {
+        if (ownedCasRollbackExecutor != null) {
+            ownedCasRollbackExecutor.shutdownNow();
+        }
     }
 
     private void startAtStoredOffset() {

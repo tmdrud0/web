@@ -151,8 +151,11 @@ class ContestScoreboardStreamProcessor {
             return applier.currentStreamOffset();
         }
         List<ContestScoreboardStreamEvent> batch = List.copyOf(events);
+        // Read before anything else: a refusal names the consumer position its batch came from, so the
+        // resubscribe it asks for is not carried out again for a position that has already been left.
+        long generation = position.consumerGeneration();
         CheckpointAdvance advance = resolveAdvance(batch);
-        return applyLock.withLock(() -> applyBatch(batch, advance));
+        return applyLock.withLock(() -> applyBatch(batch, advance, generation));
     }
 
     /**
@@ -201,19 +204,23 @@ class ContestScoreboardStreamProcessor {
         if (checkpoint < 0L) {
             // Nothing to be discontinuous with, so the first offset that exists becomes the
             // checkpoint. It is not required to be 0 or 1.
-            position.markAnchorVerified();
+            position.anchorAt(checkpoint);
             log.info("Scoreboard has no stream checkpoint; adopting the first delivered offset {} as the anchor",
                     firstDelivery);
             return CheckpointAdvance.ANCHOR;
         }
         if (position.anchorVerified()) {
+            // The checkpoint this decision was made against is part of the claim: if Redis goes back
+            // below it before the batch is applied, the script refuses the batch instead of carrying
+            // the checkpoint over what the rollback took away.
+            position.observeCheckpoint(checkpoint);
             return CheckpointAdvance.CONTINUE;
         }
         if (firstDelivery <= checkpoint) {
             // The consumer was handed an offset at or below the checkpoint, so it is reading from a
             // place the scoreboard already reached and will walk forward through everything retained
             // in between. Nothing can be skipped from here, so the position is verified.
-            position.markAnchorVerified();
+            position.anchorAt(checkpoint);
             log.info("Scoreboard stream consumer resumed at {} against checkpoint {}; treating the position "
                             + "as anchored and reading forward",
                     firstDelivery, checkpoint);
@@ -303,7 +310,7 @@ class ContestScoreboardStreamProcessor {
                             + "; the batch is left unapplied so the checkpoint does not move past results "
                             + "the standings never saw");
         }
-        position.markAnchorVerified();
+        position.anchorAt(checkpoint);
         log.warn("Scoreboard stream checkpoint {} was {}; the {} basis returned {} for the range below {} "
                         + "and the live checkpoint may now move there",
                 checkpoint,
@@ -314,7 +321,7 @@ class ContestScoreboardStreamProcessor {
         return CheckpointAdvance.ANCHOR;
     }
 
-    private long applyBatch(List<ContestScoreboardStreamEvent> batch, CheckpointAdvance advance) {
+    private long applyBatch(List<ContestScoreboardStreamEvent> batch, CheckpointAdvance advance, long generation) {
         long checkpoint = applier.currentStreamOffset();
         List<ContestScoreboardApplier.ApplyRequest> requests = new ArrayList<>(batch.size());
         boolean anchorSpent = false;
@@ -338,9 +345,18 @@ class ContestScoreboardStreamProcessor {
             ));
         }
 
-        List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(
-                requests, ContestScoreboardApplier.NO_CHECKPOINT_FLOOR);
+        // The floor is what this JVM already observed or wrote for the position, never a fresh read: a
+        // checkpoint read now would be the restored one, and the check would pass exactly when it must not.
+        long floor = position.checkpointFloor();
+        List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(requests, floor);
         long answeredAt = trace.enabled() ? System.currentTimeMillis() : 0L;
+        ContestScoreboardApplier.ApplyResult rollback = results.stream()
+                .filter(ContestScoreboardApplier.ApplyResult::rolledBack)
+                .findFirst()
+                .orElse(null);
+        if (rollback != null) {
+            refuseRegressedCheckpoint(batch, floor, rollback, generation, answeredAt);
+        }
         ContestScoreboardApplier.ApplyResult failed = results.stream()
                 .filter(result -> !result.succeeded())
                 .findFirst()
@@ -382,6 +398,42 @@ class ContestScoreboardStreamProcessor {
         // Lua writes once; a delivery repeated after ACK loss counts zero.
         metrics.recordApplied(batch.stream().map(ContestScoreboardStreamEvent::offset).toList(), appliedOffset);
         return appliedOffset;
+    }
+
+    /**
+     * Answers a batch the store refused because its checkpoint went below the floor.
+     *
+     * <p>Redis was rolled back underneath this consumer between the anchor decision and the apply, and
+     * nothing in the batch was written. It is deliberately not recorded as a failed batch or as an
+     * unapplied range: nothing failed, and the range below it is not one this consumer skipped - it is the
+     * range the rollback took away, which the mode's rollback answer re-reads. The anchor is dropped so
+     * nothing is applied from this position again, and the exception carries what the listener needs to
+     * ask for that answer right away rather than on the supervisor's next pass.</p>
+     */
+    private void refuseRegressedCheckpoint(List<ContestScoreboardStreamEvent> batch,
+                                           long floor,
+                                           ContestScoreboardApplier.ApplyResult rollback,
+                                           long generation,
+                                           long answeredAt) {
+        long stored = rollback.appliedOffset() == null ? -1L : rollback.appliedOffset();
+        position.clearAnchorVerified();
+        metrics.recordCheckpointRegressedRefusal();
+        if (trace.enabled()) {
+            trace.recovery(new ContestScoreboardExperimentTrace.RecoveryRecord(
+                    ContestScoreboardExperimentTrace.RecoveryEvent.GAP,
+                    Thread.currentThread().getName(),
+                    answeredAt,
+                    -1L,
+                    System.currentTimeMillis(),
+                    -1,
+                    "apply-cas checkpoint=" + stored + " floor=" + floor + " delivery=" + batch.get(0).offset(),
+                    "refused"
+            ));
+        }
+        log.warn("Scoreboard stream checkpoint is {} but this consumer had already observed {}; Redis was rolled "
+                        + "back underneath it, so the batch from {} was refused without writing anything",
+                stored, floor, batch.get(0).offset());
+        throw new ContestScoreboardCheckpointRegressedException(floor, stored, generation);
     }
 
     /** The stream offset a request carried, or {@code -1} when it carried none. */
