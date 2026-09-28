@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import my.oj.web.contest.scoreboard.ContestScoreboardAppliedAtTracking;
 import my.oj.web.contest.scoreboard.delivery.ContestScoreboardDelivery;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.core.env.Environment;
@@ -91,6 +92,7 @@ public class ContestScoreboardRecoveryValidator implements SmartInitializingSing
         rejectUnsupportedDelivery();
         rejectOwnerMismatch();
         rejectAConsumerWithNoStartupRecovery();
+        rejectAppliedAtTrackingOffOutsideStreamOffset();
         String store = ContestScoreboardStoreProperty.value(environment);
         if (properties.mode() == ContestScoreboardRecoveryMode.REDIS_SEQ && !"redis".equals(store)) {
             throw new IllegalStateException(
@@ -136,6 +138,27 @@ public class ContestScoreboardRecoveryValidator implements SmartInitializingSing
                     + " for. Keep the startup replay on, or turn " + STREAM_CONSUMER_PROPERTY + " off on"
                     + " this role."
             );
+        }
+    }
+
+    /**
+     * Refuses {@code applied-at-tracking=false} in a mode whose recovery reads what it would stop writing.
+     *
+     * <p>{@code full-replay} and {@code redis-seq} keep {@code scoreboard_applied_at} (and, for
+     * {@code redis-seq}, the sequence beside it) as the ledger their recovery and their drain checks read.
+     * Turning it off there would start a mode that quietly loses its own basis, so only
+     * {@code stream-offset}, whose basis is the offset stored with the standings, may run without it.</p>
+     */
+    private void rejectAppliedAtTrackingOffOutsideStreamOffset() {
+        boolean explicitlyOff = ContestScoreboardAppliedAtTracking.configured(environment)
+                .map(configured -> !configured)
+                .orElse(false);
+        if (explicitlyOff && properties.mode() != ContestScoreboardRecoveryMode.STREAM_OFFSET) {
+            throw new IllegalStateException(ContestScoreboardAppliedAtTracking.PROPERTY + "=false while "
+                    + MODE_PROPERTY + "=" + properties.mode().propertyValue() + ": only stream-offset recovers"
+                    + " without scoreboard_applied_at. " + properties.mode().propertyValue() + " uses it as the"
+                    + " ledger its recovery reads, so turning it off would remove the mode's own basis. Remove"
+                    + " the setting or set it to true.");
         }
     }
 

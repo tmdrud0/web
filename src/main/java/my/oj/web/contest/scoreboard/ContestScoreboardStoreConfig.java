@@ -14,6 +14,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 /**
@@ -38,6 +39,22 @@ public class ContestScoreboardStoreConfig {
             ObjectProvider<ContestScoreboardRecoveryProperties> recoveryProperties) {
         ContestScoreboardRecoveryProperties properties = recoveryProperties.getIfAvailable();
         return () -> properties != null && properties.mode() == ContestScoreboardRecoveryMode.REDIS_SEQ;
+    }
+
+    /**
+     * Whether the live stream path records {@code scoreboard_applied_at} - see
+     * {@link ContestScoreboardAppliedAtTracking}. Resolved once, from the value as bound and the mode as
+     * bound, so the switch the applier and the completion obey is the one the startup report prints.
+     */
+    @Bean
+    ContestScoreboardAppliedAtTracking contestScoreboardAppliedAtTracking(
+            Environment environment,
+            ObjectProvider<ContestScoreboardRecoveryProperties> recoveryProperties) {
+        ContestScoreboardRecoveryProperties properties = recoveryProperties.getIfAvailable();
+        boolean enabled = ContestScoreboardAppliedAtTracking.resolve(
+                ContestScoreboardAppliedAtTracking.configured(environment),
+                properties == null ? null : properties.mode());
+        return enabled ? ContestScoreboardAppliedAtTracking.ENABLED : ContestScoreboardAppliedAtTracking.DISABLED;
     }
 
     @Bean
@@ -67,10 +84,11 @@ public class ContestScoreboardStoreConfig {
             ContestRedisKeyValueClient redisClient,
             RedisContestScoreboardApplyMetrics metrics,
             ContestScoreboardSequenceTracking sequenceTracking,
+            ContestScoreboardAppliedAtTracking appliedAtTracking,
             @Value("${contest.scoreboard.redis.apply-chunk-size:" + RedisContestScoreboardApplier.DEFAULT_CHUNK_SIZE + "}")
             int applyChunkSize) {
         return new RedisContestScoreboardApplier(redisTemplate, redisClient, metrics, sequenceTracking,
-                ContestScoreboardAppliedAtTracking.ENABLED, applyChunkSize);
+                appliedAtTracking, applyChunkSize);
     }
 
     @Bean

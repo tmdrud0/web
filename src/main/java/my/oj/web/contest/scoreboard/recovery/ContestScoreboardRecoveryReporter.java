@@ -30,13 +30,15 @@ public class ContestScoreboardRecoveryReporter implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
-        log.info("Contest scoreboard recovery: {}", ContestScoreboardRecoverySummary.describe(
+        log.info("Contest scoreboard recovery: {} applied-at-tracking={}", ContestScoreboardRecoverySummary.describe(
                 properties.mode(),
                 ContestScoreboardStoreProperty.value(environment),
                 ContestScoreboardDelivery.of(environment),
                 properties,
                 pollProperties(environment)
-        ));
+        ), my.oj.web.contest.scoreboard.ContestScoreboardAppliedAtTracking.resolve(
+                my.oj.web.contest.scoreboard.ContestScoreboardAppliedAtTracking.configured(environment),
+                properties.mode()));
     }
 
     /**
