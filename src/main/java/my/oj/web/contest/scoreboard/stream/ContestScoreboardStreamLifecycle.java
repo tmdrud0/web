@@ -106,6 +106,30 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle, DisposableBean
     private volatile long answeredRollbackStoredOffset = Long.MIN_VALUE;
     private volatile long answeredRollbackAppliedOffset = Long.MIN_VALUE;
     /**
+     * The rewind still catching up, in the mode that answers a rollback by rewinding: the applied
+     * watermark it is catching up to, the consumer generation it started, and the checkpoint it resumed
+     * the consumer at. {@code -1} generation when no rewind has been started.
+     *
+     * <p>A rewind's re-read spends its whole catch-up with the stored checkpoint below this JVM's applied
+     * watermark, and the checkpoint moves with every batch - so each pass would see a pair it has not
+     * answered and take the catch-up for a fresh rollback, restarting the consumer at wherever the re-read
+     * had got to. That turned one rewind into one restart per supervisor interval, and the catch-up into
+     * one batch per interval. While the generation this rewind started is still the one consuming, a
+     * checkpoint below the target is its catch-up, not a rollback.</p>
+     *
+     * <p>Unless the checkpoint went below what that generation has already reached: the checkpoint it
+     * resumed at, or the floor it has since observed or written for itself
+     * ({@link ContestScoreboardStreamPosition#checkpointFloor()}). Only a rollback puts the checkpoint
+     * below either, so that one is answered like any other - which is what keeps a second rollback during
+     * the catch-up visible to this pass, beside the checkpoint CAS that refuses the next batch for it.</p>
+     *
+     * <p>Written under the monitor only; read without it on the fast path, where a stale read is
+     * re-judged under the monitor before anything is restarted.</p>
+     */
+    private volatile long rewindTarget = -1L;
+    private volatile long rewindGeneration = -1L;
+    private volatile long rewindResumedAt = -1L;
+    /**
      * Where a rollback the checkpoint CAS found is answered: never the consumer thread that found it,
      * because stopping the container from there would wait on the listener call that is still running.
      */
@@ -353,13 +377,25 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle, DisposableBean
             return;
         }
         try {
+            // The generation and what it reached are read before the checkpoint on purpose. Both only
+            // hold checkpoints that were once stored, and without a rollback the stored checkpoint does
+            // not go down - so a checkpoint read afterwards is below them only if Redis rolled back, and
+            // never merely because a batch applied between the reads.
+            long generation = position.consumerGeneration();
+            long reached = position.checkpointFloor();
             long storedOffset = applier.currentStreamOffset();
             long appliedOffset = position.highestAppliedOffset();
             long failures = position.failedBatches();
-            boolean rolledBack = storedOffset < appliedOffset;
+            boolean rolledBack = storedOffset < appliedOffset
+                    && !rewindCatchingUp(generation, reached, storedOffset);
+            // A pair already answered is not asked about again - unless the rewind that answered it has
+            // since moved past it and the checkpoint is back below where that rewind got to. A restore
+            // of the same snapshot during or after the catch-up shows exactly the pair the first rewind
+            // answered, and it is a new rollback all the same.
             boolean rollbackUnanswered = rolledBack
-                    && !(storedOffset == answeredRollbackStoredOffset
-                            && appliedOffset == answeredRollbackAppliedOffset);
+                    && (regressedBelowRewind(generation, reached, storedOffset)
+                            || !(storedOffset == answeredRollbackStoredOffset
+                                    && appliedOffset == answeredRollbackAppliedOffset));
             // Two things are asked about here and they are not alternatives: a rollback the mode has
             // not answered, and a failed batch. A mode that answers a rollback without touching the
             // consumer - the two whose basis is not the stream position - does not re-read the failed
@@ -374,6 +410,12 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle, DisposableBean
                     return;
                 }
                 boolean answeredNow = false;
+                if (rollbackUnanswered && position.consumerGeneration() != generation) {
+                    // The consumer was restarted since the reads above - by the CAS answer or a pass that
+                    // held the monitor first - so what they judged belongs to a position already left.
+                    // The next pass judges the new one.
+                    return;
+                }
                 if (rollbackUnanswered) {
                     metrics.recordRollbackDetected(ContestScoreboardStreamMetrics.DETECTED_BY_SUPERVISOR);
                     // Remembered only if this pass answered it. A rollback another pass is already
@@ -400,7 +442,16 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle, DisposableBean
                 metrics.recordFailureRestart();
                 log.warn("Resubscribing the scoreboard stream consumer at {} to re-read a failed batch",
                         storedOffset);
+                boolean catchUpInProgress = strategy.rewindsOnCheckpointRegression()
+                        && generation == rewindGeneration
+                        && storedOffset < rewindTarget;
                 startAt(storedOffset, offsetValue(storedOffset));
+                if (catchUpInProgress) {
+                    // A batch of a rewind's catch-up failed and is re-read from here. The catch-up goes on
+                    // in the new generation, so it is carried over rather than taken for a rollback.
+                    rewindGeneration = position.consumerGeneration();
+                    rewindResumedAt = storedOffset;
+                }
                 // Only once the container is back up. Recording the batch as handled before the
                 // restart succeeded - while the container is stopped and the failure count is the only
                 // thing that would ask about it again - is a retry thrown away: the next pass returns on
@@ -411,6 +462,34 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle, DisposableBean
         } catch (RuntimeException failure) {
             log.warn("Could not inspect or restart the scoreboard stream consumer", failure);
         }
+    }
+
+    /**
+     * Whether a checkpoint behind the applied watermark is a rewind's catch-up rather than a rollback.
+     *
+     * <p>Only in the mode that rewinds, only while the generation that rewind started is the one
+     * consuming, only below the target it is catching up to, and only at or above what that generation
+     * has already reached - the checkpoint it resumed at, and the floor it has observed or written since.
+     * A checkpoint below that is a rollback of the catch-up itself, and it is answered like any other.</p>
+     *
+     * @param generation the consumer generation, read before {@code storedOffset}
+     * @param reached    that generation's checkpoint floor, read before {@code storedOffset}
+     */
+    private boolean rewindCatchingUp(long generation, long reached, long storedOffset) {
+        return strategy.rewindsOnCheckpointRegression()
+                && generation == rewindGeneration
+                && storedOffset < rewindTarget
+                && storedOffset >= Math.max(rewindResumedAt, reached);
+    }
+
+    /**
+     * Whether the checkpoint went below what the generation a rewind started has already reached, which
+     * only a rollback does - during that rewind's catch-up or after it.
+     */
+    private boolean regressedBelowRewind(long generation, long reached, long storedOffset) {
+        return strategy.rewindsOnCheckpointRegression()
+                && generation == rewindGeneration
+                && storedOffset < Math.max(rewindResumedAt, reached);
     }
 
     /**
@@ -483,6 +562,12 @@ class ContestScoreboardStreamLifecycle implements SmartLifecycle, DisposableBean
         log.warn("Redis scoreboard offset rolled back from {} to {}; resubscribing from the stored offset",
                 appliedOffset, storedOffset);
         startAt(storedOffset, offsetValue(storedOffset));
+        // What the re-read is catching up to, and which consumer is doing it: until that generation
+        // reaches the target, a checkpoint below the target is this catch-up rather than a new rollback.
+        // See rewindTarget.
+        rewindTarget = appliedOffset;
+        rewindGeneration = position.consumerGeneration();
+        rewindResumedAt = storedOffset;
         // Rewinding is this mode's answer to a rollback and it has been carried out, so the observed
         // pair is answered even though the checkpoint has not moved yet: the resubscribe brings back
         // the results that move it. Without that, a checkpoint the broker no longer serves would mean

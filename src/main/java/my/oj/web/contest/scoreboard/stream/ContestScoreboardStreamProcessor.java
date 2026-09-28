@@ -172,11 +172,23 @@ class ContestScoreboardStreamProcessor {
     private CheckpointAdvance resolveAdvance(List<ContestScoreboardStreamEvent> batch) {
         long checkpoint = applier.currentStreamOffset();
         long applied = position.highestAppliedOffset();
-        if (checkpoint >= 0L && checkpoint < applied) {
+        if (checkpoint >= 0L && checkpoint < applied && !strategy.rewindsOnCheckpointRegression()) {
             // Redis rolled back behind this JVM. The supervisor answers a rollback on its own
             // cadence, so a delivery can arrive first; judging it against the pre-rollback anchor
             // would apply a step the standings can no longer reach. Forgetting the anchor makes the
             // next delivery a fresh question, whatever the supervisor does or does not do.
+            //
+            // Not in the mode that rewinds. There the answer to a rollback is a resubscribe at the
+            // restored checkpoint, and the re-read that follows spends its whole catch-up with the
+            // checkpoint below this JVM's watermark by construction - a watermark that deliberately
+            // does not go down (see ContestScoreboardStreamPosition#consumerRestarted). Judging each
+            // catch-up batch against it took every one of them for a fresh rollback: the anchor was
+            // dropped, the mode refused the "gap", and the catch-up moved one batch per supervisor
+            // cycle. A rollback of the re-reading position is still caught there, and atomically: the
+            // checkpoint floor this position observed goes to the script with the batch, and a stored
+            // checkpoint below it refuses the batch before anything is written - see
+            // refuseRegressedCheckpoint. Before this position is anchored there is no floor, and no
+            // anchor to drop either: the delivery is judged against the checkpoint below.
             position.clearAnchorVerified();
         }
         long firstDelivery = batch.get(0).offset();

@@ -140,7 +140,8 @@ rollback 이전에 적용된 결과는 rollback **이후에 시작한** replay �
 복구가 아니라 live 전달의 수리이고, `stream-offset`을 복구 기준으로 되돌리는 것이 아니다. §3.2.)
 
 rollback에 대한 pass는 **관측당 1회**만 실행한다 — 회귀를 관측한 `(storedOffset, appliedOffset)`
-쌍을 기억한다. 없으면 트래픽이 없는 동안 매 초 replay가 돈다.
+쌍을 기억한다. 없으면 트래픽이 없는 동안 매 초 replay가 돈다. 되감는 모드에서는 되감기 뒤 catch-up
+중에 stored가 계속 움직이므로 쌍만으로는 부족하다 — catch-up 판정은 아래 checkpoint floor 절에 있다.
 
 **다만 "1회"는 그 관측이 *답해졌을 때만*이다.** `ContestScoreboardRecoveryStrategy.Outcome`이 그
 구분을 타입으로 만든다: `COVERED`만 rollback을 답한 것으로 기록되고(`rebuiltThrough` 전진),
@@ -319,6 +320,17 @@ supervisor의 `stored < applied` 비교도 29 대 29로 아무것도 못 본다(
   멈추면 그 listener 호출 자신을 기다리게 되기 때문이다. 같은 monitor 아래에서 consumer generation이
   바뀌었으면(이미 누군가 재구독) 건너뛰고, 답한 (stored, applied) 쌍을 supervisor와 같은 방식으로
   기록하므로 중복 재구독이 없다. supervisor의 주기 검사는 유입이 없을 때를 위해 그대로 둔다.
+- **되감기의 catch-up은 새 롤백이 아니다.** stream-offset이 재구독하면 재읽기 내내 저장 checkpoint는
+  `highestAppliedOffset`(내려가지 않는다) 아래에 있다. 예전에는 live path가 매 batch마다
+  `checkpoint < highestAppliedOffset`을 롤백으로 보고 anchor를 풀어 `RETRYABLE_FAILURE`로 batch를
+  거부했고, supervisor도 매 주기 새 (stored, applied) 쌍을 보고 다시 되감았다 — catch-up이 supervisor
+  주기(1 s)당 batch 하나씩만 진행됐다. 이제 되감는 모드의 live path는 그 휴리스틱을 쓰지 않고 floor
+  CAS에 감지를 맡긴다(재구독 후 floor는 복원된 checkpoint에서 다시 시작하므로 catch-up은 통과한다).
+  supervisor는 되감기가 시작한 generation과 목표(되감기 시점의 applied watermark), 재개 offset을
+  기억해, 그 generation이 소비 중이고 `max(재개 offset, floor) ≤ stored < 목표`인 동안은 되감지
+  않는다. stored가 그 generation이 이미 도달한 값 아래로 내려가면 — catch-up 중이든 끝난 뒤든, 같은
+  snapshot을 다시 복원해 이전과 같은 쌍이 보이더라도 — 새 롤백으로 보고 되감는다. 다음 batch는 그보다
+  먼저 CAS에서 거부된다. 되감지 않는 두 모드의 판정은 바뀌지 않았다.
 - 감지 경로는 `contest.scoreboard.stream.rollback.detected{path="supervisor"|"apply-cas"}`로,
   거부된 batch 수는 `contest.scoreboard.stream.checkpoint.regressed`로 센다. experiment trace에는
   `GAP` 레코드(detail `apply-cas checkpoint=... floor=... delivery=...`, outcome `refused`)로 남는다.
