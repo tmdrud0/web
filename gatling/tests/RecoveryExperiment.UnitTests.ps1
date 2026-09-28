@@ -509,6 +509,58 @@ Test-Case "each recovery log line is recognised as the event it reports" {
     Assert-Equal $null (Get-FirstRecoveryEvent -Events $events -Kinds @("nothing-like-this")) "an absent event is null rather than a fabricated one"
 }
 
+Test-Case "the mysql-poll delivery's detection and range recovery are recognised" {
+    # The strings are ContestScoreboardRollbackDetector's and ContestScoreboardRangeRecovery's own log
+    # statements. Without them a redis-seq run reports no detection, which reads like a rollback nothing noticed.
+    $lines = @(
+        "2026-09-28T10:00:00.000000001Z 2026-09-28T10:00:00.000Z  WARN 1 --- [scoreboard-mysql-poll-2] m.o.w.c.s.p.ContestScoreboardRollbackDetector : Redis scoreboard rollback detected: allocator 588 is below the MySQL watermark 988; recovery range generation 3 persisted",
+        "2026-09-28T10:00:00.100000001Z 2026-09-28T10:00:00.100Z  WARN 1 --- [scoreboard-mysql-poll-2] m.o.w.c.s.p.ContestScoreboardRollbackDetector : Redis scoreboard allocator fenced to 988; new results resume above it while (588, 988] is recovered in the background",
+        "2026-09-28T10:00:01.200000001Z 2026-09-28T10:00:01.200Z  INFO 1 --- [scoreboard-mysql-poll-3] m.o.w.c.s.p.ContestScoreboardRangeRecovery : Recovered scoreboard sequence range (588, 988] generation 3: 400 result(s) re-applied in this pass"
+    )
+    $events = @(Select-RecoveryLogEvents -Lines $lines)
+    Assert-SequenceEqual @("detected-watermark", "allocator-fenced", "range-recovered") @($events | ForEach-Object { $_.Kind }) "each poll-delivery event is recognised"
+    Assert-SequenceEqual @("588", "988", "3") @($events[0].Fields) "the detection carries R, H and the generation"
+    Assert-SequenceEqual @("588", "988", "3") @($events[2].Fields) "the completion carries the same range"
+    $detection = Get-FirstRecoveryEvent -Events $events -Kinds @("detected-rewinding", "detected-nonrewinding", "detected-watermark")
+    Assert-Equal "detected-watermark" $detection.Kind "the pilot's detection lookup finds the poll delivery's detection"
+}
+
+Test-Case "quiescence reads the Stream's lag only where there is a Stream" {
+    $empty = [pscustomobject]@{ Ready = 0L; Unacked = 0L; Consumers = 0L }
+    $consumed = [pscustomobject]@{ Ready = 5092L; Unacked = 0L; Consumers = 1L }
+    $busy = [pscustomobject]@{ Ready = 3L; Unacked = 0L; Consumers = 0L }
+
+    Assert-True (Test-PipelineQuiescent -Delivery "mysql-poll" -JudgeNonPublished 0 -ScoreboardUnapplied 0 `
+            -Live $empty -Dead $empty -Stream $empty -StreamDbPending 0 -PendingEvents $null -PendingRecoveryRanges 0) `
+        "mysql-poll with nothing unapplied and no pending range is quiet, with no Stream consumer at all"
+    Assert-True (-not (Test-PipelineQuiescent -Delivery "mysql-poll" -JudgeNonPublished 0 -ScoreboardUnapplied 0 `
+                -Live $empty -Dead $empty -Stream $empty -StreamDbPending 0 -PendingEvents $null -PendingRecoveryRanges 1)) `
+        "a pending recovery range keeps mysql-poll from counting as drained - its rows are stamped applied"
+    Assert-True (-not (Test-PipelineQuiescent -Delivery "mysql-poll" -JudgeNonPublished 0 -ScoreboardUnapplied 4 `
+                -Live $empty -Dead $empty -Stream $empty -StreamDbPending 0 -PendingEvents $null -PendingRecoveryRanges 0)) `
+        "unapplied judged rows are the poller's backlog"
+    Assert-True (-not (Test-PipelineQuiescent -Delivery "mysql-poll" -JudgeNonPublished 0 -ScoreboardUnapplied 0 `
+                -Live $busy -Dead $empty -Stream $empty -StreamDbPending 0 -PendingEvents $null -PendingRecoveryRanges 0)) `
+        "the judge work queue still counts under mysql-poll"
+    Assert-True (Test-PipelineQuiescent -Delivery "rabbit-stream" -JudgeNonPublished 0 -ScoreboardUnapplied 0 `
+            -Live $empty -Dead $empty -Stream $consumed -StreamDbPending 0 -PendingEvents 0 -PendingRecoveryRanges $null) `
+        "rabbit-stream is quiet at the head with its consumer attached"
+    Assert-True (-not (Test-PipelineQuiescent -Delivery "rabbit-stream" -JudgeNonPublished 0 -ScoreboardUnapplied 0 `
+                -Live $empty -Dead $empty -Stream $empty -StreamDbPending 0 -PendingEvents 0 -PendingRecoveryRanges $null)) `
+        "a consumer-less Stream is a stopped pipeline, not a drained one"
+    Assert-True (-not (Test-PipelineQuiescent -Delivery "rabbit-stream" -JudgeNonPublished 0 -ScoreboardUnapplied 0 `
+                -Live $empty -Dead $empty -Stream $consumed -StreamDbPending 0 -PendingEvents 2 -PendingRecoveryRanges $null)) `
+        "Stream lag keeps rabbit-stream busy"
+}
+
+Test-Case "the live-impact experiment refuses redis-seq before touching the stack" {
+    $script = Join-Path $PSScriptRoot "..\run-recovery-live-impact.ps1"
+    $message = $null
+    try { & $script -Mode "redis-seq" *> $null } catch { $message = $_.Exception.Message }
+    Assert-True ($null -ne $message -and $message.Contains("run-recovery-pilot.ps1")) `
+        "redis-seq is refused with a pointer to the harness that measures it (got: '$message')"
+}
+
 # --- leftovers -------------------------------------------------------------------------------------
 
 Test-Case "a leftover row's name is attributed to the run id that wrote it" {

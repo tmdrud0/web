@@ -104,6 +104,16 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\lib\RecoveryExperiment.ps1"
 . "$PSScriptRoot\lib\RecoveryExperiment.LiveImpact.ps1"
 
+# This experiment is built on the scoreboard RabbitMQ Stream: "new" results are the ones above the Stream
+# checkpoint at the fault, the per-apply trace is written by the Stream processor, and the reference
+# rebuild goes through the Stream-gated actuator endpoint. redis-seq runs on the MySQL poller and has none
+# of the three, so a run in that mode would measure nothing it claims to. Refused up front, before the
+# stack is touched; run-recovery-pilot.ps1 measures redis-seq on the poller.
+if ($Mode -eq "redis-seq") {
+    throw ("run-recovery-live-impact.ps1 measures the scoreboard Stream path, and redis-seq no longer has one " +
+        "(contest.scoreboard.delivery=mysql-poll). Use run-recovery-pilot.ps1 for redis-seq.")
+}
+
 function Write-JsonFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path,

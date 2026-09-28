@@ -530,6 +530,50 @@ function Get-UnappliedResultCount {
         -Description "unapplied scoreboard result rows"
 }
 
+# The mysql-poll delivery's own backlog beside `scoreboard_applied_at IS NULL`: a rollback leaves the rows
+# it took away stamped as applied, so what says they are still owed to the scoreboard is the pending
+# recovery range the batch role persisted for them. Not scoped to the contest - ranges are sequence
+# ranges, global like the allocator - and read only under that delivery, because the table exists only
+# in schemas the poller runs against.
+function Get-PendingRecoveryRangeCount {
+    return Invoke-SqlInt64 `
+        -Sql "SELECT COUNT(*) FROM scoreboard_sequence_recovery_range WHERE status = 'PENDING'" `
+        -Description "pending scoreboard recovery ranges"
+}
+
+# The quiescence decision itself, apart from the readings that feed it, so both deliveries' rules can be
+# held against fixed numbers in a unit test.
+#
+#   rabbit-stream  the Stream's lag and DB-pending mark are zero and the stream queue has a consumer -
+#                  a consumer-less stream is a stopped pipeline, not a drained one.
+#   mysql-poll     there is no scoreboard Stream to have a consumer or a lag. The poller's backlog is the
+#                  unapplied rows (already a term for both) and the pending recovery ranges.
+function Test-PipelineQuiescent {
+    param(
+        [Parameter(Mandatory = $true)][string]$Delivery,
+        [Parameter(Mandatory = $true)][long]$JudgeNonPublished,
+        [Parameter(Mandatory = $true)][long]$ScoreboardUnapplied,
+        [Parameter(Mandatory = $true)]$Live,
+        [Parameter(Mandatory = $true)]$Dead,
+        [Parameter(Mandatory = $true)]$Stream,
+        [Parameter(Mandatory = $true)][long]$StreamDbPending,
+        [AllowNull()]$PendingEvents,
+        [AllowNull()]$PendingRecoveryRanges
+    )
+
+    $common = $JudgeNonPublished -eq 0L -and
+        $ScoreboardUnapplied -eq 0L -and
+        $Live.Ready -eq 0L -and $Live.Unacked -eq 0L -and
+        $Dead.Ready -eq 0L -and $Dead.Unacked -eq 0L
+    if ($Delivery -eq "mysql-poll") {
+        return $common -and $null -ne $PendingRecoveryRanges -and [long]$PendingRecoveryRanges -eq 0L
+    }
+    return $common -and
+        $Stream.Consumers -ge 1L -and
+        $StreamDbPending -eq 0L -and
+        $null -ne $PendingEvents -and [double]$PendingEvents -eq 0d
+}
+
 # Everything that has to be empty before the pipeline counts as drained, read as one observation so the
 # quiescence decision and the row it is written into describe the same instant. `PendingEvents` is the
 # only cross-role number here and it comes from Prometheus rather than from Redis: it is the stream's
@@ -555,13 +599,23 @@ function Get-PipelineOperationalState {
     Assert-OnlyProjectQueues -Queues $queues
     $scoreboard = Get-ScoreboardState
 
-    $pendingSamples = @(Invoke-PrometheusQuery `
-            -Query 'contest_scoreboard_pending_events{job="oj-app",node="batch-1"}' `
-            -Description "stream pending events")
-    if ($pendingSamples.Count -ne 1) {
-        throw "Expected exactly one batch-1 contest_scoreboard_pending_events series, found $($pendingSamples.Count)."
+    $config = Get-RecoveryConfig
+    # `contest_scoreboard_pending_events` is a meter of the Stream consumer, so under mysql-poll there is
+    # no series to read - and asking for exactly one would fail every poll of the run.
+    $pendingEvents = $null
+    $pendingRecoveryRanges = $null
+    if ($config.Delivery -eq "mysql-poll") {
+        $pendingRecoveryRanges = Get-PendingRecoveryRangeCount
     }
-    $pendingEvents = ConvertTo-RequiredDouble -Value @($pendingSamples[0].value)[1] -Description "stream pending events"
+    else {
+        $pendingSamples = @(Invoke-PrometheusQuery `
+                -Query 'contest_scoreboard_pending_events{job="oj-app",node="batch-1"}' `
+                -Description "stream pending events")
+        if ($pendingSamples.Count -ne 1) {
+            throw "Expected exactly one batch-1 contest_scoreboard_pending_events series, found $($pendingSamples.Count)."
+        }
+        $pendingEvents = ConvertTo-RequiredDouble -Value @($pendingSamples[0].value)[1] -Description "stream pending events"
+    }
 
     $live = Get-QueueCounts -Queues $queues -Name "contest.judge.live"
     $dead = Get-QueueCounts -Queues $queues -Name "contest.judge.dead"
@@ -571,16 +625,14 @@ function Get-PipelineOperationalState {
     # which is exactly the state `stream-offset` passes through while it resubscribes. The stream queue's
     # ready and unacked counts are deliberately not terms here - see the note above the function for what
     # they measure on a stream and why they made this unsatisfiable.
-    $quiescent = $judgeNonPublished -eq 0L -and
-        $scoreboardUnapplied -eq 0L -and
-        $live.Ready -eq 0L -and $live.Unacked -eq 0L -and
-        $dead.Ready -eq 0L -and $dead.Unacked -eq 0L -and
-        $stream.Consumers -ge 1L -and
-        $scoreboard.StreamDbPending -eq 0L -and
-        $pendingEvents -eq 0d
+    $quiescent = Test-PipelineQuiescent -Delivery $config.Delivery -JudgeNonPublished $judgeNonPublished `
+        -ScoreboardUnapplied $scoreboardUnapplied -Live $live -Dead $dead -Stream $stream `
+        -StreamDbPending $scoreboard.StreamDbPending -PendingEvents $pendingEvents `
+        -PendingRecoveryRanges $pendingRecoveryRanges
 
     return [pscustomobject][ordered]@{
         Quiescent = $quiescent
+        PendingRecoveryRanges = $pendingRecoveryRanges
         RabbitPollMs = $rabbitPollMs
         DurationMs = $pipelineWatch.ElapsedMilliseconds
         JudgeNonPublished = $judgeNonPublished
@@ -820,7 +872,8 @@ function ConvertFrom-DockerLogTimestamp {
     return $parsed
 }
 
-# The patterns are the product's own log statements, read off ContestScoreboardStreamLifecycle. A
+# The patterns are the product's own log statements, read off ContestScoreboardStreamLifecycle and, for
+# the mysql-poll delivery, ContestScoreboardRollbackDetector and ContestScoreboardRangeRecovery. A
 # recovery that did not log one of these did not take the path it claims to, which is why the timeline
 # is evidence and not narration.
 $script:recoveryLogPatterns = @(
@@ -862,6 +915,23 @@ $script:recoveryLogPatterns = @(
     [pscustomobject]@{
         Kind      = "consumer-started"
         Pattern   = 'Started scoreboard stream consumer at (\d+)'
+        HasOffsets = $false
+    },
+    # mysql-poll: R < H, the range (R, H] persisted. Fields are R, H and the range's generation.
+    [pscustomobject]@{
+        Kind      = "detected-watermark"
+        Pattern   = 'Redis scoreboard rollback detected: allocator (\d+) is below the MySQL watermark (\d+); recovery range generation (\d+) persisted'
+        HasOffsets = $false
+    },
+    [pscustomobject]@{
+        Kind      = "allocator-fenced"
+        Pattern   = 'Redis scoreboard allocator fenced to (\d+);'
+        HasOffsets = $false
+    },
+    # The range emptied and was completed. Fields are R, H and the generation.
+    [pscustomobject]@{
+        Kind      = "range-recovered"
+        Pattern   = 'Recovered scoreboard sequence range \((\d+), (\d+)\] generation (\d+)'
         HasOffsets = $false
     }
 )
@@ -965,7 +1035,11 @@ function Get-SampleColumnNames {
         "streamUnappliedRefusalsTotal", "streamTailProbeFailuresTotal", "redisLuaErrorsTotal",
         "sequenceRoundsTotal", "sequenceDuplicatesTotal", "sequenceReplayedTotal",
         "sequenceFailedTotal", "sequenceWindowsSaturatedTotal", "sequenceUnresolvedTotal",
-        "sequenceMappingSize", "judgeOutboxNonPublished", "unappliedResults", "rabbitLiveReady",
+        "sequenceMappingSize",
+        "pollAppliedTotal", "pollRollbacksTotal", "pollFencesTotal", "pollRecoveryAppliedTotal",
+        "pollRangesCompletedTotal", "pollRecoveryUnresolvedTotal", "pollRecoveryPendingGauge",
+        "pollResumeMaxSeconds", "pollRecoveryDurationMaxSeconds", "pollFailuresTotal",
+        "pendingRecoveryRanges", "judgeOutboxNonPublished", "unappliedResults", "rabbitLiveReady",
         "rabbitLiveUnacked", "rabbitDeadReady", "rabbitDeadUnacked", "streamQueueReady",
         "streamQueueUnacked", "streamQueueConsumers", "quiescent", "quiescentObservedAtUtc",
         "oracleObservedAtUtc",
@@ -1189,6 +1263,19 @@ function Get-RecoveryObservation {
     $observation["sequenceWindowsSaturatedTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_redis_sequence_windows_saturated_total"
     $observation["sequenceUnresolvedTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_redis_sequence_unresolved_total"
     $observation["sequenceMappingSize"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_redis_sequence_mapping_size"
+    # The mysql-poll delivery's meters (ContestScoreboardMySqlPollMetrics). They exist on the recovery
+    # owner under that delivery only, so every other run reads them as `unavailable`.
+    $observation["pollAppliedTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_mysql_poll_applied_total"
+    $observation["pollRollbacksTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_mysql_poll_rollbacks_total"
+    $observation["pollFencesTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_mysql_poll_fences_total"
+    $observation["pollRecoveryAppliedTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_mysql_poll_recovery_applied_total"
+    $observation["pollRangesCompletedTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_mysql_poll_recovery_completed_total"
+    $observation["pollRecoveryUnresolvedTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_mysql_poll_recovery_unresolved_total"
+    $observation["pollRecoveryPendingGauge"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_mysql_poll_recovery_pending"
+    $observation["pollResumeMaxSeconds"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_mysql_poll_rollback_resume_seconds_max"
+    $observation["pollRecoveryDurationMaxSeconds"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_mysql_poll_recovery_duration_seconds_max"
+    # Summed across its `task` label (poll, rollback-check, recovery) by the map reader.
+    $observation["pollFailuresTotal"] = Get-MetricValue -Metrics $roleMetrics -Name "contest_scoreboard_mysql_poll_failures_total"
     $observation["hikariActive"] = Get-MetricValue -Metrics $roleMetrics -Name "hikaricp_connections_active"
     $observation["hikariPending"] = Get-MetricValue -Metrics $roleMetrics -Name "hikaricp_connections_pending"
     $observation["appProcessCpu"] = Get-MetricValue -Metrics $roleMetrics -Name "process_cpu_usage"
@@ -1225,6 +1312,7 @@ function Get-RecoveryObservation {
     $observation["streamQueueUnacked"] = $pipeline.StreamUnacked
     $observation["streamQueueConsumers"] = $pipeline.StreamConsumers
     $observation["quiescent"] = $pipeline.Quiescent
+    $observation["pendingRecoveryRanges"] = if ($null -eq $pipeline.PendingRecoveryRanges) { "unavailable" } else { $pipeline.PendingRecoveryRanges }
 
     $mysqlWatch = [Diagnostics.Stopwatch]::StartNew()
     $status = Get-MySqlStatusCounters

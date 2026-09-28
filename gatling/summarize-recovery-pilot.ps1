@@ -273,8 +273,11 @@ $figures = @(
     [pscustomobject]@{ Name = "redisEvalCallsPerSecond"; Unit = "calls/s"; Note = "scoreboard Lua evaluations per second of the mode's own recovery window"; Ratio = @{ Numerator = "redisEvalCallsDelta"; Denominator = "recoveryWindowSeconds" } }
     [pscustomobject]@{ Name = "redisRestoreCallsDelta"; Unit = "calls"; Note = "RESTORE calls - the injector's own footprint, in every mode" }
     [pscustomobject]@{ Name = "redisDelCallsDelta"; Unit = "calls"; Note = "DEL calls - the injector's own footprint, in every mode" }
-    [pscustomobject]@{ Name = "sequenceRoundsDelta"; Unit = "rounds"; Note = "redis-seq only: allocator rounds" }
-    [pscustomobject]@{ Name = "sequenceReplayedDelta"; Unit = "results"; Note = "redis-seq only: results replayed from the duplicate window" }
+    [pscustomobject]@{ Name = "rangeRecoveryMs"; Unit = "ms"; Note = "redis-seq (mysql-poll) only: T_range_completed - T_fault, until the lost (R, H] range was re-applied and completed" }
+    [pscustomobject]@{ Name = "pollResumeMaxSeconds"; Unit = "s"; Note = "redis-seq (mysql-poll) only: rollback detection to the next poll batch applied - how long new results waited" }
+    [pscustomobject]@{ Name = "pollRollbacksDelta"; Unit = "rollbacks"; Note = "redis-seq (mysql-poll) only: allocator-below-watermark detections; one per injected fault" }
+    [pscustomobject]@{ Name = "pollRecoveryAppliedDelta"; Unit = "results"; Note = "redis-seq (mysql-poll) only: results re-applied from the bounded range" }
+    [pscustomobject]@{ Name = "maxPendingRecoveryRanges"; Unit = "ranges"; Note = "redis-seq (mysql-poll) only: pending recovery ranges at their most" }
     [pscustomobject]@{ Name = "rollbackObservedDelta"; Unit = "events"; Note = "the two non-rewinding modes only: how many rollbacks the batch role answered by rebuilding in place. stream-offset rewinds instead and never records this counter, so its 0 here is the design, not a missed detection" }
     [pscustomobject]@{ Name = "rollbackRestartsDelta"; Unit = "restarts"; Note = "how many times a mode stopped and restarted its consumer to repair" }
     [pscustomobject]@{ Name = "maxAppProcessCpu"; Unit = "ratio"; Note = "batch-1 process CPU at its peak" }

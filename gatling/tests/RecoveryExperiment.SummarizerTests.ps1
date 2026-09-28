@@ -33,7 +33,8 @@ $script:figureColumns = @(
     "maxStreamPendingEvents", "maxStreamOldestReadySeconds", "minStreamQueueConsumers", "maxUnappliedResults",
     "pollsWithoutConsumer", "appliedDeltaDuringRecovery", "mysqlQuestionsDelta", "mysqlRowsReadDelta",
     "redisTotalCommandsDelta", "redisEvalCallsDelta", "redisRestoreCallsDelta", "redisDelCallsDelta",
-    "sequenceRoundsDelta", "sequenceReplayedDelta", "rollbackObservedDelta", "rollbackRestartsDelta",
+    "rangeRecoveryMs", "pollResumeMaxSeconds", "pollRollbacksDelta", "pollRecoveryAppliedDelta",
+    "maxPendingRecoveryRanges", "rollbackObservedDelta", "rollbackRestartsDelta",
     "maxAppProcessCpu", "gatlingSuccessPercent", "gatlingObservedP95Millis", "gatlingFailedRequests"
 )
 

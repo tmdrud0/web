@@ -805,7 +805,12 @@ try {
         -Description "while the scoreboard was recovering"
 
     $script:recoveryEvents = @(Get-BatchRecoveryTimeline -SinceUtc $faultAtUtc.AddSeconds(-10).UtcDateTime.ToString("o"))
-    $detection = Get-FirstRecoveryEvent -Events $script:recoveryEvents -Kinds @("detected-rewinding", "detected-nonrewinding")
+    # The Stream modes log the checkpoint regression; the mysql-poll delivery logs the allocator found below
+    # the MySQL watermark. Either is the batch role noticing this rollback.
+    $detection = Get-FirstRecoveryEvent -Events $script:recoveryEvents -Kinds @("detected-rewinding", "detected-nonrewinding", "detected-watermark")
+    # mysql-poll only: the lost range emptied and was completed - the end of the background recovery, which
+    # the scoreboard reaching consistency does not mark by itself.
+    $rangeRecovered = Get-FirstRecoveryEvent -Events $script:recoveryEvents -Kinds @("range-recovered")
     # A detection earlier than the fault is not a detection, and it must not become a negative latency in
     # a published column. The window above opens ten seconds before the fault on purpose - a log line can
     # be stamped by a container whose clock is a little behind - so the event is kept as evidence and the
@@ -821,6 +826,9 @@ try {
     Write-Output "  new-result latency while recovering: n=$($recoveryLatency.Samples) p50=$($recoveryLatency.P50Ms)ms p95=$($recoveryLatency.P95Ms)ms max=$($recoveryLatency.MaxMs)ms"
     if ($null -ne $detection) {
         Write-Output "  batch-1 detected the rollback at $($detection.Instant.UtcDateTime.ToString('o')) ($($detection.Kind))"
+    }
+    if ($null -ne $rangeRecovered) {
+        Write-Output "  batch-1 completed the lost sequence range at $($rangeRecovered.Instant.UtcDateTime.ToString('o'))"
     }
     else {
         Write-Output "  batch-1 logged no detection event for this rollback; the timeline has $($script:recoveryEvents.Count) other event(s)"
@@ -898,6 +906,9 @@ try {
         # correct formula makes negative - so nothing but this order decides the sign. The unit suite pins
         # the order of these two arguments for this figure, the way it pins the grouping-parenthesis shape.
         detectionLatencyMs = Format-PilotElapsed $faultAtUtc $(if ($null -eq $detection) { $null } else { $detection.Instant })
+        delivery = $config.Delivery
+        rangeRecoveredAtUtc = if ($null -eq $rangeRecovered) { "unavailable" } else { $rangeRecovered.Instant.UtcDateTime.ToString("o") }
+        rangeRecoveryMs = Format-PilotElapsed $faultAtUtc $(if ($null -eq $rangeRecovered) { $null } else { $rangeRecovered.Instant })
         repairDurationMs = Format-PilotElapsed $consistentAtUtc $drainedAtUtc
         consistencyOutageMs = Format-PilotElapsed $faultAtUtc $consistentAtUtc
         backlogDrainMs = Format-PilotElapsed $faultAtUtc $drainedAtUtc
@@ -981,7 +992,9 @@ try {
         # Downwards, because a mode that stops its consumer to rewind from the checkpoint is supposed to
         # take this to zero, and that zero is the figure - a maximum would report the consumers it had
         # before it stopped them.
-        minStreamQueueConsumers = Format-PilotNumber (Get-MinAcross -Rows $recoveryWindow -Name "streamQueueConsumers")
+        # Not applicable under mysql-poll, which has no scoreboard Stream: a zero there would read as a
+        # stopped consumer.
+        minStreamQueueConsumers = if ($config.Delivery -eq "mysql-poll") { "unavailable" } else { Format-PilotNumber (Get-MinAcross -Rows $recoveryWindow -Name "streamQueueConsumers") }
         maxRabbitLiveReady = Format-PilotNumber (Get-MaxAcross -Rows $recoveryWindow -Name "rabbitLiveReady")
         maxRabbitLiveUnacked = Format-PilotNumber (Get-MaxAcross -Rows $recoveryWindow -Name "rabbitLiveUnacked")
         maxJudgeOutboxNonPublished = Format-PilotNumber (Get-MaxAcross -Rows $recoveryWindow -Name "judgeOutboxNonPublished")
@@ -989,10 +1002,13 @@ try {
         # Downwards too: the ranking shrinks by exactly the results the rollback took away, and how far it
         # shrank is what says the fault was real rather than nominal.
         minRankingCardinality = Format-PilotNumber (Get-MinAcross -Rows $recoveryWindow -Name "rankingCardinality")
-        pollsWithoutConsumer = @($recoveryWindow | Where-Object {
-                $n = Get-RowNumber -Row $_ -Name "streamQueueConsumers"
-                $null -ne $n -and $n -lt 1
-            }).Count
+        pollsWithoutConsumer = if ($config.Delivery -eq "mysql-poll") { "unavailable" } else {
+            @($recoveryWindow | Where-Object {
+                    $n = Get-RowNumber -Row $_ -Name "streamQueueConsumers"
+                    $null -ne $n -and $n -lt 1
+                }).Count
+        }
+        maxPendingRecoveryRanges = Format-PilotNumber (Get-MaxAcross -Rows $recoveryWindow -Name "pendingRecoveryRanges")
 
         # --- what the recovery cost ----------------------------------------------------------------
         #
@@ -1002,7 +1018,9 @@ try {
         # shows roughly twice the work for that reason alone. `recoveryWindowSeconds` is recorded beside
         # them so the comparison can be made per second, and the summariser presents the ratio.
         recoveryWindowSeconds = Format-PilotNumber ($recoveryWindowSeconds)
-        appliedDeltaDuringRecovery = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "appliedTotal")
+        # The Stream consumer counts applications in `appliedTotal`; the MySQL poller counts its own in
+        # `pollAppliedTotal` (new results only - range recovery is `pollRecoveryAppliedDelta` below).
+        appliedDeltaDuringRecovery = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name $(if ($config.Delivery -eq "mysql-poll") { "pollAppliedTotal" } else { "appliedTotal" }))
         mysqlQuestionsDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "mysqlQuestions")
         mysqlRowsReadDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "mysqlRowsRead")
         mysqlSlowQueriesDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "mysqlSlowQueries")
@@ -1024,6 +1042,15 @@ try {
         sequenceWindowsSaturatedDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "sequenceWindowsSaturatedTotal")
         sequenceUnresolvedDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "sequenceUnresolvedTotal")
         sequenceMappingSizeMax = Format-PilotNumber (Get-MaxAcross -Rows $recoveryWindow -Name "sequenceMappingSize")
+        # mysql-poll: the rollback as the batch role's meters saw it, over the same window.
+        pollRollbacksDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "pollRollbacksTotal")
+        pollFencesDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "pollFencesTotal")
+        pollRecoveryAppliedDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "pollRecoveryAppliedTotal")
+        pollRangesCompletedDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "pollRangesCompletedTotal")
+        pollRecoveryUnresolvedDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "pollRecoveryUnresolvedTotal")
+        pollFailuresDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "pollFailuresTotal")
+        pollResumeMaxSeconds = Format-PilotNumber (Get-MaxAcross -Rows $recoveryWindow -Name "pollResumeMaxSeconds")
+        pollRecoveryDurationMaxSeconds = Format-PilotNumber (Get-MaxAcross -Rows $recoveryWindow -Name "pollRecoveryDurationMaxSeconds")
         maxAppProcessCpu = Format-PilotNumber (Get-MaxAcross -Rows $recoveryWindow -Name "appProcessCpu")
         maxAppHeapUsedBytes = Format-PilotNumber (Get-MaxAcross -Rows $recoveryWindow -Name "appHeapUsedBytes")
         appCgroupThrottledPeriodsDelta = Format-PilotNumber (Get-DeltaAcross -Rows $recoveryWindow -Name "appCgroupThrottledPeriods")

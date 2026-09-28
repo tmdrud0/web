@@ -155,6 +155,9 @@ function Initialize-RecoveryExperiment {
         ArtifactDirectory = $resolvedArtifacts
         RunId = $RunId
         Mode = $Mode
+        # Which path feeds the scoreboard: redis-seq runs on the MySQL poller and has no scoreboard Stream,
+        # so every Stream-shaped reading of this run is either skipped or replaced for it.
+        Delivery = [string](Get-ScoreboardDeliveryEnvironment -Mode $Mode)["CONTEST_SCOREBOARD_DELIVERY"]
         ProjectName = $ProjectName
         ComposeArgs = @(
             "-p", $ProjectName,

@@ -86,4 +86,16 @@ poller·검사·복구 빈은 `contest.scoreboard.recovery.owner.enabled=true`(b
 `...LiveRecovery`, `...Scheduler`, `...StartupCheck`, `RedisSequenceRecoveryStrategy`(Stream offset 범위를
 seq 복구로 바꾸던 경로)와 duplicate-scan 쿼리. `stream-offset`/`full-replay`의 Stream 코드는 그대로이며
 `rabbit-stream` delivery에서만 빈이 된다. `contest.scoreboard.recovery.redis-seq.*` 프로퍼티는 바인딩만 되고
-더 이상 읽히지 않는다(기동 보고에는 남는다).
+더 이상 읽히지 않는다. 기동 보고(`Contest scoreboard recovery: ...`)는 모든 모드에 `delivery=`를 찍고,
+redis-seq에서는 `mysql-poll.*` 설정을 찍는다.
+
+## 실험 harness
+
+- `run-recovery-pilot.ps1`: redis-seq는 `Set-ScoreboardDeliveryEnvironment`로 delivery와 Stream 플래그를 함께
+  설정한다. 감지 시각은 `Redis scoreboard rollback detected: ...` 로그(`detected-watermark`)로,
+  범위 복구 완료는 `Recovered scoreboard sequence range ...` 로그(`range-recovered`, `rangeRecoveryMs`)로 잡는다.
+  quiescence는 Stream 지연·consumer 대신 미반영 행 0 + pending recovery range 0이다.
+  수집 지표는 `contest_scoreboard_mysql_poll_*`(`pollRollbacksDelta`, `pollRecoveryAppliedDelta`,
+  `pollResumeMaxSeconds`, `maxPendingRecoveryRanges` 등)이고, Stream consumer 관련 수치는 `unavailable`이다.
+- `run-recovery-live-impact.ps1`: Stream checkpoint, Stream processor trace, Stream 전용 rebuild endpoint에
+  기반한 실험이라 redis-seq는 시작 전에 거부한다.
