@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import my.oj.web.contest.scoreboard.delivery.ContestScoreboardDelivery;
 import io.micrometer.core.instrument.MeterRegistry;
 import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollLifecycle;
 import my.oj.web.contest.scoreboard.poll.ContestScoreboardRollbackDetector;
@@ -92,7 +93,10 @@ class ContestScoreboardRecoveryModeStartupRedisIntegrationTests {
                 .as("the duplicate counter is registered by this mode alone")
                 .isNotNull();
         // The startup report is a pure function of exactly these inputs, which is what it prints.
-        assertThat(ContestScoreboardRecoverySummary.describe(properties.mode(), "redis", properties))
-                .startsWith("mode=redis-seq store=redis");
+        assertThat(ContestScoreboardRecoverySummary.describe(properties.mode(), "redis",
+                ContestScoreboardDelivery.of(context.getEnvironment()), properties,
+                ContestScoreboardRecoveryReporter.pollProperties(context.getEnvironment())))
+                .startsWith("mode=redis-seq store=redis")
+                .contains("delivery=mysql-poll batch-size=500 poll-interval=3600s");
     }
 }

@@ -1,6 +1,9 @@
 package my.oj.web.contest.scoreboard.recovery;
 
 import lombok.extern.slf4j.Slf4j;
+import my.oj.web.contest.scoreboard.delivery.ContestScoreboardDelivery;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollProperties;
+import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.core.env.Environment;
@@ -30,7 +33,18 @@ public class ContestScoreboardRecoveryReporter implements ApplicationRunner {
         log.info("Contest scoreboard recovery: {}", ContestScoreboardRecoverySummary.describe(
                 properties.mode(),
                 ContestScoreboardStoreProperty.value(environment),
-                properties
+                ContestScoreboardDelivery.of(environment),
+                properties,
+                pollProperties(environment)
         ));
+    }
+
+    /**
+     * Bound here rather than injected: the poll properties are registered with the poller, which exists on
+     * the recovery owner only, while every role prints this report.
+     */
+    static ContestScoreboardMySqlPollProperties pollProperties(Environment environment) {
+        return Binder.get(environment).bindOrCreate("contest.scoreboard.mysql-poll",
+                ContestScoreboardMySqlPollProperties.class);
     }
 }

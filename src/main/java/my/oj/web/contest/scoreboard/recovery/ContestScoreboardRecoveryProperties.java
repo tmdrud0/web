@@ -56,7 +56,11 @@ public record ContestScoreboardRecoveryProperties(
     }
 
     /**
-     * Detecting a reused sequence number and a lost tail.
+     * Settings of the removed Stream-driven {@code redis-seq} checks. Still bound so that an existing
+     * configuration keeps starting, but <strong>nothing reads them</strong>: {@code redis-seq} now runs on
+     * the {@code mysql-poll} delivery and its settings are {@code contest.scoreboard.mysql-poll.*}.
+     *
+     * <p>Detecting a reused sequence number and a lost tail.
      *
      * <p>The two check intervals are handed to the scheduler as they are, with no clamp, and the
      * retry backoff bounds how long a failed replay waits before offering the same chunk again. A

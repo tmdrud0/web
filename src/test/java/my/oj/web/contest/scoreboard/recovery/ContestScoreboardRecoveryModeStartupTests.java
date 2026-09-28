@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import my.oj.web.contest.scoreboard.delivery.ContestScoreboardDelivery;
 import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollLifecycle;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -60,7 +61,10 @@ class ContestScoreboardRecoveryModeStartupTests {
         // Neither of the other modes' exclusive beans may come up alongside this one.
         assertThat(context.getBeanNamesForType(ContestScoreboardMySqlPollLifecycle.class)).isEmpty();
         assertThat(context.getBeanNamesForType(ContestScoreboardRedisSequenceMetrics.class)).isEmpty();
-        assertThat(ContestScoreboardRecoverySummary.describe(properties.mode(), "memory", properties))
-                .startsWith("mode=full-replay store=memory");
+        assertThat(ContestScoreboardRecoverySummary.describe(properties.mode(), "memory",
+                ContestScoreboardDelivery.of(context.getEnvironment()), properties,
+                ContestScoreboardRecoveryReporter.pollProperties(context.getEnvironment())))
+                .startsWith("mode=full-replay store=memory")
+                .contains("delivery=rabbit-stream");
     }
 }

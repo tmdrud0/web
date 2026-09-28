@@ -1,5 +1,6 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import my.oj.web.contest.scoreboard.delivery.ContestScoreboardDelivery;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -29,33 +30,42 @@ class ContestScoreboardRecoverySummaryTests {
         assertSummary("redis-seq", "redis");
     }
 
+    /**
+     * redis-seq reports the delivery and the mysql-poll settings it runs with, and nothing of the removed
+     * Stream-driven checks - a report naming a duplicate-check interval would describe a check that no
+     * longer exists.
+     */
     @Test
     void reportsTheSettingsTheSelectedModeActuallyReads() {
         contextRunner
                 .withPropertyValues(
                         "contest.scoreboard.recovery.mode=redis-seq",
-                        "contest.scoreboard.recovery.redis-seq.check-window-size=250",
-                        "contest.scoreboard.recovery.redis-seq.max-iterations=7",
-                        "contest.scoreboard.recovery.redis-seq.retry-backoff=175ms",
-                        "contest.scoreboard.recovery.redis-seq.startup-check-enabled=false"
+                        "contest.scoreboard.delivery=mysql-poll",
+                        "contest.scoreboard.mysql-poll.batch-size=250",
+                        "contest.scoreboard.mysql-poll.poll-interval=175ms",
+                        "contest.scoreboard.mysql-poll.recovery-max-iterations=7",
+                        "contest.scoreboard.recovery.redis-seq.check-window-size=250"
                 )
                 .run(context -> {
                     ContestScoreboardRecoveryProperties properties =
                             context.getBean(ContestScoreboardRecoveryProperties.class);
                     String summary = ContestScoreboardRecoverySummary.describe(
-                            properties.mode(), "redis", properties);
+                            properties.mode(), "redis", ContestScoreboardDelivery.of(context.getEnvironment()),
+                            properties, ContestScoreboardRecoveryReporter.pollProperties(context.getEnvironment()));
 
                     assertThat(summary)
                             .contains("mode=redis-seq")
                             .contains("store=redis")
                             .contains("recovery-owner=true")
-                            .contains("duplicate-check-interval=30s")
-                            .contains("lost-tail-check-interval=30s")
-                            .contains("check-window-size=250")
-                            .contains("max-windows-per-pass=10")
-                            .contains("max-iterations=7")
-                            .contains("retry-backoff=175ms")
-                            .contains("startup-check-enabled=false");
+                            .contains("delivery=mysql-poll")
+                            .contains("batch-size=250")
+                            .contains("poll-interval=175ms")
+                            .contains("rollback-check-interval=5s")
+                            .contains("recovery-interval=1s")
+                            .contains("recovery-chunk-size=500")
+                            .contains("recovery-max-iterations=7")
+                            .doesNotContain("duplicate-check-interval")
+                            .doesNotContain("check-window-size");
                 });
     }
 
@@ -66,8 +76,11 @@ class ContestScoreboardRecoverySummaryTests {
                     context.getBean(ContestScoreboardRecoveryProperties.class);
 
             assertThat(ContestScoreboardStoreProperty.value(new MockEnvironment())).isEqualTo("memory");
-            assertThat(ContestScoreboardRecoverySummary.describe(properties.mode(), "memory", properties))
-                    .contains("store=memory");
+            assertThat(ContestScoreboardRecoverySummary.describe(properties.mode(), "memory",
+                    ContestScoreboardDelivery.of(context.getEnvironment()), properties,
+                    ContestScoreboardRecoveryReporter.pollProperties(context.getEnvironment())))
+                    .contains("store=memory")
+                    .contains("delivery=rabbit-stream");
         });
     }
 
@@ -296,14 +309,17 @@ class ContestScoreboardRecoverySummaryTests {
 
     private void assertSummary(String mode, String store) {
         contextRunner
-                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode)
+                .withPropertyValues("contest.scoreboard.recovery.mode=" + mode,
+                        "contest.scoreboard.delivery=" + ("redis-seq".equals(mode) ? "mysql-poll" : "rabbit-stream"))
                 .run(context -> {
                     ContestScoreboardRecoveryProperties properties =
                             context.getBean(ContestScoreboardRecoveryProperties.class);
-                    String summary = ContestScoreboardRecoverySummary.describe(properties.mode(), store, properties);
+                    String summary = ContestScoreboardRecoverySummary.describe(properties.mode(), store,
+                            ContestScoreboardDelivery.of(context.getEnvironment()), properties,
+                            ContestScoreboardRecoveryReporter.pollProperties(context.getEnvironment()));
 
                     assertThat(summary)
-                            .startsWith("mode=" + mode + " store=" + store + " recovery-owner=true ")
+                            .startsWith("mode=" + mode + " store=" + store + " recovery-owner=true delivery=")
                             .doesNotContain("null");
                 });
     }

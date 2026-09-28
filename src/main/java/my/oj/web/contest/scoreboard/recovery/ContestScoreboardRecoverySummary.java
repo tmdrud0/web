@@ -1,5 +1,8 @@
 package my.oj.web.contest.scoreboard.recovery;
 
+import my.oj.web.contest.scoreboard.delivery.ContestScoreboardDelivery;
+import my.oj.web.contest.scoreboard.poll.ContestScoreboardMySqlPollProperties;
+
 import java.time.Duration;
 
 /**
@@ -14,16 +17,21 @@ public final class ContestScoreboardRecoverySummary {
     }
 
     /**
-     * @param store the effective {@code contest.scoreboard.store} value
-     * @return a single line naming the mode and every setting that mode reads
+     * @param store    the effective {@code contest.scoreboard.store} value
+     * @param delivery the effective {@code contest.scoreboard.delivery}
+     * @param poll     the {@code mysql-poll} settings, read only for that delivery
+     * @return a single line naming the mode, its delivery and every setting that mode reads
      */
     public static String describe(ContestScoreboardRecoveryMode mode,
                                   String store,
-                                  ContestScoreboardRecoveryProperties properties) {
+                                  ContestScoreboardDelivery delivery,
+                                  ContestScoreboardRecoveryProperties properties,
+                                  ContestScoreboardMySqlPollProperties poll) {
         StringBuilder summary = new StringBuilder()
                 .append("mode=").append(mode.propertyValue())
                 .append(" store=").append(store)
-                .append(" recovery-owner=").append(properties.owner().enabled());
+                .append(" recovery-owner=").append(properties.owner().enabled())
+                .append(" delivery=").append(delivery.propertyValue());
         switch (mode) {
             case STREAM_OFFSET -> {
                 ContestScoreboardRecoveryProperties.StreamOffset streamOffset = properties.streamOffset();
@@ -37,18 +45,14 @@ public final class ContestScoreboardRecoverySummary {
                         .append(" replay-batch-size=").append(fullReplay.replayBatchSize())
                         .append(" startup-replay-enabled=").append(fullReplay.startupReplayEnabled());
             }
-            case REDIS_SEQ -> {
-                ContestScoreboardRecoveryProperties.RedisSequence redisSeq = properties.redisSeq();
-                summary.append(" duplicate-check-interval=").append(duration(redisSeq.duplicateCheckInterval()))
-                        .append(" lost-tail-check-interval=").append(duration(redisSeq.lostTailCheckInterval()))
-                        .append(" check-window-size=").append(redisSeq.checkWindowSize())
-                        .append(" max-windows-per-pass=").append(redisSeq.maxWindowsPerPass())
-                        .append(" max-iterations=").append(redisSeq.maxIterations())
-                        .append(" replay-batch-size=").append(redisSeq.replayBatchSize())
-                        .append(" retry-max-attempts=").append(redisSeq.retryMaxAttempts())
-                        .append(" retry-backoff=").append(duration(redisSeq.retryBackoff()))
-                        .append(" startup-check-enabled=").append(redisSeq.startupCheckEnabled());
-            }
+            // redis-seq is delivered and recovered by the MySQL poller; the mysql-poll settings are the
+            // ones it runs with. The legacy contest.scoreboard.recovery.redis-seq.* settings are not read.
+            case REDIS_SEQ -> summary.append(" batch-size=").append(poll.batchSize())
+                    .append(" poll-interval=").append(duration(poll.pollInterval()))
+                    .append(" rollback-check-interval=").append(duration(poll.rollbackCheckInterval()))
+                    .append(" recovery-interval=").append(duration(poll.recoveryInterval()))
+                    .append(" recovery-chunk-size=").append(poll.recoveryChunkSize())
+                    .append(" recovery-max-iterations=").append(poll.recoveryMaxIterations());
         }
         return summary.toString();
     }
