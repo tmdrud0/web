@@ -2,6 +2,7 @@ package my.oj.web.contest.scoreboard.poll;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
+import my.oj.web.contest.scoreboard.experiment.ContestScoreboardExperimentTrace;
 
 import java.time.Duration;
 import java.util.HashSet;
@@ -22,13 +23,18 @@ final class PollFixture {
 
     PollFixture(InMemorySequencedScoreboard scoreboard, InMemorySequenceLedger ledger, int batchSize,
                 int chunkSize, int maxIterations) {
+        this(scoreboard, ledger, batchSize, chunkSize, maxIterations, ContestScoreboardExperimentTrace.NOOP);
+    }
+
+    PollFixture(InMemorySequencedScoreboard scoreboard, InMemorySequenceLedger ledger, int batchSize,
+                int chunkSize, int maxIterations, ContestScoreboardExperimentTrace trace) {
         this.scoreboard = scoreboard;
         this.ledger = ledger;
-        this.application = new ContestScoreboardSequencedApplication(scoreboard, ledger);
-        this.detector = new ContestScoreboardRollbackDetector(scoreboard, ledger, applyLock, metrics);
+        this.application = new ContestScoreboardSequencedApplication(scoreboard, ledger, trace);
+        this.detector = new ContestScoreboardRollbackDetector(scoreboard, ledger, applyLock, metrics, trace);
         this.poller = new ContestScoreboardMySqlPoller(ledger, application, detector, applyLock, metrics, batchSize);
         this.recovery = new ContestScoreboardRangeRecovery(ledger, application, detector, applyLock, metrics,
-                chunkSize, maxIterations);
+                chunkSize, maxIterations, trace);
     }
 
     PollFixture(int batchSize) {

@@ -79,7 +79,7 @@ public class ContestScoreboardMySqlPollLifecycle implements SmartLifecycle {
                 return;
             }
             if (!startupChecked) {
-                ContestScoreboardRollbackDetector.Detection detection = detector.check();
+                ContestScoreboardRollbackDetector.Detection detection = detector.check("startup");
                 startupChecked = true;
                 log.info("Startup scoreboard rollback check: allocator={} watermark={} rolledBack={}",
                         detection.allocator(), detection.watermark(), detection.rolledBack());
@@ -94,7 +94,7 @@ public class ContestScoreboardMySqlPollLifecycle implements SmartLifecycle {
     void checkTick() {
         try {
             if (startupChecked && ownership.holds()) {
-                detector.check();
+                detector.check("periodic");
             }
         } catch (RuntimeException failure) {
             metrics.recordFailure("rollback-check");

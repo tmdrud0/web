@@ -65,13 +65,20 @@ public interface ContestScoreboardExperimentTrace {
      * end. {@code PASS_SKIPPED} is an attempt that found the gate held. {@code CHUNK} is one replayed
      * chunk, and its lock instant separates waiting for the apply lock from holding it. {@code GAP} is
      * the live path asking the mode about a range below a delivery.</p>
+     *
+     * <p>{@code ROLLBACK_DETECTED} is the {@code mysql-poll} delivery's detector finding the Redis allocator
+     * below the MySQL watermark: written once the range is persisted and the allocator fenced. Its detail is
+     * the range, its outcome the check that found it ({@code startup}, {@code periodic}, {@code poll-batch},
+     * {@code script-refusal}, {@code recovery-refusal}). Under that delivery a range recovery is a
+     * {@code PASS_START}/{@code CHUNK}/{@code PASS_END} pass like any other.</p>
      */
     enum RecoveryEvent {
         PASS_START,
         PASS_END,
         PASS_SKIPPED,
         CHUNK,
-        GAP
+        GAP,
+        ROLLBACK_DETECTED
     }
 
     /**

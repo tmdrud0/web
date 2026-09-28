@@ -56,7 +56,7 @@ public class ContestScoreboardMySqlPoller {
                 return applied;
             }
             ContestScoreboardSequencedApplication.ChunkOutcome outcome = applyLock.withLock(() -> {
-                detector.check();
+                detector.check("poll-batch");
                 return application.applyChunk(rows, 0L);
             });
             applied += outcome.applied();
@@ -64,7 +64,7 @@ public class ContestScoreboardMySqlPoller {
             if (outcome.rolledBack()) {
                 // Redis was restored between the check and the script. What this batch applied is
                 // recorded, so the check now sees the full range; the rest waits for the next poll.
-                detector.check();
+                detector.check("script-refusal");
                 return applied;
             }
             if (rows.size() < batchSize) {

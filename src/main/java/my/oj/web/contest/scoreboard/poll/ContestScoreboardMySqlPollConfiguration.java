@@ -2,8 +2,10 @@ package my.oj.web.contest.scoreboard.poll;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplyLock;
+import my.oj.web.contest.scoreboard.experiment.ContestScoreboardExperimentTrace;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryOwnerCondition;
 import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardSequencedApplier;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Conditional;
@@ -45,16 +47,18 @@ public class ContestScoreboardMySqlPollConfiguration {
 
     @Bean
     ContestScoreboardSequencedApplication contestScoreboardSequencedApplication(
-            ContestScoreboardSequencedApplier applier, ContestScoreboardSequenceLedger ledger) {
-        return new ContestScoreboardSequencedApplication(applier, ledger);
+            ContestScoreboardSequencedApplier applier, ContestScoreboardSequenceLedger ledger,
+            ObjectProvider<ContestScoreboardExperimentTrace> trace) {
+        return new ContestScoreboardSequencedApplication(applier, ledger, trace(trace));
     }
 
     @Bean
     ContestScoreboardRollbackDetector contestScoreboardRollbackDetector(ContestScoreboardSequencedApplier applier,
                                                                        ContestScoreboardSequenceLedger ledger,
                                                                        ContestScoreboardApplyLock applyLock,
-                                                                       ContestScoreboardMySqlPollMetrics metrics) {
-        return new ContestScoreboardRollbackDetector(applier, ledger, applyLock, metrics);
+                                                                       ContestScoreboardMySqlPollMetrics metrics,
+                                                                       ObjectProvider<ContestScoreboardExperimentTrace> trace) {
+        return new ContestScoreboardRollbackDetector(applier, ledger, applyLock, metrics, trace(trace));
     }
 
     @Bean
@@ -74,9 +78,15 @@ public class ContestScoreboardMySqlPollConfiguration {
                                                                  ContestScoreboardRollbackDetector detector,
                                                                  ContestScoreboardApplyLock applyLock,
                                                                  ContestScoreboardMySqlPollMetrics metrics,
-                                                                 ContestScoreboardMySqlPollProperties properties) {
+                                                                 ContestScoreboardMySqlPollProperties properties,
+                                                                 ObjectProvider<ContestScoreboardExperimentTrace> trace) {
         return new ContestScoreboardRangeRecovery(ledger, application, detector, applyLock, metrics,
-                properties.recoveryChunkSize(), properties.recoveryMaxIterations());
+                properties.recoveryChunkSize(), properties.recoveryMaxIterations(), trace(trace));
+    }
+
+    /** The live-impact experiment's trace when a run turned it on; otherwise one that records nothing. */
+    private static ContestScoreboardExperimentTrace trace(ObjectProvider<ContestScoreboardExperimentTrace> trace) {
+        return trace.getIfAvailable(() -> ContestScoreboardExperimentTrace.NOOP);
     }
 
     @Bean
