@@ -10,6 +10,7 @@ import my.oj.web.contest.scoreboard.redis.RedisContestScoreboardSequenceSource;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryMode;
 import my.oj.web.contest.scoreboard.recovery.ContestScoreboardRecoveryProperties;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -61,11 +62,15 @@ public class ContestScoreboardStoreConfig {
 
     @Bean
     @ConditionalOnProperty(prefix = "contest.scoreboard", name = "store", havingValue = "redis")
-    ContestScoreboardApplier redisContestScoreboardApplier(StringRedisTemplate redisTemplate,
-                                                           ContestRedisKeyValueClient redisClient,
-                                                           RedisContestScoreboardApplyMetrics metrics,
-                                                           ContestScoreboardSequenceTracking sequenceTracking) {
-        return new RedisContestScoreboardApplier(redisTemplate, redisClient, metrics, sequenceTracking);
+    ContestScoreboardApplier redisContestScoreboardApplier(
+            StringRedisTemplate redisTemplate,
+            ContestRedisKeyValueClient redisClient,
+            RedisContestScoreboardApplyMetrics metrics,
+            ContestScoreboardSequenceTracking sequenceTracking,
+            @Value("${contest.scoreboard.redis.apply-chunk-size:" + RedisContestScoreboardApplier.DEFAULT_CHUNK_SIZE + "}")
+            int applyChunkSize) {
+        return new RedisContestScoreboardApplier(redisTemplate, redisClient, metrics, sequenceTracking,
+                ContestScoreboardAppliedAtTracking.ENABLED, applyChunkSize);
     }
 
     @Bean

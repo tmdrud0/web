@@ -2,31 +2,92 @@ package my.oj.web.contest.scoreboard.redis;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import my.oj.web.contest.scoreboard.ContestScoreboardApplier;
+import my.oj.web.contest.scoreboard.ContestScoreboardAppliedAtTracking;
+import my.oj.web.contest.scoreboard.ContestScoreboardSequenceTracking;
 import my.oj.web.contest.scoreboard.ContestScoreboardUpdate;
 import my.oj.web.submission.SubmissionResult;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class RedisContestScoreboardApplierTests {
 
+    /**
+     * The batch stops at the first failure across chunk boundaries: a failed event in the second chunk
+     * ends the batch, and the third chunk is never sent - which is what keeps a later offset from being
+     * carried over the poison by a script that would otherwise run.
+     */
     @Test
     void applyAllStopsAtFirstFailureSoNoLaterOffsetCanJumpPoison() {
-        CountingApplier applier = new CountingApplier(1L);
+        StringRedisTemplate template = mock(StringRedisTemplate.class);
+        when(template.execute(any(RedisScript.class), anyList(), any(Object[].class)))
+                .thenReturn(List.of(entry(1L, 0L), entry(1L, 1L)))
+                .thenReturn(List.of(entry(1L, 2L), List.of(3L, 2L, -1L, "user_script: poison event")));
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        RedisContestScoreboardApplier applier = chunked(template, registry, 2);
 
-        List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(requests());
+        List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(requests(6), 7L);
 
-        assertThat(results).hasSize(2);
-        assertThat(results.get(0).succeeded()).isTrue();
-        assertThat(results.get(0).appliedOffset()).isZero();
-        assertThat(results.get(1).succeeded()).isFalse();
-        assertThat(results.get(1).errorMessage()).contains("poison");
-        assertThat(applier.calls).containsExactly(0L, 1L);
+        assertThat(results).hasSize(4);
+        assertThat(results.subList(0, 3)).allMatch(ContestScoreboardApplier.ApplyResult::newlyApplied);
+        assertThat(results.get(3).succeeded()).isFalse();
+        assertThat(results.get(3).correlationId()).isEqualTo(3L);
+        assertThat(results.get(3).errorMessage()).contains("poison");
+        // Two scripts for two chunks reached; the third chunk was never sent.
+        verify(template, times(2)).execute(any(RedisScript.class), anyList(), any(Object[].class));
+        assertThat(registry.get("contest.scoreboard.redis.apply.calls").summary().totalAmount()).isEqualTo(2.0);
+    }
+
+    /**
+     * The first chunk is checked against the caller's floor; the second against the checkpoint the
+     * first one left, which this call wrote itself.
+     */
+    @Test
+    void theCheckpointFloorIsCarriedFromChunkToChunk() {
+        StringRedisTemplate template = mock(StringRedisTemplate.class);
+        when(template.execute(any(RedisScript.class), anyList(), any(Object[].class)))
+                .thenReturn(List.of(entry(1L, 0L), entry(2L, 1L)))
+                .thenReturn(List.of(entry(1L, 2L)));
+        RedisContestScoreboardApplier applier = chunked(template, new SimpleMeterRegistry(), 2);
+
+        applier.applyAll(requests(3), 7L);
+
+        ArgumentCaptor<Object[]> arguments = ArgumentCaptor.forClass(Object[].class);
+        verify(template, times(2)).execute(any(RedisScript.class), anyList(), arguments.capture());
+        List<Object[]> calls = arguments.getAllValues();
+        assertThat(calls.get(0)[0]).isEqualTo("2");
+        assertThat(calls.get(0)[1]).isEqualTo("7");
+        assertThat(calls.get(1)[0]).isEqualTo("1");
+        assertThat(calls.get(1)[1]).isEqualTo("7");
+    }
+
+    @Test
+    void aRollbackReplyEndsTheBatchWithoutSendingTheRest() {
+        StringRedisTemplate template = mock(StringRedisTemplate.class);
+        when(template.execute(any(RedisScript.class), anyList(), any(Object[].class)))
+                .thenReturn(List.of(List.of(4L, 900L, -1L)));
+        RedisContestScoreboardApplier applier = chunked(template, new SimpleMeterRegistry(), 2);
+
+        List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(requests(5), 1000L);
+
+        assertThat(results).singleElement().satisfies(result -> {
+            assertThat(result.rolledBack()).isTrue();
+            assertThat(result.appliedOffset()).isEqualTo(900L);
+        });
+        verify(template, times(1)).execute(any(RedisScript.class), anyList(), any(Object[].class));
     }
 
     @Test
@@ -51,12 +112,24 @@ class RedisContestScoreboardApplierTests {
         assertThat(redisClient.sIsMember(ContestScoreboardRedisKeys.STREAM_DB_PENDING, "5001")).isTrue();
     }
 
-    private static List<ContestScoreboardApplier.ApplyRequest> requests() {
-        return List.of(
-                ContestScoreboardApplier.ApplyRequest.stream(0L, payload(1001L)),
-                ContestScoreboardApplier.ApplyRequest.stream(1L, payload(1002L)),
-                ContestScoreboardApplier.ApplyRequest.stream(2L, payload(1003L))
-        );
+    private static List<ContestScoreboardApplier.ApplyRequest> requests(int count) {
+        List<ContestScoreboardApplier.ApplyRequest> requests = new ArrayList<>();
+        for (long offset = 0L; offset < count; offset++) {
+            requests.add(ContestScoreboardApplier.ApplyRequest.stream(offset, payload(1001L + offset)));
+        }
+        return requests;
+    }
+
+    private static List<Object> entry(long status, long offset) {
+        return List.of(status, offset, -1L);
+    }
+
+    private static RedisContestScoreboardApplier chunked(StringRedisTemplate template,
+                                                         SimpleMeterRegistry registry,
+                                                         int chunkSize) {
+        return new RedisContestScoreboardApplier(template, new InMemoryContestRedisKeyValueClient(),
+                new RedisContestScoreboardApplyMetrics(registry), ContestScoreboardSequenceTracking.DISABLED,
+                ContestScoreboardAppliedAtTracking.ENABLED, chunkSize);
     }
 
     private static ContestScoreboardUpdate payload(long submissionId) {
@@ -67,25 +140,5 @@ class RedisContestScoreboardApplierTests {
                 SubmissionResult.ACCEPTED,
                 LocalDateTime.of(2026, 3, 10, 12, 2)
         );
-    }
-
-    private static final class CountingApplier extends RedisContestScoreboardApplier {
-        private final long failingOffset;
-        private final java.util.ArrayList<Long> calls = new java.util.ArrayList<>();
-
-        private CountingApplier(long failingOffset) {
-            super(mock(StringRedisTemplate.class), new InMemoryContestRedisKeyValueClient(),
-                    new RedisContestScoreboardApplyMetrics(new SimpleMeterRegistry()));
-            this.failingOffset = failingOffset;
-        }
-
-        @Override
-        public Long apply(ApplyRequest request) {
-            calls.add(request.streamOffset());
-            if (request.streamOffset() == failingOffset) {
-                throw new IllegalStateException("poison event");
-            }
-            return request.streamOffset();
-        }
     }
 }

@@ -338,7 +338,8 @@ class ContestScoreboardStreamProcessor {
             ));
         }
 
-        List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(requests);
+        List<ContestScoreboardApplier.ApplyResult> results = applier.applyAll(
+                requests, ContestScoreboardApplier.NO_CHECKPOINT_FLOOR);
         long answeredAt = trace.enabled() ? System.currentTimeMillis() : 0L;
         ContestScoreboardApplier.ApplyResult failed = results.stream()
                 .filter(result -> !result.succeeded())

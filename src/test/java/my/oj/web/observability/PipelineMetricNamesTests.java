@@ -170,7 +170,7 @@ class PipelineMetricNamesTests {
                 .bindTo(registry);
 
         RedisContestScoreboardApplyMetrics redisApply = new RedisContestScoreboardApplyMetrics(registry);
-        redisApply.recordPipeline(java.time.Duration.ofMillis(1));
+        redisApply.recordBatch(java.time.Duration.ofMillis(1), 1);
         redisApply.recordLuaError(new IllegalStateException("synthetic scrape materialisation"));
         new RedisContestScoreboardWrongAttemptMetrics(mock(
                 my.oj.web.contest.scoreboard.redis.ContestRedisKeyValueClient.class))

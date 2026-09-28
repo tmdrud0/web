@@ -16,7 +16,7 @@ class RedisContestScoreboardApplyMetricsTests {
         PrometheusMeterRegistry registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
         RedisContestScoreboardApplyMetrics metrics = new RedisContestScoreboardApplyMetrics(registry);
 
-        metrics.recordPipeline(Duration.ofMillis(7));
+        metrics.recordBatch(Duration.ofMillis(7), 5);
 
         String scrape = registry.scrape();
         assertThat(scrape).contains("contest_scoreboard_redis_pipeline_seconds_bucket{le=\"0.01\"} 1");

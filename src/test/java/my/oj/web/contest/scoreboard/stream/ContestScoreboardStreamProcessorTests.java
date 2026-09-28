@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -75,7 +76,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void sparseOffsetsFromAnAnchoredPositionAreNotMistakenForAGap() {
         when(applier.currentStreamOffset()).thenReturn(4L, 4L, 12L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
 
         long applied = processor.process(List.of(event(4L, 104L), event(5L, 105L), event(7L, 107L),
                 event(12L, 112L)));
@@ -95,7 +96,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void aResubscribeAnchorIsAcceptedAsThePosition() {
         when(applier.currentStreamOffset()).thenReturn(5L, 5L, 9L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
 
         processor.process(List.of(event(5L, 105L), event(9L, 109L)));
 
@@ -111,7 +112,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void aDeliveryAboveAnUnretainedCheckpointIsAnchoredOnlyAfterTheBasisRebuiltIt() {
         when(applier.currentStreamOffset()).thenReturn(5L, 5L, 11L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         position.recordAppliedOffset(5L);
 
@@ -144,7 +145,7 @@ class ContestScoreboardStreamProcessorTests {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("checkpoint does not move past results the standings never saw");
 
-        verify(applier, never()).applyAll(anyList());
+        verify(applier, never()).applyAll(anyList(), anyLong());
         verify(completion, never()).complete(anyList());
         assertThat(counter("contest.scoreboard.stream.offset.gaps")).isEqualTo(1.0);
     }
@@ -157,7 +158,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void aScoreboardWithNoCheckpointAdoptsTheFirstOffsetItIsHanded() {
         when(applier.currentStreamOffset()).thenReturn(-1L, -1L, 7L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
 
         processor.process(List.of(event(7L, 107L), event(8L, 108L)));
 
@@ -178,7 +179,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void aRollbackIsCountedApartFromARetentionGapAndJudgedAfresh() {
         when(applier.currentStreamOffset()).thenReturn(2L, 2L, 100L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         position.recordAppliedOffset(4L);
         // The anchor was verified for the position the consumer held before Redis rolled back.
@@ -200,7 +201,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void redisSequenceLiveProgressLetsARollbackBatchApplyWithoutClaimingCoverage() {
         when(applier.currentStreamOffset()).thenReturn(2L, 2L, 100L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         when(strategy.mode()).thenReturn(ContestScoreboardRecoveryMode.REDIS_SEQ);
         when(strategy.rebuildHistory(any())).thenReturn(Outcome.LIVE_PROGRESS);
         position.recordAppliedOffset(4L);
@@ -231,7 +232,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void theRangeCarriesHowFarACompletedRebuildAlreadyReached() {
         when(applier.currentStreamOffset()).thenReturn(5L, 5L, 10L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         when(strategy.rebuildHistory(any())).thenReturn(Outcome.COVERED);
         position.recordAppliedOffset(5L);
         position.markRebuiltThrough(9L);
@@ -249,7 +250,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void failedRedisApplyDoesNotCompleteMysqlOrCountAppliedEvents() {
         when(applier.currentStreamOffset()).thenReturn(4L);
-        when(applier.applyAll(anyList())).thenReturn(List.of(
+        when(applier.applyAll(anyList(), anyLong())).thenReturn(List.of(
                 ContestScoreboardApplier.ApplyResult.failure(5L, "Redis unavailable")
         ));
 
@@ -268,7 +269,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void aFailedApplyIsRecordedAsTheRangeTheCheckpointMayNotPass() {
         when(applier.currentStreamOffset()).thenReturn(4L);
-        when(applier.applyAll(anyList())).thenReturn(List.of(
+        when(applier.applyAll(anyList(), anyLong())).thenReturn(List.of(
                 ContestScoreboardApplier.ApplyResult.success(4L, 4L),
                 ContestScoreboardApplier.ApplyResult.failure(5L, "Redis unavailable")
         ));
@@ -297,7 +298,7 @@ class ContestScoreboardStreamProcessorTests {
                 .hasMessageContaining("nothing rebuilt")
                 .hasMessageContaining("does not move past results the standings never saw");
 
-        verify(applier, never()).applyAll(anyList());
+        verify(applier, never()).applyAll(anyList(), anyLong());
         verify(completion, never()).complete(anyList());
         verify(strategy, never()).rebuildHistory(any());
         assertThat(counter("contest.scoreboard.stream.unapplied.refusals")).isEqualTo(1.0);
@@ -307,7 +308,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void aDeliveryThatStartsAtTheUnappliedRangeIsAppliedAndReleasesIt() {
         when(applier.currentStreamOffset()).thenReturn(-1L, -1L, 2L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         position.recordUnappliedRange(0L);
 
         long applied = processor.process(List.of(event(0L, 100L), event(2L, 102L)));
@@ -347,7 +348,7 @@ class ContestScoreboardStreamProcessorTests {
         assertThat(counter("contest.scoreboard.stream.unapplied.refusals")).isZero();
         // Being asked about does not clear it: only the delivery that applies the range does.
         assertThat(position.unappliedFrom()).isEqualTo(6L);
-        verify(applier, never()).applyAll(anyList());
+        verify(applier, never()).applyAll(anyList(), anyLong());
     }
 
     @Test
@@ -364,7 +365,7 @@ class ContestScoreboardStreamProcessorTests {
                 .hasMessageContaining("checkpoint does not move past results the standings never saw");
 
         verify(strategy).rebuildHistory(any());
-        verify(applier, never()).applyAll(anyList());
+        verify(applier, never()).applyAll(anyList(), anyLong());
         assertThat(position.unappliedFrom()).isEqualTo(6L);
         assertThat(position.rebuiltThrough()).isEqualTo(-1L);
     }
@@ -372,7 +373,7 @@ class ContestScoreboardStreamProcessorTests {
     @Test
     void successfulRetryCountsPartiallyAppliedOffsetsButAckRedeliveryDoesNotCountTwice() {
         when(applier.currentStreamOffset()).thenReturn(5L, 5L, 6L, 5L, 5L, 6L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         List<ContestScoreboardStreamEvent> events = List.of(event(5L, 105L), event(6L, 106L));
 
         processor.process(events);
@@ -391,7 +392,7 @@ class ContestScoreboardStreamProcessorTests {
 
     private List<ContestScoreboardApplier.ApplyRequest> requests() {
         ArgumentCaptor<List<ContestScoreboardApplier.ApplyRequest>> captured = requestsCaptor();
-        verify(applier).applyAll(captured.capture());
+        verify(applier).applyAll(captured.capture(), anyLong());
         return captured.getValue();
     }
 

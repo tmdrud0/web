@@ -36,6 +36,12 @@ public class InMemoryContestScoreboard {
      * @return whether this call changed the standings: a duplicate submission or an unjudged one is
      *         recorded for nothing, which is what the sequence issue hangs off
      */
+    /** Whether the contest has already recorded this submission, judged or not. */
+    public boolean hasProcessed(long contestId, long submissionId) {
+        ContestState state = contests.get(contestId);
+        return state != null && state.appliedSubmissions.contains(submissionId);
+    }
+
     public boolean apply(ContestScoreboardUpdate update) {
         long submissionId = update.contestSubmissionId();
         ContestState state = getContestState(update.contestId(), update.contestStart());

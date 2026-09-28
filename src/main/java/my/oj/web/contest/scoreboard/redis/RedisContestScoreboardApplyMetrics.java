@@ -1,6 +1,7 @@
 package my.oj.web.contest.scoreboard.redis;
 
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 
@@ -27,20 +28,42 @@ public class RedisContestScoreboardApplyMetrics {
     };
 
     private final MeterRegistry registry;
-    private final Timer pipelineLatency;
+    private final Timer batchLatency;
+    private final DistributionSummary batchCalls;
     private final ConcurrentMap<String, Counter> luaErrors = new ConcurrentHashMap<>();
 
     public RedisContestScoreboardApplyMetrics(MeterRegistry registry) {
         this.registry = registry;
-        this.pipelineLatency = Timer.builder("contest.scoreboard.redis.pipeline")
-                .description("Wall-clock duration of one Redis scoreboard applyAll pipeline, "
-                        + "including command-error classification fallback")
+        // The meter keeps its old name on purpose: the harness scripts, the Grafana panels and the
+        // earlier runs all read contest_scoreboard_redis_pipeline_seconds_*, and renaming it would cut
+        // every comparison with them. What it measures is spelled out here instead - it was never a
+        // Redis pipeline, and is now one batched EVAL per chunk.
+        this.batchLatency = Timer.builder("contest.scoreboard.redis.pipeline")
+                .description("Wall-clock duration of one Redis scoreboard applyAll batch: one batched Lua "
+                        + "EVAL per chunk of contest.scoreboard.redis.apply-chunk-size events, sent in order "
+                        + "and stopped at the first failure (not a Redis pipeline)")
                 .serviceLevelObjectives(PIPELINE_BUCKETS)
+                .register(registry);
+        this.batchCalls = DistributionSummary.builder("contest.scoreboard.redis.apply.calls")
+                .description("Redis round trips (batched Lua EVALs) spent on one applyAll batch")
+                .baseUnit("calls")
                 .register(registry);
     }
 
-    public void recordPipeline(Duration duration) {
-        pipelineLatency.record(duration);
+    /**
+     * Records one applyAll batch.
+     *
+     * @param redisCalls how many scripts the batch sent to Redis - one per chunk reached
+     */
+    public void recordBatch(Duration duration, int redisCalls) {
+        batchLatency.record(duration);
+        batchCalls.record(redisCalls);
+    }
+
+    /** Classifies a failure the batched script reported as an event's result rather than raising. */
+    public void recordLuaError(String failureMessage) {
+        String kind = classify(failureMessage);
+        luaErrors.computeIfAbsent(kind, this::registerLuaErrorCounter).increment();
     }
 
     public void recordLuaError(Throwable failure) {
@@ -60,11 +83,15 @@ public class RedisContestScoreboardApplyMetrics {
         Throwable current = failure;
         while (current != null) {
             if (current.getMessage() != null) {
-                messages.append(' ').append(current.getMessage().toLowerCase(Locale.ROOT));
+                messages.append(' ').append(current.getMessage());
             }
             current = current.getCause();
         }
-        String message = messages.toString();
+        return classify(messages.toString());
+    }
+
+    static String classify(String failureMessage) {
+        String message = failureMessage == null ? "" : failureMessage.toLowerCase(Locale.ROOT);
         if (message.contains("unexpected redis key type")) {
             return "unexpected_key_type";
         }

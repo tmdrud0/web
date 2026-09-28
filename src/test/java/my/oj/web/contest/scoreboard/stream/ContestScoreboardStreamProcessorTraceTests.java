@@ -26,6 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -51,7 +52,7 @@ class ContestScoreboardStreamProcessorTraceTests {
     void anAppliedBatchIsRecordedEventByEventWithOneApplyInstant() {
         RecordingExperimentTrace trace = new RecordingExperimentTrace();
         when(applier.currentStreamOffset()).thenReturn(4L, 4L, 9L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> success(invocation.getArgument(0)));
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> success(invocation.getArgument(0)));
         long before = System.currentTimeMillis();
 
         processor(trace).process(List.of(event(4L, 104L), event(7L, 107L), event(9L, 109L)));
@@ -71,7 +72,7 @@ class ContestScoreboardStreamProcessorTraceTests {
     void aBatchTheApplierRefusedIsNotRecorded() {
         RecordingExperimentTrace trace = new RecordingExperimentTrace();
         when(applier.currentStreamOffset()).thenReturn(4L, 4L);
-        when(applier.applyAll(anyList())).thenReturn(List.of(
+        when(applier.applyAll(anyList(), anyLong())).thenReturn(List.of(
                 ContestScoreboardApplier.ApplyResult.success(4L, 4L),
                 ContestScoreboardApplier.ApplyResult.failure(5L, "refused")));
 
@@ -112,7 +113,7 @@ class ContestScoreboardStreamProcessorTraceTests {
     void theTraceChangesNothingTheProcessorSendsOrReturns() {
         List<List<ContestScoreboardApplier.ApplyRequest>> sent = new ArrayList<>();
         when(applier.currentStreamOffset()).thenReturn(4L, 4L, 12L, 4L, 4L, 12L);
-        when(applier.applyAll(anyList())).thenAnswer(invocation -> {
+        when(applier.applyAll(anyList(), anyLong())).thenAnswer(invocation -> {
             List<ContestScoreboardApplier.ApplyRequest> requests = invocation.getArgument(0);
             sent.add(requests);
             return success(requests);
